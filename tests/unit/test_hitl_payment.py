@@ -15,17 +15,19 @@ from invoice_agents.models import (
     PaymentStatus,
 )
 from invoice_agents.payment.service import mock_payment
+from invoice_agents.source_store import snapshot_source
 from invoice_agents.tools.comparison import (
     InventoryReader,
     build_risk_assessment,
     compare_inventory,
     compute_invoice_totals,
 )
-from invoice_agents.tools.evidence import extract_invoice_evidence, get_source_metadata
+from invoice_agents.tools.evidence import extract_invoice_evidence
 
 
-def load(invoice_dir: Path, name: str):  # type: ignore[no-untyped-def]
-    return extract_invoice_evidence(get_source_metadata(invoice_dir / name))
+def load(invoice_dir: Path, name: str, archive: Path):  # type: ignore[no-untyped-def]
+    source = snapshot_source(invoice_dir / name, archive, max_bytes=10_485_760)
+    return extract_invoice_evidence(source)
 
 
 def persist_case(store: WorkflowStore, case_id: str, invoice) -> None:  # type: ignore[no-untyped-def]
@@ -64,7 +66,7 @@ def test_review_request_and_human_decision_are_persisted(
     settings: Settings,
 ) -> None:
     store = WorkflowStore(workflow_db)
-    inv = load(invoice_dir, "invoice_1002.txt")
+    inv = load(invoice_dir, "invoice_1002.txt", workflow_db.parent / "sources")
     persist_case(store, "case_review", inv)
     comparisons, _ = compare_inventory(inv, InventoryReader(inventory_db))
     risk = build_risk_assessment(inv, comparisons, [], compute_invoice_totals(inv), settings)
@@ -90,8 +92,8 @@ def test_mock_payment_pays_once_across_duplicate_representations(
     invoice_dir: Path, workflow_db: Path
 ) -> None:
     store = WorkflowStore(workflow_db)
-    text = load(invoice_dir, "invoice_1011.txt")
-    pdf = load(invoice_dir, "invoice_1011.pdf")
+    text = load(invoice_dir, "invoice_1011.txt", workflow_db.parent / "sources")
+    pdf = load(invoice_dir, "invoice_1011.pdf", workflow_db.parent / "sources")
     persist_case(store, "case_text", text)
     approve_final(store, "case_text")
     first = mock_payment("case_text", text, store, workflow_db)
@@ -110,7 +112,7 @@ def test_rejected_and_injected_failure_never_report_payment_success(
     invoice_dir: Path, workflow_db: Path
 ) -> None:
     store = WorkflowStore(workflow_db)
-    rejected_invoice = load(invoice_dir, "invoice_1001.txt")
+    rejected_invoice = load(invoice_dir, "invoice_1001.txt", workflow_db.parent / "sources")
     persist_case(store, "case_rejected", rejected_invoice)
     store.save_final_decision(
         "case_rejected",
@@ -124,7 +126,7 @@ def test_rejected_and_injected_failure_never_report_payment_success(
     rejected = mock_payment("case_rejected", rejected_invoice, store, workflow_db)
     assert rejected.status is PaymentStatus.NOT_ELIGIBLE
 
-    failed_invoice = load(invoice_dir, "invoice_1004.json")
+    failed_invoice = load(invoice_dir, "invoice_1004.json", workflow_db.parent / "sources")
     persist_case(store, "case_failed_payment", failed_invoice)
     approve_final(store, "case_failed_payment")
     failed = mock_payment(

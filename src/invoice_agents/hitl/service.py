@@ -21,6 +21,7 @@ from invoice_agents.models import (
     RiskAssessment,
     SourceArtifact,
 )
+from invoice_agents.source_store import verified_source_path
 from invoice_agents.tools.comparison import normalize_alias
 from invoice_agents.tools.evidence import render_pdf_page
 
@@ -35,6 +36,7 @@ def _render_review_pages(source: SourceArtifact, review_id: str) -> list[dict[st
 
     if source.source_format != "pdf":
         return []
+    verified_source_path(source)
     page_count = source.page_count or 1
     pages = range(1, page_count + 1) if page_count <= 3 else range(1, 2)
     output_dir = Path("artifacts/reviews").resolve() / review_id

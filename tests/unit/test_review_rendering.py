@@ -16,6 +16,7 @@ from invoice_agents.tools.comparison import (
     compare_inventory,
     compute_invoice_totals,
 )
+from invoice_agents.tools.evidence import render_pdf_page
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "invoices"
 
@@ -78,3 +79,20 @@ def test_non_pdf_review_has_no_rendered_pages(
     monkeypatch.chdir(tmp_path)
     review = build_review("invoice_1002.txt", settings)
     assert review.evidence_bundle["rendered_pages"] == []
+
+
+def test_pdf_render_uses_snapshot_after_submitted_path_is_replaced(
+    tmp_path: Path, settings: Settings
+) -> None:
+    submitted = tmp_path / "submitted.pdf"
+    submitted.write_bytes((DATA_DIR / "invoice_1011.pdf").read_bytes())
+    prepared = prepare_case(submitted, settings)
+    assert isinstance(prepared, tuple), f"prepare_case failed: {prepared}"
+    source = WorkflowStore(settings.workflow_db).load_extraction(prepared[0]).source
+    first = render_pdf_page(source, 1, tmp_path / "first")
+
+    submitted.write_bytes((DATA_DIR / "invoice_1012.pdf").read_bytes())
+    second = render_pdf_page(source, 1, tmp_path / "second")
+
+    assert source.canonical_path != submitted.resolve()
+    assert first["sha256"] == second["sha256"]

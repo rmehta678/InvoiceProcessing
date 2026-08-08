@@ -92,6 +92,7 @@ def golden(tmp_path_factory: pytest.TempPathFactory) -> dict[str, CaseEvidence]:
         xai_api_key="golden-matrix-not-used",
         inventory_db=inventory_db,
         workflow_db=workflow_db,
+        source_archive_dir=tmp / "sources",
     )
     store = WorkflowStore(settings.workflow_db)
     reader = InventoryReader(settings.inventory_db)

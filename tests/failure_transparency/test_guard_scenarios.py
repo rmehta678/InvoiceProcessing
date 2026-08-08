@@ -45,7 +45,8 @@ from invoice_agents.orchestration import (
     run_prepared_case,
 )
 from invoice_agents.payment.service import mock_payment
-from invoice_agents.tools.evidence import extract_invoice_evidence, get_source_metadata
+from invoice_agents.source_store import snapshot_source
+from invoice_agents.tools.evidence import extract_invoice_evidence
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
 
@@ -389,17 +390,19 @@ async def test_retry_events_count_into_usage(
 
 def test_synthetic_fixture_sources_fail_visibly(tmp_path: Path) -> None:
     with pytest.raises(SourceEvidenceError) as corrupt_pdf_error:
-        get_source_metadata(FIXTURES_DIR / "corrupt.pdf")
+        snapshot_source(FIXTURES_DIR / "corrupt.pdf", tmp_path / "sources", 10_485_760)
     assert corrupt_pdf_error.value.category in {"PARSE", "SOURCE"}
     assert corrupt_pdf_error.value.stop_reason == "SOURCE_INSPECTION_FAILED"
 
     with pytest.raises(SourceEvidenceError) as malformed_json_error:
-        extract_invoice_evidence(get_source_metadata(FIXTURES_DIR / "malformed.json"))
+        source = snapshot_source(FIXTURES_DIR / "malformed.json", tmp_path / "sources", 10_485_760)
+        extract_invoice_evidence(source)
     assert malformed_json_error.value.category == "PARSE"
     assert malformed_json_error.value.stop_reason == "JSON_PARSE_FAILED"
 
     with pytest.raises(SourceEvidenceError) as empty_error:
-        extract_invoice_evidence(get_source_metadata(FIXTURES_DIR / "empty.txt"))
+        source = snapshot_source(FIXTURES_DIR / "empty.txt", tmp_path / "sources", 10_485_760)
+        extract_invoice_evidence(source)
     assert empty_error.value.category == "PARSE"
     assert empty_error.value.stop_reason == "SOURCE_EMPTY"
 

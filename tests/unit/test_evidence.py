@@ -6,7 +6,13 @@ from pathlib import Path
 import pytest
 
 from invoice_agents.errors import SourceEvidenceError
-from invoice_agents.tools.evidence import extract_invoice_evidence, get_source_metadata
+from invoice_agents.source_store import snapshot_source
+from invoice_agents.tools.evidence import extract_invoice_evidence
+
+
+def snapshot(path: Path, archive: Path):  # type: ignore[no-untyped-def]
+    return snapshot_source(path, archive, max_bytes=10_485_760)
+
 
 EXPECTED = {
     "invoice_1001.txt": ("INV-1001", 2, Decimal("5000.00")),
@@ -34,9 +40,9 @@ EXPECTED = {
 
 @pytest.mark.parametrize(("filename", "expected"), EXPECTED.items())
 def test_all_twenty_artifacts_extract(
-    invoice_dir: Path, filename: str, expected: tuple[str, int, Decimal]
+    invoice_dir: Path, tmp_path: Path, filename: str, expected: tuple[str, int, Decimal]
 ) -> None:
-    invoice = extract_invoice_evidence(get_source_metadata(invoice_dir / filename))
+    invoice = extract_invoice_evidence(snapshot(invoice_dir / filename, tmp_path / "sources"))
     assert invoice.invoice_number.normalized_value == expected[0]
     assert len(invoice.lines) == expected[1]
     assert invoice.declared_total == expected[2]
@@ -47,20 +53,24 @@ def test_all_twenty_artifacts_extract(
     )
 
 
-def test_special_raw_normalization_and_missing_fields(invoice_dir: Path) -> None:
-    ocr = extract_invoice_evidence(get_source_metadata(invoice_dir / "invoice_1012.txt"))
+def test_special_raw_normalization_and_missing_fields(invoice_dir: Path, tmp_path: Path) -> None:
+    ocr = extract_invoice_evidence(snapshot(invoice_dir / "invoice_1012.txt", tmp_path / "sources"))
     assert ocr.invoice_date.raw_value == "26-Jan-2O26"
     assert ocr.invoice_date.normalized_value == "2026-01-26"
     assert ocr.invoice_date.ambiguity is not None
-    invalid = extract_invoice_evidence(get_source_metadata(invoice_dir / "invoice_1009.json"))
+    invalid = extract_invoice_evidence(
+        snapshot(invoice_dir / "invoice_1009.json", tmp_path / "sources")
+    )
     assert {"vendor", "due_date", "payment_terms"}.issubset(invalid.missing_fields)
     assert invalid.lines[0].quantity == Decimal("-5")
 
 
-def test_email_vendor_and_pdf_columns_are_not_conflated(invoice_dir: Path) -> None:
-    email = extract_invoice_evidence(get_source_metadata(invoice_dir / "invoice_1008.txt"))
+def test_email_vendor_and_pdf_columns_are_not_conflated(invoice_dir: Path, tmp_path: Path) -> None:
+    email = extract_invoice_evidence(
+        snapshot(invoice_dir / "invoice_1008.txt", tmp_path / "sources")
+    )
     assert email.vendor.normalized_value == "NoProd Industries"
-    pdf = extract_invoice_evidence(get_source_metadata(invoice_dir / "invoice_1013.pdf"))
+    pdf = extract_invoice_evidence(snapshot(invoice_dir / "invoice_1013.pdf", tmp_path / "sources"))
     assert pdf.vendor.normalized_value == "Atlas Industrial Supply"
 
 
@@ -68,12 +78,12 @@ def test_unknown_corrupt_and_empty_sources_fail(tmp_path: Path) -> None:
     unsupported = tmp_path / "invoice.bin"
     unsupported.write_bytes(b"x")
     with pytest.raises(SourceEvidenceError, match="unsupported"):
-        get_source_metadata(unsupported)
+        snapshot(unsupported, tmp_path / "sources")
     broken = tmp_path / "invoice.json"
     broken.write_text("{broken", encoding="utf-8")
     with pytest.raises(SourceEvidenceError, match="JSON parse failed"):
-        extract_invoice_evidence(get_source_metadata(broken))
+        extract_invoice_evidence(snapshot(broken, tmp_path / "sources"))
     empty = tmp_path / "invoice.txt"
     empty.write_text("", encoding="utf-8")
     with pytest.raises(SourceEvidenceError, match="empty"):
-        extract_invoice_evidence(get_source_metadata(empty))
+        extract_invoice_evidence(snapshot(empty, tmp_path / "sources"))

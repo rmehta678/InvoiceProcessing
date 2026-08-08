@@ -11,11 +11,9 @@ import csv
 import hashlib
 import json
 import re
-from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal
-from uuid import NAMESPACE_URL, uuid5
 from xml.etree import ElementTree
 
 import fitz
@@ -30,8 +28,8 @@ from invoice_agents.models import (
     InvoiceLine,
     SourceArtifact,
 )
+from invoice_agents.source_store import verified_source_path
 
-SUPPORTED_FORMATS = {".txt": "txt", ".json": "json", ".csv": "csv", ".xml": "xml", ".pdf": "pdf"}
 RELATIVE_DATE = re.compile(r"\b(today|tomorrow|yesterday|next\s+\w+|last\s+\w+)\b", re.I)
 MONEY_TOKEN = re.compile(r"[-+]?\$?\s*[0-9O][0-9O,]*(?:\.[0-9O]{1,2})?")
 
@@ -44,59 +42,12 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def get_source_metadata(path: Path) -> SourceArtifact:
-    """Return immutable file identity; unsupported formats never enter a case."""
-
-    resolved = path.expanduser().resolve()
-    if not resolved.is_file():
-        raise SourceEvidenceError(
-            ErrorCategory.SOURCE,
-            f"invoice source does not exist or is not a file: {resolved}",
-            stop_reason="SOURCE_NOT_FOUND",
-        )
-    source_format = SUPPORTED_FORMATS.get(resolved.suffix.lower())
-    if source_format is None:
-        raise SourceEvidenceError(
-            ErrorCategory.SOURCE,
-            f"unsupported invoice format {resolved.suffix or '<none>'}",
-            stop_reason="SOURCE_FORMAT_UNSUPPORTED",
-        )
-    stat = resolved.stat()
-    source_hash = _sha256(resolved)
-    page_count: int | None = None
-    row_count: int | None = None
-    try:
-        if source_format == "pdf":
-            page_count = len(PdfReader(resolved).pages)
-            if page_count < 1:
-                raise ValueError("PDF has no pages")
-        elif source_format == "csv":
-            with resolved.open("r", encoding="utf-8-sig", newline="") as handle:
-                row_count = sum(1 for _ in csv.reader(handle))
-    except Exception as exc:
-        raise SourceEvidenceError(
-            ErrorCategory.PARSE,
-            f"could not inspect {source_format} source: {exc}",
-            stop_reason="SOURCE_INSPECTION_FAILED",
-        ) from exc
-    source_id = f"src_{uuid5(NAMESPACE_URL, str(resolved) + ':' + source_hash).hex}"
-    return SourceArtifact(
-        source_id=source_id,
-        canonical_path=resolved,
-        sha256=source_hash,
-        source_format=source_format,
-        size_bytes=stat.st_size,
-        modified_at=datetime.fromtimestamp(stat.st_mtime, tz=UTC),
-        page_count=page_count,
-        row_count=row_count,
-    )
-
-
 def read_text_invoice(source: SourceArtifact) -> dict[str, Any]:
     """Read UTF-8 text with stable one-based line references."""
 
+    path = verified_source_path(source)
     try:
-        raw = source.canonical_path.read_text(encoding="utf-8-sig")
+        raw = path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError) as exc:
         raise SourceEvidenceError(
             ErrorCategory.SOURCE,
@@ -118,8 +69,9 @@ def read_text_invoice(source: SourceArtifact) -> dict[str, Any]:
 def read_json_invoice(source: SourceArtifact) -> dict[str, Any]:
     """Parse one JSON object; malformed or non-object roots are explicit failures."""
 
+    path = verified_source_path(source)
     try:
-        value = json.loads(source.canonical_path.read_text(encoding="utf-8-sig"))
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise SourceEvidenceError(
             ErrorCategory.PARSE,
@@ -138,8 +90,9 @@ def read_json_invoice(source: SourceArtifact) -> dict[str, Any]:
 def read_csv_invoice(source: SourceArtifact) -> dict[str, Any]:
     """Read CSV rows without assuming vertical or row-oriented layout."""
 
+    path = verified_source_path(source)
     try:
-        with source.canonical_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
             rows = list(csv.reader(handle))
     except (OSError, UnicodeError, csv.Error) as exc:
         raise SourceEvidenceError(
@@ -159,8 +112,9 @@ def read_csv_invoice(source: SourceArtifact) -> dict[str, Any]:
 def read_xml_invoice(source: SourceArtifact) -> dict[str, Any]:
     """Parse XML into a transparent path/value representation."""
 
+    path = verified_source_path(source)
     try:
-        root = ElementTree.parse(source.canonical_path).getroot()
+        root = ElementTree.parse(path).getroot()
     except (OSError, ElementTree.ParseError) as exc:
         raise SourceEvidenceError(
             ErrorCategory.PARSE,
@@ -186,8 +140,9 @@ def read_xml_invoice(source: SourceArtifact) -> dict[str, Any]:
 def extract_pdf_text(source: SourceArtifact) -> dict[str, Any]:
     """Extract text by page while retaining that extraction is not visual proof."""
 
+    path = verified_source_path(source)
     try:
-        reader = PdfReader(source.canonical_path)
+        reader = PdfReader(path)
         pages = []
         for index, page in enumerate(reader.pages, 1):
             text = page.extract_text() or ""
@@ -222,10 +177,11 @@ def render_pdf_page(source: SourceArtifact, page: int, output_dir: Path) -> dict
             f"PDF page {page} is out of range",
             stop_reason="RENDER_PAGE_INVALID",
         )
+    source_path = verified_source_path(source)
     output_dir.mkdir(parents=True, exist_ok=True)
     target = (output_dir / f"{source.source_id}-page-{page}.png").resolve()
     try:
-        document = fitz.open(source.canonical_path)
+        document = fitz.open(source_path)
         try:
             pixmap = document[page - 1].get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
             pixmap.save(target)

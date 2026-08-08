@@ -6,12 +6,13 @@ from invoice_agents.config import Settings
 from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import WorkflowStore
 from invoice_agents.orchestration import prepare_case
+from invoice_agents.source_store import snapshot_source
 from invoice_agents.tools.comparison import (
     InventoryReader,
     apply_mapping_evidence,
     compare_inventory_evidence,
 )
-from invoice_agents.tools.evidence import extract_invoice_evidence, get_source_metadata
+from invoice_agents.tools.evidence import extract_invoice_evidence
 
 
 def prepare(invoice_dir: Path, name: str, settings: Settings) -> str:
@@ -70,9 +71,12 @@ def test_unresolved_line_keeps_null_sku_and_exposes_candidates(
 
 
 def test_apply_mapping_evidence_leaves_input_invoice_unmodified(
-    invoice_dir: Path, inventory_db: Path
+    invoice_dir: Path, inventory_db: Path, tmp_path: Path
 ) -> None:
-    invoice = extract_invoice_evidence(get_source_metadata(invoice_dir / "invoice_1001.txt"))
+    source = snapshot_source(
+        invoice_dir / "invoice_1001.txt", tmp_path / "sources", max_bytes=10_485_760
+    )
+    invoice = extract_invoice_evidence(source)
     reader = InventoryReader(inventory_db)
     mappings, _comparisons, unresolved = compare_inventory_evidence(invoice, reader)
     enriched = apply_mapping_evidence(invoice, mappings, unresolved)

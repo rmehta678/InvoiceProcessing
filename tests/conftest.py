@@ -36,4 +36,5 @@ def settings(inventory_db: Path, workflow_db: Path) -> Settings:
         xai_api_key="test-only-not-a-real-key",
         inventory_db=inventory_db,
         workflow_db=workflow_db,
+        source_archive_dir=workflow_db.parent / "sources",
     )

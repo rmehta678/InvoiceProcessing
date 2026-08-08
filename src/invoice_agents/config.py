@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     xai_api_key: SecretStr | None = Field(default=None, validation_alias="XAI_API_KEY")
     inventory_db: Path = Path("inventory.db")
     workflow_db: Path = Path("workflow.db")
+    source_archive_dir: Path = Path("artifacts/sources")
+    source_max_bytes: int = Field(default=10_485_760, gt=0)
     review_threshold_amount: Decimal = Decimal("10000.00")
     review_threshold_currency: str = "USD"
     review_threshold_effective_date: date = date(2026, 8, 6)

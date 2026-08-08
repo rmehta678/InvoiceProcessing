@@ -39,6 +39,7 @@ from invoice_agents.models import (
     UsageSummary,
 )
 from invoice_agents.observability.audit import AuditRecorder, bind_audit_recorder
+from invoice_agents.source_store import snapshot_source
 from invoice_agents.tools.comparison import (
     InventoryReader,
     apply_mapping_evidence,
@@ -46,7 +47,7 @@ from invoice_agents.tools.comparison import (
     compare_inventory_evidence,
     compute_invoice_totals,
 )
-from invoice_agents.tools.evidence import extract_invoice_evidence, get_source_metadata
+from invoice_agents.tools.evidence import extract_invoice_evidence
 
 # AutoGen's MaxMessageTermination phrasing, matched exactly so an upgrade that changes
 # it fails the pinned contract test instead of silently misclassifying stops.
@@ -149,7 +150,7 @@ def prepare_case(path: Path, settings: Settings) -> tuple[str, datetime] | CaseR
     case_id = f"case_{uuid4().hex}"
     source_id: str | None = None
     try:
-        source = get_source_metadata(path)
+        source = snapshot_source(path, settings.source_archive_dir, settings.source_max_bytes)
         source_id = source.source_id
         store = WorkflowStore(settings.workflow_db)
         store.register_source(source)
@@ -344,7 +345,6 @@ async def run_prepared_case(case_id: str, started_at: datetime, settings: Settin
     )
     context = AgentCaseContext(
         case_id=case_id,
-        source_path=invoice.source.canonical_path,
         settings=settings,
         store=store,
         audit=audit,
@@ -551,7 +551,7 @@ async def resume_case(case_id: str, settings: Settings) -> CaseResult:
     if human.decision is HumanDecisionKind.ESTABLISH_MAPPING:
         _recompute_after_mapping(case_id, human, settings, store, audit)
         invoice = store.load_extraction(case_id)
-    context = AgentCaseContext(case_id, invoice.source.canonical_path, settings, store, audit)
+    context = AgentCaseContext(case_id, settings, store, audit)
     client = create_model_client(settings)
     team = build_team(context, client)
     usage = previous.usage.model_copy(deep=True)
