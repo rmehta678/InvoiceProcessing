@@ -10,8 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
-from pypdf import PdfReader
-
+from invoice_agents.config import Settings
 from invoice_agents.errors import ErrorCategory, SourceEvidenceError
 from invoice_agents.models import SourceArtifact
 
@@ -148,11 +147,7 @@ def inspect_snapshot(target: Path, expected_hash: str, size_bytes: int) -> Sourc
     page_count: int | None = None
     row_count: int | None = None
     try:
-        if source_format == "pdf":
-            page_count = len(PdfReader(resolved).pages)
-            if page_count < 1:
-                raise ValueError("PDF has no pages")
-        elif source_format == "csv":
+        if source_format == "csv":
             with resolved.open("r", encoding="utf-8-sig", newline="") as handle:
                 row_count = sum(1 for _ in csv.reader(handle))
     except Exception as exc:
@@ -163,7 +158,7 @@ def inspect_snapshot(target: Path, expected_hash: str, size_bytes: int) -> Sourc
         ) from exc
     stat = resolved.stat()
     source_id = f"src_{uuid5(NAMESPACE_URL, str(resolved) + ':' + expected_hash).hex}"
-    return SourceArtifact(
+    source = SourceArtifact(
         source_id=source_id,
         canonical_path=resolved,
         sha256=expected_hash,
@@ -173,6 +168,12 @@ def inspect_snapshot(target: Path, expected_hash: str, size_bytes: int) -> Sourc
         page_count=page_count,
         row_count=row_count,
     )
+    if source_format == "pdf":
+        from invoice_agents.pdf_worker import inspect_pdf_in_worker
+
+        page_count = inspect_pdf_in_worker(source, Settings().pdf_parse_timeout_seconds)
+        source = source.model_copy(update={"page_count": page_count})
+    return source
 
 
 def snapshot_source(path: Path, archive_dir: Path, max_bytes: int) -> SourceArtifact:

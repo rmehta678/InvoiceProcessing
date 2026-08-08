@@ -21,7 +21,7 @@ from sse_starlette.sse import EventSourceResponse
 from invoice_agents.config import XAI_BASE_URL, XAI_MODEL, Settings
 from invoice_agents.db.core import DatabaseKind, verify_database
 from invoice_agents.db.store import WorkflowStore
-from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
+from invoice_agents.errors import ErrorCategory, InvoiceAgentsError, SourceEvidenceError
 from invoice_agents.hitl.service import record_human_decision
 from invoice_agents.models import (
     CanonicalMapping,
@@ -462,6 +462,30 @@ async def review_decide(
 # --------------------------------------------------------------------------- submit & batch
 
 
+async def write_bounded_upload(upload: UploadFile, target: Path, max_bytes: int) -> int:
+    """Stream an upload in fixed chunks and remove every incomplete target."""
+
+    written = 0
+    created = False
+    try:
+        with target.open("xb") as handle:
+            created = True
+            while chunk := await upload.read(65_536):
+                written += len(chunk)
+                if written > max_bytes:
+                    raise SourceEvidenceError(
+                        ErrorCategory.SOURCE,
+                        f"invoice source exceeds the {max_bytes}-byte ceiling",
+                        stop_reason="SOURCE_TOO_LARGE",
+                    )
+                handle.write(chunk)
+        return written
+    except BaseException:
+        if created:
+            target.unlink(missing_ok=True)
+        raise
+
+
 @router.get("/submit")
 async def submit_page(request: Request) -> Response:
     settings = _settings(request)
@@ -499,7 +523,15 @@ async def _resolve_submission(
         while target.exists():
             target = upload_dir / f"{Path(name).stem}-{counter}{Path(name).suffix}"
             counter += 1
-        target.write_bytes(await upload.read())
+        try:
+            await write_bounded_upload(upload, target, _settings(request).source_max_bytes)
+        except InvoiceAgentsError as exc:
+            return _render(
+                request,
+                "error.html",
+                {"nav": None, "error": exc},
+                status_code=400,
+            )
         return [target]
     if existing:
         invoice_root = INVOICE_DIR.resolve()

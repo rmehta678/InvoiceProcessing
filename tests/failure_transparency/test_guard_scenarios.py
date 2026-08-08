@@ -391,8 +391,8 @@ async def test_retry_events_count_into_usage(
 def test_synthetic_fixture_sources_fail_visibly(tmp_path: Path) -> None:
     with pytest.raises(SourceEvidenceError) as corrupt_pdf_error:
         snapshot_source(FIXTURES_DIR / "corrupt.pdf", tmp_path / "sources", 10_485_760)
-    assert corrupt_pdf_error.value.category in {"PARSE", "SOURCE"}
-    assert corrupt_pdf_error.value.stop_reason == "SOURCE_INSPECTION_FAILED"
+    assert corrupt_pdf_error.value.category == "TOOL"
+    assert corrupt_pdf_error.value.stop_reason == "PDF_WORKER_FAILED"
 
     with pytest.raises(SourceEvidenceError) as malformed_json_error:
         source = snapshot_source(FIXTURES_DIR / "malformed.json", tmp_path / "sources", 10_485_760)

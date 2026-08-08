@@ -8,7 +8,6 @@ returning an empty invoice.
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import re
 from decimal import Decimal, InvalidOperation
@@ -16,10 +15,9 @@ from pathlib import Path
 from typing import Any, Literal
 from xml.etree import ElementTree
 
-import fitz
 from dateutil import parser as date_parser
-from pypdf import PdfReader
 
+from invoice_agents.config import Settings
 from invoice_agents.errors import ErrorCategory, SourceEvidenceError
 from invoice_agents.models import (
     EvidenceRef,
@@ -41,14 +39,6 @@ SENSITIVE_EVIDENCE = re.compile(
 )
 CREDENTIAL_VALUE = re.compile(r"\b(?:sk-proj|xai)-[A-Za-z0-9._~-]+", re.I)
 EVIDENCE_EXCERPT_LIMIT = 160
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def read_text_invoice(source: SourceArtifact) -> dict[str, Any]:
@@ -149,26 +139,9 @@ def read_xml_invoice(source: SourceArtifact) -> dict[str, Any]:
 def extract_pdf_text(source: SourceArtifact) -> dict[str, Any]:
     """Extract text by page while retaining that extraction is not visual proof."""
 
-    path = verified_source_path(source)
-    try:
-        reader = PdfReader(path)
-        pages = []
-        for index, page in enumerate(reader.pages, 1):
-            text = page.extract_text() or ""
-            pages.append({"page": index, "text": text})
-    except Exception as exc:
-        raise SourceEvidenceError(
-            ErrorCategory.PARSE,
-            f"PDF text extraction failed: {exc}",
-            stop_reason="PDF_EXTRACTION_FAILED",
-        ) from exc
-    if not any(str(page["text"]).strip() for page in pages):
-        raise SourceEvidenceError(
-            ErrorCategory.PARSE,
-            "PDF contains no extractable text; visual/OCR review is required",
-            stop_reason="PDF_TEXT_EMPTY",
-        )
-    return {"pages": pages, "extractor": "pypdf"}
+    from invoice_agents.pdf_worker import extract_pdf_in_worker
+
+    return extract_pdf_in_worker(source, Settings().pdf_parse_timeout_seconds)
 
 
 def render_pdf_page(source: SourceArtifact, page: int, output_dir: Path) -> dict[str, Any]:
@@ -186,23 +159,16 @@ def render_pdf_page(source: SourceArtifact, page: int, output_dir: Path) -> dict
             f"PDF page {page} is out of range",
             stop_reason="RENDER_PAGE_INVALID",
         )
-    source_path = verified_source_path(source)
     output_dir.mkdir(parents=True, exist_ok=True)
     target = (output_dir / f"{source.source_id}-page-{page}.png").resolve()
-    try:
-        document = fitz.open(source_path)
-        try:
-            pixmap = document[page - 1].get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-            pixmap.save(target)
-        finally:
-            document.close()
-    except Exception as exc:
-        raise SourceEvidenceError(
-            ErrorCategory.TOOL,
-            f"PDF page render failed: {exc}",
-            stop_reason="PDF_RENDER_FAILED",
-        ) from exc
-    return {"path": str(target), "page": page, "sha256": _sha256(target), "renderer": "PyMuPDF"}
+    from invoice_agents.pdf_worker import render_pdf_page_in_worker
+
+    return render_pdf_page_in_worker(
+        source,
+        page,
+        target,
+        Settings().pdf_parse_timeout_seconds,
+    )
 
 
 def _ref(
@@ -1078,7 +1044,11 @@ def extract_invoice_evidence(source: SourceArtifact) -> ExtractedInvoice:
     if source.source_format == "txt":
         return _extract_textual(source, read_text_invoice(source)["raw_text"])
     if source.source_format == "pdf":
-        pages = extract_pdf_text(source)["pages"]
+        pdf_result = extract_pdf_text(source)
+        pages = pdf_result["pages"]
+        page_count = pdf_result.get("page_count")
+        if isinstance(page_count, int):
+            source = source.model_copy(update={"page_count": page_count})
         combined = "\n".join(f"[PAGE {page['page']}]\n{page['text']}" for page in pages)
         invoice = _extract_textual(source, combined, "page")
         invoice.extraction_notes.append(

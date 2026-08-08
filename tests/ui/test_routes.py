@@ -469,6 +469,27 @@ def test_submit_upload_lands_in_uploads_dir(
     assert header is not None
 
 
+def test_submit_rejects_upload_one_byte_over_limit_without_partial_file(
+    client: TestClient,
+    settings: Settings,
+    ui_workdir: Path,
+) -> None:
+    content = (ui_workdir / "data" / "invoices" / "invoice_1001.txt").read_bytes()
+    settings.source_max_bytes = len(content) - 1
+
+    response = client.post(
+        "/submit",
+        files={"upload": ("oversized.txt", content, "text/plain")},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 400
+    assert "SOURCE_TOO_LARGE" in response.text
+    upload_dir = ui_workdir / "data" / "invoices" / "uploads"
+    assert upload_dir.is_dir()
+    assert list(upload_dir.iterdir()) == []
+
+
 def test_submit_rejects_unknown_and_missing_choice(client: TestClient) -> None:
     missing = client.post("/submit", data={"existing": "nope.txt"})
     assert missing.status_code == 404
