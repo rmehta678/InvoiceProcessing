@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from invoice_agents.errors import SourceEvidenceError
+from invoice_agents.models import SourceArtifact
 from invoice_agents.source_store import snapshot_source
 from invoice_agents.tools.evidence import extract_invoice_evidence
 
@@ -38,6 +39,42 @@ EXPECTED = {
 }
 
 
+def write_text_invoice(
+    tmp_path: Path,
+    *,
+    quantity: str = "2",
+    unit_price: str = "$50.00",
+    declared_line_total: str = "$100.00",
+    total: str = "$100.00",
+    notes_column: bool = False,
+    note: str = "",
+    document_fields: tuple[str, ...] = (),
+) -> SourceArtifact:
+    """Create a complete, immutable text invoice with one controllable numeric field."""
+
+    path = tmp_path / "numeric-evidence.txt"
+    lines = [
+        "INVOICE",
+        "Vendor: Numeric Supplies",
+        "Invoice Number: INV-4242",
+        "Date: 2026-01-15",
+        "Due Date: 2026-02-01",
+        "",
+    ]
+    if notes_column:
+        lines.append("Item Qty Unit Price Amount Notes")
+    lines.extend(
+        (
+            f"WidgetA qty: {quantity} unit price: {unit_price} {declared_line_total}{note}",
+        )
+    )
+    lines.extend(document_fields)
+    lines.append(f"Total: {total}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return snapshot_source(path, tmp_path / "sources", 10_485_760)
+
+
 @pytest.mark.parametrize(("filename", "expected"), EXPECTED.items())
 def test_all_twenty_artifacts_extract(
     invoice_dir: Path, tmp_path: Path, filename: str, expected: tuple[str, int, Decimal]
@@ -63,6 +100,133 @@ def test_special_raw_normalization_and_missing_fields(invoice_dir: Path, tmp_pat
     )
     assert {"vendor", "due_date", "payment_terms"}.issubset(invalid.missing_fields)
     assert invalid.lines[0].quantity == Decimal("-5")
+
+
+@pytest.mark.parametrize("raw", ["100BAD", "$5,000.00oops", "12X34", "100.00 USD extra"])
+def test_declared_total_rejects_trailing_content(raw: str, tmp_path: Path) -> None:
+    source = write_text_invoice(tmp_path, total=raw)
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        extract_invoice_evidence(source)
+
+    assert excinfo.value.category == "PARSE"
+    assert excinfo.value.stop_reason == "MALFORMED_MONEY_FIELD"
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["field"] == "declared total"
+    assert excinfo.value.details["locator"] == "line:8"
+    assert excinfo.value.details["source_id"] == source.source_id
+    assert excinfo.value.details["raw_value"] == raw
+
+
+@pytest.mark.parametrize(
+    ("field", "raw"),
+    [
+        ("quantity", "12X34"),
+        ("unit price", "$5,000.00oops"),
+        ("declared line total", "100.00 USD extra"),
+    ],
+)
+def test_line_numeric_field_rejects_trailing_content(
+    field: str, raw: str, tmp_path: Path
+) -> None:
+    values = {
+        "quantity": "2",
+        "unit_price": "$50.00",
+        "declared_line_total": "$100.00",
+    }
+    values[field.replace(" ", "_")] = raw
+    source = write_text_invoice(tmp_path, **values)
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        extract_invoice_evidence(source)
+
+    assert excinfo.value.category == "PARSE"
+    assert excinfo.value.stop_reason == "MALFORMED_MONEY_FIELD"
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["field"] == field
+    assert excinfo.value.details["locator"] == "line:7"
+    assert excinfo.value.details["raw_value"] == raw
+
+
+@pytest.mark.parametrize(
+    ("label", "field"),
+    [
+        ("Subtotal", "declared subtotal"),
+        ("Tax (0%)", "declared tax"),
+        ("Shipping", "declared fee"),
+        ("Total", "declared total"),
+    ],
+)
+def test_document_money_field_rejects_trailing_content(
+    label: str, field: str, tmp_path: Path
+) -> None:
+    raw = "$5,000.00oops"
+    kwargs = {"total": raw} if label == "Total" else {"document_fields": (f"{label}: {raw}",)}
+    source = write_text_invoice(tmp_path, **kwargs)
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        extract_invoice_evidence(source)
+
+    assert excinfo.value.stop_reason == "MALFORMED_MONEY_FIELD"
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["field"] == field
+    assert excinfo.value.details["raw_value"] == raw
+
+
+def test_line_note_suffix_requires_a_declared_notes_column(tmp_path: Path) -> None:
+    no_notes_column = write_text_invoice(
+        tmp_path / "no-notes-column",
+        declared_line_total="$100.00Custom promotion",
+    )
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        extract_invoice_evidence(no_notes_column)
+    assert excinfo.value.stop_reason == "MALFORMED_MONEY_FIELD"
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["field"] == "declared line total"
+
+    notes_column = write_text_invoice(
+        tmp_path / "notes-column",
+        declared_line_total="$100.00",
+        notes_column=True,
+        note="Custom promotion",
+    )
+    invoice = extract_invoice_evidence(notes_column)
+    assert invoice.lines[0].declared_line_total == Decimal("100.00")
+
+
+@pytest.mark.parametrize(
+    ("values", "expected_quantity", "expected_total"),
+    [
+        (
+            {
+                "quantity": "-2",
+                "unit_price": "€1,250.00",
+                "declared_line_total": "-€2,500.00",
+                "total": "-€2,500.00",
+            },
+            Decimal("-2"),
+            Decimal("-2500.00"),
+        ),
+        (
+            {
+                "quantity": "1O",
+                "unit_price": "$1,2O0.00",
+                "declared_line_total": "$12,000.O0",
+                "total": "$12,000.O0",
+            },
+            Decimal("10"),
+            Decimal("12000.00"),
+        ),
+    ],
+)
+def test_complete_numeric_fields_preserve_supported_formats(
+    values: dict[str, str], expected_quantity: Decimal, expected_total: Decimal, tmp_path: Path
+) -> None:
+    invoice = extract_invoice_evidence(write_text_invoice(tmp_path, **values))
+
+    assert invoice.lines[0].quantity == expected_quantity
+    assert invoice.lines[0].declared_line_total == expected_total
+    assert invoice.declared_total == expected_total
 
 
 def test_email_vendor_and_pdf_columns_are_not_conflated(invoice_dir: Path, tmp_path: Path) -> None:

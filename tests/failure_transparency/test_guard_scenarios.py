@@ -406,6 +406,39 @@ def test_synthetic_fixture_sources_fail_visibly(tmp_path: Path) -> None:
     assert empty_error.value.category == "PARSE"
     assert empty_error.value.stop_reason == "SOURCE_EMPTY"
 
+
+def test_malformed_money_error_preserves_safe_evidence_context(tmp_path: Path) -> None:
+    raw_total = "100.00 Bearer secret-provider-credential"
+    submitted = tmp_path / "malformed-money.txt"
+    submitted.write_text(
+        "\n".join(
+            (
+                "INVOICE",
+                "Vendor: Numeric Supplies",
+                "Invoice Number: INV-4242",
+                "Date: 2026-01-15",
+                "Due Date: 2026-02-01",
+                "WidgetA qty: 2 unit price: $50.00 $100.00",
+                f"Total: {raw_total}",
+            )
+        ),
+        encoding="utf-8",
+    )
+    source = snapshot_source(submitted, tmp_path / "sources", 10_485_760)
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        extract_invoice_evidence(source)
+
+    error = _error_record(excinfo.value)
+    assert error.category == "PARSE"
+    assert error.stop_reason == "MALFORMED_MONEY_FIELD"
+    assert error.details["field"] == "declared total"
+    assert error.details["locator"] == "line:7"
+    assert error.details["source_id"] == source.source_id
+    assert error.details["raw_value"] == "[REDACTED]"
+    assert "secret-provider-credential" not in error.message
+    assert "secret-provider-credential" not in str(error.details)
+
     bad_database = tmp_path / "not_a_database.db"
     bad_database.write_bytes(b"not a sqlite database\n")
     with pytest.raises(DatabaseVerificationError) as bad_db_error:

@@ -31,7 +31,14 @@ from invoice_agents.models import (
 from invoice_agents.source_store import verified_source_path
 
 RELATIVE_DATE = re.compile(r"\b(today|tomorrow|yesterday|next\s+\w+|last\s+\w+)\b", re.I)
-MONEY_TOKEN = re.compile(r"[-+]?\$?\s*[0-9O][0-9O,]*(?:\.[0-9O]{1,2})?")
+MONEY_TOKEN = re.compile(
+    r"^(?:[-+]?[$€]?|[$€][-+]?)?[0-9O][0-9O,]*(?:\.[0-9O]{1,2})?$", re.I
+)
+SENSITIVE_EVIDENCE = re.compile(
+    r"(?:api[_-]?key|authorization|bearer|cookie|password|secret|token)", re.I
+)
+EVIDENCE_EXCERPT_LIMIT = 160
+MONEY_VALUE = r"(?:[-+]?[$€]?|[$€][-+]?)?[0-9O][0-9O,]*(?:\.[0-9O]{1,2})?"
 
 
 def _sha256(path: Path) -> str:
@@ -231,20 +238,75 @@ def _value(
     )
 
 
-def _decimal(raw: Any, *, allow_ocr: bool = False) -> tuple[Decimal, str | None]:
-    if isinstance(raw, bool) or raw is None:
-        raise ValueError("numeric value is missing")
-    value = str(raw).strip().replace("$", "").replace("€", "").replace(",", "").replace(" ", "")
+def safe_evidence_excerpt(raw: str) -> str:
+    """Return bounded malformed evidence without exposing credential-like text."""
+
+    if SENSITIVE_EVIDENCE.search(raw):
+        return "[REDACTED]"
+    if len(raw) <= EVIDENCE_EXCERPT_LIMIT:
+        return raw
+    return raw[:EVIDENCE_EXCERPT_LIMIT] + "..."
+
+
+def _parse_complete_decimal(
+    raw: str,
+    field: str,
+    source: SourceArtifact,
+    *,
+    locator: str = "unknown",
+) -> tuple[Decimal, str | None]:
+    """Parse one entire numeric field after whitespace normalization.
+
+    Commas, dollar/euro symbols, leading signs, and OCR-like ``O`` digits are
+    retained from the source contract. Any other character is evidence of a
+    malformed field rather than a value that can be partially trusted.
+    """
+
+    normalized = re.sub(r"\s+", "", raw)
+    if not normalized or MONEY_TOKEN.fullmatch(normalized) is None:
+        raise SourceEvidenceError(
+            ErrorCategory.PARSE,
+            f"malformed {field} value at {locator}",
+            stop_reason="MALFORMED_MONEY_FIELD",
+            details={
+                "field": field,
+                "locator": locator,
+                "source_id": source.source_id,
+                "raw_value": safe_evidence_excerpt(raw),
+            },
+        )
     note: str | None = None
+    value = normalized.replace("$", "").replace("€", "").replace(",", "")
     if "O" in value.upper():
-        if not allow_ocr:
-            raise ValueError(f"invalid numeric value {raw!r}")
         value = value.upper().replace("O", "0")
-        note = f"OCR-like O normalized to 0 in {raw!r}"
+        note = f"OCR-like O normalized to 0 in {safe_evidence_excerpt(raw)!r}"
     try:
         return Decimal(value), note
     except InvalidOperation as exc:
-        raise ValueError(f"invalid decimal value {raw!r}") from exc
+        raise SourceEvidenceError(
+            ErrorCategory.PARSE,
+            f"malformed {field} value at {locator}",
+            stop_reason="MALFORMED_MONEY_FIELD",
+            details={
+                "field": field,
+                "locator": locator,
+                "source_id": source.source_id,
+                "raw_value": safe_evidence_excerpt(raw),
+            },
+        ) from exc
+
+
+def _line_total_without_extracted_note(raw: str | None, *, has_notes_column: bool) -> str | None:
+    """Separate the trailing Notes-column value only when the table declares one."""
+
+    if raw is None or not has_notes_column:
+        return raw
+    match = re.fullmatch(
+        rf"(?P<amount>{MONEY_VALUE})(?P<note>.*)",
+        raw,
+        re.I,
+    )
+    return match.group("amount") if match else raw
 
 
 def _invoice_number(raw: Any) -> tuple[str | None, str, str | None]:
@@ -321,12 +383,18 @@ def _line(
     locator: str,
     raw_total: Any = None,
 ) -> InvoiceLine:
-    quantity, quantity_note = _decimal(raw_quantity, allow_ocr=True)
-    price, price_note = _decimal(raw_price, allow_ocr=True)
+    quantity, quantity_note = _parse_complete_decimal(
+        str(raw_quantity), "quantity", source, locator=locator
+    )
+    price, price_note = _parse_complete_decimal(
+        str(raw_price), "unit price", source, locator=locator
+    )
     declared: Decimal | None = None
     total_note: str | None = None
     if raw_total not in (None, ""):
-        declared, total_note = _decimal(raw_total, allow_ocr=True)
+        declared, total_note = _parse_complete_decimal(
+            str(raw_total), "declared line total", source, locator=locator
+        )
     ambiguity = [note for note in (quantity_note, price_note, total_note) if note]
     item = str(raw_item).strip().lstrip("- ")
     return InvoiceLine(
@@ -433,36 +501,29 @@ def _extract_json(source: SourceArtifact) -> ExtractedInvoice:
                 f"JSON line_items[{index}] must be an object",
                 stop_reason="JSON_LINE_INVALID",
             )
-        try:
-            lines.append(
-                _line(
-                    source,
-                    f"{source.source_id}:json:{index}",
-                    item.get("item"),
-                    item.get("quantity"),
-                    item.get("unit_price"),
-                    "json_path",
-                    f"$.line_items[{index}]",
-                    item.get("amount"),
-                )
+        lines.append(
+            _line(
+                source,
+                f"{source.source_id}:json:{index}",
+                item.get("item"),
+                item.get("quantity"),
+                item.get("unit_price"),
+                "json_path",
+                f"$.line_items[{index}]",
+                item.get("amount"),
             )
-        except ValueError as exc:
-            raise SourceEvidenceError(
-                ErrorCategory.PARSE,
-                f"invalid JSON line_items[{index}]: {exc}",
-                stop_reason="JSON_LINE_VALUE_INVALID",
-            ) from exc
-    try:
-        subtotal = _decimal(obj["subtotal"])[0] if obj.get("subtotal") is not None else None
-        tax_rate = _decimal(obj["tax_rate"])[0] if obj.get("tax_rate") is not None else None
-        tax_amount = _decimal(obj["tax_amount"])[0] if obj.get("tax_amount") is not None else None
-        total = _decimal(obj["total"])[0] if obj.get("total") is not None else None
-    except ValueError as exc:
-        raise SourceEvidenceError(
-            ErrorCategory.PARSE,
-            f"invalid JSON total field: {exc}",
-            stop_reason="JSON_TOTAL_INVALID",
-        ) from exc
+        )
+
+    def decimal_field(key: str, field: str) -> Decimal | None:
+        raw = obj.get(key)
+        if raw is None:
+            return None
+        return _parse_complete_decimal(str(raw), field, source, locator=f"$.{key}")[0]
+
+    subtotal = decimal_field("subtotal", "declared subtotal")
+    tax_rate = decimal_field("tax_rate", "declared tax rate")
+    tax_amount = decimal_field("tax_amount", "declared tax")
+    total = decimal_field("total", "declared total")
     return _finish_invoice(
         ExtractedInvoice(
             source=source,
@@ -540,60 +601,68 @@ def _extract_textual(
     )
 
     extracted_lines: list[InvoiceLine] = []
+    has_notes_column = any(
+        re.search(
+            r"^\s*item\b.*\bqty\b.*\b(?:unit\s+price|price)\b.*\b(?:amount|total)\b.*\bnotes?\b",
+            text_line,
+            re.I,
+        )
+        for text_line in lines
+    )
+    quantity_candidate = r"[-+]?[0-9O]\S*"
+    money_candidate = r"(?:[-+]?[$€]?|[$€][-+]?)?[0-9O]\S*"
     table_pattern = re.compile(
         r"^\s*-?\s*(?P<item>[A-Za-z][A-Za-z0-9 ]*?(?:\s*\([^)]*\))?)\s+"
-        r"(?:(?:qty\s*:?\s*|x)(?P<q1>-?\d+(?:\.\d+)?)|(?P<q2>-?\d+(?:\.\d+)?))\s+"
-        r"(?:(?:unit\s+price\s*:?\s*|@\s*)?)\$?(?P<price>[0-9O][0-9O,]*(?:\.[0-9O]{1,2})?)"
-        r"(?:\s*(?:ea(?:ch)?\b)?)"
-        r"(?:\s+\$?(?P<total>[0-9O][0-9O,]*(?:\.[0-9O]{1,2})?))?",
+        rf"(?:(?:qty\s*:?\s*|x)(?P<q1>{quantity_candidate})|(?P<q2>{quantity_candidate}))\s+"
+        rf"(?:(?:unit\s+price\s*:?\s*|@\s*)?)(?P<price>{money_candidate})"
+        r"(?:\s+(?:ea(?:ch)?))?"
+        r"(?:\s+(?P<total>.+?))?\s*$",
         re.I,
     )
     excluded = {"subtotal", "total", "tax", "sales tax", "shipping", "amount"}
     for index, text_line in enumerate(lines, 1):
-        match = table_pattern.match(text_line)
+        match = table_pattern.fullmatch(text_line)
         if not match:
             continue
         item = match.group("item").strip()
         if item.lower() in excluded or item.lower().startswith(("invoice", "date", "due")):
             continue
         quantity = match.group("q1") or match.group("q2")
-        try:
-            extracted_lines.append(
-                _line(
-                    source,
-                    f"{source.source_id}:{locator_prefix}:{index}",
-                    item,
-                    quantity,
-                    match.group("price"),
-                    "page" if locator_prefix.startswith("page") else "line",
-                    f"{locator_prefix}:{index}",
-                    match.group("total"),
-                )
+        extracted_lines.append(
+            _line(
+                source,
+                f"{source.source_id}:{locator_prefix}:{index}",
+                item,
+                quantity,
+                match.group("price"),
+                "page" if locator_prefix.startswith("page") else "line",
+                f"{locator_prefix}:{index}",
+                _line_total_without_extracted_note(
+                    match.group("total"), has_notes_column=has_notes_column
+                ),
             )
-        except ValueError as exc:
-            raise SourceEvidenceError(
-                ErrorCategory.PARSE,
-                f"invalid line at {locator_prefix}:{index}: {exc}",
-                stop_reason="TEXT_LINE_INVALID",
-            ) from exc
+        )
 
-    def total_value(pattern: str) -> tuple[Decimal | None, str | None]:
-        raw, _ = _find_labeled(lines, [pattern])
+    def total_value(pattern: str, field: str) -> tuple[Decimal | None, str | None]:
+        raw, line_number = _find_labeled(lines, [pattern])
         if raw is None:
             return None, None
-        money = MONEY_TOKEN.search(raw)
-        if money is None:
-            return None, None
-        try:
-            return _decimal(money.group(), allow_ocr=True)
-        except ValueError:
-            return None, None
+        return _parse_complete_decimal(
+            raw, field, source, locator=f"{locator_prefix}:{line_number}"
+        )
 
-    subtotal, subtotal_note = total_value(r"^\s*Subtotal\s*:\s*(?P<value>.+)$")
-    tax, tax_note = total_value(r"^\s*(?:Tax(?:\s*\([^)]*\))?|Sales\s+Tax)\s*:\s*(?P<value>.+)$")
-    shipping, shipping_note = total_value(r"^\s*Shipping\s*:\s*(?P<value>.+)$")
+    subtotal, subtotal_note = total_value(
+        r"^\s*Subtotal\s*:\s*(?P<value>.+)$", "declared subtotal"
+    )
+    tax, tax_note = total_value(
+        r"^\s*(?:Tax(?:\s*\([^)]*\))?|Sales\s+Tax)\s*:\s*(?P<value>.+)$", "declared tax"
+    )
+    shipping, shipping_note = total_value(
+        r"^\s*Shipping\s*:\s*(?P<value>.+)$", "declared fee"
+    )
     total, total_note = total_value(
-        r"^\s*(?:Total\s+Amount|Grand\s+Total|TOTAL|Total|Amt)\s*:\s*(?P<value>.+)$"
+        r"^\s*(?:Total\s+Amount|Grand\s+Total|TOTAL|Total|Amt)\s*:\s*(?P<value>.+)$",
+        "declared total",
     )
     tax_rate_raw, _ = _find_labeled(lines, [r"Tax\s*\((?P<value>\d+(?:\.\d+)?)%\)"])
     tax_rate = Decimal(tax_rate_raw) / 100 if tax_rate_raw else None
@@ -677,8 +746,15 @@ def _extract_csv(source: SourceArtifact) -> ExtractedInvoice:
         raw_terms, terms_row = first("payment_terms")
 
         def dec(key: str) -> Decimal | None:
-            raw, _ = first(key)
-            return _decimal(raw)[0] if raw is not None else None
+            raw, row_number = first(key)
+            if raw is None:
+                return None
+            field = {
+                "subtotal": "declared subtotal",
+                "tax": "declared tax",
+                "total": "declared total",
+            }[key]
+            return _parse_complete_decimal(raw, field, source, locator=f"row:{row_number}")[0]
 
         return _finish_invoice(
             ExtractedInvoice(
@@ -732,7 +808,14 @@ def _extract_csv(source: SourceArtifact) -> ExtractedInvoice:
         label = padded[normalized_header["unit price"]].strip().rstrip(":").lower()
         raw_value = padded[normalized_header["line total"]].strip()
         if label and raw_value:
-            amount = _decimal(raw_value, allow_ocr=True)[0]
+            field = "declared fee"
+            if label.startswith("subtotal"):
+                field = "declared subtotal"
+            elif label.startswith("tax"):
+                field = "declared tax"
+            elif label.startswith("total"):
+                field = "declared total"
+            amount = _parse_complete_decimal(raw_value, field, source, locator=f"row:{row_index}")[0]
             if label.startswith("subtotal"):
                 totals["subtotal"] = amount
             elif label.startswith("tax"):
@@ -823,28 +906,29 @@ def _extract_xml(source: SourceArtifact) -> ExtractedInvoice:
         raw_item = node.findtext("name")
         raw_quantity = node.findtext("quantity")
         raw_price = node.findtext("unit_price")
-        try:
-            lines.append(
-                _line(
-                    source,
-                    f"{source.source_id}:xpath:{index}",
-                    raw_item,
-                    raw_quantity,
-                    raw_price,
-                    "xpath",
-                    f"/invoice/line_items/item[{index}]",
-                )
+        lines.append(
+            _line(
+                source,
+                f"{source.source_id}:xpath:{index}",
+                raw_item,
+                raw_quantity,
+                raw_price,
+                "xpath",
+                f"/invoice/line_items/item[{index}]",
             )
-        except ValueError as exc:
-            raise SourceEvidenceError(
-                ErrorCategory.PARSE,
-                f"invalid XML item[{index}]: {exc}",
-                stop_reason="XML_LINE_INVALID",
-            ) from exc
+        )
 
     def dec(path: str) -> Decimal | None:
         raw = text(path)
-        return _decimal(raw)[0] if raw is not None else None
+        if raw is None:
+            return None
+        field = {
+            "./totals/subtotal": "declared subtotal",
+            "./totals/tax_rate": "declared tax rate",
+            "./totals/tax_amount": "declared tax",
+            "./totals/total": "declared total",
+        }[path]
+        return _parse_complete_decimal(raw, field, source, locator=path)[0]
 
     return _finish_invoice(
         ExtractedInvoice(
