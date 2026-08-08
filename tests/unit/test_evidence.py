@@ -1,5 +1,6 @@
 """Golden format extraction for every supplied artifact."""
 
+import csv
 from decimal import Decimal
 from pathlib import Path
 
@@ -194,6 +195,95 @@ def test_line_note_suffix_requires_a_declared_notes_column(tmp_path: Path) -> No
     assert invoice.lines[0].declared_line_total == Decimal("100.00")
 
 
+def test_notes_column_does_not_apply_before_its_table_header(tmp_path: Path) -> None:
+    path = tmp_path / "notes-scope.txt"
+    path.write_text(
+        "\n".join(
+            (
+                "INVOICE",
+                "Vendor: Numeric Supplies",
+                "Invoice Number: INV-4242",
+                "Date: 2026-01-15",
+                "Due Date: 2026-02-01",
+                "WidgetA qty: 2 unit price: $50.00 $100.00MALFORMED",
+                "",
+                "Item Qty Unit Price Amount Notes",
+                "WidgetB 2 $50.00 $100.00Arbitrary current-table note",
+                "Total: $200.00",
+            )
+        ),
+        encoding="utf-8",
+    )
+    source = snapshot_source(path, tmp_path / "sources", 10_485_760)
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        extract_invoice_evidence(source)
+
+    assert excinfo.value.stop_reason == "MALFORMED_MONEY_FIELD"
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["field"] == "declared line total"
+    assert excinfo.value.details["locator"] == "line:6"
+
+
+def test_notes_column_ends_at_the_next_table_header(tmp_path: Path) -> None:
+    path = tmp_path / "notes-boundary.txt"
+    path.write_text(
+        "\n".join(
+            (
+                "INVOICE",
+                "Vendor: Numeric Supplies",
+                "Invoice Number: INV-4242",
+                "Date: 2026-01-15",
+                "Due Date: 2026-02-01",
+                "Item Qty Unit Price Amount Notes",
+                "WidgetA 2 $50.00 $100.00Arbitrary first-table note",
+                "",
+                "Item Qty Unit Price Amount",
+                "WidgetB 2 $50.00 $100.00MALFORMED",
+                "Total: $200.00",
+            )
+        ),
+        encoding="utf-8",
+    )
+    source = snapshot_source(path, tmp_path / "sources", 10_485_760)
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        extract_invoice_evidence(source)
+
+    assert excinfo.value.stop_reason == "MALFORMED_MONEY_FIELD"
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["field"] == "declared line total"
+    assert excinfo.value.details["locator"] == "line:10"
+
+
+def test_notes_column_does_not_turn_malformed_comma_grouping_into_a_note(tmp_path: Path) -> None:
+    path = tmp_path / "notes-comma.txt"
+    path.write_text(
+        "\n".join(
+            (
+                "INVOICE",
+                "Vendor: Numeric Supplies",
+                "Invoice Number: INV-4242",
+                "Date: 2026-01-15",
+                "Due Date: 2026-02-01",
+                "Item Qty Unit Price Amount Notes",
+                "WidgetA 2 $50.00 $1,,00.00Arbitrary note",
+                "Total: $100.00",
+            )
+        ),
+        encoding="utf-8",
+    )
+    source = snapshot_source(path, tmp_path / "sources", 10_485_760)
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        extract_invoice_evidence(source)
+
+    assert excinfo.value.stop_reason == "MALFORMED_MONEY_FIELD"
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["field"] == "declared line total"
+    assert excinfo.value.details["raw_value"] == "$1,,00.00Arbitrary note"
+
+
 @pytest.mark.parametrize(
     ("values", "expected_quantity", "expected_total"),
     [
@@ -227,6 +317,65 @@ def test_complete_numeric_fields_preserve_supported_formats(
     assert invoice.lines[0].quantity == expected_quantity
     assert invoice.lines[0].declared_line_total == expected_total
     assert invoice.declared_total == expected_total
+
+
+@pytest.mark.parametrize("raw", ["$1,,00.00", "$100,", "$12,34.00"])
+def test_declared_total_rejects_malformed_comma_grouping(raw: str, tmp_path: Path) -> None:
+    source = write_text_invoice(tmp_path, total=raw)
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        extract_invoice_evidence(source)
+
+    assert excinfo.value.stop_reason == "MALFORMED_MONEY_FIELD"
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["field"] == "declared total"
+    assert excinfo.value.details["raw_value"] == raw
+
+
+def test_text_tax_rate_rejects_malformed_content(tmp_path: Path) -> None:
+    source = write_text_invoice(
+        tmp_path,
+        document_fields=("Tax (0BAD%): $0.00",),
+    )
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        extract_invoice_evidence(source)
+
+    assert excinfo.value.stop_reason == "MALFORMED_MONEY_FIELD"
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["field"] == "declared tax rate"
+    assert excinfo.value.details["raw_value"] == "0BAD"
+
+
+def test_row_oriented_csv_tax_rate_rejects_malformed_content(tmp_path: Path) -> None:
+    path = tmp_path / "malformed-tax-rate.csv"
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "Invoice Number",
+                "Vendor",
+                "Date",
+                "Due Date",
+                "Item",
+                "Qty",
+                "Unit Price",
+                "Line Total",
+            ]
+        )
+        writer.writerow(["INV-4242", "Numeric Supplies", "2026-01-15", "2026-02-01", "WidgetA", "2", "$50.00", "$100.00"])
+        writer.writerow(["", "", "", "", "", "", "Tax (0BAD%)", "$0.00"])
+        writer.writerow(["", "", "", "", "", "", "Total", "$100.00"])
+    source = snapshot_source(path, tmp_path / "sources", 10_485_760)
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        extract_invoice_evidence(source)
+
+    assert excinfo.value.stop_reason == "MALFORMED_MONEY_FIELD"
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["field"] == "declared tax rate"
+    assert excinfo.value.details["locator"] == "row:3"
+    assert excinfo.value.details["raw_value"] == "0BAD"
 
 
 def test_email_vendor_and_pdf_columns_are_not_conflated(invoice_dir: Path, tmp_path: Path) -> None:

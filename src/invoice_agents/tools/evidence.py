@@ -31,14 +31,16 @@ from invoice_agents.models import (
 from invoice_agents.source_store import verified_source_path
 
 RELATIVE_DATE = re.compile(r"\b(today|tomorrow|yesterday|next\s+\w+|last\s+\w+)\b", re.I)
+INTEGER_VALUE = r"(?:[0-9O]{1,3}(?:,[0-9O]{3})+|[0-9O]+)"
+MONEY_VALUE = rf"(?:[-+]?[$€]?|[$€][-+]?)?{INTEGER_VALUE}(?:\.[0-9O]{{1,2}})?"
 MONEY_TOKEN = re.compile(
-    r"^(?:[-+]?[$€]?|[$€][-+]?)?[0-9O][0-9O,]*(?:\.[0-9O]{1,2})?$", re.I
+    rf"^{MONEY_VALUE}$", re.I
 )
 SENSITIVE_EVIDENCE = re.compile(
     r"(?:api[_-]?key|authorization|bearer|cookie|password|secret|token)", re.I
 )
+CREDENTIAL_VALUE = re.compile(r"\b(?:sk-proj|xai)-[A-Za-z0-9._~-]+", re.I)
 EVIDENCE_EXCERPT_LIMIT = 160
-MONEY_VALUE = r"(?:[-+]?[$€]?|[$€][-+]?)?[0-9O][0-9O,]*(?:\.[0-9O]{1,2})?"
 
 
 def _sha256(path: Path) -> str:
@@ -241,7 +243,7 @@ def _value(
 def safe_evidence_excerpt(raw: str) -> str:
     """Return bounded malformed evidence without exposing credential-like text."""
 
-    if SENSITIVE_EVIDENCE.search(raw):
+    if SENSITIVE_EVIDENCE.search(raw) or CREDENTIAL_VALUE.search(raw):
         return "[REDACTED]"
     if len(raw) <= EVIDENCE_EXCERPT_LIMIT:
         return raw
@@ -306,7 +308,39 @@ def _line_total_without_extracted_note(raw: str | None, *, has_notes_column: boo
         raw,
         re.I,
     )
-    return match.group("amount") if match else raw
+    if match is None:
+        return raw
+    note = match.group("note")
+    if not note or note[0].isspace() or note[0].isalpha():
+        return match.group("amount")
+    return raw
+
+
+def _table_header_notes_column(text: str) -> bool | None:
+    """Return a table's Notes-column capability, or None when this is not a header."""
+
+    match = re.fullmatch(
+        r"\s*(?:item|description)\b.*\bqty\b.*\b(?:unit\s+price|price|rate)\b"
+        r".*\b(?:amount|total)\b(?P<trailing>.*)",
+        text,
+        re.I,
+    )
+    if match is None:
+        return None
+    return bool(re.search(r"\bnotes?\b", match.group("trailing"), re.I))
+
+
+def _is_table_boundary(text: str) -> bool:
+    """Recognize the document-level labels that end an invoice line-item table."""
+
+    return bool(
+        re.match(
+            r"\s*(?:subtotal|tax(?:\s*\([^)]*\))?|sales\s+tax|shipping|"
+            r"total(?:\s+amount)?|grand\s+total|amt|payment\s+terms|terms)\b",
+            text,
+            re.I,
+        )
+    )
 
 
 def _invoice_number(raw: Any) -> tuple[str | None, str, str | None]:
@@ -601,14 +635,6 @@ def _extract_textual(
     )
 
     extracted_lines: list[InvoiceLine] = []
-    has_notes_column = any(
-        re.search(
-            r"^\s*item\b.*\bqty\b.*\b(?:unit\s+price|price)\b.*\b(?:amount|total)\b.*\bnotes?\b",
-            text_line,
-            re.I,
-        )
-        for text_line in lines
-    )
     quantity_candidate = r"[-+]?[0-9O]\S*"
     money_candidate = r"(?:[-+]?[$€]?|[$€][-+]?)?[0-9O]\S*"
     table_pattern = re.compile(
@@ -620,7 +646,14 @@ def _extract_textual(
         re.I,
     )
     excluded = {"subtotal", "total", "tax", "sales tax", "shipping", "amount"}
+    has_notes_column = False
     for index, text_line in enumerate(lines, 1):
+        notes_column = _table_header_notes_column(text_line)
+        if notes_column is not None:
+            has_notes_column = notes_column
+            continue
+        if not text_line.strip() or _is_table_boundary(text_line):
+            has_notes_column = False
         match = table_pattern.fullmatch(text_line)
         if not match:
             continue
@@ -664,8 +697,21 @@ def _extract_textual(
         r"^\s*(?:Total\s+Amount|Grand\s+Total|TOTAL|Total|Amt)\s*:\s*(?P<value>.+)$",
         "declared total",
     )
-    tax_rate_raw, _ = _find_labeled(lines, [r"Tax\s*\((?P<value>\d+(?:\.\d+)?)%\)"])
-    tax_rate = Decimal(tax_rate_raw) / 100 if tax_rate_raw else None
+    tax_rate: Decimal | None = None
+    for index, text_line in enumerate(lines, 1):
+        rate_match = re.fullmatch(
+            r"\s*(?:tax|sales\s+tax)\s*\(\s*(?P<value>[^%]*)%\s*\)\s*:\s*.+",
+            text_line,
+            re.I,
+        )
+        if rate_match is not None:
+            tax_rate = _parse_complete_decimal(
+                rate_match.group("value"),
+                "declared tax rate",
+                source,
+                locator=f"{locator_prefix}:{index}",
+            )[0] / 100
+            break
     notes = [note for note in (subtotal_note, tax_note, shipping_note, total_note) if note]
     full_locator: Literal["page", "line"] = "page" if locator_prefix.startswith("page") else "line"
     invoice = ExtractedInvoice(
@@ -805,7 +851,8 @@ def _extract_csv(source: SourceArtifact) -> ExtractedInvoice:
         if padded[normalized_header["invoice number"]].strip():
             data_rows.append((padded, row_index))
             continue
-        label = padded[normalized_header["unit price"]].strip().rstrip(":").lower()
+        raw_label = padded[normalized_header["unit price"]].strip().rstrip(":")
+        label = raw_label.lower()
         raw_value = padded[normalized_header["line total"]].strip()
         if label and raw_value:
             field = "declared fee"
@@ -820,9 +867,14 @@ def _extract_csv(source: SourceArtifact) -> ExtractedInvoice:
                 totals["subtotal"] = amount
             elif label.startswith("tax"):
                 totals["tax"] = amount
-                rate_match = re.search(r"(\d+(?:\.\d+)?)%", label)
+                rate_match = re.fullmatch(r"tax\s*\(\s*(?P<value>[^%]*)%\s*\)", raw_label, re.I)
                 if rate_match:
-                    tax_rate = Decimal(rate_match.group(1)) / 100
+                    tax_rate = _parse_complete_decimal(
+                        rate_match.group("value"),
+                        "declared tax rate",
+                        source,
+                        locator=f"row:{row_index}",
+                    )[0] / 100
             elif label.startswith("total"):
                 totals["total"] = amount
     if not data_rows:

@@ -407,8 +407,17 @@ def test_synthetic_fixture_sources_fail_visibly(tmp_path: Path) -> None:
     assert empty_error.value.stop_reason == "SOURCE_EMPTY"
 
 
-def test_malformed_money_error_preserves_safe_evidence_context(tmp_path: Path) -> None:
-    raw_total = "100.00 Bearer secret-provider-credential"
+@pytest.mark.parametrize(
+    "raw_total",
+    [
+        "100.00 Bearer secret-provider-credential",
+        "100.00 sk-proj-sensitive-provider-credential",
+        "100.00 xai-sensitive-provider-credential",
+    ],
+)
+def test_malformed_money_error_preserves_safe_evidence_context(
+    raw_total: str, tmp_path: Path
+) -> None:
     submitted = tmp_path / "malformed-money.txt"
     submitted.write_text(
         "\n".join(
