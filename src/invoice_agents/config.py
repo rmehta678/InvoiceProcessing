@@ -35,7 +35,16 @@ class Settings(BaseSettings):
     pdf_parse_timeout_seconds: float = Field(default=15.0, gt=0, le=120)
     pdf_worker_cpu_seconds: int = Field(default=10, ge=1, le=60)
     # Additional virtual-address headroom above the spawned worker's measured baseline.
-    pdf_worker_memory_bytes: int = Field(default=536_870_912, ge=134_217_728)
+    pdf_worker_memory_bytes: int = Field(
+        default=536_870_912,
+        ge=134_217_728,
+        le=1_073_741_824,
+    )
+    pdf_worker_result_max_bytes: int = Field(
+        default=4_194_304,
+        ge=65_536,
+        le=16_777_216,
+    )
     review_threshold_amount: Decimal = Decimal("10000.00")
     review_threshold_currency: str = "USD"
     review_threshold_effective_date: date = date(2026, 8, 6)

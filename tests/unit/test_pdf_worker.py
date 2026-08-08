@@ -5,6 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import multiprocessing
+import os
+import struct
+import time
 from datetime import UTC, datetime
 from importlib import import_module
 from multiprocessing.connection import Connection
@@ -12,8 +15,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 from pypdf import PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
+from invoice_agents.config import Settings
 from invoice_agents.errors import SourceEvidenceError
 from invoice_agents.models import SourceArtifact
 
@@ -46,6 +52,28 @@ def content_addressed_pdf(path: Path, archive: Path, page_count: int | None) -> 
     )
 
 
+def write_compressed_text_pdf(path: Path, text_bytes: int) -> None:
+    """Create a tiny Flate-compressed PDF whose real extracted text is much larger."""
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+    font = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        }
+    )
+    page[NameObject("/Resources")] = DictionaryObject(
+        {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})}
+    )
+    stream = DecodedStreamObject()
+    stream.set_data(b"BT /F1 1 Tf 20 700 Td (" + b"A" * text_bytes + b") Tj ET")
+    page[NameObject("/Contents")] = stream.flate_encode()
+    with path.open("wb") as handle:
+        writer.write(handle)
+
+
 def child_pids() -> set[int]:
     return {child.pid for child in multiprocessing.active_children() if child.pid is not None}
 
@@ -63,6 +91,17 @@ def attempt_over_limit_allocation(connection: Connection, allowance_bytes: int) 
             connection.send("allocated")
     except Exception as exc:
         connection.send(f"limit-failed:{type(exc).__name__}:{exc}")
+    finally:
+        connection.close()
+
+
+def write_slow_wire_message(connection: Connection, payload: bytes, delay: float) -> None:
+    """Send one framed result in pieces to pressure the parent's complete-receipt deadline."""
+
+    try:
+        os.write(connection.fileno(), struct.pack("!I", len(payload)) + payload[:1])
+        time.sleep(delay)
+        os.write(connection.fileno(), payload[1:])
     finally:
         connection.close()
 
@@ -96,14 +135,83 @@ def test_pdf_timeout_terminates_and_joins_spawned_worker(tmp_path: Path) -> None
     assert child_pids() == before
 
 
-def test_pdf_parser_crash_fails_closed_and_reaps_worker(tmp_path: Path) -> None:
-    source = content_addressed_pdf(FIXTURE_DIR / "corrupt.pdf", tmp_path / "sources", None)
+def test_bounded_receive_deadline_covers_complete_message() -> None:
+    context = multiprocessing.get_context("spawn")
+    parent_connection, child_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=write_slow_wire_message,
+        args=(child_connection, b'{"ok":true,"result":{}}', 0.25),
+    )
+    process.start()
+    child_connection.close()
+    try:
+        with pytest.raises(SourceEvidenceError) as excinfo:
+            pdf_worker()._receive_bounded_message(
+                parent_connection,
+                max_bytes=1_024,
+                deadline=time.monotonic() + 0.05,
+            )
+        assert excinfo.value.stop_reason == "PDF_PARSE_TIMEOUT"
+    finally:
+        if process.is_alive():
+            process.terminate()
+        process.join(1.0)
+        parent_connection.close()
+    assert not process.is_alive()
+
+
+def test_oversized_extraction_result_fails_generically_and_reaps_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    submitted = tmp_path / "compressed-large-text.pdf"
+    write_compressed_text_pdf(submitted, 200_000)
+    assert submitted.stat().st_size < 65_536
+    source = content_addressed_pdf(submitted, tmp_path / "sources", 1)
+    monkeypatch.setenv("INVOICE_PDF_WORKER_RESULT_MAX_BYTES", "65536")
     before = child_pids()
 
     with pytest.raises(SourceEvidenceError) as excinfo:
         pdf_worker().extract_pdf_in_worker(source, timeout_seconds=5.0)
 
     assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
+    assert excinfo.value.message == "PDF worker failed"
+    assert excinfo.value.details is None
+    assert child_pids() == before
+
+
+def test_near_ceiling_result_drains_without_pipe_deadlock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    submitted = tmp_path / "near-ceiling.pdf"
+    write_compressed_text_pdf(submitted, 200_000)
+    source = content_addressed_pdf(submitted, tmp_path / "sources", 1)
+    monkeypatch.setenv("INVOICE_PDF_WORKER_RESULT_MAX_BYTES", "262144")
+
+    result = pdf_worker().extract_pdf_in_worker(source, timeout_seconds=5.0)
+
+    pages = result["pages"]
+    assert isinstance(pages, list)
+    assert len(pages[0]["text"]) == 200_000
+
+
+def test_pdf_parser_crash_is_silent_generic_and_reaps_worker(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    submitted = tmp_path / "corrupt-secret.pdf"
+    submitted.write_bytes(FIXTURE_DIR.joinpath("corrupt.pdf").read_bytes() + b"SECRET_SENTINEL")
+    source = content_addressed_pdf(submitted, tmp_path / "sources", None)
+    before = child_pids()
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        pdf_worker().extract_pdf_in_worker(source, timeout_seconds=5.0)
+
+    assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
+    assert excinfo.value.message == "PDF worker failed"
+    captured = capfd.readouterr()
+    visible = captured.out + captured.err + str(excinfo.value)
+    assert "SECRET_SENTINEL" not in visible
+    assert "Traceback" not in visible
+    assert "incorrect startxref" not in visible
     assert child_pids() == before
 
 
@@ -163,3 +271,101 @@ def test_pdf_worker_renders_page_to_real_png(tmp_path: Path) -> None:
     }
     assert target.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     assert not [path for path in tmp_path.iterdir() if path.name.startswith(".pdf-render-")]
+
+
+def test_pdf_worker_memory_allowance_rejects_excessive_configuration() -> None:
+    with pytest.raises(ValidationError):
+        Settings(pdf_worker_memory_bytes=1_073_741_825)
+
+
+@pytest.mark.parametrize(
+    ("operation", "payload", "expected_page"),
+    [
+        ("inspect", {"ok": True, "result": {"page_count": "1"}}, None),
+        (
+            "extract",
+            {
+                "ok": True,
+                "result": {"pages": "not-a-list", "extractor": "pypdf", "page_count": 1},
+            },
+            None,
+        ),
+        (
+            "render",
+            {
+                "ok": True,
+                "result": {"page": 1, "sha256": None, "renderer": "PyMuPDF"},
+            },
+            1,
+        ),
+    ],
+)
+def test_invalid_operation_result_envelopes_fail_generically(
+    operation: str,
+    payload: dict[str, object],
+    expected_page: int | None,
+) -> None:
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        pdf_worker()._decode_worker_message(
+            operation,
+            json.dumps(payload).encode("utf-8"),
+            expected_page=expected_page,
+        )
+
+    assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
+    assert excinfo.value.message == "PDF worker failed"
+    assert excinfo.value.details is None
+
+
+def test_unknown_error_category_fails_generically() -> None:
+    payload = {
+        "ok": False,
+        "category": "NOT_A_CATEGORY",
+        "message": "unsafe child detail",
+        "stop_reason": "UNSAFE_REASON",
+    }
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        pdf_worker()._decode_worker_message(
+            "extract", json.dumps(payload).encode("utf-8"), expected_page=None
+        )
+
+    assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
+    assert excinfo.value.message == "PDF worker failed"
+    assert "unsafe child detail" not in str(excinfo.value)
+
+
+def test_known_failure_category_cannot_smuggle_raw_child_message() -> None:
+    payload = {
+        "ok": False,
+        "category": "TOOL",
+        "message": "SECRET_SENTINEL raw parser exception",
+        "stop_reason": "PDF_WORKER_FAILED",
+    }
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        pdf_worker()._decode_worker_message(
+            "extract", json.dumps(payload).encode("utf-8"), expected_page=None
+        )
+
+    assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
+    assert excinfo.value.message == "PDF worker failed"
+    assert "SECRET_SENTINEL" not in str(excinfo.value)
+
+
+def test_error_envelope_rejects_disallowed_empty_details() -> None:
+    payload = {
+        "ok": False,
+        "category": "PARSE",
+        "message": "PDF contains no extractable text",
+        "stop_reason": "PDF_TEXT_EMPTY",
+        "details": {},
+    }
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        pdf_worker()._decode_worker_message(
+            "extract", json.dumps(payload).encode("utf-8"), expected_page=None
+        )
+
+    assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
+    assert excinfo.value.message == "PDF worker failed"

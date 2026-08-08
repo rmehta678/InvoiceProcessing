@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import multiprocessing
 import os
 import resource
+import selectors
+import struct
 import subprocess
 import sys
 import tempfile
+import time
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -21,6 +25,9 @@ from invoice_agents.models import SourceArtifact
 
 WorkerOperation = Literal["inspect", "extract", "render"]
 JOIN_GRACE_SECONDS = 1.0
+WIRE_HEADER_BYTES = 4
+WIRE_READ_CHUNK_BYTES = 65_536
+GENERIC_WORKER_MESSAGE = "PDF worker failed"
 
 
 def _bounded_limit(resource_name: int, requested: int) -> tuple[int, int]:
@@ -70,13 +77,46 @@ def _current_virtual_memory_bytes() -> int:
     return value
 
 
-def _send(connection: Connection, payload: dict[str, object]) -> None:
-    """Cross the process boundary as JSON text, never arbitrary pickled results."""
+def _generic_failure_payload() -> dict[str, object]:
+    return {
+        "ok": False,
+        "category": ErrorCategory.TOOL.value,
+        "message": GENERIC_WORKER_MESSAGE,
+        "stop_reason": "PDF_WORKER_FAILED",
+    }
 
-    connection.send(json.dumps(payload))
+
+def _write_all(file_descriptor: int, content: bytes) -> None:
+    written = 0
+    while written < len(content):
+        count = os.write(file_descriptor, content[written:])
+        if count < 1:
+            raise BrokenPipeError("PDF result pipe closed")
+        written += count
 
 
-def _page_limit_error(connection: Connection, page_count: int, max_pages: int) -> None:
+def _send(
+    connection: Connection,
+    payload: dict[str, object],
+    max_bytes: int,
+) -> None:
+    """Send one size-capped JSON message using a bounded four-byte frame header."""
+
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > max_bytes:
+        encoded = json.dumps(_generic_failure_payload(), separators=(",", ":")).encode("utf-8")
+    if len(encoded) > max_bytes:
+        raise RuntimeError("PDF result ceiling cannot contain the generic failure envelope")
+    framed = struct.pack("!I", len(encoded)) + encoded
+    _write_all(connection.fileno(), framed)
+
+
+def _page_limit_error(
+    connection: Connection,
+    page_count: int,
+    max_pages: int,
+    result_max_bytes: int,
+) -> None:
     _send(
         connection,
         {
@@ -86,7 +126,19 @@ def _page_limit_error(connection: Connection, page_count: int, max_pages: int) -
             "stop_reason": "PDF_PAGE_LIMIT_EXCEEDED",
             "details": {"page_count": page_count, "max_pages": max_pages},
         },
+        result_max_bytes,
     )
+
+
+def _silence_child_output() -> None:
+    """Prevent parser diagnostics and tracebacks from crossing inherited file descriptors."""
+
+    descriptor = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(descriptor, 1)
+        os.dup2(descriptor, 2)
+    finally:
+        os.close(descriptor)
 
 
 def _worker_main(
@@ -96,12 +148,14 @@ def _worker_main(
     max_pages: int,
     cpu_seconds: int,
     memory_bytes: int,
+    result_max_bytes: int,
     page: int | None,
     render_target: str | None,
 ) -> None:
-    """Run exactly one PDF operation; unexpected exceptions crash the worker visibly."""
+    """Run one PDF operation and reduce unexpected failures to a generic envelope."""
 
     try:
+        _silence_child_output()
         _apply_resource_limits(cpu_seconds, memory_bytes)
         source = SourceArtifact.model_validate(source_payload)
         from invoice_agents.source_store import verified_source_path
@@ -115,10 +169,14 @@ def _worker_main(
             if page_count < 1:
                 raise ValueError("PDF has no pages")
             if page_count > max_pages:
-                _page_limit_error(connection, page_count, max_pages)
+                _page_limit_error(connection, page_count, max_pages, result_max_bytes)
                 return
             if operation == "inspect":
-                _send(connection, {"ok": True, "result": {"page_count": page_count}})
+                _send(
+                    connection,
+                    {"ok": True, "result": {"page_count": page_count}},
+                    result_max_bytes,
+                )
                 return
             pages: list[dict[str, object]] = []
             for index, pdf_page in enumerate(reader.pages, 1):
@@ -134,6 +192,7 @@ def _worker_main(
                         ),
                         "stop_reason": "PDF_TEXT_EMPTY",
                     },
+                    result_max_bytes,
                 )
                 return
             _send(
@@ -146,6 +205,7 @@ def _worker_main(
                         "page_count": page_count,
                     },
                 },
+                result_max_bytes,
             )
             return
 
@@ -157,7 +217,7 @@ def _worker_main(
         try:
             page_count = document.page_count
             if page_count > max_pages:
-                _page_limit_error(connection, page_count, max_pages)
+                _page_limit_error(connection, page_count, max_pages, result_max_bytes)
                 return
             if page < 1 or page > page_count:
                 _send(
@@ -168,6 +228,7 @@ def _worker_main(
                         "message": f"PDF page {page} is out of range",
                         "stop_reason": "RENDER_PAGE_INVALID",
                     },
+                    result_max_bytes,
                 )
                 return
             pixmap = document[page - 1].get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
@@ -186,7 +247,11 @@ def _worker_main(
                     "renderer": "PyMuPDF",
                 },
             },
+            result_max_bytes,
         )
+    except BaseException:
+        with contextlib.suppress(BaseException):
+            _send(connection, _generic_failure_payload(), result_max_bytes)
     finally:
         connection.close()
 
@@ -200,12 +265,190 @@ def _stop_process(process: BaseProcess) -> None:
         process.join()
 
 
-def _worker_failed(message: str = "PDF worker exited without a valid result") -> SourceEvidenceError:
+def _worker_failed() -> SourceEvidenceError:
     return SourceEvidenceError(
         ErrorCategory.TOOL,
-        message,
+        GENERIC_WORKER_MESSAGE,
         stop_reason="PDF_WORKER_FAILED",
     )
+
+
+def _parse_timeout() -> SourceEvidenceError:
+    return SourceEvidenceError(
+        ErrorCategory.TIMEOUT,
+        "PDF processing exceeded the configured deadline",
+        stop_reason="PDF_PARSE_TIMEOUT",
+    )
+
+
+def _receive_bounded_message(
+    connection: Connection,
+    *,
+    max_bytes: int,
+    deadline: float,
+) -> bytes:
+    """Receive exactly one capped frame without blocking past the absolute deadline."""
+
+    file_descriptor = connection.fileno()
+    was_blocking = os.get_blocking(file_descriptor)
+    selector = selectors.DefaultSelector()
+    selector.register(file_descriptor, selectors.EVENT_READ)
+    os.set_blocking(file_descriptor, False)
+
+    def read_exact(length: int) -> bytes:
+        received = bytearray()
+        while len(received) < length:
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                raise _parse_timeout()
+            if not selector.select(remaining_seconds):
+                raise _parse_timeout()
+            try:
+                chunk = os.read(
+                    file_descriptor,
+                    min(WIRE_READ_CHUNK_BYTES, length - len(received)),
+                )
+            except BlockingIOError:
+                continue
+            if not chunk:
+                raise _worker_failed()
+            received.extend(chunk)
+        return bytes(received)
+
+    try:
+        header = read_exact(WIRE_HEADER_BYTES)
+        (message_length,) = struct.unpack("!I", header)
+        if message_length < 1 or message_length > max_bytes:
+            raise _worker_failed()
+        return read_exact(message_length)
+    finally:
+        selector.close()
+        os.set_blocking(file_descriptor, was_blocking)
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _decode_worker_message(
+    operation: WorkerOperation,
+    encoded: bytes,
+    *,
+    expected_page: int | None,
+) -> dict[str, object]:
+    """Validate the complete common and operation-specific JSON envelope."""
+
+    try:
+        payload = json.loads(encoded.decode("utf-8"))
+        if not isinstance(payload, dict) or not isinstance(payload.get("ok"), bool):
+            raise ValueError("invalid common envelope")
+        if payload["ok"] is False:
+            required = {"ok", "category", "message", "stop_reason"}
+            if set(payload) not in (required, required | {"details"}):
+                raise ValueError("invalid error envelope keys")
+            category = payload["category"]
+            message = payload["message"]
+            stop_reason = payload["stop_reason"]
+            details = payload.get("details")
+            if not all(isinstance(value, str) for value in (category, message, stop_reason)):
+                raise ValueError("invalid error envelope values")
+            if details is not None and not isinstance(details, dict):
+                raise ValueError("invalid error details")
+            if stop_reason == "PDF_WORKER_FAILED":
+                if category != ErrorCategory.TOOL.value or details is not None:
+                    raise ValueError("invalid generic worker failure")
+                raise _worker_failed()
+            if stop_reason == "PDF_PAGE_LIMIT_EXCEEDED":
+                if (
+                    category != ErrorCategory.PARSE.value
+                    or not isinstance(details, dict)
+                    or set(details) != {"page_count", "max_pages"}
+                    or not _is_int(details.get("page_count"))
+                    or not _is_int(details.get("max_pages"))
+                    or details["page_count"] <= details["max_pages"]
+                    or details["max_pages"] < 1
+                ):
+                    raise ValueError("invalid page-limit failure")
+                raise SourceEvidenceError(
+                    ErrorCategory.PARSE,
+                    f"PDF has {details['page_count']} pages; maximum is {details['max_pages']}",
+                    stop_reason="PDF_PAGE_LIMIT_EXCEEDED",
+                    details=details,
+                )
+            if stop_reason == "PDF_TEXT_EMPTY":
+                if (
+                    operation != "extract"
+                    or category != ErrorCategory.PARSE.value
+                    or details is not None
+                ):
+                    raise ValueError("invalid empty-text failure")
+                raise SourceEvidenceError(
+                    ErrorCategory.PARSE,
+                    "PDF contains no extractable text; visual/OCR review is required",
+                    stop_reason="PDF_TEXT_EMPTY",
+                )
+            if stop_reason == "RENDER_PAGE_INVALID":
+                if (
+                    operation != "render"
+                    or category != ErrorCategory.SOURCE.value
+                    or details is not None
+                ):
+                    raise ValueError("invalid render-page failure")
+                raise SourceEvidenceError(
+                    ErrorCategory.SOURCE,
+                    f"PDF page {expected_page} is out of range",
+                    stop_reason="RENDER_PAGE_INVALID",
+                )
+            raise ValueError("unknown worker stop reason")
+        if set(payload) != {"ok", "result"} or not isinstance(payload["result"], dict):
+            raise ValueError("invalid success envelope")
+        result = payload["result"]
+        if operation == "inspect":
+            if set(result) != {"page_count"} or not _is_int(result.get("page_count")):
+                raise ValueError("invalid inspection metadata")
+            if result["page_count"] < 1:
+                raise ValueError("invalid inspection page count")
+        elif operation == "extract":
+            if set(result) != {"pages", "extractor", "page_count"}:
+                raise ValueError("invalid extraction metadata")
+            pages = result["pages"]
+            page_count = result["page_count"]
+            if (
+                result["extractor"] != "pypdf"
+                or not _is_int(page_count)
+                or page_count < 1
+                or not isinstance(pages, list)
+                or len(pages) != page_count
+            ):
+                raise ValueError("invalid extraction result")
+            for page_number, page_result in enumerate(pages, 1):
+                if (
+                    not isinstance(page_result, dict)
+                    or set(page_result) != {"page", "text"}
+                    or page_result.get("page") != page_number
+                    or not isinstance(page_result.get("text"), str)
+                ):
+                    raise ValueError("invalid extracted page")
+        elif operation == "render":
+            if set(result) != {"page", "sha256", "renderer"}:
+                raise ValueError("invalid render metadata")
+            digest = result["sha256"]
+            if (
+                not _is_int(result["page"])
+                or result["page"] != expected_page
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+                or result["renderer"] != "PyMuPDF"
+            ):
+                raise ValueError("invalid render result")
+        else:
+            raise ValueError("unknown worker operation")
+        return cast(dict[str, object], result)
+    except SourceEvidenceError:
+        raise
+    except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+        raise _worker_failed() from None
 
 
 def _run_worker(
@@ -244,63 +487,44 @@ def _run_worker(
             settings.pdf_max_pages,
             settings.pdf_worker_cpu_seconds,
             settings.pdf_worker_memory_bytes,
+            settings.pdf_worker_result_max_bytes,
             page,
             str(render_target) if render_target is not None else None,
         ),
         name=f"invoice-pdf-{operation}",
     )
     started = False
+    deadline = time.monotonic() + timeout_seconds
     try:
         process.start()
         started = True
         child_connection.close()
-        if not parent_connection.poll(timeout_seconds):
-            _stop_process(process)
-            raise SourceEvidenceError(
-                ErrorCategory.TIMEOUT,
-                f"PDF {operation} exceeded the {timeout_seconds:g}-second deadline",
-                stop_reason="PDF_PARSE_TIMEOUT",
-            )
+        encoded = _receive_bounded_message(
+            parent_connection,
+            max_bytes=settings.pdf_worker_result_max_bytes,
+            deadline=deadline,
+        )
         try:
-            wire_payload = parent_connection.recv()
-        except EOFError as exc:
-            process.join(JOIN_GRACE_SECONDS)
-            raise _worker_failed() from exc
-        process.join(JOIN_GRACE_SECONDS)
+            result = _decode_worker_message(
+                operation,
+                encoded,
+                expected_page=page,
+            )
+        except SourceEvidenceError:
+            if time.monotonic() > deadline:
+                raise _parse_timeout() from None
+            raise
+        if time.monotonic() > deadline:
+            raise _parse_timeout()
+        process.join(max(0.0, deadline - time.monotonic()))
         if process.is_alive():
             _stop_process(process)
-            raise _worker_failed("PDF worker did not exit after returning a result")
-        if process.exitcode != 0 or not isinstance(wire_payload, str):
+            raise _parse_timeout()
+        if process.exitcode != 0:
             raise _worker_failed()
-        try:
-            payload = json.loads(wire_payload)
-        except (json.JSONDecodeError, TypeError) as exc:
-            raise _worker_failed("PDF worker returned malformed JSON") from exc
-        if not isinstance(payload, dict) or not isinstance(payload.get("ok"), bool):
-            raise _worker_failed("PDF worker returned an invalid result envelope")
-        if payload["ok"] is False:
-            category = payload.get("category")
-            message = payload.get("message")
-            stop_reason = payload.get("stop_reason")
-            details = payload.get("details")
-            if not isinstance(category, str):
-                raise _worker_failed("PDF worker returned an invalid error category")
-            if not isinstance(message, str) or not isinstance(stop_reason, str):
-                raise _worker_failed("PDF worker returned an invalid error envelope")
-            if details is not None and not isinstance(details, dict):
-                raise _worker_failed("PDF worker returned invalid error details")
-            raise SourceEvidenceError(
-                ErrorCategory(category),
-                message,
-                stop_reason=stop_reason,
-                details=details,
-            )
-        result = payload.get("result")
-        if not isinstance(result, dict):
-            raise _worker_failed("PDF worker returned invalid result metadata")
-        return cast(dict[str, object], result)
+        return result
     except BaseException:
-        if started and process.is_alive():
+        if started:
             _stop_process(process)
         raise
     finally:
@@ -314,7 +538,7 @@ def inspect_pdf_in_worker(source: SourceArtifact, timeout_seconds: float) -> int
     result = _run_worker("inspect", source, timeout_seconds)
     page_count = result.get("page_count")
     if not isinstance(page_count, int):
-        raise _worker_failed("PDF inspection returned an invalid page count")
+        raise _worker_failed()
     return page_count
 
 
@@ -349,7 +573,7 @@ def render_pdf_page_in_worker(
             render_target=temporary,
         )
         if not temporary.is_file():
-            raise _worker_failed("PDF render worker returned without a completed image")
+            raise _worker_failed()
         os.replace(temporary, resolved)
         return {
             "path": str(resolved),
