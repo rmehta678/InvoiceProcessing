@@ -76,6 +76,44 @@ def write_text_invoice(
     return snapshot_source(path, tmp_path / "sources", 10_485_760)
 
 
+def write_row_oriented_tax_csv(
+    tmp_path: Path, tax_rows: tuple[tuple[str, str], ...]
+) -> SourceArtifact:
+    """Create a row-oriented CSV with real tax labels and independently controlled amounts."""
+
+    path = tmp_path / "tax-labels.csv"
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "Invoice Number",
+                "Vendor",
+                "Date",
+                "Due Date",
+                "Item",
+                "Qty",
+                "Unit Price",
+                "Line Total",
+            ]
+        )
+        writer.writerow(
+            [
+                "INV-4242",
+                "Numeric Supplies",
+                "2026-01-15",
+                "2026-02-01",
+                "WidgetA",
+                "2",
+                "$50.00",
+                "$100.00",
+            ]
+        )
+        for label, amount in tax_rows:
+            writer.writerow(["", "", "", "", "", "", label, amount])
+        writer.writerow(["", "", "", "", "", "", "Total", "$110.00"])
+    return snapshot_source(path, tmp_path / "sources", 10_485_760)
+
+
 @pytest.mark.parametrize(("filename", "expected"), EXPECTED.items())
 def test_all_twenty_artifacts_extract(
     invoice_dir: Path, tmp_path: Path, filename: str, expected: tuple[str, int, Decimal]
@@ -363,6 +401,47 @@ def test_text_tax_rate_rejects_malformed_wrapper(label: str, tmp_path: Path) -> 
     assert excinfo.value.details["raw_value"] == label
 
 
+def test_text_tax_rate_rejects_malformed_wrapper_without_amount(tmp_path: Path) -> None:
+    source = write_text_invoice(
+        tmp_path,
+        document_fields=("Tax (10%oops):",),
+    )
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        extract_invoice_evidence(source)
+
+    assert excinfo.value.stop_reason == "MALFORMED_MONEY_FIELD"
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["field"] == "declared tax rate"
+    assert excinfo.value.details["raw_value"] == "Tax (10%oops)"
+
+
+def test_text_tax_rate_validates_later_malformed_label_after_bare_tax(tmp_path: Path) -> None:
+    source = write_text_invoice(
+        tmp_path,
+        document_fields=("Tax: $0.00", "Tax (10%oops): $10.00"),
+    )
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        extract_invoice_evidence(source)
+
+    assert excinfo.value.stop_reason == "MALFORMED_MONEY_FIELD"
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["field"] == "declared tax rate"
+    assert excinfo.value.details["raw_value"] == "Tax (10%oops)"
+
+
+def test_text_tax_rate_retains_later_valid_label_after_bare_tax(tmp_path: Path) -> None:
+    source = write_text_invoice(
+        tmp_path,
+        document_fields=("Tax: $0.00", "Tax (10%): $10.00"),
+    )
+
+    invoice = extract_invoice_evidence(source)
+
+    assert invoice.declared_tax_rate == Decimal("0.1")
+
+
 def test_row_oriented_csv_tax_rate_rejects_malformed_content(tmp_path: Path) -> None:
     path = tmp_path / "malformed-tax-rate.csv"
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -445,6 +524,32 @@ def test_row_oriented_csv_tax_rate_preserves_unparenthesized_label(tmp_path: Pat
         writer.writerow(["", "", "", "", "", "", "Tax 10%", "$10.00"])
         writer.writerow(["", "", "", "", "", "", "Total", "$110.00"])
     source = snapshot_source(path, tmp_path / "sources", 10_485_760)
+
+    invoice = extract_invoice_evidence(source)
+
+    assert invoice.declared_tax_rate == Decimal("0.1")
+
+
+def test_row_oriented_csv_tax_rate_rejects_malformed_wrapper_without_amount(
+    tmp_path: Path,
+) -> None:
+    source = write_row_oriented_tax_csv(tmp_path, (("Tax (10%oops)", ""),))
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        extract_invoice_evidence(source)
+
+    assert excinfo.value.stop_reason == "MALFORMED_MONEY_FIELD"
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["field"] == "declared tax rate"
+    assert excinfo.value.details["locator"] == "row:3"
+    assert excinfo.value.details["raw_value"] == "Tax (10%oops)"
+
+
+def test_row_oriented_csv_tax_rate_does_not_overwrite_valid_rate_with_bare_tax(tmp_path: Path) -> None:
+    source = write_row_oriented_tax_csv(
+        tmp_path,
+        (("Tax 10%", "$10.00"), ("Tax", "$0.00")),
+    )
 
     invoice = extract_invoice_evidence(source)
 

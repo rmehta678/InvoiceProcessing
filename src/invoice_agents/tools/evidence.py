@@ -380,6 +380,12 @@ def _parse_tax_rate_label(
     )[0] / 100
 
 
+def _is_tax_label(label: str) -> bool:
+    """True when a label declares a tax field rather than merely containing that text."""
+
+    return re.fullmatch(r"\s*(?:tax|sales\s+tax)\b.*", label, re.I) is not None
+
+
 def _invoice_number(raw: Any) -> tuple[str | None, str, str | None]:
     if raw is None or not str(raw).strip():
         return None, "none", None
@@ -737,17 +743,18 @@ def _extract_textual(
     tax_rate: Decimal | None = None
     for index, text_line in enumerate(lines, 1):
         label_match = re.fullmatch(
-            r"\s*(?P<label>(?:tax|sales\s+tax)\b.*?)\s*:\s*.+",
+            r"\s*(?P<label>(?:tax|sales\s+tax)\b.*?)\s*:\s*.*",
             text_line,
             re.I,
         )
         if label_match is not None:
-            tax_rate = _parse_tax_rate_label(
+            parsed_rate = _parse_tax_rate_label(
                 label_match.group("label"),
                 source,
                 locator=f"{locator_prefix}:{index}",
             )
-            break
+            if parsed_rate is not None:
+                tax_rate = parsed_rate
     notes = [note for note in (subtotal_note, tax_note, shipping_note, total_note) if note]
     full_locator: Literal["page", "line"] = "page" if locator_prefix.startswith("page") else "line"
     invoice = ExtractedInvoice(
@@ -890,20 +897,24 @@ def _extract_csv(source: SourceArtifact) -> ExtractedInvoice:
         raw_label = padded[normalized_header["unit price"]].strip().rstrip(":")
         label = raw_label.lower()
         raw_value = padded[normalized_header["line total"]].strip()
+        is_tax_label = _is_tax_label(raw_label)
+        if is_tax_label:
+            parsed_rate = _parse_tax_rate_label(raw_label, source, locator=f"row:{row_index}")
+            if parsed_rate is not None:
+                tax_rate = parsed_rate
         if label and raw_value:
             field = "declared fee"
             if label.startswith("subtotal"):
                 field = "declared subtotal"
-            elif label.startswith(("tax", "sales tax")):
+            elif is_tax_label:
                 field = "declared tax"
             elif label.startswith("total"):
                 field = "declared total"
             amount = _parse_complete_decimal(raw_value, field, source, locator=f"row:{row_index}")[0]
             if label.startswith("subtotal"):
                 totals["subtotal"] = amount
-            elif label.startswith(("tax", "sales tax")):
+            elif is_tax_label:
                 totals["tax"] = amount
-                tax_rate = _parse_tax_rate_label(raw_label, source, locator=f"row:{row_index}")
             elif label.startswith("total"):
                 totals["total"] = amount
     if not data_rows:
