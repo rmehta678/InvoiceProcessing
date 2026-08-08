@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -42,6 +42,48 @@ class _WireMessage:
     @property
     def payload_bytes(self) -> int:
         return WIRE_HEADER_BYTES + len(self.metadata) + len(self.text)
+
+
+@dataclass(slots=True)
+class _ExtractionWireBuilder:
+    """Aggregate only capped extraction bytes and compact page descriptors."""
+
+    page_count: int
+    max_bytes: int
+    text: bytearray = field(default_factory=bytearray)
+    page_descriptors: bytearray = field(default_factory=bytearray)
+    has_text: bool = False
+
+    def append_page(self, page_number: int, page_text: str) -> None:
+        page_start = len(self.text)
+        _append_bounded_utf8(self.text, page_text, max_bytes=self.max_bytes)
+        text_bytes = len(self.text) - page_start
+        descriptor = (
+            (b"," if self.page_descriptors else b"")
+            + f'{{"page":{page_number},"text_bytes":{text_bytes}}}'.encode("ascii")
+        )
+        if self._metadata_size_with(descriptor) > METADATA_MAX_BYTES:
+            raise _ResultTooLarge
+        self.page_descriptors.extend(descriptor)
+        self.has_text = self.has_text or (bool(page_text) and not page_text.isspace())
+
+    def build(self) -> _WireMessage:
+        metadata = bytearray(b'{"ok":true,"result":{"pages":[')
+        metadata.extend(self.page_descriptors)
+        metadata.extend(
+            f'],"extractor":"pypdf","page_count":{self.page_count}}}}}'.encode("ascii")
+        )
+        message = _WireMessage(metadata=metadata, text=self.text)
+        if len(metadata) > METADATA_MAX_BYTES or message.payload_bytes > self.max_bytes:
+            raise _ResultTooLarge
+        return message
+
+    def _metadata_size_with(self, descriptor: bytes) -> int:
+        prefix_bytes = len(b'{"ok":true,"result":{"pages":[')
+        suffix_bytes = len(
+            f'],"extractor":"pypdf","page_count":{self.page_count}}}}}'.encode("ascii")
+        )
+        return prefix_bytes + len(self.page_descriptors) + len(descriptor) + suffix_bytes
 
 
 class _ResultTooLarge(Exception):
@@ -154,6 +196,25 @@ def _metadata_bytes(payload: dict[str, object]) -> bytearray:
     return encoded
 
 
+def _append_bounded_utf8(
+    destination: bytearray,
+    source: str,
+    *,
+    max_bytes: int,
+) -> None:
+    for start in range(0, len(source), TEXT_ENCODE_CHARS):
+        encoded_chunk = source[start : start + TEXT_ENCODE_CHARS].encode("utf-8")
+        if (
+            WIRE_HEADER_BYTES
+            + METADATA_MAX_BYTES
+            + len(destination)
+            + len(encoded_chunk)
+            > max_bytes
+        ):
+            raise _ResultTooLarge
+        destination.extend(encoded_chunk)
+
+
 def _encode_bounded_message(
     payload: dict[str, object],
     *,
@@ -177,17 +238,7 @@ def _encode_bounded_message(
                     raise ValueError("invalid child extraction result")
                 page_start = len(text)
                 page_text = page["text"]
-                for start in range(0, len(page_text), TEXT_ENCODE_CHARS):
-                    encoded_chunk = page_text[start : start + TEXT_ENCODE_CHARS].encode("utf-8")
-                    if (
-                        WIRE_HEADER_BYTES
-                        + METADATA_MAX_BYTES
-                        + len(text)
-                        + len(encoded_chunk)
-                        > max_bytes
-                    ):
-                        raise _ResultTooLarge
-                    text.extend(encoded_chunk)
+                _append_bounded_utf8(text, page_text, max_bytes=max_bytes)
                 page_metadata.append(
                     {
                         "page": page.get("page"),
@@ -225,6 +276,12 @@ def _send(
     """Send one capped metadata/text frame without full-payload concatenation."""
 
     message = _encode_bounded_message(payload, max_bytes=max_bytes)
+    _send_wire_message(connection, message)
+
+
+def _send_wire_message(connection: Connection, message: _WireMessage) -> None:
+    """Write one already-bounded wire message without concatenating its buffers."""
+
     file_descriptor = connection.fileno()
     _write_all(file_descriptor, struct.pack("!I", message.payload_bytes))
     _write_all(file_descriptor, struct.pack("!I", len(message.metadata)))
@@ -299,10 +356,18 @@ def _worker_main(
                     result_max_bytes,
                 )
                 return
-            pages: list[dict[str, object]] = []
-            for index, pdf_page in enumerate(reader.pages, 1):
-                pages.append({"page": index, "text": pdf_page.extract_text() or ""})
-            if not any(str(item["text"]).strip() for item in pages):
+            extraction = _ExtractionWireBuilder(
+                page_count=page_count,
+                max_bytes=result_max_bytes,
+            )
+            try:
+                for index, pdf_page in enumerate(reader.pages, 1):
+                    page_text = pdf_page.extract_text() or ""
+                    extraction.append_page(index, page_text)
+            except _ResultTooLarge:
+                _send(connection, _generic_failure_payload(), result_max_bytes)
+                return
+            if not extraction.has_text:
                 _send(
                     connection,
                     {
@@ -316,18 +381,10 @@ def _worker_main(
                     result_max_bytes,
                 )
                 return
-            _send(
-                connection,
-                {
-                    "ok": True,
-                    "result": {
-                        "pages": pages,
-                        "extractor": "pypdf",
-                        "page_count": page_count,
-                    },
-                },
-                result_max_bytes,
-            )
+            try:
+                _send_wire_message(connection, extraction.build())
+            except _ResultTooLarge:
+                _send(connection, _generic_failure_payload(), result_max_bytes)
             return
 
         if page is None or render_target is None:
@@ -636,9 +693,13 @@ def _decode_worker_message(
             raise ValueError("unknown worker operation")
         check_deadline()
         return cast(dict[str, object], result)
-    except SourceEvidenceError:
+    except SourceEvidenceError as error:
+        if error.stop_reason == "PDF_PARSE_TIMEOUT":
+            raise
+        check_deadline()
         raise
     except Exception:
+        check_deadline()
         raise _worker_failed() from None
 
 

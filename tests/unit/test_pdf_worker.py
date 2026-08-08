@@ -56,21 +56,28 @@ def content_addressed_pdf(path: Path, archive: Path, page_count: int | None) -> 
 def write_compressed_text_pdf(path: Path, text_bytes: int) -> None:
     """Create a tiny Flate-compressed PDF whose real extracted text is much larger."""
 
+    write_compressed_pages_pdf(path, [text_bytes])
+
+
+def write_compressed_pages_pdf(path: Path, page_text_bytes: list[int]) -> None:
+    """Create Flate-compressed pages whose extracted text sizes are controlled."""
+
     writer = PdfWriter()
-    page = writer.add_blank_page(width=612, height=792)
-    font = DictionaryObject(
-        {
-            NameObject("/Type"): NameObject("/Font"),
-            NameObject("/Subtype"): NameObject("/Type1"),
-            NameObject("/BaseFont"): NameObject("/Helvetica"),
-        }
-    )
-    page[NameObject("/Resources")] = DictionaryObject(
-        {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})}
-    )
-    stream = DecodedStreamObject()
-    stream.set_data(b"BT /F1 1 Tf 20 700 Td (" + b"A" * text_bytes + b") Tj ET")
-    page[NameObject("/Contents")] = stream.flate_encode()
+    for text_bytes in page_text_bytes:
+        page = writer.add_blank_page(width=612, height=792)
+        font = DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Font"),
+                NameObject("/Subtype"): NameObject("/Type1"),
+                NameObject("/BaseFont"): NameObject("/Helvetica"),
+            }
+        )
+        page[NameObject("/Resources")] = DictionaryObject(
+            {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})}
+        )
+        stream = DecodedStreamObject()
+        stream.set_data(b"BT /F1 1 Tf 20 700 Td (" + b"A" * text_bytes + b") Tj ET")
+        page[NameObject("/Contents")] = stream.flate_encode()
     with path.open("wb") as handle:
         writer.write(handle)
 
@@ -112,6 +119,53 @@ def stall_worker_after_result_header(connection: Connection, *_args: object) -> 
 
     try:
         os.write(connection.fileno(), struct.pack("!I", 128) + b"{")
+        time.sleep(5.0)
+    finally:
+        connection.close()
+
+
+def probe_real_page_extraction(connection: Connection, *worker_args: object) -> None:
+    """Record real pypdf page extractions and child allocations around production worker code."""
+
+    from pypdf._page import PageObject
+
+    extraction_path = Path(os.environ["INVOICE_TEST_EXTRACTION_PROBE_PATH"])
+    allocation_path = Path(os.environ["INVOICE_TEST_ALLOCATION_PROBE_PATH"])
+    original_extract_text = PageObject.extract_text
+    extraction_count = 0
+
+    def recording_extract_text(page: PageObject, *args: Any, **kwargs: Any) -> str:
+        nonlocal extraction_count
+        extraction_count += 1
+        extraction_path.write_text(str(extraction_count), encoding="ascii")
+        return original_extract_text(page, *args, **kwargs)
+
+    PageObject.extract_text = recording_extract_text
+    tracemalloc.start()
+    try:
+        pdf_worker()._worker_main(connection, *worker_args)
+    finally:
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        allocation_path.write_text(str(peak), encoding="ascii")
+
+
+def send_page_limit_error_then_stall(connection: Connection, *_args: object) -> None:
+    """Send a valid page-limit frame and stay alive for parent cleanup verification."""
+
+    payload = json.dumps(
+        {
+            "ok": False,
+            "category": "PARSE",
+            "message": "PDF page limit exceeded",
+            "stop_reason": "PDF_PAGE_LIMIT_EXCEEDED",
+            "details": {"page_count": 101, "max_pages": 100},
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    wire_payload = struct.pack("!I", len(payload)) + payload
+    try:
+        os.write(connection.fileno(), struct.pack("!I", len(wire_payload)) + wire_payload)
         time.sleep(5.0)
     finally:
         connection.close()
@@ -183,6 +237,34 @@ def test_run_worker_automatically_reaps_child_that_stalls_mid_result(
     with pytest.raises(SourceEvidenceError) as excinfo:
         worker_module._run_worker("extract", source, timeout_seconds=0.05)
 
+    assert excinfo.value.stop_reason == "PDF_PARSE_TIMEOUT"
+    assert child_pids() == before
+
+
+def test_error_validation_crossing_deadline_times_out_and_reaps_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = content_addressed_pdf(DATA_DIR / "invoice_1011.pdf", tmp_path / "sources", 1)
+    worker_module = pdf_worker()
+    original_is_int = worker_module._is_int
+    delayed = False
+
+    def delayed_is_int(value: object) -> bool:
+        nonlocal delayed
+        if not delayed:
+            delayed = True
+            time.sleep(1.1)
+        return original_is_int(value)
+
+    monkeypatch.setattr(worker_module, "_worker_main", send_page_limit_error_then_stall)
+    monkeypatch.setattr(worker_module, "_is_int", delayed_is_int)
+    before = child_pids()
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        worker_module._run_worker("extract", source, timeout_seconds=1.0)
+
+    assert delayed
     assert excinfo.value.stop_reason == "PDF_PARSE_TIMEOUT"
     assert child_pids() == before
 
@@ -266,6 +348,32 @@ def test_oversized_extraction_result_fails_generically_and_reaps_worker(
     assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
     assert excinfo.value.message == "PDF worker failed"
     assert excinfo.value.details is None
+    assert child_pids() == before
+
+
+def test_oversized_first_page_stops_real_extraction_before_later_pages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    submitted = tmp_path / "multi-page-compressed-large-text.pdf"
+    write_compressed_pages_pdf(submitted, [200_000, 2_000_000])
+    assert submitted.stat().st_size < 65_536
+    source = content_addressed_pdf(submitted, tmp_path / "sources", 2)
+    extraction_path = tmp_path / "extraction-count.txt"
+    allocation_path = tmp_path / "allocation-peak.txt"
+    monkeypatch.setenv("INVOICE_PDF_WORKER_RESULT_MAX_BYTES", "65536")
+    monkeypatch.setenv("INVOICE_TEST_EXTRACTION_PROBE_PATH", str(extraction_path))
+    monkeypatch.setenv("INVOICE_TEST_ALLOCATION_PROBE_PATH", str(allocation_path))
+    worker_module = pdf_worker()
+    monkeypatch.setattr(worker_module, "_worker_main", probe_real_page_extraction)
+    before = child_pids()
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        worker_module._run_worker("extract", source, timeout_seconds=10.0)
+
+    assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
+    assert extraction_path.read_text(encoding="ascii") == "1"
+    assert int(allocation_path.read_text(encoding="ascii")) < 4_000_000
     assert child_pids() == before
 
 
