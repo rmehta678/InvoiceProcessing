@@ -109,16 +109,16 @@ def copy_and_hash_atomically(
 
         source_hash = digest.hexdigest()
         target = archive / f"{source_hash}{suffix}"
-        if target.exists() or target.is_symlink():
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
             _verify_path(target, source_hash, size_bytes)
-            temporary.unlink()
-        else:
-            os.replace(temporary, target)
-            directory_fd = os.open(archive, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+        temporary.unlink()
+        directory_fd = os.open(archive, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
         _verify_path(target, source_hash, size_bytes)
         return source_hash, size_bytes, target
     except SourceEvidenceError:

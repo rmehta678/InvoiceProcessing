@@ -1,6 +1,7 @@
 """Immutable content-addressed invoice source storage."""
 
 import hashlib
+import os
 from importlib import import_module
 from pathlib import Path
 
@@ -80,6 +81,36 @@ def test_snapshot_refuses_to_replace_a_broken_symlink_at_content_address(
 
     assert caught.value.stop_reason == "SOURCE_HASH_MISMATCH"
     assert target.is_symlink()
+
+
+def test_atomic_publication_does_not_clobber_a_conflicting_race_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    submitted = tmp_path / "submitted.txt"
+    submitted.write_bytes(b"trusted")
+    expected_hash = hashlib.sha256(b"trusted").hexdigest()
+    archive = tmp_path / "archive"
+    target = archive / f"{expected_hash}.txt"
+    conflicting_bytes = b"race winner must remain"
+    real_replace = os.replace
+    real_link = os.link
+
+    def replace_after_race(source: Path, destination: Path) -> None:
+        Path(destination).write_bytes(conflicting_bytes)
+        real_replace(source, destination)
+
+    def link_after_race(source: Path, destination: Path) -> None:
+        Path(destination).write_bytes(conflicting_bytes)
+        real_link(source, destination)
+
+    monkeypatch.setattr(os, "replace", replace_after_race)
+    monkeypatch.setattr(os, "link", link_after_race)
+
+    with pytest.raises(SourceEvidenceError) as caught:
+        source_store().snapshot_source(submitted, archive, max_bytes=1024)
+
+    assert caught.value.stop_reason == "SOURCE_HASH_MISMATCH"
+    assert target.read_bytes() == conflicting_bytes
 
 
 def test_prepare_case_extracts_archived_bytes_after_submitted_path_changes(
