@@ -78,7 +78,8 @@ def connect_database(path: Path, *, read_only: bool = False) -> Iterator[sqlite3
 def _migration_resources(kind: DatabaseKind) -> list[Traversable]:
     root = files("invoice_agents.db").joinpath("migrations", kind.value)
     resources = sorted(
-        item for item in root.iterdir() if item.name[:3].isdigit() and item.name.endswith(".sql")
+        (item for item in root.iterdir() if item.name[:3].isdigit() and item.name.endswith(".sql")),
+        key=lambda item: item.name,
     )
     if not resources:
         raise DatabaseVerificationError(
