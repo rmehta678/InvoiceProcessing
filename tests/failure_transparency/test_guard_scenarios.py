@@ -387,7 +387,7 @@ async def test_retry_events_count_into_usage(
     assert WorkflowStore(settings.workflow_db).count_events(case_id, "provider.retry") == 2
 
 
-def test_synthetic_fixture_sources_fail_visibly() -> None:
+def test_synthetic_fixture_sources_fail_visibly(tmp_path: Path) -> None:
     with pytest.raises(SourceEvidenceError) as corrupt_pdf_error:
         get_source_metadata(FIXTURES_DIR / "corrupt.pdf")
     assert corrupt_pdf_error.value.category in {"PARSE", "SOURCE"}
@@ -403,6 +403,8 @@ def test_synthetic_fixture_sources_fail_visibly() -> None:
     assert empty_error.value.category == "PARSE"
     assert empty_error.value.stop_reason == "SOURCE_EMPTY"
 
+    bad_database = tmp_path / "not_a_database.db"
+    bad_database.write_bytes(b"not a sqlite database\n")
     with pytest.raises(DatabaseVerificationError) as bad_db_error:
-        verify_database(FIXTURES_DIR / "not_a_database.db", DatabaseKind.WORKFLOW)
+        verify_database(bad_database, DatabaseKind.WORKFLOW)
     assert bad_db_error.value.stop_reason == "DATABASE_SIGNATURE_INVALID"
