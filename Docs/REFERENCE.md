@@ -21,6 +21,10 @@ uv run python -m invoice_agents.db migrate --db workflow.db --kind workflow
 uv run python -m invoice_agents.db verify --db workflow.db --kind workflow
 ```
 
+Database migrations are runtime package resources, so these commands work from an installed wheel
+as well as from a source checkout. The source repository's `data/invoices/` directory is only a
+demonstration corpus; installed batch users must pass their own `--invoice-dir PATH`.
+
 Verification pins the inventory seed verbatim; it contains only facts from the challenge README:
 
 | SKU | Item | Available stock |

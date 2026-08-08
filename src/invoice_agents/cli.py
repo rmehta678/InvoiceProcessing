@@ -110,6 +110,13 @@ def batch_command(
 ) -> None:
     """Process all supported files with per-case status and bounded concurrency."""
 
+    if not invoice_dir.is_dir():
+        console.print(
+            "SOURCE_DIRECTORY_MISSING: source-repository demo corpus is unavailable; "
+            "pass --invoice-dir PATH",
+            style="red",
+        )
+        raise typer.Exit(1)
     paths = sorted(
         path
         for path in invoice_dir.iterdir()

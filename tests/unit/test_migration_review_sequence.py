@@ -9,9 +9,9 @@ import pytest
 
 from invoice_agents.db.core import (
     DatabaseKind,
+    _migration_resources,
     connect_database,
     migrate_database,
-    project_root,
     verify_database,
 )
 from invoice_agents.db.store import WorkflowStore
@@ -74,9 +74,7 @@ def build_v1_workflow_db(tmp_path: Path) -> Path:
     """Apply only 001_initial.sql and populate case, review, and human-decision rows."""
 
     path = tmp_path / "workflow_v1.db"
-    script = (project_root() / "migrations" / "workflow" / "001_initial.sql").read_text(
-        encoding="utf-8"
-    )
+    script = _migration_resources(DatabaseKind.WORKFLOW)[0].read_text(encoding="utf-8")
     at = LEGACY_AT.isoformat()
     with connect_database(path) as connection:
         connection.executescript(script)

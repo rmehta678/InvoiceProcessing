@@ -26,6 +26,10 @@ The last command brings everything up: it creates, migrates, and seeds both SQLi
 <http://127.0.0.1:8787>. Use `--port` to change the port and `--no-init-db` to skip database
 setup. The server is localhost-only by design.
 
+`data/invoices/` is a source-repository demonstration corpus; it is not installed with the
+application. Installed users provide their own directory with `--invoice-dir PATH` when running
+`invoice-agents batch`.
+
 ## What to expect
 
 The console opens on a **dashboard** with a preflight strip showing database and API-key health;

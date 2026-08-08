@@ -47,6 +47,7 @@ invoice-agents = "invoice_agents.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/invoice_agents"]
+include = ["src/invoice_agents/**/*.sql"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers"

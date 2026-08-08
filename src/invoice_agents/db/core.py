@@ -7,6 +7,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
+from importlib.resources import files
+from importlib.resources.abc import Traversable
 from pathlib import Path
 
 from invoice_agents.errors import DatabaseVerificationError, ErrorCategory
@@ -52,12 +54,6 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def project_root() -> Path:
-    """Resolve the source checkout containing the versioned SQL files."""
-
-    return Path(__file__).resolve().parents[3]
-
-
 def infer_kind(path: Path) -> DatabaseKind:
     return DatabaseKind.WORKFLOW if "workflow" in path.name.lower() else DatabaseKind.INVENTORY
 
@@ -79,16 +75,18 @@ def connect_database(path: Path, *, read_only: bool = False) -> Iterator[sqlite3
         connection.close()
 
 
-def _migration_files(kind: DatabaseKind) -> list[Path]:
-    migration_dir = project_root() / "migrations" / kind.value
-    files = sorted(migration_dir.glob("[0-9][0-9][0-9]_*.sql"))
-    if not files:
+def _migration_resources(kind: DatabaseKind) -> list[Traversable]:
+    root = files("invoice_agents.db").joinpath("migrations", kind.value)
+    resources = sorted(
+        item for item in root.iterdir() if item.name[:3].isdigit() and item.name.endswith(".sql")
+    )
+    if not resources:
         raise DatabaseVerificationError(
             ErrorCategory.DATABASE,
-            f"no migration files found for {kind.value} at {migration_dir}",
+            f"no packaged migration files found for {kind.value}",
             stop_reason="MIGRATION_NOT_FOUND",
         )
-    return files
+    return resources
 
 
 def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
@@ -107,11 +105,11 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
             int(row["version"])
             for row in connection.execute("SELECT version FROM schema_version").fetchall()
         }
-        for migration in _migration_files(selected_kind):
-            version = int(migration.name.split("_", 1)[0])
+        for resource in _migration_resources(selected_kind):
+            version = int(resource.name.split("_", 1)[0])
             if version in existing:
                 continue
-            script = migration.read_text(encoding="utf-8")
+            script = resource.read_text(encoding="utf-8")
             try:
                 connection.executescript(script)
                 connection.execute(
@@ -123,7 +121,7 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
                 connection.rollback()
                 raise DatabaseVerificationError(
                     ErrorCategory.DATABASE,
-                    f"migration {migration.name} failed: {exc}",
+                    f"migration {resource.name} failed: {exc}",
                     stop_reason="MIGRATION_FAILED",
                 ) from exc
             applied.append(version)
