@@ -343,6 +343,43 @@ def _is_table_boundary(text: str) -> bool:
     )
 
 
+def _parse_tax_rate_label(
+    label: str,
+    source: SourceArtifact,
+    *,
+    locator: str,
+) -> Decimal | None:
+    """Parse a complete parenthesized or unparenthesized tax-rate label."""
+
+    intent = re.fullmatch(r"\s*(?:tax|sales\s+tax)\b(?P<suffix>.*)", label, re.I)
+    if intent is None:
+        return None
+    suffix = intent.group("suffix")
+    if not suffix.strip():
+        return None
+    wrapper = re.fullmatch(r"\s*\(\s*(?P<value>[^%]*)\s*%\s*\)\s*", suffix)
+    if wrapper is None:
+        wrapper = re.fullmatch(r"\s+(?P<value>[^%]*)\s*%\s*", suffix)
+    if wrapper is None:
+        raise SourceEvidenceError(
+            ErrorCategory.PARSE,
+            f"malformed declared tax rate value at {locator}",
+            stop_reason="MALFORMED_MONEY_FIELD",
+            details={
+                "field": "declared tax rate",
+                "locator": locator,
+                "source_id": source.source_id,
+                "raw_value": safe_evidence_excerpt(label),
+            },
+        )
+    return _parse_complete_decimal(
+        wrapper.group("value"),
+        "declared tax rate",
+        source,
+        locator=locator,
+    )[0] / 100
+
+
 def _invoice_number(raw: Any) -> tuple[str | None, str, str | None]:
     if raw is None or not str(raw).strip():
         return None, "none", None
@@ -699,18 +736,17 @@ def _extract_textual(
     )
     tax_rate: Decimal | None = None
     for index, text_line in enumerate(lines, 1):
-        rate_match = re.fullmatch(
-            r"\s*(?:tax|sales\s+tax)\s*\(\s*(?P<value>[^%]*)%\s*\)\s*:\s*.+",
+        label_match = re.fullmatch(
+            r"\s*(?P<label>(?:tax|sales\s+tax)\b.*?)\s*:\s*.+",
             text_line,
             re.I,
         )
-        if rate_match is not None:
-            tax_rate = _parse_complete_decimal(
-                rate_match.group("value"),
-                "declared tax rate",
+        if label_match is not None:
+            tax_rate = _parse_tax_rate_label(
+                label_match.group("label"),
                 source,
                 locator=f"{locator_prefix}:{index}",
-            )[0] / 100
+            )
             break
     notes = [note for note in (subtotal_note, tax_note, shipping_note, total_note) if note]
     full_locator: Literal["page", "line"] = "page" if locator_prefix.startswith("page") else "line"
@@ -858,23 +894,16 @@ def _extract_csv(source: SourceArtifact) -> ExtractedInvoice:
             field = "declared fee"
             if label.startswith("subtotal"):
                 field = "declared subtotal"
-            elif label.startswith("tax"):
+            elif label.startswith(("tax", "sales tax")):
                 field = "declared tax"
             elif label.startswith("total"):
                 field = "declared total"
             amount = _parse_complete_decimal(raw_value, field, source, locator=f"row:{row_index}")[0]
             if label.startswith("subtotal"):
                 totals["subtotal"] = amount
-            elif label.startswith("tax"):
+            elif label.startswith(("tax", "sales tax")):
                 totals["tax"] = amount
-                rate_match = re.fullmatch(r"tax\s*\(\s*(?P<value>[^%]*)%\s*\)", raw_label, re.I)
-                if rate_match:
-                    tax_rate = _parse_complete_decimal(
-                        rate_match.group("value"),
-                        "declared tax rate",
-                        source,
-                        locator=f"row:{row_index}",
-                    )[0] / 100
+                tax_rate = _parse_tax_rate_label(raw_label, source, locator=f"row:{row_index}")
             elif label.startswith("total"):
                 totals["total"] = amount
     if not data_rows:

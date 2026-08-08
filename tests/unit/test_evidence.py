@@ -347,6 +347,22 @@ def test_text_tax_rate_rejects_malformed_content(tmp_path: Path) -> None:
     assert excinfo.value.details["raw_value"] == "0BAD"
 
 
+@pytest.mark.parametrize("label", ["Tax (10%oops)", "Tax (10%%)"])
+def test_text_tax_rate_rejects_malformed_wrapper(label: str, tmp_path: Path) -> None:
+    source = write_text_invoice(
+        tmp_path,
+        document_fields=(f"{label}: $10.00",),
+    )
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        extract_invoice_evidence(source)
+
+    assert excinfo.value.stop_reason == "MALFORMED_MONEY_FIELD"
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["field"] == "declared tax rate"
+    assert excinfo.value.details["raw_value"] == label
+
+
 def test_row_oriented_csv_tax_rate_rejects_malformed_content(tmp_path: Path) -> None:
     path = tmp_path / "malformed-tax-rate.csv"
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -376,6 +392,63 @@ def test_row_oriented_csv_tax_rate_rejects_malformed_content(tmp_path: Path) -> 
     assert excinfo.value.details["field"] == "declared tax rate"
     assert excinfo.value.details["locator"] == "row:3"
     assert excinfo.value.details["raw_value"] == "0BAD"
+
+
+def test_row_oriented_csv_tax_rate_rejects_malformed_wrapper(tmp_path: Path) -> None:
+    path = tmp_path / "malformed-tax-wrapper.csv"
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "Invoice Number",
+                "Vendor",
+                "Date",
+                "Due Date",
+                "Item",
+                "Qty",
+                "Unit Price",
+                "Line Total",
+            ]
+        )
+        writer.writerow(["INV-4242", "Numeric Supplies", "2026-01-15", "2026-02-01", "WidgetA", "2", "$50.00", "$100.00"])
+        writer.writerow(["", "", "", "", "", "", "Tax (10%oops)", "$10.00"])
+        writer.writerow(["", "", "", "", "", "", "Total", "$110.00"])
+    source = snapshot_source(path, tmp_path / "sources", 10_485_760)
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        extract_invoice_evidence(source)
+
+    assert excinfo.value.stop_reason == "MALFORMED_MONEY_FIELD"
+    assert excinfo.value.details is not None
+    assert excinfo.value.details["field"] == "declared tax rate"
+    assert excinfo.value.details["locator"] == "row:3"
+    assert excinfo.value.details["raw_value"] == "Tax (10%oops)"
+
+
+def test_row_oriented_csv_tax_rate_preserves_unparenthesized_label(tmp_path: Path) -> None:
+    path = tmp_path / "unparenthesized-tax-rate.csv"
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "Invoice Number",
+                "Vendor",
+                "Date",
+                "Due Date",
+                "Item",
+                "Qty",
+                "Unit Price",
+                "Line Total",
+            ]
+        )
+        writer.writerow(["INV-4242", "Numeric Supplies", "2026-01-15", "2026-02-01", "WidgetA", "2", "$50.00", "$100.00"])
+        writer.writerow(["", "", "", "", "", "", "Tax 10%", "$10.00"])
+        writer.writerow(["", "", "", "", "", "", "Total", "$110.00"])
+    source = snapshot_source(path, tmp_path / "sources", 10_485_760)
+
+    invoice = extract_invoice_evidence(source)
+
+    assert invoice.declared_tax_rate == Decimal("0.1")
 
 
 def test_email_vendor_and_pdf_columns_are_not_conflated(invoice_dir: Path, tmp_path: Path) -> None:
