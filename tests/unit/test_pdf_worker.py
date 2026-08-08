@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import struct
 import time
+import tracemalloc
 from datetime import UTC, datetime
 from importlib import import_module
 from multiprocessing.connection import Connection
@@ -106,6 +107,16 @@ def write_slow_wire_message(connection: Connection, payload: bytes, delay: float
         connection.close()
 
 
+def stall_worker_after_result_header(connection: Connection, *_args: object) -> None:
+    """Begin a valid-sized frame, then stall until the production parent kills this process."""
+
+    try:
+        os.write(connection.fileno(), struct.pack("!I", 128) + b"{")
+        time.sleep(5.0)
+    finally:
+        connection.close()
+
+
 def test_worker_address_space_limit_blocks_allocation_beyond_allowance() -> None:
     context = multiprocessing.get_context("spawn")
     parent_connection, child_connection = context.Pipe(duplex=False)
@@ -158,6 +169,85 @@ def test_bounded_receive_deadline_covers_complete_message() -> None:
         process.join(1.0)
         parent_connection.close()
     assert not process.is_alive()
+
+
+def test_run_worker_automatically_reaps_child_that_stalls_mid_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = content_addressed_pdf(DATA_DIR / "invoice_1011.pdf", tmp_path / "sources", 1)
+    worker_module = pdf_worker()
+    monkeypatch.setattr(worker_module, "_worker_main", stall_worker_after_result_header)
+    before = child_pids()
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        worker_module._run_worker("extract", source, timeout_seconds=0.05)
+
+    assert excinfo.value.stop_reason == "PDF_PARSE_TIMEOUT"
+    assert child_pids() == before
+
+
+def test_bounded_result_encoding_does_not_allocate_a_second_full_text_copy() -> None:
+    worker_module = pdf_worker()
+    large_text = "A" * 8_000_000
+    payload = {
+        "ok": True,
+        "result": {
+            "pages": [{"page": 1, "text": large_text}],
+            "extractor": "pypdf",
+            "page_count": 1,
+        },
+    }
+    tracemalloc.start()
+    try:
+        encoded = worker_module._encode_bounded_message(payload, max_bytes=65_536)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert encoded.text == bytearray()
+    assert b"PDF_WORKER_FAILED" in encoded.metadata
+    assert peak < 1_000_000
+
+
+def test_bounded_result_encoding_does_not_allocate_oversized_metadata() -> None:
+    worker_module = pdf_worker()
+    payload = {
+        "ok": False,
+        "category": "TOOL",
+        "message": "A" * 8_000_000,
+        "stop_reason": "PDF_WORKER_FAILED",
+    }
+    tracemalloc.start()
+    try:
+        encoded = worker_module._encode_bounded_message(payload, max_bytes=65_536)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert encoded.text == bytearray()
+    assert b"PDF_WORKER_FAILED" in encoded.metadata
+    assert peak < 1_000_000
+
+
+def test_write_all_uses_views_without_recopying_remaining_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_module = pdf_worker()
+    content = b"A" * 4_000_000
+
+    def partial_write(_file_descriptor: int, remaining: bytes) -> int:
+        return min(len(remaining), 4_096)
+
+    monkeypatch.setattr(os, "write", partial_write)
+    tracemalloc.start()
+    try:
+        worker_module._write_all(999, content)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 1_000_000
 
 
 def test_oversized_extraction_result_fails_generically_and_reaps_worker(
@@ -369,3 +459,99 @@ def test_error_envelope_rejects_disallowed_empty_details() -> None:
 
     assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
     assert excinfo.value.message == "PDF worker failed"
+
+
+@pytest.mark.parametrize("page_number", [True, 1.0])
+def test_extract_page_number_requires_a_strict_integer(page_number: object) -> None:
+    payload = {
+        "ok": True,
+        "result": {
+            "pages": [{"page": page_number, "text_bytes": 7}],
+            "extractor": "pypdf",
+            "page_count": 1,
+        },
+    }
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        pdf_worker()._decode_worker_message(
+            "extract",
+            json.dumps(payload).encode("utf-8"),
+            expected_page=None,
+            text_payload=b"invoice",
+        )
+
+    assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
+
+
+@pytest.mark.parametrize(
+    ("operation", "result"),
+    [
+        ("inspect", {"page_count": 2}),
+        (
+            "extract",
+            {
+                "pages": [
+                    {"page": 1, "text_bytes": 1},
+                    {"page": 2, "text_bytes": 1},
+                ],
+                "extractor": "pypdf",
+                "page_count": 2,
+            },
+        ),
+    ],
+)
+def test_success_envelope_cannot_exceed_configured_page_limit(
+    operation: str,
+    result: dict[str, object],
+) -> None:
+    payload = {"ok": True, "result": result}
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        pdf_worker()._decode_worker_message(
+            operation,
+            json.dumps(payload).encode("utf-8"),
+            expected_page=None,
+            max_pages=1,
+        )
+
+    assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
+
+
+def test_recursive_metadata_decode_failure_is_generic() -> None:
+    recursive_json = b"[" * 10_000 + b"]" * 10_000
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        pdf_worker()._decode_worker_message(
+            "extract", recursive_json, expected_page=None
+        )
+
+    assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
+    assert excinfo.value.message == "PDF worker failed"
+
+
+def test_incremental_text_decode_enforces_deadline_during_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = {
+        "ok": True,
+        "result": {
+            "pages": [{"page": 1, "text_bytes": 4_000_000}],
+            "extractor": "pypdf",
+            "page_count": 1,
+        },
+    }
+
+    monotonic_values = iter((0.0, 0.0, 0.0, 2.0))
+    monkeypatch.setattr(time, "monotonic", lambda: next(monotonic_values, 2.0))
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        pdf_worker()._decode_worker_message(
+            "extract",
+            json.dumps(metadata).encode("utf-8"),
+            expected_page=None,
+            max_pages=100,
+            text_payload=b"A" * 4_000_000,
+            deadline=1.0,
+        )
+
+    assert excinfo.value.stop_reason == "PDF_PARSE_TIMEOUT"

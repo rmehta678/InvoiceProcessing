@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import hashlib
 import json
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -27,7 +29,23 @@ WorkerOperation = Literal["inspect", "extract", "render"]
 JOIN_GRACE_SECONDS = 1.0
 WIRE_HEADER_BYTES = 4
 WIRE_READ_CHUNK_BYTES = 65_536
+METADATA_MAX_BYTES = 32_768
+TEXT_ENCODE_CHARS = 4_096
 GENERIC_WORKER_MESSAGE = "PDF worker failed"
+
+
+@dataclass(slots=True)
+class _WireMessage:
+    metadata: bytearray
+    text: bytearray
+
+    @property
+    def payload_bytes(self) -> int:
+        return WIRE_HEADER_BYTES + len(self.metadata) + len(self.text)
+
+
+class _ResultTooLarge(Exception):
+    """Internal control flow for replacing an oversized result with a generic failure."""
 
 
 def _bounded_limit(resource_name: int, requested: int) -> tuple[int, int]:
@@ -86,13 +104,117 @@ def _generic_failure_payload() -> dict[str, object]:
     }
 
 
-def _write_all(file_descriptor: int, content: bytes) -> None:
+def _write_all(
+    file_descriptor: int,
+    content: bytes | bytearray | memoryview,
+) -> None:
+    view = memoryview(content)
     written = 0
-    while written < len(content):
-        count = os.write(file_descriptor, content[written:])
+    while written < len(view):
+        count = os.write(file_descriptor, view[written:])
         if count < 1:
             raise BrokenPipeError("PDF result pipe closed")
         written += count
+
+
+def _metadata_bytes(payload: dict[str, object]) -> bytearray:
+    stack: list[object] = [payload]
+    seen_containers: set[int] = set()
+    visited_values = 0
+    while stack:
+        value = stack.pop()
+        visited_values += 1
+        if visited_values > METADATA_MAX_BYTES:
+            raise _ResultTooLarge
+        if isinstance(value, str):
+            if len(value) > METADATA_MAX_BYTES // 6:
+                raise _ResultTooLarge
+            continue
+        if isinstance(value, dict):
+            identity = id(value)
+            if identity in seen_containers or len(value) > METADATA_MAX_BYTES:
+                raise _ResultTooLarge
+            seen_containers.add(identity)
+            stack.extend(value.keys())
+            stack.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            identity = id(value)
+            if identity in seen_containers or len(value) > METADATA_MAX_BYTES:
+                raise _ResultTooLarge
+            seen_containers.add(identity)
+            stack.extend(value)
+
+    encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
+    encoded = bytearray()
+    for piece in encoder.iterencode(payload):
+        encoded_piece = piece.encode("utf-8")
+        if len(encoded) + len(encoded_piece) > METADATA_MAX_BYTES:
+            raise _ResultTooLarge
+        encoded.extend(encoded_piece)
+    return encoded
+
+
+def _encode_bounded_message(
+    payload: dict[str, object],
+    *,
+    max_bytes: int,
+) -> _WireMessage:
+    """Encode metadata plus page text without constructing a second full text copy."""
+
+    try:
+        text = bytearray()
+        metadata_payload = payload
+        result = payload.get("result")
+        if (
+            payload.get("ok") is True
+            and isinstance(result, dict)
+            and result.get("extractor") == "pypdf"
+            and isinstance(result.get("pages"), list)
+        ):
+            page_metadata: list[dict[str, object]] = []
+            for page in result["pages"]:
+                if not isinstance(page, dict) or not isinstance(page.get("text"), str):
+                    raise ValueError("invalid child extraction result")
+                page_start = len(text)
+                page_text = page["text"]
+                for start in range(0, len(page_text), TEXT_ENCODE_CHARS):
+                    encoded_chunk = page_text[start : start + TEXT_ENCODE_CHARS].encode("utf-8")
+                    if (
+                        WIRE_HEADER_BYTES
+                        + METADATA_MAX_BYTES
+                        + len(text)
+                        + len(encoded_chunk)
+                        > max_bytes
+                    ):
+                        raise _ResultTooLarge
+                    text.extend(encoded_chunk)
+                page_metadata.append(
+                    {
+                        "page": page.get("page"),
+                        "text_bytes": len(text) - page_start,
+                    }
+                )
+            metadata_payload = {
+                "ok": True,
+                "result": {
+                    "pages": page_metadata,
+                    "extractor": "pypdf",
+                    "page_count": result.get("page_count"),
+                },
+            }
+        metadata = _metadata_bytes(metadata_payload)
+        message = _WireMessage(metadata=metadata, text=text)
+        if message.payload_bytes > max_bytes:
+            raise _ResultTooLarge
+        return message
+    except _ResultTooLarge:
+        metadata = _metadata_bytes(_generic_failure_payload())
+        message = _WireMessage(metadata=metadata, text=bytearray())
+        if message.payload_bytes > max_bytes:
+            raise RuntimeError(
+                "PDF result ceiling cannot contain the generic failure envelope"
+            ) from None
+        return message
 
 
 def _send(
@@ -100,15 +222,14 @@ def _send(
     payload: dict[str, object],
     max_bytes: int,
 ) -> None:
-    """Send one size-capped JSON message using a bounded four-byte frame header."""
+    """Send one capped metadata/text frame without full-payload concatenation."""
 
-    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    if len(encoded) > max_bytes:
-        encoded = json.dumps(_generic_failure_payload(), separators=(",", ":")).encode("utf-8")
-    if len(encoded) > max_bytes:
-        raise RuntimeError("PDF result ceiling cannot contain the generic failure envelope")
-    framed = struct.pack("!I", len(encoded)) + encoded
-    _write_all(connection.fileno(), framed)
+    message = _encode_bounded_message(payload, max_bytes=max_bytes)
+    file_descriptor = connection.fileno()
+    _write_all(file_descriptor, struct.pack("!I", message.payload_bytes))
+    _write_all(file_descriptor, struct.pack("!I", len(message.metadata)))
+    _write_all(file_descriptor, message.metadata)
+    _write_all(file_descriptor, message.text)
 
 
 def _page_limit_error(
@@ -286,7 +407,7 @@ def _receive_bounded_message(
     *,
     max_bytes: int,
     deadline: float,
-) -> bytes:
+) -> bytearray:
     """Receive exactly one capped frame without blocking past the absolute deadline."""
 
     file_descriptor = connection.fileno()
@@ -295,7 +416,7 @@ def _receive_bounded_message(
     selector.register(file_descriptor, selectors.EVENT_READ)
     os.set_blocking(file_descriptor, False)
 
-    def read_exact(length: int) -> bytes:
+    def read_exact(length: int) -> bytearray:
         received = bytearray()
         while len(received) < length:
             remaining_seconds = deadline - time.monotonic()
@@ -313,7 +434,7 @@ def _receive_bounded_message(
             if not chunk:
                 raise _worker_failed()
             received.extend(chunk)
-        return bytes(received)
+        return received
 
     try:
         header = read_exact(WIRE_HEADER_BYTES)
@@ -326,23 +447,55 @@ def _receive_bounded_message(
         os.set_blocking(file_descriptor, was_blocking)
 
 
+def _split_wire_message(
+    encoded: bytes | bytearray | memoryview,
+) -> tuple[memoryview, memoryview]:
+    """Split one received frame into bounded metadata and page-text views."""
+
+    view = memoryview(encoded)
+    if len(view) <= WIRE_HEADER_BYTES:
+        raise _worker_failed()
+    (metadata_length,) = struct.unpack("!I", view[:WIRE_HEADER_BYTES])
+    metadata_end = WIRE_HEADER_BYTES + metadata_length
+    if (
+        metadata_length < 1
+        or metadata_length > METADATA_MAX_BYTES
+        or metadata_end > len(view)
+    ):
+        raise _worker_failed()
+    return view[WIRE_HEADER_BYTES:metadata_end], view[metadata_end:]
+
+
 def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _decode_worker_message(
     operation: WorkerOperation,
-    encoded: bytes,
+    encoded: bytes | bytearray | memoryview,
     *,
     expected_page: int | None,
+    max_pages: int = 100,
+    text_payload: bytes | bytearray | memoryview = b"",
+    deadline: float = float("inf"),
 ) -> dict[str, object]:
-    """Validate the complete common and operation-specific JSON envelope."""
+    """Validate bounded metadata and incrementally decode extraction text."""
+
+    def check_deadline() -> None:
+        if time.monotonic() >= deadline:
+            raise _parse_timeout()
 
     try:
-        payload = json.loads(encoded.decode("utf-8"))
+        check_deadline()
+        if len(encoded) < 1 or len(encoded) > METADATA_MAX_BYTES:
+            raise ValueError("invalid metadata size")
+        payload = json.loads(bytes(encoded).decode("utf-8"))
+        check_deadline()
         if not isinstance(payload, dict) or not isinstance(payload.get("ok"), bool):
             raise ValueError("invalid common envelope")
         if payload["ok"] is False:
+            if len(text_payload) != 0:
+                raise ValueError("error envelope included text")
             required = {"ok", "category", "message", "stop_reason"}
             if set(payload) not in (required, required | {"details"}):
                 raise ValueError("invalid error envelope keys")
@@ -367,6 +520,7 @@ def _decode_worker_message(
                     or not _is_int(details.get("max_pages"))
                     or details["page_count"] <= details["max_pages"]
                     or details["max_pages"] < 1
+                    or details["max_pages"] != max_pages
                 ):
                     raise ValueError("invalid page-limit failure")
                 raise SourceEvidenceError(
@@ -404,9 +558,11 @@ def _decode_worker_message(
             raise ValueError("invalid success envelope")
         result = payload["result"]
         if operation == "inspect":
+            if len(text_payload) != 0:
+                raise ValueError("inspection result included text")
             if set(result) != {"page_count"} or not _is_int(result.get("page_count")):
                 raise ValueError("invalid inspection metadata")
-            if result["page_count"] < 1:
+            if result["page_count"] < 1 or result["page_count"] > max_pages:
                 raise ValueError("invalid inspection page count")
         elif operation == "extract":
             if set(result) != {"pages", "extractor", "page_count"}:
@@ -417,19 +573,53 @@ def _decode_worker_message(
                 result["extractor"] != "pypdf"
                 or not _is_int(page_count)
                 or page_count < 1
+                or page_count > max_pages
                 or not isinstance(pages, list)
                 or len(pages) != page_count
+                or len(pages) > max_pages
             ):
                 raise ValueError("invalid extraction result")
+            text_view = memoryview(text_payload)
+            text_offset = 0
+            decoded_pages: list[dict[str, object]] = []
             for page_number, page_result in enumerate(pages, 1):
                 if (
                     not isinstance(page_result, dict)
-                    or set(page_result) != {"page", "text"}
+                    or set(page_result) != {"page", "text_bytes"}
+                    or not _is_int(page_result.get("page"))
                     or page_result.get("page") != page_number
-                    or not isinstance(page_result.get("text"), str)
+                    or not _is_int(page_result.get("text_bytes"))
+                    or page_result["text_bytes"] < 0
                 ):
                     raise ValueError("invalid extracted page")
+                page_end = text_offset + page_result["text_bytes"]
+                if page_end > len(text_view):
+                    raise ValueError("invalid extracted text length")
+                decoder = codecs.getincrementaldecoder("utf-8")("strict")
+                decoded_chunks: list[str] = []
+                while text_offset < page_end:
+                    check_deadline()
+                    chunk_end = min(text_offset + WIRE_READ_CHUNK_BYTES, page_end)
+                    decoded_chunks.append(
+                        decoder.decode(text_view[text_offset:chunk_end], final=False)
+                    )
+                    text_offset = chunk_end
+                    check_deadline()
+                decoded_chunks.append(decoder.decode(b"", final=True))
+                check_deadline()
+                page_text = "".join(decoded_chunks)
+                check_deadline()
+                decoded_pages.append({"page": page_number, "text": page_text})
+            if text_offset != len(text_view):
+                raise ValueError("unexpected extracted text")
+            result = {
+                "pages": decoded_pages,
+                "extractor": "pypdf",
+                "page_count": page_count,
+            }
         elif operation == "render":
+            if len(text_payload) != 0:
+                raise ValueError("render result included text")
             if set(result) != {"page", "sha256", "renderer"}:
                 raise ValueError("invalid render metadata")
             digest = result["sha256"]
@@ -444,10 +634,11 @@ def _decode_worker_message(
                 raise ValueError("invalid render result")
         else:
             raise ValueError("unknown worker operation")
+        check_deadline()
         return cast(dict[str, object], result)
     except SourceEvidenceError:
         raise
-    except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+    except Exception:
         raise _worker_failed() from None
 
 
@@ -504,18 +695,15 @@ def _run_worker(
             max_bytes=settings.pdf_worker_result_max_bytes,
             deadline=deadline,
         )
-        try:
-            result = _decode_worker_message(
-                operation,
-                encoded,
-                expected_page=page,
-            )
-        except SourceEvidenceError:
-            if time.monotonic() > deadline:
-                raise _parse_timeout() from None
-            raise
-        if time.monotonic() > deadline:
-            raise _parse_timeout()
+        metadata, text_payload = _split_wire_message(encoded)
+        result = _decode_worker_message(
+            operation,
+            metadata,
+            expected_page=page,
+            max_pages=settings.pdf_max_pages,
+            text_payload=text_payload,
+            deadline=deadline,
+        )
         process.join(max(0.0, deadline - time.monotonic()))
         if process.is_alive():
             _stop_process(process)
