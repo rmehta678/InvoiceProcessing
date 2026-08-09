@@ -7,11 +7,14 @@ from pathlib import Path
 
 import pytest
 
+from invoice_agents.agents.decision_rules import blocking_evidence
+from invoice_agents.config import Settings
 from invoice_agents.db.core import (
     DatabaseKind,
     _migration_resources,
     connect_database,
     migrate_database,
+    seed_inventory,
     verify_database,
 )
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
@@ -21,18 +24,28 @@ from invoice_agents.models import (
     CaseStatus,
     Critique,
     DecisionKind,
-    EvidenceValue,
     ExtractedInvoice,
     HumanDecisionKind,
+    Money,
     ReviewRequest,
     RiskAssessment,
     SourceArtifact,
 )
-from invoice_agents.tools.comparison import compute_invoice_totals
+from invoice_agents.source_store import snapshot_source
+from invoice_agents.tools.comparison import (
+    InventoryReader,
+    apply_mapping_evidence,
+    build_risk_assessment,
+    compare_inventory_evidence,
+    compute_invoice_totals,
+    find_prior_invoice_candidates,
+)
+from invoice_agents.tools.evidence import extract_invoice_evidence
 
 CASE_ID = "case_v1_legacy"
 REVIEW_ID = "rev_v1_legacy"
 LEGACY_AT = datetime(2026, 1, 1, tzinfo=UTC)
+LEGACY_SOURCE = Path(__file__).resolve().parents[2] / "data" / "invoices" / "invoice_1001.txt"
 
 
 def make_critique() -> Critique:
@@ -46,25 +59,20 @@ def make_critique() -> Critique:
     )
 
 
-def make_source() -> SourceArtifact:
-    return SourceArtifact(
-        source_id="src_v1_legacy",
-        canonical_path=Path("invoice_legacy.txt"),
-        sha256="f" * 64,
-        source_format="txt",
-        size_bytes=1,
-        modified_at=LEGACY_AT,
-    )
+def make_source(archive_dir: Path) -> SourceArtifact:
+    return snapshot_source(LEGACY_SOURCE, archive_dir, max_bytes=10_485_760)
 
 
-def make_review(review_id: str, created_at: datetime) -> ReviewRequest:
+def make_review(
+    review_id: str, created_at: datetime, source: SourceArtifact
+) -> ReviewRequest:
     return ReviewRequest(
         review_id=review_id,
         case_id=CASE_ID,
         status="PENDING",
         reasons=["legacy policy trigger"],
         amount=None,
-        source=make_source(),
+        source=source,
         evidence_bundle={},
         agent_recommendation=DecisionKind.HOLD,
         agent_rationale=["legacy review"],
@@ -74,38 +82,47 @@ def make_review(review_id: str, created_at: datetime) -> ReviewRequest:
     )
 
 
-def make_invoice() -> ExtractedInvoice:
-    missing = EvidenceValue(raw_value=None, normalized_value=None)
-    return ExtractedInvoice(
-        source=make_source(),
-        invoice_number=EvidenceValue(raw_value="INV-LEGACY", normalized_value="INV-LEGACY"),
-        vendor=EvidenceValue(raw_value="Legacy Vendor", normalized_value="Legacy Vendor"),
-        invoice_date=missing,
-        due_date=missing,
-        payment_terms=missing,
-        currency=missing,
-        lines=[],
-        missing_fields=["invoice_date", "due_date", "payment_terms", "currency"],
-    )
+def make_invoice(source: SourceArtifact) -> ExtractedInvoice:
+    return extract_invoice_evidence(source)
 
 
 def persist_bound_review_evidence(
-    store: WorkflowStore, claim: ExecutionClaim
+    store: WorkflowStore,
+    claim: ExecutionClaim,
+    settings: Settings,
+    source: SourceArtifact,
 ) -> tuple[ExtractedInvoice, RiskAssessment, Critique]:
-    invoice = make_invoice()
-    risk = RiskAssessment(
-        financial=compute_invoice_totals(invoice),
-        dates=[],
-        inventory=[],
-        identity_candidates=[],
-        suspicious_signals=[],
-        unavailable_reconciliations=[],
-        policy_review_reasons=["legacy policy trigger"],
+    source_invoice = make_invoice(source)
+    mappings, comparisons, unresolved = compare_inventory_evidence(
+        source_invoice, InventoryReader(settings.inventory_db)
+    )
+    invoice = apply_mapping_evidence(source_invoice, mappings, unresolved)
+    identity = find_prior_invoice_candidates(CASE_ID, invoice, store)
+    risk = build_risk_assessment(
+        invoice,
+        comparisons,
+        identity,
+        compute_invoice_totals(invoice),
+        settings,
     )
     case_critique = make_critique()
     store.save_extraction(CASE_ID, invoice, claim)
-    store.save_identity(CASE_ID, [], claim)
-    store.save_comparison(CASE_ID, "inventory", {"comparisons": []}, claim)
+    store.save_identity(
+        CASE_ID,
+        [candidate.model_dump(mode="json") for candidate in identity],
+        claim,
+    )
+    store.save_comparison(
+        CASE_ID,
+        "inventory",
+        {
+            "comparisons": [comparison.model_dump(mode="json") for comparison in comparisons],
+            "unresolved_candidates": {
+                item: result.model_dump(mode="json") for item, result in unresolved.items()
+            },
+        },
+        claim,
+    )
     store.save_comparison(CASE_ID, "risk", risk.model_dump(mode="json"), claim)
     store.save_critique(CASE_ID, case_critique, claim)
     return invoice, risk, case_critique
@@ -123,17 +140,26 @@ def make_bound_review(
         case_id=CASE_ID,
         status="PENDING",
         reasons=["legacy policy trigger"],
-        amount=None,
+        amount=(
+            Money(amount=invoice.declared_total, currency=invoice.currency.normalized_value)
+            if invoice.declared_total is not None
+            and invoice.currency.normalized_value is not None
+            else None
+        ),
         source=invoice.source,
         evidence_bundle={
             "invoice": invoice.model_dump(mode="json"),
             "financial": risk.financial.model_dump(mode="json"),
-            "inventory": [],
-            "identity_candidates": [],
-            "dates": [],
-            "suspicious_signals": [],
-            "unavailable_reconciliations": [],
-            "blocking_evidence": [],
+            "inventory": [item.model_dump(mode="json") for item in risk.inventory],
+            "identity_candidates": [
+                item.model_dump(mode="json") for item in risk.identity_candidates
+            ],
+            "dates": [item.model_dump(mode="json") for item in risk.dates],
+            "suspicious_signals": risk.suspicious_signals,
+            "unavailable_reconciliations": risk.unavailable_reconciliations,
+            "blocking_evidence": [
+                item.model_dump(mode="json") for item in blocking_evidence(risk)
+            ],
         },
         agent_recommendation=DecisionKind.HOLD,
         agent_rationale=["legacy review"],
@@ -143,18 +169,19 @@ def make_bound_review(
     )
 
 
-def v1_review_payload() -> str:
+def v1_review_payload(source: SourceArtifact) -> str:
     """A valid pre-schema-v2 review payload: no 'sequence' key at all."""
 
-    payload = make_review(REVIEW_ID, LEGACY_AT).model_dump(mode="json")
+    payload = make_review(REVIEW_ID, LEGACY_AT, source).model_dump(mode="json")
     del payload["sequence"]
     return json.dumps(payload)
 
 
-def build_v1_workflow_db(tmp_path: Path) -> Path:
+def build_v1_workflow_db(tmp_path: Path) -> tuple[Path, SourceArtifact]:
     """Apply only 001_initial.sql and populate case, review, and human-decision rows."""
 
     path = tmp_path / "workflow_v1.db"
+    source = make_source(tmp_path / "sources")
     script = _migration_resources(DatabaseKind.WORKFLOW)[0].read_text(encoding="utf-8")
     at = LEGACY_AT.isoformat()
     with connect_database(path) as connection:
@@ -163,7 +190,6 @@ def build_v1_workflow_db(tmp_path: Path) -> Path:
             "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
         connection.execute("INSERT INTO schema_version(version, applied_at) VALUES (1, ?)", (at,))
-        source = make_source()
         connection.execute(
             "INSERT INTO source_artifacts("
             "source_id, canonical_path, source_hash, source_format, size_bytes, modified_at, "
@@ -182,12 +208,19 @@ def build_v1_workflow_db(tmp_path: Path) -> Path:
         connection.execute(
             "INSERT INTO cases(case_id, source_id, status, stop_reason, started_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (CASE_ID, "src_v1_legacy", "NEEDS_HUMAN", "HUMAN_REVIEW_REQUESTED", at, at),
+            (
+                CASE_ID,
+                source.source_id,
+                "NEEDS_HUMAN",
+                "HUMAN_REVIEW_REQUESTED",
+                at,
+                at,
+            ),
         )
         connection.execute(
             "INSERT INTO review_requests(review_id, case_id, status, payload_json, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
-            (REVIEW_ID, CASE_ID, "PENDING", v1_review_payload(), at),
+            (REVIEW_ID, CASE_ID, "PENDING", v1_review_payload(source), at),
         )
         connection.execute(
             "INSERT INTO human_decisions("
@@ -204,11 +237,11 @@ def build_v1_workflow_db(tmp_path: Path) -> Path:
             ),
         )
         connection.commit()
-    return path
+    return path, source
 
 
 def test_v1_database_is_rejected_until_migrated_and_rows_gain_sequence(tmp_path: Path) -> None:
-    path = build_v1_workflow_db(tmp_path)
+    path, _source = build_v1_workflow_db(tmp_path)
     with pytest.raises(DatabaseVerificationError) as excinfo:
         verify_database(path, DatabaseKind.WORKFLOW)
     assert excinfo.value.stop_reason == "DATABASE_VERSION_MISMATCH"
@@ -229,13 +262,23 @@ def test_v1_database_is_rejected_until_migrated_and_rows_gain_sequence(tmp_path:
 
 
 def test_second_review_cycle_is_sequenced_and_duplicates_are_rejected(tmp_path: Path) -> None:
-    path = build_v1_workflow_db(tmp_path)
+    path, source = build_v1_workflow_db(tmp_path)
     migrate_database(path, DatabaseKind.WORKFLOW)
-    store = WorkflowStore(path)
+    inventory_db = tmp_path / "inventory.db"
+    migrate_database(inventory_db, DatabaseKind.INVENTORY)
+    seed_inventory(inventory_db)
+    settings = Settings(
+        workflow_db=path,
+        inventory_db=inventory_db,
+        source_archive_dir=tmp_path / "sources",
+    )
+    store = WorkflowStore(settings)
     claim = store.claim_case_execution(
         CASE_ID, frozenset({CaseStatus.NEEDS_HUMAN}), lease_seconds=60
     )
-    invoice, risk, case_critique = persist_bound_review_evidence(store, claim)
+    invoice, risk, case_critique = persist_bound_review_evidence(
+        store, claim, settings, source
+    )
     saved = store.save_review(
         make_bound_review(
             "rev_v2_cycle", datetime(2026, 2, 1, tzinfo=UTC), invoice, risk, case_critique
@@ -287,14 +330,21 @@ def test_missing_required_indexes_fail_verification(workflow_db: Path, inventory
 def test_atomic_human_decision_preflight_rejects_wal_without_mutation(
     wal_database: str, workflow_db: Path, inventory_db: Path
 ) -> None:
-    store = WorkflowStore(workflow_db)
-    source = make_source()
+    settings = Settings(
+        workflow_db=workflow_db,
+        inventory_db=inventory_db,
+        source_archive_dir=workflow_db.parent / "sources",
+    )
+    store = WorkflowStore(settings)
+    source = make_source(settings.source_archive_dir)
     store.register_source(source)
     store.create_case(CASE_ID, source, LEGACY_AT)
     claim = store.claim_case_execution(
         CASE_ID, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    invoice, risk, case_critique = persist_bound_review_evidence(store, claim)
+    invoice, risk, case_critique = persist_bound_review_evidence(
+        store, claim, settings, source
+    )
     review = store.save_review(
         make_bound_review("rev_journal_mode", LEGACY_AT, invoice, risk, case_critique), claim
     )

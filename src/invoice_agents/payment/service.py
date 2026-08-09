@@ -7,7 +7,6 @@ two payments without a separately reviewed adjustment design.
 
 from __future__ import annotations
 
-import hashlib
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -15,6 +14,7 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
+from invoice_agents.config import Settings
 from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import (
     ExecutionClaim,
@@ -35,6 +35,7 @@ from invoice_agents.models import (
     ReviewRequest,
     RiskAssessment,
 )
+from invoice_agents.payment.identity import payment_identity_key
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,14 +120,22 @@ def _reconcile_review_authorization(
 
 
 def _load_authorization_snapshot(
-    connection: sqlite3.Connection, case_id: str, generation: int
+    connection: sqlite3.Connection,
+    case_id: str,
+    generation: int,
+    settings: Settings,
 ) -> _AuthorizationSnapshot:
     """Load and validate one complete generation-bound approval snapshot."""
 
     from invoice_agents.agents.decision_rules import validate_final_decision
 
     try:
-        evidence = load_generation_evidence_snapshot(connection, case_id, generation)
+        evidence = load_generation_evidence_snapshot(
+            connection,
+            case_id,
+            generation,
+            settings,
+        )
     except EvidenceSnapshotError as exc:
         raise _AuthorizationSnapshotError(f"evidence snapshot is invalid: {exc}") from exc
     invoice = evidence.invoice
@@ -155,7 +164,9 @@ def _load_authorization_snapshot(
             raise _AuthorizationSnapshotError("review snapshot digest does not match evidence")
 
     decision_row = connection.execute(
-        "SELECT payload_json, decision_generation, evidence_snapshot_digest "
+        "SELECT payload_json, decision_generation, evidence_snapshot_digest, source_id, "
+        "invoice_number, vendor, authorized_amount, authorized_currency, "
+        "payment_idempotency_key, review_id "
         "FROM final_decisions WHERE case_id = ?",
         (case_id,),
     ).fetchone()
@@ -188,16 +199,35 @@ def _load_authorization_snapshot(
         raise _AuthorizationSnapshotError(
             "final decision does not match the latest independent critique"
         )
+    expected_review_id = review.review_id if review is not None else None
+    exact_authorization_columns = (
+        decision_row["source_id"] == invoice.source.source_id
+        and decision_row["invoice_number"] == invoice.invoice_number.normalized_value
+        and decision_row["vendor"] == invoice.vendor.normalized_value
+        and decision_row["authorized_amount"]
+        == (str(invoice.declared_total) if invoice.declared_total is not None else None)
+        and decision_row["authorized_currency"] == invoice.currency.normalized_value
+        and decision_row["payment_idempotency_key"] == payment_idempotency_key(invoice)
+        and decision_row["review_id"] == expected_review_id
+    )
+    if not exact_authorization_columns:
+        raise _AuthorizationSnapshotError(
+            "final decision relational authorization fields do not match evidence"
+        )
     return _AuthorizationSnapshot(invoice, decision, risk, review, evidence.digest)
 
 
-def _validate_paid_ledger_source(connection: sqlite3.Connection, row: sqlite3.Row) -> None:
+def _validate_paid_ledger_source(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    settings: Settings,
+) -> None:
     """Reject a PAID idempotency row whose source authorization has drifted."""
 
     case_id = str(row["case_id"])
     generation = int(row["decision_generation"])
     try:
-        snapshot = _load_authorization_snapshot(connection, case_id, generation)
+        snapshot = _load_authorization_snapshot(connection, case_id, generation, settings)
     except (InvoiceAgentsError, _AuthorizationSnapshotError, ValueError) as exc:
         raise InvoiceAgentsError(
             ErrorCategory.PAYMENT,
@@ -215,6 +245,15 @@ def _validate_paid_ledger_source(connection: sqlite3.Connection, row: sqlite3.Ro
         and invoice.currency.normalized_value == str(row["currency"])
         and invoice.declared_total is not None
         and invoice.declared_total == Decimal(str(row["amount"]))
+        and row["source_id"] == invoice.source.source_id
+        and row["invoice_number"] == invoice.invoice_number.normalized_value
+        and row["review_id"]
+        == (snapshot.review.review_id if snapshot.review is not None else None)
+        and str(row["status"]) in {PaymentStatus.PAID, PaymentStatus.FAILED}
+        and (
+            (str(row["status"]) == PaymentStatus.PAID and row["error"] is None)
+            or (str(row["status"]) == PaymentStatus.FAILED and row["error"] is not None)
+        )
     )
     if not valid:
         raise InvoiceAgentsError(
@@ -228,13 +267,10 @@ def _validate_paid_ledger_source(connection: sqlite3.Connection, row: sqlite3.Ro
 def payment_idempotency_key(invoice: ExtractedInvoice) -> str:
     """Build a stable identity across duplicate formats and revisions."""
 
-    material = "|".join(
-        [
-            (invoice.vendor.normalized_value or "").casefold().strip(),
-            (invoice.invoice_number.normalized_value or "").casefold().strip(),
-        ]
+    return payment_identity_key(
+        invoice.vendor.normalized_value,
+        invoice.invoice_number.normalized_value,
     )
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def _from_row(
@@ -287,6 +323,7 @@ def mock_payment(
             case_id=case_id,
             stop_reason="STALE_EXECUTION_CLAIM",
         )
+    snapshot_settings = store._snapshot_settings()
 
     def not_eligible(key: str, vendor: str | None, error: str) -> PaymentResult:
         return PaymentResult(
@@ -330,7 +367,12 @@ def mock_payment(
                 )
 
             try:
-                snapshot = _load_authorization_snapshot(connection, case_id, claim.generation)
+                snapshot = _load_authorization_snapshot(
+                    connection,
+                    case_id,
+                    claim.generation,
+                    snapshot_settings,
+                )
             except _AuthorizationSnapshotError as exc:
                 key = payment_idempotency_key(invoice)
                 connection.rollback()
@@ -356,12 +398,21 @@ def mock_payment(
                     vendor,
                     "payment requires a vendor, currency, and positive declared total",
                 )
+            for existing_case_row in connection.execute(
+                "SELECT * FROM payments WHERE case_id = ?",
+                (case_id,),
+            ).fetchall():
+                _validate_paid_ledger_source(
+                    connection,
+                    existing_case_row,
+                    snapshot_settings,
+                )
             prior = connection.execute(
                 "SELECT * FROM payments WHERE idempotency_key = ?", (key,)
             ).fetchone()
             if prior is not None:
                 if PaymentStatus(str(prior["status"])) is PaymentStatus.PAID:
-                    _validate_paid_ledger_source(connection, prior)
+                    _validate_paid_ledger_source(connection, prior, snapshot_settings)
                 connection.rollback()
                 return _from_row(
                     prior,
@@ -375,8 +426,9 @@ def mock_payment(
             connection.execute(
                 "INSERT INTO payments("
                 "payment_id, case_id, idempotency_key, vendor, amount, currency, status, error, "
-                "created_at, decision_generation, evidence_snapshot_digest) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "created_at, decision_generation, evidence_snapshot_digest, source_id, "
+                "invoice_number, review_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     payment_id,
                     case_id,
@@ -389,6 +441,9 @@ def mock_payment(
                     created_at.isoformat(),
                     claim.generation,
                     snapshot.evidence_snapshot_digest,
+                    persisted_invoice.source.source_id,
+                    persisted_invoice.invoice_number.normalized_value,
+                    snapshot.review.review_id if snapshot.review is not None else None,
                 ),
             )
             connection.commit()

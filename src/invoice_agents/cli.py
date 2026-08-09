@@ -222,7 +222,7 @@ def review_decide(
             reviewer,
             decision,
             reason,
-            WorkflowStore(settings.workflow_db),
+            WorkflowStore(settings),
             settings.inventory_db,
             mappings=_parse_mapping(mapping or []),
             superseded_case_id=superseded_case_id,

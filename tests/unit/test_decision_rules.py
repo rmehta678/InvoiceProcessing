@@ -1,6 +1,6 @@
 """Pure final-decision rules: validate_final_decision and blocking_evidence on minimal models."""
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -23,6 +23,7 @@ from invoice_agents.models import (
     InventoryStatus,
     ReviewRequest,
     RiskAssessment,
+    RiskPolicy,
     SourceArtifact,
 )
 
@@ -76,6 +77,12 @@ def make_risk(
     reasons: list[str] | None = None,
 ) -> RiskAssessment:
     return RiskAssessment(
+        policy=RiskPolicy(
+            review_threshold_amount=Decimal("10000.00"),
+            review_threshold_currency="USD",
+            review_threshold_effective_date=date(2026, 8, 6),
+            due_date_tolerance_days=3,
+        ),
         financial=make_financial(total_delta),
         dates=[],
         inventory=inventory or [],

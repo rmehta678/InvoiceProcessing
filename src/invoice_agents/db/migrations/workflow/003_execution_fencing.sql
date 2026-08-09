@@ -7,12 +7,25 @@ ALTER TABLE final_decisions ADD COLUMN decision_generation INTEGER NOT NULL DEFA
 ALTER TABLE payments ADD COLUMN decision_generation INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE extractions ADD COLUMN execution_generation INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE identity_results ADD COLUMN execution_generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE identity_results ADD COLUMN evaluated_at TEXT;
 ALTER TABLE comparison_results ADD COLUMN execution_generation INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE critique_results ADD COLUMN execution_generation INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE review_requests ADD COLUMN execution_generation INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE review_requests ADD COLUMN evidence_snapshot_digest TEXT;
 ALTER TABLE final_decisions ADD COLUMN evidence_snapshot_digest TEXT;
 ALTER TABLE payments ADD COLUMN evidence_snapshot_digest TEXT;
+ALTER TABLE final_decisions ADD COLUMN source_id TEXT;
+ALTER TABLE final_decisions ADD COLUMN invoice_number TEXT;
+ALTER TABLE final_decisions ADD COLUMN vendor TEXT;
+ALTER TABLE final_decisions ADD COLUMN authorized_amount TEXT;
+ALTER TABLE final_decisions ADD COLUMN authorized_currency TEXT;
+ALTER TABLE final_decisions ADD COLUMN payment_idempotency_key TEXT;
+ALTER TABLE final_decisions ADD COLUMN review_id TEXT;
+ALTER TABLE payments ADD COLUMN source_id TEXT;
+ALTER TABLE payments ADD COLUMN invoice_number TEXT;
+ALTER TABLE payments ADD COLUMN review_id TEXT;
+
+UPDATE identity_results SET evaluated_at = created_at WHERE evaluated_at IS NULL;
 
 CREATE INDEX idx_cases_execution_lease
 ON cases(execution_state, lease_expires_at);
@@ -45,6 +58,126 @@ WHEN EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'PAID_FINAL_DECISION_IMMUTABLE');
+END;
+
+CREATE TRIGGER trg_final_decisions_authorization_insert
+BEFORE INSERT ON final_decisions
+WHEN json_valid(NEW.payload_json) <> 1
+    OR json_extract(NEW.payload_json, '$.decision') NOT IN ('APPROVE', 'REJECT', 'HOLD', 'FAILED')
+    OR NOT (
+        (json_extract(NEW.payload_json, '$.decision') = 'APPROVE'
+            AND json_extract(NEW.payload_json, '$.payment_eligible') = 1)
+        OR (json_extract(NEW.payload_json, '$.decision') <> 'APPROVE'
+            AND json_extract(NEW.payload_json, '$.payment_eligible') = 0)
+    )
+    OR NOT EXISTS (
+        SELECT 1
+        FROM cases c
+        JOIN extractions e ON e.case_id = c.case_id
+        WHERE c.case_id = NEW.case_id
+            AND e.execution_generation = NEW.decision_generation
+            AND e.version = (
+                SELECT MAX(latest.version) FROM extractions latest
+                WHERE latest.case_id = NEW.case_id
+                    AND latest.execution_generation = NEW.decision_generation
+            )
+            AND c.source_id = NEW.source_id
+            AND json_extract(e.payload_json, '$.source.source_id') = NEW.source_id
+            AND json_extract(e.payload_json, '$.invoice_number.normalized_value')
+                IS NEW.invoice_number
+            AND json_extract(e.payload_json, '$.vendor.normalized_value') IS NEW.vendor
+            AND json_extract(e.payload_json, '$.declared_total') IS NEW.authorized_amount
+            AND json_extract(e.payload_json, '$.currency.normalized_value')
+                IS NEW.authorized_currency
+            AND NEW.payment_idempotency_key = payment_identity_key(
+                NEW.vendor, NEW.invoice_number
+            )
+    )
+    OR NOT (
+        (NEW.review_id IS NULL AND NOT EXISTS (
+            SELECT 1 FROM review_requests
+            WHERE case_id = NEW.case_id
+                AND execution_generation = NEW.decision_generation
+        ))
+        OR EXISTS (
+            SELECT 1 FROM review_requests r
+            WHERE r.review_id = NEW.review_id
+                AND r.case_id = NEW.case_id
+                AND r.execution_generation = NEW.decision_generation
+                AND r.evidence_snapshot_digest = NEW.evidence_snapshot_digest
+                AND r.sequence = (
+                    SELECT MAX(latest.sequence) FROM review_requests latest
+                    WHERE latest.case_id = NEW.case_id
+                )
+        )
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'FINAL_DECISION_AUTHORIZATION_INVALID');
+END;
+
+CREATE TRIGGER trg_final_decisions_immutable_update
+BEFORE UPDATE ON final_decisions
+BEGIN
+    SELECT RAISE(ABORT, 'FINAL_DECISION_IMMUTABLE');
+END;
+
+CREATE TRIGGER trg_final_decisions_immutable_delete
+BEFORE DELETE ON final_decisions
+BEGIN
+    SELECT RAISE(ABORT, 'FINAL_DECISION_IMMUTABLE');
+END;
+
+CREATE TRIGGER trg_payments_authorization_insert
+BEFORE INSERT ON payments
+WHEN NEW.status NOT IN ('PAID', 'FAILED')
+    OR (NEW.status = 'PAID' AND NEW.error IS NOT NULL)
+    OR (NEW.status = 'FAILED' AND NEW.error IS NULL)
+    OR NOT EXISTS (
+        SELECT 1
+        FROM final_decisions f
+        JOIN cases c ON c.case_id = f.case_id
+        WHERE f.case_id = NEW.case_id
+            AND f.decision_generation = NEW.decision_generation
+            AND f.evidence_snapshot_digest = NEW.evidence_snapshot_digest
+            AND json_valid(f.payload_json) = 1
+            AND json_extract(f.payload_json, '$.decision') = 'APPROVE'
+            AND json_extract(f.payload_json, '$.payment_eligible') = 1
+            AND f.source_id = NEW.source_id
+            AND f.invoice_number = NEW.invoice_number
+            AND f.vendor = NEW.vendor
+            AND f.authorized_amount = NEW.amount
+            AND f.authorized_currency = NEW.currency
+            AND f.payment_idempotency_key = NEW.idempotency_key
+            AND f.review_id IS NEW.review_id
+            AND c.source_id = NEW.source_id
+            AND NEW.idempotency_key = payment_identity_key(NEW.vendor, NEW.invoice_number)
+            AND CAST(NEW.amount AS NUMERIC) > 0
+            AND (
+                NEW.review_id IS NULL
+                OR EXISTS (
+                    SELECT 1 FROM review_requests r
+                    WHERE r.review_id = NEW.review_id
+                        AND r.case_id = NEW.case_id
+                        AND r.status = 'RESOLVED'
+                        AND r.execution_generation = NEW.decision_generation
+                        AND r.evidence_snapshot_digest = NEW.evidence_snapshot_digest
+                )
+            )
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'PAYMENT_AUTHORIZATION_INVALID');
+END;
+
+CREATE TRIGGER trg_payments_immutable_update
+BEFORE UPDATE ON payments
+BEGIN
+    SELECT RAISE(ABORT, 'PAYMENT_IMMUTABLE');
+END;
+
+CREATE TRIGGER trg_payments_immutable_delete
+BEFORE DELETE ON payments
+BEGIN
+    SELECT RAISE(ABORT, 'PAYMENT_IMMUTABLE');
 END;
 
 CREATE TRIGGER trg_cases_execution_authority_insert

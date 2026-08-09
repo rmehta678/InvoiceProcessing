@@ -211,7 +211,7 @@ def prepare_case(path: Path, settings: Settings) -> tuple[str, datetime] | CaseR
     try:
         source = snapshot_source(path, settings.source_archive_dir, settings.source_max_bytes)
         source_id = source.source_id
-        store = WorkflowStore(settings.workflow_db)
+        store = WorkflowStore(settings)
         store.register_source(source)
         store.create_case(case_id, source, started_at)
         case_created = True
@@ -237,7 +237,7 @@ def prepare_case(path: Path, settings: Settings) -> tuple[str, datetime] | CaseR
         result = _failed_result(case_id, source_id, started_at, exc)
         if source_id is not None and case_created:
             try:
-                failed_store = WorkflowStore(settings.workflow_db)
+                failed_store = WorkflowStore(settings)
                 if claim is None:
                     claim = failed_store.claim_case_execution(
                         case_id,
@@ -397,7 +397,7 @@ def _write_result(result: CaseResult) -> Path:
 async def run_prepared_case(case_id: str, started_at: datetime, settings: Settings) -> CaseResult:
     """Run one fresh Swarm and convert every terminal path to an explicit case status."""
 
-    store = WorkflowStore(settings.workflow_db)
+    store = WorkflowStore(settings)
     claim = store.claim_case_execution(
         case_id,
         frozenset({CaseStatus.INCOMPLETE}),
@@ -612,7 +612,7 @@ async def resume_case(case_id: str, settings: Settings) -> CaseResult:
     """Load a stopped Swarm only after an attributable human decision and resume it."""
 
     preflight(settings)
-    store = WorkflowStore(settings.workflow_db)
+    store = WorkflowStore(settings)
     try:
         claim = store.claim_case_execution(
             case_id,

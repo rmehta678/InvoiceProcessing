@@ -24,9 +24,11 @@ from invoice_agents.models import (
 from invoice_agents.observability.audit import AuditRecorder
 from invoice_agents.tools.comparison import (
     InventoryReader,
+    apply_mapping_evidence,
     build_risk_assessment,
-    compare_inventory,
+    compare_inventory_evidence,
     compute_invoice_totals,
+    find_prior_invoice_candidates,
 )
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures"
@@ -54,14 +56,18 @@ def first_pass_review(
 ) -> tuple[RiskAssessment, ReviewRequest, ExecutionClaim]:
     """Run the deterministic pass-1 evidence chain and persist it like the team does."""
 
-    invoice = store.load_extraction(case_id)
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    store.promote_predecessor_extraction(claim)
-    comparisons, unresolved = compare_inventory(invoice, InventoryReader(settings.inventory_db))
+    invoice = store.promote_predecessor_extraction(claim)
+    mappings, comparisons, unresolved = compare_inventory_evidence(
+        invoice, InventoryReader(settings.inventory_db)
+    )
+    invoice = apply_mapping_evidence(invoice, mappings, unresolved)
+    store.save_extraction(case_id, invoice, claim)
+    identity = find_prior_invoice_candidates(case_id, invoice, store)
     risk = build_risk_assessment(
-        invoice, comparisons, [], compute_invoice_totals(invoice), settings
+        invoice, comparisons, identity, compute_invoice_totals(invoice), settings
     )
     store.save_comparison(
         case_id,
@@ -74,7 +80,11 @@ def first_pass_review(
         },
         claim,
     )
-    store.save_identity(case_id, [], claim)
+    store.save_identity(
+        case_id,
+        [candidate.model_dump(mode="json") for candidate in identity],
+        claim,
+    )
     store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim)
     case_critique = make_critique()
     store.save_critique(case_id, case_critique, claim)
@@ -129,7 +139,7 @@ def test_mapping_recompute_resolves_blocker_and_authorizes_approve(
     invoice_dir: Path, settings: Settings
 ) -> None:
     case_id = prepare(invoice_dir / "invoice_1010.txt", settings)
-    store = WorkflowStore(settings.workflow_db)
+    store = WorkflowStore(settings)
     first_risk, review, claim = first_pass_review(case_id, settings, store)
     assert any(item.status is InventoryStatus.AMBIGUOUS for item in first_risk.inventory)
     resolved = establish_mapping_and_recompute(
@@ -167,7 +177,7 @@ def test_mapping_recompute_with_exceeding_stock_stays_blocked_and_needs_second_r
     settings: Settings,
 ) -> None:
     case_id = prepare(FIXTURE_DIR / "invoice_2001_bulk_alias.txt", settings)
-    store = WorkflowStore(settings.workflow_db)
+    store = WorkflowStore(settings)
     first_risk, review, claim = first_pass_review(case_id, settings, store)
     bulk = next(item for item in first_risk.inventory if item.raw_items == ["WidgetA (bulk)"])
     assert bulk.status is InventoryStatus.AMBIGUOUS

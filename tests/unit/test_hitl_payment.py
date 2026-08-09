@@ -24,7 +24,6 @@ from invoice_agents.models import (
     FinalDecision,
     HumanDecisionKind,
     IdentityCandidate,
-    IdentityRelationship,
     PaymentStatus,
     ReviewRequest,
 )
@@ -32,9 +31,11 @@ from invoice_agents.payment.service import mock_payment
 from invoice_agents.source_store import snapshot_source
 from invoice_agents.tools.comparison import (
     InventoryReader,
+    apply_mapping_evidence,
     build_risk_assessment,
-    compare_inventory,
+    compare_inventory_evidence,
     compute_invoice_totals,
+    find_prior_invoice_candidates,
 )
 from invoice_agents.tools.evidence import extract_invoice_evidence
 
@@ -85,16 +86,30 @@ def record_payment_evidence(
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    store.promote_predecessor_extraction(claim)
-    comparisons, _ = compare_inventory(invoice, InventoryReader(settings.inventory_db))
-    risk = build_risk_assessment(
-        invoice, comparisons, [], compute_invoice_totals(invoice), settings
+    promoted = store.promote_predecessor_extraction(claim)
+    mappings, comparisons, unresolved = compare_inventory_evidence(
+        promoted, InventoryReader(settings.inventory_db)
     )
-    store.save_identity(case_id, [], claim)
+    enriched = apply_mapping_evidence(promoted, mappings, unresolved)
+    store.save_extraction(case_id, enriched, claim)
+    identity = find_prior_invoice_candidates(case_id, enriched, store)
+    risk = build_risk_assessment(
+        enriched, comparisons, identity, compute_invoice_totals(enriched), settings
+    )
+    store.save_identity(
+        case_id,
+        [item.model_dump(mode="json") for item in identity],
+        claim,
+    )
     store.save_comparison(
         case_id,
         "inventory",
-        {"comparisons": [item.model_dump(mode="json") for item in comparisons]},
+        {
+            "comparisons": [item.model_dump(mode="json") for item in comparisons],
+            "unresolved_candidates": {
+                item: result.model_dump(mode="json") for item, result in unresolved.items()
+            },
+        },
         claim,
     )
     store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim)
@@ -103,7 +118,7 @@ def record_payment_evidence(
     if authorize_review:
         review = create_review_request(
             case_id,
-            invoice,
+            enriched,
             risk,
             case_critique,
             DecisionKind.HOLD,
@@ -151,26 +166,40 @@ def pending_review(
 ) -> ReviewRequest:
     """Persist a review through the real extraction/comparison path."""
 
-    store = WorkflowStore(settings.workflow_db)
+    store = WorkflowStore(settings)
     invoice = load(source.parent, source.name, settings.source_archive_dir)
     persist_case(store, case_id, invoice, started_at=started_at)
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    store.promote_predecessor_extraction(claim)
-    comparisons, _ = compare_inventory(invoice, InventoryReader(settings.inventory_db))
+    promoted = store.promote_predecessor_extraction(claim)
+    mappings, comparisons, unresolved = compare_inventory_evidence(
+        promoted, InventoryReader(settings.inventory_db)
+    )
+    enriched = apply_mapping_evidence(promoted, mappings, unresolved)
+    store.save_extraction(case_id, enriched, claim)
+    identity = identity_candidates or find_prior_invoice_candidates(case_id, enriched, store)
     risk = build_risk_assessment(
-        invoice,
+        enriched,
         comparisons,
-        identity_candidates or [],
-        compute_invoice_totals(invoice),
+        identity,
+        compute_invoice_totals(enriched),
         settings,
     )
-    store.save_identity(case_id, identity_candidates or [], claim)
+    store.save_identity(
+        case_id,
+        [item.model_dump(mode="json") for item in identity],
+        claim,
+    )
     store.save_comparison(
         case_id,
         "inventory",
-        {"comparisons": [item.model_dump(mode="json") for item in comparisons]},
+        {
+            "comparisons": [item.model_dump(mode="json") for item in comparisons],
+            "unresolved_candidates": {
+                item: result.model_dump(mode="json") for item, result in unresolved.items()
+            },
+        },
         claim,
     )
     store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim)
@@ -178,7 +207,7 @@ def pending_review(
     store.save_critique(case_id, case_critique, claim)
     review = create_review_request(
         case_id,
-        invoice,
+        enriched,
         risk,
         case_critique,
         DecisionKind.HOLD,
@@ -229,36 +258,12 @@ def test_review_request_and_human_decision_are_persisted(
     workflow_db: Path,
     settings: Settings,
 ) -> None:
-    store = WorkflowStore(workflow_db)
-    inv = load(invoice_dir, "invoice_1002.txt", workflow_db.parent / "sources")
-    persist_case(store, "case_review", inv)
-    claim = store.claim_case_execution(
-        "case_review", frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
-    )
-    store.promote_predecessor_extraction(claim)
-    comparisons, _ = compare_inventory(inv, InventoryReader(inventory_db))
-    risk = build_risk_assessment(inv, comparisons, [], compute_invoice_totals(inv), settings)
-    store.save_identity("case_review", [], claim)
-    store.save_comparison(
+    store = WorkflowStore(settings)
+    review = pending_review(
+        invoice_dir / "invoice_1002.txt",
         "case_review",
-        "inventory",
-        {"comparisons": [item.model_dump(mode="json") for item in comparisons]},
-        claim,
+        settings,
     )
-    store.save_comparison("case_review", "risk", risk.model_dump(mode="json"), claim)
-    case_critique = critique()
-    store.save_critique("case_review", case_critique, claim)
-    review = create_review_request(
-        "case_review",
-        inv,
-        risk,
-        case_critique,
-        DecisionKind.HOLD,
-        ["stock exceeds"],
-        store,
-        claim,
-    )
-    store.release_case_execution(claim)
     assert review.status == "PENDING"
     resolved = record_human_decision(
         review.review_id,
@@ -287,7 +292,7 @@ def test_nonexistent_review_decision_leaves_both_databases_unchanged(
             "reviewer@example.com",
             HumanDecisionKind.REJECT,
             "the evidence does not support payment",
-            WorkflowStore(settings.workflow_db),
+            WorkflowStore(settings),
             settings.inventory_db,
         )
 
@@ -318,7 +323,7 @@ def test_mapping_payload_on_non_mapping_decision_is_rejected_without_mutation(
             "reviewer@example.com",
             HumanDecisionKind.REJECT,
             "rejecting while a stale client submits mapping fields",
-            WorkflowStore(settings.workflow_db),
+            WorkflowStore(settings),
             settings.inventory_db,
             mappings=[mapping("WidgetA (bulk)")],
         )
@@ -345,7 +350,7 @@ def test_mapping_alias_absent_from_unresolved_review_evidence_is_rejected_withou
             "reviewer@example.com",
             HumanDecisionKind.ESTABLISH_MAPPING,
             "this alias was not in the review package",
-            WorkflowStore(settings.workflow_db),
+            WorkflowStore(settings),
             settings.inventory_db,
             mappings=[mapping("invented alias")],
         )
@@ -372,7 +377,7 @@ def test_unknown_mapping_sku_is_rejected_without_mutation(
             "reviewer@example.com",
             HumanDecisionKind.ESTABLISH_MAPPING,
             "the target must exist in inventory",
-            WorkflowStore(settings.workflow_db),
+            WorkflowStore(settings),
             settings.inventory_db,
             mappings=[mapping("WidgetA (bulk)", "SKU-DOES-NOT-EXIST")],
         )
@@ -399,7 +404,7 @@ def test_unknown_blocker_id_is_rejected_without_mutation(
             "reviewer@example.com",
             HumanDecisionKind.APPROVE,
             "the submitted blocker did not come from this review",
-            WorkflowStore(settings.workflow_db),
+            WorkflowStore(settings),
             settings.inventory_db,
             addressed_blocker_ids=["inventory:invented:UNKNOWN"],
         )
@@ -426,7 +431,7 @@ def test_superseded_case_on_non_supersession_decision_is_rejected_without_mutati
             "reviewer@example.com",
             HumanDecisionKind.REJECT,
             "a stale form included an unrelated supersession field",
-            WorkflowStore(settings.workflow_db),
+            WorkflowStore(settings),
             settings.inventory_db,
             superseded_case_id="case_unrelated",
         )
@@ -461,7 +466,7 @@ def test_workflow_write_failure_rolls_back_alias_and_decision_across_both_files(
             "reviewer@example.com",
             HumanDecisionKind.ESTABLISH_MAPPING,
             "the bulk name is an approved alias",
-            WorkflowStore(settings.workflow_db),
+            WorkflowStore(settings),
             settings.inventory_db,
             mappings=[mapping("WidgetA (bulk)")],
         )
@@ -483,7 +488,7 @@ def test_semantic_replay_ignores_timestamp_and_normalized_whitespace(
         "reviewer@example.com",
         HumanDecisionKind.ESTABLISH_MAPPING,
         "bulk aliases are authorized",
-        WorkflowStore(settings.workflow_db),
+        WorkflowStore(settings),
         settings.inventory_db,
         mappings=[mapping("WidgetA (bulk)")],
         addressed_blocker_ids=[str(item["blocker_id"]) for item in blockers],
@@ -497,7 +502,7 @@ def test_semantic_replay_ignores_timestamp_and_normalized_whitespace(
         " reviewer@example.com ",
         HumanDecisionKind.ESTABLISH_MAPPING,
         "  bulk   aliases\nare authorized  ",
-        WorkflowStore(settings.workflow_db),
+        WorkflowStore(settings),
         settings.inventory_db,
         mappings=[mapping("WidgetA (bulk)")],
         addressed_blocker_ids=[str(item["blocker_id"]) for item in reversed(blockers)],
@@ -523,7 +528,7 @@ def test_every_semantically_different_retry_fails_without_mutation(
         "reviewer@example.com",
         HumanDecisionKind.ESTABLISH_MAPPING,
         "approved mapping evidence",
-        WorkflowStore(settings.workflow_db),
+        WorkflowStore(settings),
         settings.inventory_db,
         mappings=[mapping("WidgetA (bulk)")],
     )
@@ -556,7 +561,7 @@ def test_every_semantically_different_retry_fails_without_mutation(
                 inputs["reviewer"],
                 inputs["decision"],
                 inputs["reason"],
-                WorkflowStore(settings.workflow_db),
+                WorkflowStore(settings),
                 settings.inventory_db,
                 mappings=inputs["mappings"],
                 superseded_case_id=inputs["superseded_case_id"],
@@ -590,7 +595,7 @@ def test_resolved_blank_field_retry_is_classified_as_already_resolved_before_val
         "reviewer@example.com",
         HumanDecisionKind.ESTABLISH_MAPPING,
         "approved mapping evidence",
-        WorkflowStore(settings.workflow_db),
+        WorkflowStore(settings),
         settings.inventory_db,
         mappings=[mapping("WidgetA (bulk)")],
     )
@@ -604,7 +609,7 @@ def test_resolved_blank_field_retry_is_classified_as_already_resolved_before_val
             reviewer,
             HumanDecisionKind.ESTABLISH_MAPPING,
             reason,
-            WorkflowStore(settings.workflow_db),
+            WorkflowStore(settings),
             settings.inventory_db,
             mappings=[mapping("WidgetA (bulk)")],
         )
@@ -628,7 +633,7 @@ def test_resolved_retry_uses_only_workflow_state_when_inventory_is_wal(
         "reviewer@example.com",
         HumanDecisionKind.REJECT,
         "the evidence does not support payment",
-        WorkflowStore(settings.workflow_db),
+        WorkflowStore(settings),
         settings.inventory_db,
     )
     with connect_database(settings.inventory_db) as connection:
@@ -641,7 +646,7 @@ def test_resolved_retry_uses_only_workflow_state_when_inventory_is_wal(
             "reviewer@example.com",
             HumanDecisionKind.REJECT,
             "the evidence does not support payment",
-            WorkflowStore(settings.workflow_db),
+            WorkflowStore(settings),
             settings.inventory_db,
         )
         assert replayed == resolved
@@ -652,7 +657,7 @@ def test_resolved_retry_uses_only_workflow_state_when_inventory_is_wal(
                 "other@example.com",
                 HumanDecisionKind.REJECT,
                 "the evidence does not support payment",
-                WorkflowStore(settings.workflow_db),
+                WorkflowStore(settings),
                 settings.inventory_db,
             )
         assert excinfo.value.stop_reason == "REVIEW_ALREADY_RESOLVED"
@@ -674,7 +679,7 @@ def test_resolved_retry_never_opens_an_unavailable_inventory_path(
         "reviewer@example.com",
         HumanDecisionKind.REJECT,
         "the evidence does not support payment",
-        WorkflowStore(settings.workflow_db),
+        WorkflowStore(settings),
         settings.inventory_db,
     )
     unavailable_inventory = tmp_path / "missing-parent" / "inventory.db"
@@ -687,7 +692,7 @@ def test_resolved_retry_never_opens_an_unavailable_inventory_path(
             "reviewer@example.com",
             HumanDecisionKind.REJECT,
             "the evidence does not support payment",
-            WorkflowStore(settings.workflow_db),
+            WorkflowStore(settings),
             unavailable_inventory,
         )
         assert replayed == resolved
@@ -698,7 +703,7 @@ def test_resolved_retry_never_opens_an_unavailable_inventory_path(
                 "other@example.com",
                 HumanDecisionKind.REJECT,
                 "the evidence does not support payment",
-                WorkflowStore(settings.workflow_db),
+                WorkflowStore(settings),
                 unavailable_inventory,
             )
         assert excinfo.value.stop_reason == "REVIEW_ALREADY_RESOLVED"
@@ -723,7 +728,7 @@ def test_pending_blank_field_still_fails_validation_before_inventory_access(
             "reviewer@example.com",
             HumanDecisionKind.ESTABLISH_MAPPING,
             "   ",
-            WorkflowStore(settings.workflow_db),
+            WorkflowStore(settings),
             unavailable_inventory,
             mappings=[mapping("WidgetA (bulk)")],
         )
@@ -751,7 +756,7 @@ def test_conflicting_targets_for_one_normalized_alias_are_rejected_without_mutat
             "reviewer@example.com",
             HumanDecisionKind.ESTABLISH_MAPPING,
             "one alias cannot authorize two inventory identities",
-            WorkflowStore(settings.workflow_db),
+            WorkflowStore(settings),
             settings.inventory_db,
             mappings=[
                 mapping("WidgetA (bulk)", "SKU-WIDGET-A"),
@@ -782,7 +787,7 @@ def test_only_one_of_two_competing_human_decisions_commits(settings: Settings) -
                 f"{kind.value.lower()}@example.com",
                 kind,
                 f"competing {kind.value.lower()} decision",
-                WorkflowStore(settings.workflow_db),
+                WorkflowStore(settings),
                 settings.inventory_db,
             )
         except InvoiceAgentsError as exc:
@@ -803,14 +808,14 @@ def test_only_one_of_two_competing_human_decisions_commits(settings: Settings) -
             "SELECT COUNT(*) FROM human_decisions WHERE review_id = ?", (review.review_id,)
         ).fetchone()[0]
     assert count == 1
-    stored = WorkflowStore(settings.workflow_db).load_review(review.review_id)
+    stored = WorkflowStore(settings).load_review(review.review_id)
     assert stored.human_decision == committed[0].human_decision
 
 
 def test_supersession_requires_distinct_earlier_review_candidate_for_same_invoice_vendor(
     settings: Settings,
 ) -> None:
-    store = WorkflowStore(settings.workflow_db)
+    store = WorkflowStore(settings)
     prior_at = datetime(2026, 1, 1, tzinfo=UTC)
     current_at = datetime(2026, 2, 1, tzinfo=UTC)
     later_at = datetime(2026, 3, 1, tzinfo=UTC)
@@ -822,34 +827,29 @@ def test_supersession_requires_distinct_earlier_review_candidate_for_same_invoic
     persist_case(store, "case_later_revision", original, started_at=later_at)
     persist_case(store, "case_unrelated", unrelated, started_at=prior_at)
 
-    def candidate(case_id: str) -> IdentityCandidate:
-        return IdentityCandidate(
-            case_id=case_id,
-            source_id=original.source.source_id,
-            invoice_number=original.invoice_number.normalized_value,
-            vendor=original.vendor.normalized_value,
-            source_hash=original.source.sha256,
-            revision=original.revision.normalized_value if original.revision else None,
-            source_format=original.source.source_format,
-            relationship=IdentityRelationship.POSSIBLE_REVISION,
-            explanation="same invoice/vendor with different revision evidence",
-        )
-
-    comparisons, _ = compare_inventory(revised, InventoryReader(settings.inventory_db))
-    risk = build_risk_assessment(
-        revised,
-        comparisons,
-        [candidate("case_prior_revision"), candidate("case_later_revision")],
-        compute_invoice_totals(revised),
-        settings,
-    )
     claim = store.claim_case_execution(
         "case_current_revision",
         frozenset({CaseStatus.INCOMPLETE}),
         lease_seconds=60,
     )
-    store.promote_predecessor_extraction(claim)
-    candidates = [candidate("case_prior_revision"), candidate("case_later_revision")]
+    promoted = store.promote_predecessor_extraction(claim)
+    mappings, comparisons, unresolved = compare_inventory_evidence(
+        promoted, InventoryReader(settings.inventory_db)
+    )
+    enriched = apply_mapping_evidence(promoted, mappings, unresolved)
+    store.save_extraction("case_current_revision", enriched, claim)
+    candidates = find_prior_invoice_candidates("case_current_revision", enriched, store)
+    assert {candidate.case_id for candidate in candidates} == {
+        "case_prior_revision",
+        "case_later_revision",
+    }
+    risk = build_risk_assessment(
+        enriched,
+        comparisons,
+        candidates,
+        compute_invoice_totals(enriched),
+        settings,
+    )
     store.save_identity(
         "case_current_revision",
         [item.model_dump(mode="json") for item in candidates],
@@ -858,7 +858,12 @@ def test_supersession_requires_distinct_earlier_review_candidate_for_same_invoic
     store.save_comparison(
         "case_current_revision",
         "inventory",
-        {"comparisons": [item.model_dump(mode="json") for item in comparisons]},
+        {
+            "comparisons": [item.model_dump(mode="json") for item in comparisons],
+            "unresolved_candidates": {
+                item: result.model_dump(mode="json") for item, result in unresolved.items()
+            },
+        },
         claim,
     )
     store.save_comparison("case_current_revision", "risk", risk.model_dump(mode="json"), claim)
@@ -866,7 +871,7 @@ def test_supersession_requires_distinct_earlier_review_candidate_for_same_invoic
     store.save_critique("case_current_revision", case_critique, claim)
     review = create_review_request(
         "case_current_revision",
-        revised,
+        enriched,
         risk,
         case_critique,
         DecisionKind.HOLD,
@@ -937,7 +942,7 @@ def test_cli_accepts_repeatable_address_blocker_options(
     result = CliRunner().invoke(cli.app, args)
 
     assert result.exit_code == 0, result.output
-    stored = WorkflowStore(settings.workflow_db).load_review(review.review_id)
+    stored = WorkflowStore(settings).load_review(review.review_id)
     assert stored.human_decision is not None
     assert stored.human_decision.addressed_blocker_ids == blocker_ids
 
@@ -946,16 +951,18 @@ def test_mock_payment_pays_once_across_duplicate_representations(
     invoice_dir: Path, settings: Settings
 ) -> None:
     workflow_db = settings.workflow_db
-    store = WorkflowStore(workflow_db)
+    store = WorkflowStore(settings)
     text = load(invoice_dir, "invoice_1011.txt", workflow_db.parent / "sources")
     pdf = load(invoice_dir, "invoice_1011.pdf", workflow_db.parent / "sources")
     persist_case(store, "case_text", text)
     text_claim = record_payment_evidence(store, "case_text", text, settings)
+    text = store.load_current_extraction(text_claim)
     approve_final(store, "case_text", text_claim)
     first = mock_payment("case_text", text, store, workflow_db, text_claim)
     assert first.status is PaymentStatus.PAID
     persist_case(store, "case_pdf", pdf)
     pdf_claim = record_payment_evidence(store, "case_pdf", pdf, settings, authorize_review=True)
+    pdf = store.load_current_extraction(pdf_claim)
     approve_final(store, "case_pdf", pdf_claim)
     duplicate = mock_payment("case_pdf", pdf, store, workflow_db, pdf_claim)
     assert duplicate.status is PaymentStatus.DUPLICATE
@@ -969,12 +976,13 @@ def test_rejected_and_injected_failure_never_report_payment_success(
     invoice_dir: Path, settings: Settings
 ) -> None:
     workflow_db = settings.workflow_db
-    store = WorkflowStore(workflow_db)
+    store = WorkflowStore(settings)
     rejected_invoice = load(invoice_dir, "invoice_1001.txt", workflow_db.parent / "sources")
     persist_case(store, "case_rejected", rejected_invoice)
     rejected_claim = record_payment_evidence(
         store, "case_rejected", rejected_invoice, settings, DecisionKind.REJECT
     )
+    rejected_invoice = store.load_current_extraction(rejected_claim)
     store.save_final_decision(
         "case_rejected",
         FinalDecision(
@@ -991,6 +999,7 @@ def test_rejected_and_injected_failure_never_report_payment_success(
     failed_invoice = load(invoice_dir, "invoice_1004.json", workflow_db.parent / "sources")
     persist_case(store, "case_failed_payment", failed_invoice)
     failed_claim = record_payment_evidence(store, "case_failed_payment", failed_invoice, settings)
+    failed_invoice = store.load_current_extraction(failed_claim)
     approve_final(store, "case_failed_payment", failed_claim)
     failed = mock_payment(
         "case_failed_payment",
@@ -1005,10 +1014,11 @@ def test_rejected_and_injected_failure_never_report_payment_success(
 
 
 def test_payment_rejects_missing_risk_snapshot(invoice_dir: Path, settings: Settings) -> None:
-    store = WorkflowStore(settings.workflow_db)
+    store = WorkflowStore(settings)
     invoice = load(invoice_dir, "invoice_1001.txt", settings.source_archive_dir)
     persist_case(store, "case_missing_payment_risk", invoice)
     claim = record_payment_evidence(store, "case_missing_payment_risk", invoice, settings)
+    invoice = store.load_current_extraction(claim)
     approve_final(store, "case_missing_payment_risk", claim)
     with connect_database(settings.workflow_db) as connection:
         connection.execute(
@@ -1039,10 +1049,11 @@ def test_payment_rejects_missing_risk_snapshot(invoice_dir: Path, settings: Sett
 def test_payment_rejects_final_decision_from_prior_execution_generation(
     invoice_dir: Path, settings: Settings
 ) -> None:
-    store = WorkflowStore(settings.workflow_db)
+    store = WorkflowStore(settings)
     invoice = load(invoice_dir, "invoice_1001.txt", settings.source_archive_dir)
     persist_case(store, "case_stale_payment_decision", invoice)
     stale = record_payment_evidence(store, "case_stale_payment_decision", invoice, settings)
+    invoice = store.load_current_extraction(stale)
     approve_final(store, "case_stale_payment_decision", stale)
     with connect_database(settings.workflow_db) as connection:
         connection.execute(

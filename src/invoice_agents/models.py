@@ -219,6 +219,15 @@ class DateAssessment(StrictModel):
     explanation: str
 
 
+class RiskPolicy(StrictModel):
+    """Configured business-policy inputs that produced one risk assessment."""
+
+    review_threshold_amount: Decimal
+    review_threshold_currency: CurrencyCode
+    review_threshold_effective_date: date
+    due_date_tolerance_days: int = Field(ge=0, le=10)
+
+
 class IdentityCandidate(StrictModel):
     case_id: str
     source_id: str
@@ -232,6 +241,7 @@ class IdentityCandidate(StrictModel):
 
 
 class RiskAssessment(StrictModel):
+    policy: RiskPolicy
     financial: FinancialComparison
     dates: list[DateAssessment]
     inventory: list[InventoryComparison]

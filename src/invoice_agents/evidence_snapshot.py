@@ -5,9 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+from invoice_agents.config import Settings
+from invoice_agents.errors import InvoiceAgentsError
 from invoice_agents.models import (
     Critique,
     ExtractedInvoice,
@@ -18,7 +21,11 @@ from invoice_agents.models import (
     ReviewRequest,
     RiskAssessment,
     SourceArtifact,
+    ToolStatus,
 )
+
+SNAPSHOT_DIGEST_DOMAIN = b"galatiq.invoice-agents/evidence-snapshot\x00"
+SNAPSHOT_DIGEST_VERSION = 1
 
 
 class EvidenceSnapshotError(ValueError):
@@ -30,6 +37,7 @@ class EvidenceSnapshot:
     case_id: str
     invoice: ExtractedInvoice
     identity: tuple[IdentityCandidate, ...]
+    identity_evaluated_at: datetime
     inventory_payload: dict[str, Any]
     inventory: tuple[InventoryComparison, ...]
     risk: RiskAssessment
@@ -39,6 +47,25 @@ class EvidenceSnapshot:
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _digest_snapshot_envelope(envelope: dict[str, Any]) -> str:
+    payload = _canonical_json(envelope).encode("utf-8")
+    preimage = (
+        SNAPSHOT_DIGEST_DOMAIN
+        + SNAPSHOT_DIGEST_VERSION.to_bytes(4, "big")
+        + len(payload).to_bytes(8, "big")
+        + payload
+    )
+    return hashlib.sha256(preimage).hexdigest()
+
+
+def _without_mapping_results(invoice: ExtractedInvoice) -> ExtractedInvoice:
+    source_derived = invoice.model_copy(deep=True)
+    for line in source_derived.lines:
+        line.candidate_skus = []
+        line.canonical_sku = None
+    return source_derived
 
 
 def _validate_inventory_relationships(
@@ -124,10 +151,22 @@ def build_evidence_snapshot(
     inventory_json: str,
     risk_json: str,
     critique_json: str,
+    *,
+    identity_evaluated_at: datetime,
+    authoritative_identity: tuple[IdentityCandidate, ...],
+    settings: Settings,
+    excluded_alias_sources: frozenset[str] = frozenset(),
 ) -> EvidenceSnapshot:
     """Parse, validate, and digest one exact generation's latest evidence rows."""
 
-    from invoice_agents.tools.comparison import compute_invoice_totals
+    from invoice_agents.tools.comparison import (
+        InventoryReader,
+        apply_mapping_evidence,
+        build_risk_assessment,
+        compare_inventory_evidence,
+        compute_invoice_totals,
+    )
+    from invoice_agents.tools.evidence import extract_invoice_evidence
 
     try:
         invoice = ExtractedInvoice.model_validate_json(extraction_json)
@@ -148,6 +187,58 @@ def build_evidence_snapshot(
         raise EvidenceSnapshotError(
             "embedded extraction source metadata does not match source_artifacts"
         )
+    try:
+        source_invoice = extract_invoice_evidence(authoritative_source)
+    except InvoiceAgentsError as exc:
+        raise EvidenceSnapshotError(f"authoritative source cannot be re-extracted: {exc}") from exc
+    if _without_mapping_results(invoice) != source_invoice:
+        raise EvidenceSnapshotError(
+            "stored extraction facts or evidence references do not derive from archived source bytes"
+        )
+    if identity != authoritative_identity:
+        raise EvidenceSnapshotError(
+            "identity candidates do not match the authoritative evaluated case scope"
+        )
+    reader = InventoryReader(
+        settings.inventory_db,
+        excluded_alias_sources=excluded_alias_sources,
+    )
+    mappings, expected_inventory, unresolved = compare_inventory_evidence(source_invoice, reader)
+    inventory_errors = [
+        result.error
+        for result in unresolved.values()
+        if result.status is ToolStatus.ERROR
+    ]
+    if inventory_errors:
+        raise EvidenceSnapshotError(
+            f"authoritative inventory cannot be re-read: {inventory_errors}"
+        )
+    expected_invoice = apply_mapping_evidence(source_invoice, mappings, unresolved)
+    if invoice != expected_invoice:
+        raise EvidenceSnapshotError(
+            "stored mapping outcomes do not derive from source and authoritative inventory"
+        )
+    expected_inventory_payload = {
+        "comparisons": [item.model_dump(mode="json") for item in expected_inventory],
+        "unresolved_candidates": {
+            item: result.model_dump(mode="json") for item, result in unresolved.items()
+        },
+    }
+    if raw_inventory != expected_inventory_payload or inventory != tuple(expected_inventory):
+        raise EvidenceSnapshotError(
+            "inventory evidence does not derive from the configured authoritative database"
+        )
+    expected_risk = build_risk_assessment(
+        invoice,
+        expected_inventory,
+        list(authoritative_identity),
+        compute_invoice_totals(invoice),
+        settings,
+    )
+    if risk != expected_risk:
+        raise EvidenceSnapshotError(
+            "risk policy, dates, identity, inventory, or financial facts were not re-derived"
+        )
     if list(identity) != risk.identity_candidates or list(inventory) != risk.inventory:
         raise EvidenceSnapshotError(
             "risk identity or inventory evidence does not match its component rows"
@@ -161,15 +252,17 @@ def build_evidence_snapshot(
         "case_id": case_id,
         "invoice": invoice.model_dump(mode="json"),
         "identity": [item.model_dump(mode="json") for item in identity],
+        "identity_evaluated_at": identity_evaluated_at.isoformat(),
         "inventory": raw_inventory,
         "risk": risk.model_dump(mode="json"),
         "critique": critique.model_dump(mode="json"),
     }
-    digest = hashlib.sha256(_canonical_json(envelope).encode("utf-8")).hexdigest()
+    digest = _digest_snapshot_envelope(envelope)
     return EvidenceSnapshot(
         case_id=case_id,
         invoice=invoice,
         identity=identity,
+        identity_evaluated_at=identity_evaluated_at,
         inventory_payload=raw_inventory,
         inventory=inventory,
         risk=risk,

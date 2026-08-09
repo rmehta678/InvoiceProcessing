@@ -201,6 +201,14 @@ def connect_database(path: Path, *, read_only: bool = False) -> Iterator[sqlite3
     else:
         connection = sqlite3.connect(path, timeout=5)
     connection.row_factory = sqlite3.Row
+    from invoice_agents.payment.identity import payment_identity_key
+
+    connection.create_function(
+        "payment_identity_key",
+        2,
+        payment_identity_key,
+        deterministic=True,
+    )
     connection.execute("PRAGMA foreign_keys = ON")
     try:
         yield connection
@@ -407,7 +415,12 @@ def verify_database(
                 "lease_expires_at",
             },
             "extractions": {"case_id", "payload_json", "execution_generation"},
-            "identity_results": {"case_id", "payload_json", "execution_generation"},
+            "identity_results": {
+                "case_id",
+                "payload_json",
+                "execution_generation",
+                "evaluated_at",
+            },
             "comparison_results": {
                 "case_id",
                 "comparison_type",
@@ -430,6 +443,13 @@ def verify_database(
                 "payload_json",
                 "decision_generation",
                 "evidence_snapshot_digest",
+                "source_id",
+                "invoice_number",
+                "vendor",
+                "authorized_amount",
+                "authorized_currency",
+                "payment_idempotency_key",
+                "review_id",
             },
             "payments": {
                 "case_id",
@@ -437,6 +457,9 @@ def verify_database(
                 "status",
                 "decision_generation",
                 "evidence_snapshot_digest",
+                "source_id",
+                "invoice_number",
+                "review_id",
             },
             "events": {"case_id", "event_type", "payload_json"},
         }

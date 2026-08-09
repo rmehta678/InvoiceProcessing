@@ -5,7 +5,7 @@ import os
 import sqlite3
 import stat
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -36,6 +36,7 @@ from invoice_agents.models import (
     HumanDecisionKind,
     ReviewRequest,
     RiskAssessment,
+    RiskPolicy,
     SourceArtifact,
 )
 from invoice_agents.observability.audit import AuditRecorder
@@ -50,9 +51,11 @@ from invoice_agents.payment.service import mock_payment
 from invoice_agents.source_store import snapshot_source
 from invoice_agents.tools.comparison import (
     InventoryReader,
+    apply_mapping_evidence,
     build_risk_assessment,
-    compare_inventory,
+    compare_inventory_evidence,
     compute_invoice_totals,
+    find_prior_invoice_candidates,
 )
 from invoice_agents.tools.evidence import extract_invoice_evidence
 
@@ -128,6 +131,12 @@ def _zero_financial() -> FinancialComparison:
 
 def _risk(policy_review_reasons: list[str]) -> RiskAssessment:
     return RiskAssessment(
+        policy=RiskPolicy(
+            review_threshold_amount=Decimal("10000.00"),
+            review_threshold_currency="USD",
+            review_threshold_effective_date=date(2026, 8, 6),
+            due_date_tolerance_days=3,
+        ),
         financial=_zero_financial(),
         dates=[],
         inventory=[],
@@ -180,7 +189,7 @@ def _pending_review(case_id: str) -> ReviewRequest:
 
 def _persist_blocking_review(invoice_dir: Path, settings: Settings) -> ReviewRequest:
     case_id, _started_at = _prepare(invoice_dir, settings)
-    store = WorkflowStore(settings.workflow_db)
+    store = WorkflowStore(settings)
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
@@ -191,16 +200,30 @@ def _persist_blocking_review(invoice_dir: Path, settings: Settings) -> ReviewReq
             (5, "SKU-WIDGET-A"),
         )
         connection.commit()
-    comparisons, _unresolved = compare_inventory(invoice, InventoryReader(settings.inventory_db))
+    mappings, comparisons, unresolved = compare_inventory_evidence(
+        invoice, InventoryReader(settings.inventory_db)
+    )
+    invoice = apply_mapping_evidence(invoice, mappings, unresolved)
+    store.save_extraction(case_id, invoice, claim)
+    identity = find_prior_invoice_candidates(case_id, invoice, store)
     risk = build_risk_assessment(
-        invoice, comparisons, [], compute_invoice_totals(invoice), settings
+        invoice, comparisons, identity, compute_invoice_totals(invoice), settings
     )
     case_critique = _critique(DecisionKind.HOLD)
-    store.save_identity(case_id, [], claim)
+    store.save_identity(
+        case_id,
+        [candidate.model_dump(mode="json") for candidate in identity],
+        claim,
+    )
     store.save_comparison(
         case_id,
         "inventory",
-        {"comparisons": [item.model_dump(mode="json") for item in comparisons]},
+        {
+            "comparisons": [item.model_dump(mode="json") for item in comparisons],
+            "unresolved_candidates": {
+                item: result.model_dump(mode="json") for item, result in unresolved.items()
+            },
+        },
         claim,
     )
     store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim)
@@ -246,7 +269,7 @@ def test_review_decision_persists_explicit_blocker_authorization(
         "reviewer@example.com",
         HumanDecisionKind.APPROVE,
         "the cited stock exception is authorized",
-        WorkflowStore(settings.workflow_db),
+        WorkflowStore(settings),
         settings.inventory_db,
         addressed_blocker_ids=blocker_ids,
     )
@@ -275,7 +298,7 @@ def test_review_service_rejects_invalid_blocker_authorization(
             "reviewer@example.com",
             decision,
             "submitted authorization",
-            WorkflowStore(settings.workflow_db),
+            WorkflowStore(settings),
             settings.inventory_db,
             addressed_blocker_ids=addressed,
         )
@@ -433,22 +456,36 @@ async def test_malformed_provider_response_categorized(
 
 
 def test_payment_ledger_write_failure(invoice_dir: Path, settings: Settings) -> None:
-    store = WorkflowStore(settings.workflow_db)
+    store = WorkflowStore(settings)
     case_id, _ = _prepare(invoice_dir, settings, "invoice_1004.json")
     invoice = store.load_extraction(case_id)
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
     invoice = store.promote_predecessor_extraction(claim)
-    comparisons, _unresolved = compare_inventory(invoice, InventoryReader(settings.inventory_db))
-    risk = build_risk_assessment(
-        invoice, comparisons, [], compute_invoice_totals(invoice), settings
+    mappings, comparisons, unresolved = compare_inventory_evidence(
+        invoice, InventoryReader(settings.inventory_db)
     )
-    store.save_identity(case_id, [], claim)
+    invoice = apply_mapping_evidence(invoice, mappings, unresolved)
+    store.save_extraction(case_id, invoice, claim)
+    identity = find_prior_invoice_candidates(case_id, invoice, store)
+    risk = build_risk_assessment(
+        invoice, comparisons, identity, compute_invoice_totals(invoice), settings
+    )
+    store.save_identity(
+        case_id,
+        [candidate.model_dump(mode="json") for candidate in identity],
+        claim,
+    )
     store.save_comparison(
         case_id,
         "inventory",
-        {"comparisons": [item.model_dump(mode="json") for item in comparisons]},
+        {
+            "comparisons": [item.model_dump(mode="json") for item in comparisons],
+            "unresolved_candidates": {
+                item: result.model_dump(mode="json") for item, result in unresolved.items()
+            },
+        },
         claim,
     )
     store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim)

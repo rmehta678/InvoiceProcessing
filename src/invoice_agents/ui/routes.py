@@ -80,7 +80,7 @@ def _registry(request: Request) -> RunRegistry:
 
 
 def _store(request: Request) -> WorkflowStore:
-    return WorkflowStore(_settings(request).workflow_db)
+    return WorkflowStore(_settings(request))
 
 
 def _render(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 import threading
@@ -22,7 +23,11 @@ import invoice_agents.payment.service as payment_module
 from invoice_agents import orchestration
 from invoice_agents.config import Settings
 from invoice_agents.db.core import DatabaseKind, connect_database, migrate_database, verify_database
-from invoice_agents.db.store import ExecutionClaim, WorkflowStore
+from invoice_agents.db.store import (
+    ExecutionClaim,
+    WorkflowStore,
+    load_generation_evidence_snapshot,
+)
 from invoice_agents.errors import DatabaseVerificationError, InvoiceAgentsError
 from invoice_agents.hitl.service import create_review_request, record_human_decision
 from invoice_agents.models import (
@@ -33,6 +38,8 @@ from invoice_agents.models import (
     ExtractedInvoice,
     FinalDecision,
     HumanDecisionKind,
+    InventoryComparison,
+    InventoryStatus,
     PaymentStatus,
     RiskAssessment,
 )
@@ -41,9 +48,11 @@ from invoice_agents.payment.service import mock_payment
 from invoice_agents.source_store import snapshot_source
 from invoice_agents.tools.comparison import (
     InventoryReader,
+    apply_mapping_evidence,
     build_risk_assessment,
-    compare_inventory,
+    compare_inventory_evidence,
     compute_invoice_totals,
+    find_prior_invoice_candidates,
 )
 from invoice_agents.tools.evidence import extract_invoice_evidence
 
@@ -55,25 +64,39 @@ def _persist_case(settings: Settings, case_id: str) -> WorkflowStore:
         max_bytes=settings.source_max_bytes,
     )
     invoice = extract_invoice_evidence(source)
-    store = WorkflowStore(settings.workflow_db)
+    store = WorkflowStore(settings)
     store.register_source(source)
     store.create_case(case_id, source, datetime.now(UTC))
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
     store.save_extraction(case_id, invoice, claim)
-    comparisons, _unresolved = compare_inventory(invoice, InventoryReader(settings.inventory_db))
-    store.save_identity(case_id, [], claim)
+    mappings, comparisons, unresolved = compare_inventory_evidence(
+        invoice, InventoryReader(settings.inventory_db)
+    )
+    invoice = apply_mapping_evidence(invoice, mappings, unresolved)
+    store.save_extraction(case_id, invoice, claim)
+    identity = find_prior_invoice_candidates(case_id, invoice, store)
+    store.save_identity(
+        case_id,
+        [item.model_dump(mode="json") for item in identity],
+        claim,
+    )
     store.save_comparison(
         case_id,
         "inventory",
-        {"comparisons": [item.model_dump(mode="json") for item in comparisons]},
+        {
+            "comparisons": [item.model_dump(mode="json") for item in comparisons],
+            "unresolved_candidates": {
+                item: result.model_dump(mode="json") for item, result in unresolved.items()
+            },
+        },
         claim,
     )
     risk = build_risk_assessment(
         invoice,
         comparisons,
-        [],
+        identity,
         compute_invoice_totals(invoice),
         settings,
     )
@@ -154,6 +177,31 @@ def _approve_with_resolved_review(
 
 def _tampered_total(invoice: ExtractedInvoice) -> ExtractedInvoice:
     return invoice.model_copy(update={"declared_total": Decimal("88888.00")}, deep=True)
+
+
+def _source_inaccurate_price_snapshot(invoice: ExtractedInvoice) -> ExtractedInvoice:
+    """Rewrite source-derived prices and totals into a self-consistent $88,888 claim."""
+
+    forged = invoice.model_copy(deep=True)
+    target_total = Decimal("88888.00")
+    unchanged_total = sum(
+        (line.calculated_line_total for line in forged.lines[1:]),
+        start=Decimal("0"),
+    )
+    first = forged.lines[0]
+    first_total = target_total - unchanged_total
+    first_price = first_total / first.quantity
+    first.raw_unit_price = f"${first_price:.2f}"
+    first.unit_price = first_price
+    first.calculated_line_total = first_total
+    first.evidence[0].raw_value = (
+        f"{first.raw_item}|{first.raw_quantity}|${first_price:.2f}|"
+        f"{first.raw_declared_line_total}"
+    )
+    forged.declared_subtotal = target_total
+    forged.declared_tax_amount = Decimal("0.00")
+    forged.declared_total = target_total
+    return forged
 
 
 def test_two_resume_claims_have_exactly_one_database_owner(settings: Settings) -> None:
@@ -473,7 +521,7 @@ def test_payment_and_competing_final_decision_cannot_commit_impossible_state(
     assert paid == 1
     with (
         connect_database(settings.workflow_db) as connection,
-        pytest.raises(sqlite3.IntegrityError, match="PAID_FINAL_DECISION_IMMUTABLE"),
+        pytest.raises(sqlite3.IntegrityError, match="FINAL_DECISION_IMMUTABLE"),
     ):
         connection.execute("DELETE FROM final_decisions WHERE case_id = ?", (case_id,))
 
@@ -484,6 +532,12 @@ def test_payment_and_competing_final_decision_cannot_commit_impossible_state(
         "trg_final_decisions_no_insert_after_paid",
         "trg_final_decisions_no_update_after_paid",
         "trg_final_decisions_no_delete_after_paid",
+        "trg_final_decisions_authorization_insert",
+        "trg_final_decisions_immutable_update",
+        "trg_final_decisions_immutable_delete",
+        "trg_payments_authorization_insert",
+        "trg_payments_immutable_update",
+        "trg_payments_immutable_delete",
         "trg_review_requests_snapshot_digest_insert",
         "trg_extractions_immutable_after_final_insert",
         "trg_human_decisions_immutable_update",
@@ -527,6 +581,9 @@ def test_store_rejects_post_paid_decision_mutation_even_if_triggers_were_dropped
             "trg_final_decisions_no_insert_after_paid",
             "trg_final_decisions_no_update_after_paid",
             "trg_final_decisions_no_delete_after_paid",
+            "trg_final_decisions_authorization_insert",
+            "trg_final_decisions_immutable_update",
+            "trg_final_decisions_immutable_delete",
         ):
             connection.execute(f"DROP TRIGGER {name}")
         connection.commit()
@@ -547,6 +604,179 @@ def test_store_rejects_post_paid_decision_mutation_even_if_triggers_were_dropped
     assert store.load_final_decision(case_id) == approved
 
 
+@pytest.mark.parametrize("operation", ["update", "delete"])
+def test_final_decision_row_is_immutable_immediately_after_insert(
+    settings: Settings, operation: str
+) -> None:
+    case_id = f"case_final_row_immutable_{operation}"
+    store = _persist_case(settings, case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    approved = _approve(store, case_id, claim)
+    sql = (
+        "UPDATE final_decisions SET payload_json = payload_json WHERE case_id = ?"
+        if operation == "update"
+        else "DELETE FROM final_decisions WHERE case_id = ?"
+    )
+
+    with (
+        connect_database(settings.workflow_db) as connection,
+        pytest.raises(sqlite3.IntegrityError, match="FINAL_DECISION_IMMUTABLE"),
+    ):
+        connection.execute(sql, (case_id,))
+
+    assert store.load_final_decision(case_id) == approved
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("idempotency_key", "0" * 64),
+        ("vendor", "Different Vendor"),
+        ("amount", "88888.00"),
+        ("currency", "EUR"),
+    ],
+)
+def test_payment_insert_requires_exact_authorized_invoice_fields(
+    settings: Settings, field: str, invalid_value: str
+) -> None:
+    case_id = f"case_payment_insert_mismatch_{field}"
+    store = _persist_case(settings, case_id)
+    invoice = store.load_extraction(case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    _approve(store, case_id, claim)
+    with connect_database(settings.workflow_db) as connection:
+        final_row = connection.execute(
+            "SELECT evidence_snapshot_digest, source_id, invoice_number, review_id "
+            "FROM final_decisions WHERE case_id = ?",
+            (case_id,),
+        ).fetchone()
+        values = {
+            "idempotency_key": payment_module.payment_idempotency_key(invoice),
+            "vendor": str(invoice.vendor.normalized_value),
+            "amount": str(invoice.declared_total),
+            "currency": str(invoice.currency.normalized_value),
+            "source_id": str(final_row["source_id"]),
+            "invoice_number": str(final_row["invoice_number"]),
+            "review_id": final_row["review_id"],
+        }
+        values[field] = invalid_value
+        with pytest.raises(sqlite3.IntegrityError, match="PAYMENT_AUTHORIZATION_INVALID"):
+            connection.execute(
+                "INSERT INTO payments(payment_id, case_id, idempotency_key, vendor, amount, "
+                "currency, status, error, created_at, decision_generation, "
+                "evidence_snapshot_digest, source_id, invoice_number, review_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'PAID', NULL, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"pay_invalid_{field}",
+                    case_id,
+                    values["idempotency_key"],
+                    values["vendor"],
+                    values["amount"],
+                    values["currency"],
+                    datetime.now(UTC).isoformat(),
+                    claim.generation,
+                    final_row["evidence_snapshot_digest"],
+                    values["source_id"],
+                    values["invoice_number"],
+                    values["review_id"],
+                ),
+            )
+
+
+def test_paid_entry_cannot_coexist_with_rejected_final_or_arbitrary_amount(
+    settings: Settings,
+) -> None:
+    case_id = "case_paid_rejected_amount_invariant"
+    store = _persist_case(settings, case_id)
+    invoice = store.load_extraction(case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    approved = _approve(store, case_id, claim)
+    rejected = FinalDecision(
+        decision=DecisionKind.REJECT,
+        reasons=["relational invariant probe"],
+        critic_disposition=DecisionKind.REJECT,
+        payment_eligible=False,
+    )
+    with connect_database(settings.workflow_db) as connection:
+        final_row = connection.execute(
+            "SELECT evidence_snapshot_digest FROM final_decisions WHERE case_id = ?",
+            (case_id,),
+        ).fetchone()
+        with pytest.raises(sqlite3.IntegrityError, match="FINAL_DECISION_IMMUTABLE"):
+            connection.execute(
+                "UPDATE final_decisions SET payload_json = ? WHERE case_id = ?",
+                (rejected.model_dump_json(), case_id),
+            )
+            connection.execute(
+                "INSERT INTO payments(payment_id, case_id, idempotency_key, vendor, amount, "
+                "currency, status, error, created_at, decision_generation, "
+                "evidence_snapshot_digest) VALUES (?, ?, ?, ?, ?, ?, 'PAID', NULL, ?, ?, ?)",
+                (
+                    "pay_rejected_arbitrary_amount",
+                    case_id,
+                    payment_module.payment_idempotency_key(invoice),
+                    str(invoice.vendor.normalized_value),
+                    "88888.00",
+                    str(invoice.currency.normalized_value),
+                    datetime.now(UTC).isoformat(),
+                    claim.generation,
+                    final_row["evidence_snapshot_digest"],
+                ),
+            )
+            connection.commit()
+
+    assert store.load_final_decision(case_id) == approved
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM payments WHERE case_id = ?", (case_id,)
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("inject_failure", [False, True], ids=["paid", "failed"])
+@pytest.mark.parametrize("operation", ["update", "delete"])
+def test_payment_row_is_immutable_after_insert(
+    settings: Settings, inject_failure: bool, operation: str
+) -> None:
+    case_id = f"case_payment_row_immutable_{operation}_{inject_failure}"
+    store = _persist_case(settings, case_id)
+    invoice = store.load_extraction(case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    _approve(store, case_id, claim)
+    payment = mock_payment(
+        case_id,
+        invoice,
+        store,
+        settings.workflow_db,
+        claim,
+        inject_failure=inject_failure,
+    )
+    assert payment.payment_id is not None
+    sql = (
+        "UPDATE payments SET error = error WHERE payment_id = ?"
+        if operation == "update"
+        else "DELETE FROM payments WHERE payment_id = ?"
+    )
+
+    with (
+        connect_database(settings.workflow_db) as connection,
+        pytest.raises(sqlite3.IntegrityError, match="PAYMENT_IMMUTABLE"),
+    ):
+        connection.execute(sql, (payment.payment_id,))
+
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM payments WHERE payment_id = ?", (payment.payment_id,)
+        ).fetchone()[0] == 1
+
+
 def test_duplicate_payment_revalidates_source_case_snapshot(settings: Settings) -> None:
     store = _persist_case(settings, "case_paid_source")
     first_invoice = store.load_extraction("case_paid_source")
@@ -560,11 +790,11 @@ def test_duplicate_payment_revalidates_source_case_snapshot(settings: Settings) 
     assert first.status is PaymentStatus.PAID
 
     second_store = _persist_case(settings, "case_duplicate_attempt")
-    second_invoice = second_store.load_extraction("case_duplicate_attempt")
-    second_claim = second_store.claim_case_execution(
-        "case_duplicate_attempt", frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    second_invoice, second_claim = _approve_with_resolved_review(
+        second_store,
+        "case_duplicate_attempt",
+        settings,
     )
-    _approve(second_store, "case_duplicate_attempt", second_claim)
     with connect_database(settings.workflow_db) as connection:
         connection.execute(
             "DROP TRIGGER IF EXISTS trg_comparison_results_immutable_after_final_delete"
@@ -861,13 +1091,16 @@ def test_adoption_rejects_semantically_incoherent_predecessor_snapshot(
             deep=True,
         )
     with connect_database(settings.workflow_db) as connection:
+        next_version = connection.execute(
+            "SELECT MAX(version) + 1 FROM extractions WHERE case_id = ?", (case_id,)
+        ).fetchone()[0]
         connection.execute(
             "INSERT INTO extractions(extraction_id, case_id, version, payload_json, "
             "created_at, execution_generation) VALUES (?, ?, ?, ?, ?, ?)",
             (
                 f"ext_incoherent_{tampering}",
                 case_id,
-                2,
+                next_version,
                 forged.model_dump_json(),
                 datetime.now(UTC).isoformat(),
                 1,
@@ -938,6 +1171,237 @@ def test_adoption_rejects_inventory_relationship_tamper(settings: Settings) -> N
             (case_id, claim.generation),
         ).fetchone()[0]
     assert adopted == 0
+
+
+def test_adoption_rejects_self_consistent_snapshot_that_disagrees_with_source_bytes(
+    settings: Settings,
+) -> None:
+    configured = settings.model_copy(
+        update={"review_threshold_amount": Decimal("100000.00")}, deep=True
+    )
+    case_id = "case_source_inaccurate_snapshot"
+    store = _persist_case(configured, case_id)
+    invoice = store.load_extraction(case_id)
+    inaccurate = _source_inaccurate_price_snapshot(invoice)
+    inventory_payload = store.load_comparison(case_id, "inventory")
+    comparisons = [
+        InventoryComparison.model_validate(item) for item in inventory_payload["comparisons"]
+    ]
+    for comparison in comparisons:
+        comparison.evidence = [
+            reference
+            for line in inaccurate.lines
+            if line.raw_item in comparison.raw_items
+            for reference in line.evidence
+        ]
+    inventory_payload["comparisons"] = [
+        item.model_dump(mode="json") for item in comparisons
+    ]
+    inaccurate_risk = build_risk_assessment(
+        inaccurate,
+        comparisons,
+        [],
+        compute_invoice_totals(inaccurate),
+        configured,
+    )
+    assert inaccurate.declared_total == Decimal("88888.00")
+    assert inaccurate_risk.financial.exact
+    assert not inaccurate_risk.policy_review_reasons
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "UPDATE extractions SET payload_json = ? WHERE case_id = ? "
+            "AND execution_generation = 1",
+            (inaccurate.model_dump_json(), case_id),
+        )
+        connection.execute(
+            "UPDATE comparison_results SET payload_json = ? WHERE case_id = ? "
+            "AND comparison_type = 'inventory' AND execution_generation = 1",
+            (json.dumps(inventory_payload), case_id),
+        )
+        connection.execute(
+            "UPDATE comparison_results SET payload_json = ? WHERE case_id = ? "
+            "AND comparison_type = 'risk' AND execution_generation = 1",
+            (inaccurate_risk.model_dump_json(), case_id),
+        )
+        connection.commit()
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.adopt_latest_evidence(claim)
+
+    assert excinfo.value.stop_reason == "EVIDENCE_PROVENANCE_INVALID"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        paid = connection.execute(
+            "SELECT COUNT(*) FROM payments WHERE case_id = ?", (case_id,)
+        ).fetchone()[0]
+    assert paid == 0
+
+
+def test_adoption_rejects_omitted_configured_threshold_review_reason(
+    settings: Settings,
+) -> None:
+    configured = settings.model_copy(
+        update={"review_threshold_amount": Decimal("1000.00")}, deep=True
+    )
+    case_id = "case_threshold_reason_omitted"
+    store = _persist_case(configured, case_id)
+    risk = store.load_comparison(case_id, "risk")
+    assert risk["policy_review_reasons"]
+    risk["policy_review_reasons"] = []
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "UPDATE comparison_results SET payload_json = ? WHERE case_id = ? "
+            "AND comparison_type = 'risk' AND execution_generation = 1",
+            (json.dumps(risk), case_id),
+        )
+        connection.commit()
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.adopt_latest_evidence(claim)
+
+    assert excinfo.value.stop_reason == "EVIDENCE_PROVENANCE_INVALID"
+
+
+def test_adoption_rejects_omitted_authoritative_identity_candidate(
+    settings: Settings,
+) -> None:
+    _persist_case(settings, "case_identity_scope_prior")
+    case_id = "case_identity_scope_omitted"
+    store = _persist_case(settings, case_id)
+    invoice = store.load_extraction(case_id)
+    inventory = [
+        InventoryComparison.model_validate(item)
+        for item in store.load_comparison(case_id, "inventory")["comparisons"]
+    ]
+    risk = build_risk_assessment(
+        invoice, inventory, [], compute_invoice_totals(invoice), settings
+    )
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "UPDATE identity_results SET payload_json = '[]' WHERE case_id = ? "
+            "AND execution_generation = 1",
+            (case_id,),
+        )
+        connection.execute(
+            "UPDATE comparison_results SET payload_json = ? WHERE case_id = ? "
+            "AND comparison_type = 'risk' AND execution_generation = 1",
+            (risk.model_dump_json(), case_id),
+        )
+        connection.commit()
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.adopt_latest_evidence(claim)
+
+    assert excinfo.value.stop_reason == "EVIDENCE_PROVENANCE_INVALID"
+
+
+def test_adoption_rejects_dates_not_rederived_from_extraction(settings: Settings) -> None:
+    case_id = "case_risk_dates_omitted"
+    store = _persist_case(settings, case_id)
+    risk = store.load_comparison(case_id, "risk")
+    assert risk["dates"]
+    risk["dates"] = []
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "UPDATE comparison_results SET payload_json = ? WHERE case_id = ? "
+            "AND comparison_type = 'risk' AND execution_generation = 1",
+            (json.dumps(risk), case_id),
+        )
+        connection.commit()
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.adopt_latest_evidence(claim)
+
+    assert excinfo.value.stop_reason == "EVIDENCE_PROVENANCE_INVALID"
+
+
+def test_adoption_rejects_inventory_row_not_in_authoritative_database(
+    settings: Settings,
+) -> None:
+    case_id = "case_inventory_row_inaccurate"
+    store = _persist_case(settings, case_id)
+    invoice = store.load_extraction(case_id)
+    inventory_payload = store.load_comparison(case_id, "inventory")
+    comparisons = [
+        InventoryComparison.model_validate(item) for item in inventory_payload["comparisons"]
+    ]
+    comparison = comparisons[0]
+    assert comparison.queried_row is not None
+    comparison.queried_row = comparison.queried_row.model_copy(
+        update={"available_stock": 0}, deep=True
+    )
+    comparison.available_stock = 0
+    comparison.status = InventoryStatus.OUT_OF_STOCK
+    comparison.explanation = (
+        f"aggregate quantity {comparison.requested_quantity} compared with exact row "
+        f"{comparison.queried_row.model_dump()}"
+    )
+    inventory_payload["comparisons"] = [
+        item.model_dump(mode="json") for item in comparisons
+    ]
+    risk = build_risk_assessment(
+        invoice, comparisons, [], compute_invoice_totals(invoice), settings
+    )
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "UPDATE comparison_results SET payload_json = ? WHERE case_id = ? "
+            "AND comparison_type = 'inventory' AND execution_generation = 1",
+            (json.dumps(inventory_payload), case_id),
+        )
+        connection.execute(
+            "UPDATE comparison_results SET payload_json = ? WHERE case_id = ? "
+            "AND comparison_type = 'risk' AND execution_generation = 1",
+            (risk.model_dump_json(), case_id),
+        )
+        connection.commit()
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.adopt_latest_evidence(claim)
+
+    assert excinfo.value.stop_reason == "EVIDENCE_PROVENANCE_INVALID"
+
+
+def test_snapshot_digest_uses_explicit_domain_version_and_payload_length(
+    settings: Settings,
+) -> None:
+    case_id = "case_snapshot_digest_framing"
+    _persist_case(settings, case_id)
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        snapshot = load_generation_evidence_snapshot(connection, case_id, 1, settings)
+    envelope = {
+        "case_id": case_id,
+        "invoice": snapshot.invoice.model_dump(mode="json"),
+        "identity": [item.model_dump(mode="json") for item in snapshot.identity],
+        "identity_evaluated_at": snapshot.identity_evaluated_at.isoformat(),
+        "inventory": snapshot.inventory_payload,
+        "risk": snapshot.risk.model_dump(mode="json"),
+        "critique": snapshot.critique.model_dump(mode="json"),
+    }
+    payload = json.dumps(
+        envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    expected = hashlib.sha256(
+        b"galatiq.invoice-agents/evidence-snapshot\x00"
+        + (1).to_bytes(4, "big")
+        + len(payload).to_bytes(8, "big")
+        + payload
+    ).hexdigest()
+
+    assert snapshot.digest == expected
 
 
 def test_human_approval_cannot_pay_a_later_same_generation_total(settings: Settings) -> None:
@@ -1078,13 +1542,16 @@ def test_fresh_extraction_promotion_rejects_future_generation(
     store = _persist_case(settings, case_id)
     invoice = store.load_extraction(case_id)
     with connect_database(settings.workflow_db) as connection:
+        next_version = connection.execute(
+            "SELECT MAX(version) + 1 FROM extractions WHERE case_id = ?", (case_id,)
+        ).fetchone()[0]
         connection.execute(
             "INSERT INTO extractions(extraction_id, case_id, version, payload_json, "
             "created_at, execution_generation) VALUES (?, ?, ?, ?, ?, ?)",
             (
                 "ext_forged_promotion",
                 case_id,
-                2,
+                next_version,
                 invoice.model_copy(
                     update={
                         "invoice_number": invoice.invoice_number.model_copy(
@@ -1163,11 +1630,11 @@ def test_duplicate_reconciles_paid_source_human_decision_rows(settings: Settings
 
     duplicate_case = "case_paid_review_duplicate"
     _persist_case(settings, duplicate_case)
-    duplicate_invoice = store.load_extraction(duplicate_case)
-    duplicate_claim = store.claim_case_execution(
-        duplicate_case, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    duplicate_invoice, duplicate_claim = _approve_with_resolved_review(
+        store,
+        duplicate_case,
+        settings,
     )
-    _approve(store, duplicate_case, duplicate_claim)
     review = store.load_current_review(source_claim)
     assert review is not None
     with connect_database(settings.workflow_db) as connection:
@@ -1226,8 +1693,67 @@ def test_migration_003_rolls_back_and_is_retryable_after_mid_migration_failure(
     assert "execution_token" not in columns
     assert versions == [1, 2]
 
+    legacy_evaluated_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC).isoformat()
+    with real_connect(path) as connection:
+        connection.execute(
+            "INSERT INTO source_artifacts(source_id, canonical_path, source_hash, "
+            "source_format, size_bytes, modified_at, metadata_json, created_at) "
+            "VALUES ('src_v2', '/tmp/v2.txt', ?, 'txt', 1, ?, '{}', ?)",
+            ("a" * 64, legacy_evaluated_at, legacy_evaluated_at),
+        )
+        connection.execute(
+            "INSERT INTO cases(case_id, source_id, status, started_at, updated_at) "
+            "VALUES ('case_v2', 'src_v2', 'INCOMPLETE', ?, ?)",
+            (legacy_evaluated_at, legacy_evaluated_at),
+        )
+        connection.execute(
+            "INSERT INTO identity_results(identity_id, case_id, payload_json, created_at) "
+            "VALUES ('ident_v2', 'case_v2', '[]', ?)",
+            (legacy_evaluated_at,),
+        )
+        connection.commit()
+
     assert migrate_database(path, DatabaseKind.WORKFLOW) == [3]
     assert verify_database(path, DatabaseKind.WORKFLOW)["schema_version"] == 3
+    with real_connect(path, read_only=True) as connection:
+        identity_columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(identity_results)")
+        }
+        final_columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(final_decisions)")
+        }
+        payment_columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(payments)")
+        }
+        trigger_names = {
+            str(row["name"])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            )
+        }
+        backfilled_at = connection.execute(
+            "SELECT evaluated_at FROM identity_results WHERE identity_id = 'ident_v2'"
+        ).fetchone()["evaluated_at"]
+    assert "evaluated_at" in identity_columns
+    assert {
+        "source_id",
+        "invoice_number",
+        "vendor",
+        "authorized_amount",
+        "authorized_currency",
+        "payment_idempotency_key",
+        "review_id",
+    } <= final_columns
+    assert {"source_id", "invoice_number", "review_id"} <= payment_columns
+    assert {
+        "trg_final_decisions_authorization_insert",
+        "trg_final_decisions_immutable_update",
+        "trg_final_decisions_immutable_delete",
+        "trg_payments_authorization_insert",
+        "trg_payments_immutable_update",
+        "trg_payments_immutable_delete",
+    } <= trigger_names
+    assert backfilled_at == legacy_evaluated_at
 
 
 @pytest.mark.asyncio

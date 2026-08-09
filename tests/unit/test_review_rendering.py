@@ -12,9 +12,11 @@ from invoice_agents.models import CaseStatus, Critique, DecisionKind, ReviewRequ
 from invoice_agents.orchestration import prepare_case
 from invoice_agents.tools.comparison import (
     InventoryReader,
+    apply_mapping_evidence,
     build_risk_assessment,
-    compare_inventory,
+    compare_inventory_evidence,
     compute_invoice_totals,
+    find_prior_invoice_candidates,
 )
 from invoice_agents.tools.evidence import render_pdf_page
 
@@ -36,23 +38,36 @@ def build_review(name: str, settings: Settings) -> ReviewRequest:
     prepared = prepare_case(DATA_DIR / name, settings)
     assert isinstance(prepared, tuple), f"prepare_case failed: {prepared}"
     case_id = prepared[0]
-    store = WorkflowStore(settings.workflow_db)
-    invoice = store.load_extraction(case_id)
+    store = WorkflowStore(settings)
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    store.promote_predecessor_extraction(claim)
-    comparisons, _unresolved = compare_inventory(invoice, InventoryReader(settings.inventory_db))
+    invoice = store.promote_predecessor_extraction(claim)
+    mappings, comparisons, unresolved = compare_inventory_evidence(
+        invoice, InventoryReader(settings.inventory_db)
+    )
+    invoice = apply_mapping_evidence(invoice, mappings, unresolved)
+    store.save_extraction(case_id, invoice, claim)
+    identity = find_prior_invoice_candidates(case_id, invoice, store)
     risk = build_risk_assessment(
-        invoice, comparisons, [], compute_invoice_totals(invoice), settings
+        invoice, comparisons, identity, compute_invoice_totals(invoice), settings
     )
     assert risk.policy_review_reasons
     case_critique = make_critique()
-    store.save_identity(case_id, [], claim)
+    store.save_identity(
+        case_id,
+        [candidate.model_dump(mode="json") for candidate in identity],
+        claim,
+    )
     store.save_comparison(
         case_id,
         "inventory",
-        {"comparisons": [item.model_dump(mode="json") for item in comparisons]},
+        {
+            "comparisons": [item.model_dump(mode="json") for item in comparisons],
+            "unresolved_candidates": {
+                item: result.model_dump(mode="json") for item, result in unresolved.items()
+            },
+        },
         claim,
     )
     store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim)

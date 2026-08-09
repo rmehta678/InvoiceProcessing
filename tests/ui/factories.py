@@ -27,9 +27,11 @@ from invoice_agents.orchestration import prepare_case
 from invoice_agents.payment.service import mock_payment
 from invoice_agents.tools.comparison import (
     InventoryReader,
+    apply_mapping_evidence,
     build_risk_assessment,
     compare_inventory_evidence,
     compute_invoice_totals,
+    find_prior_invoice_candidates,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -63,15 +65,17 @@ def record_case_evidence(
 ) -> tuple[RiskAssessment, ExecutionClaim]:
     """Persist inventory/risk/critique evidence exactly as the agent tools do."""
 
-    store = WorkflowStore(settings.workflow_db)
-    invoice = store.load_extraction(case_id)
+    store = WorkflowStore(settings)
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    store.promote_predecessor_extraction(claim)
-    _mappings, comparisons, unresolved = compare_inventory_evidence(
+    invoice = store.promote_predecessor_extraction(claim)
+    mappings, comparisons, unresolved = compare_inventory_evidence(
         invoice, InventoryReader(settings.inventory_db)
     )
+    invoice = apply_mapping_evidence(invoice, mappings, unresolved)
+    store.save_extraction(case_id, invoice, claim)
+    identity = find_prior_invoice_candidates(case_id, invoice, store)
     store.save_comparison(
         case_id,
         "inventory",
@@ -84,9 +88,13 @@ def record_case_evidence(
         claim,
     )
     risk = build_risk_assessment(
-        invoice, comparisons, [], compute_invoice_totals(invoice), settings
+        invoice, comparisons, identity, compute_invoice_totals(invoice), settings
     )
-    store.save_identity(case_id, [], claim)
+    store.save_identity(
+        case_id,
+        [candidate.model_dump(mode="json") for candidate in identity],
+        claim,
+    )
     store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim)
     store.save_critique(case_id, make_critique(critic_disposition), claim)
     return risk, claim
@@ -96,9 +104,9 @@ def make_succeeded_case(settings: Settings, name: str = "invoice_1001.txt") -> s
     """A fully persisted approved case paid through the real mock-payment service."""
 
     case_id, started_at = prepare_fixture_case(settings, DATA_DIR / name)
-    store = WorkflowStore(settings.workflow_db)
-    invoice = store.load_extraction(case_id)
+    store = WorkflowStore(settings)
     _risk, claim = record_case_evidence(settings, case_id, DecisionKind.APPROVE)
+    invoice = store.load_current_extraction(claim)
     decision = FinalDecision(
         decision=DecisionKind.APPROVE,
         reasons=["all deterministic checks passed"],
@@ -128,9 +136,9 @@ def make_pending_review_case(
     """A NEEDS_HUMAN case with a persisted pending review package and team state."""
 
     case_id, started_at = prepare_fixture_case(settings, source or (DATA_DIR / "invoice_1002.txt"))
-    store = WorkflowStore(settings.workflow_db)
-    invoice = store.load_extraction(case_id)
+    store = WorkflowStore(settings)
     risk, claim = record_case_evidence(settings, case_id, DecisionKind.HOLD)
+    invoice = store.load_current_extraction(claim)
     assert risk.policy_review_reasons, "fixture invoice must trigger review policy"
     review = create_review_request(
         case_id,
@@ -160,7 +168,7 @@ def make_failed_case(settings: Settings, name: str = "invoice_1001.txt") -> str:
     """A FAILED case whose error records must render at the top of the page."""
 
     case_id, started_at = prepare_fixture_case(settings, DATA_DIR / name)
-    store = WorkflowStore(settings.workflow_db)
+    store = WorkflowStore(settings)
     invoice = store.load_extraction(case_id)
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60

@@ -29,6 +29,7 @@ from invoice_agents.models import (
     InventoryRow,
     InventoryStatus,
     RiskAssessment,
+    RiskPolicy,
     ToolStatus,
 )
 
@@ -42,8 +43,14 @@ def normalize_alias(value: str) -> str:
 class InventoryReader:
     """Read-only, parameterized access to the authoritative inventory database."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        excluded_alias_sources: frozenset[str] = frozenset(),
+    ) -> None:
         self.path = path.resolve()
+        self.excluded_alias_sources = excluded_alias_sources
 
     @staticmethod
     def _row(row: sqlite3.Row) -> InventoryRow:
@@ -108,6 +115,9 @@ class InventoryReader:
                 query=alias,
                 error=f"SQLite alias lookup failed: {exc}",
             )
+        rows = [
+            row for row in rows if str(row["source"]) not in self.excluded_alias_sources
+        ]
         if not rows:
             return InventoryLookupResult(status=ToolStatus.NOT_FOUND, query=alias)
         if len(rows) > 1:
@@ -520,6 +530,58 @@ def assess_date(field: str, raw_value: str | None, normalized: str | None) -> Da
     )
 
 
+def classify_identity_candidate(
+    candidate_case_id: str,
+    invoice: ExtractedInvoice,
+    prior: ExtractedInvoice,
+) -> IdentityCandidate:
+    """Classify one authoritative prior extraction against the current invoice."""
+
+    same_hash = prior.source.sha256 == invoice.source.sha256
+    same_number = (
+        prior.invoice_number.normalized_value == invoice.invoice_number.normalized_value
+    )
+    same_vendor = prior.vendor.normalized_value == invoice.vendor.normalized_value
+    prior_revision = prior.revision.normalized_value if prior.revision else None
+    current_revision = invoice.revision.normalized_value if invoice.revision else None
+    if same_hash:
+        relationship = IdentityRelationship.EXACT_ARTIFACT
+        explanation = "source SHA-256 matches a prior artifact"
+    elif (
+        same_number
+        and same_vendor
+        and prior_revision != current_revision
+        and (prior_revision or current_revision)
+    ):
+        relationship = IdentityRelationship.POSSIBLE_REVISION
+        explanation = "invoice/vendor match while revision evidence differs"
+    elif same_number and same_vendor:
+        relationship = (
+            IdentityRelationship.DUPLICATE_REPRESENTATION
+            if prior.declared_total == invoice.declared_total
+            else IdentityRelationship.CONFLICT
+        )
+        explanation = (
+            "invoice/vendor/amount match across distinct source representations"
+            if relationship is IdentityRelationship.DUPLICATE_REPRESENTATION
+            else "invoice/vendor match but declared amounts conflict"
+        )
+    else:
+        relationship = IdentityRelationship.CONFLICT
+        explanation = "partial identity match has conflicting invoice or vendor evidence"
+    return IdentityCandidate(
+        case_id=candidate_case_id,
+        source_id=prior.source.source_id,
+        invoice_number=prior.invoice_number.normalized_value,
+        vendor=prior.vendor.normalized_value,
+        source_hash=prior.source.sha256,
+        revision=prior_revision,
+        source_format=prior.source.source_format,
+        relationship=relationship,
+        explanation=explanation,
+    )
+
+
 def find_prior_invoice_candidates(
     case_id: str,
     invoice: ExtractedInvoice,
@@ -532,54 +594,8 @@ def find_prior_invoice_candidates(
         case_id, invoice.invoice_number.normalized_value, invoice.vendor.normalized_value
     )
     for row in rows:
-        same_hash = str(row["source_hash"]) == invoice.source.sha256
-        same_number = row["invoice_number"] == invoice.invoice_number.normalized_value
-        same_vendor = row["vendor"] == invoice.vendor.normalized_value
-        prior_revision = str(row["revision"]) if row["revision"] is not None else None
-        current_revision = invoice.revision.normalized_value if invoice.revision else None
-        if same_hash:
-            relationship = IdentityRelationship.EXACT_ARTIFACT
-            explanation = "source SHA-256 matches a prior artifact"
-        elif (
-            same_number
-            and same_vendor
-            and prior_revision != current_revision
-            and (prior_revision or current_revision)
-        ):
-            relationship = IdentityRelationship.POSSIBLE_REVISION
-            explanation = "invoice/vendor match while revision evidence differs"
-        elif same_number and same_vendor:
-            try:
-                prior = store.load_extraction(str(row["case_id"]))
-                amounts_match = prior.declared_total == invoice.declared_total
-            except Exception:
-                amounts_match = False
-            relationship = (
-                IdentityRelationship.DUPLICATE_REPRESENTATION
-                if amounts_match
-                else IdentityRelationship.CONFLICT
-            )
-            explanation = (
-                "invoice/vendor/amount match across distinct source representations"
-                if amounts_match
-                else "invoice/vendor match but declared amounts conflict"
-            )
-        else:
-            relationship = IdentityRelationship.CONFLICT
-            explanation = "partial identity match has conflicting invoice or vendor evidence"
-        candidates.append(
-            IdentityCandidate(
-                case_id=str(row["case_id"]),
-                source_id=str(row["source_id"]),
-                invoice_number=str(row["invoice_number"]) if row["invoice_number"] else None,
-                vendor=str(row["vendor"]) if row["vendor"] else None,
-                source_hash=str(row["source_hash"]),
-                revision=prior_revision,
-                source_format=str(row["source_format"]),
-                relationship=relationship,
-                explanation=explanation,
-            )
-        )
+        prior = store.load_extraction(str(row["case_id"]))
+        candidates.append(classify_identity_candidate(str(row["case_id"]), invoice, prior))
     return candidates
 
 
@@ -592,6 +608,12 @@ def build_risk_assessment(
 ) -> RiskAssessment:
     """Apply explicit review policy to evidence without synthesizing an approval."""
 
+    policy = RiskPolicy(
+        review_threshold_amount=settings.review_threshold_amount,
+        review_threshold_currency=settings.review_threshold_currency,
+        review_threshold_effective_date=settings.review_threshold_effective_date,
+        due_date_tolerance_days=settings.due_date_tolerance_days,
+    )
     dates = [
         assess_date(
             "invoice_date", invoice.invoice_date.raw_value, invoice.invoice_date.normalized_value
@@ -607,16 +629,16 @@ def build_risk_assessment(
     review: list[str] = []
     currency = invoice.currency.normalized_value
     amount = invoice.declared_total
-    if currency != settings.review_threshold_currency:
+    if currency != policy.review_threshold_currency:
         review.append(
             f"currency {currency or '<missing>'} has no approved FX/threshold policy against "
-            f"{settings.review_threshold_currency}"
+            f"{policy.review_threshold_currency}"
         )
-    elif amount is not None and amount >= settings.review_threshold_amount:
+    elif amount is not None and amount >= policy.review_threshold_amount:
         review.append(
             f"declared amount {amount} {currency} is at or above policy threshold "
-            f"{settings.review_threshold_amount} {settings.review_threshold_currency} effective "
-            f"{settings.review_threshold_effective_date.isoformat()}"
+            f"{policy.review_threshold_amount} {policy.review_threshold_currency} effective "
+            f"{policy.review_threshold_effective_date.isoformat()}"
         )
     if invoice.missing_fields:
         review.append(f"required fields are missing: {', '.join(invoice.missing_fields)}")
@@ -678,12 +700,12 @@ def build_risk_assessment(
     if net_terms and dates[0].parsed_date and dates[1].parsed_date:
         expected_due = dates[0].parsed_date + timedelta(days=int(net_terms.group(1)))
         delta_days = (dates[1].parsed_date - expected_due).days
-        if abs(delta_days) > settings.due_date_tolerance_days:
+        if abs(delta_days) > policy.due_date_tolerance_days:
             review.append(
                 f"stated due date {dates[1].parsed_date.isoformat()} deviates from the "
                 f"Net {int(net_terms.group(1))} expectation {expected_due.isoformat()} by "
                 f"{delta_days:+d} days, beyond the configured tolerance of "
-                f"{settings.due_date_tolerance_days} days"
+                f"{policy.due_date_tolerance_days} days"
             )
     review.extend(suspicious)
     # Database scope is stated every time so no agent can imply unsupported reconciliation.
@@ -695,6 +717,7 @@ def build_risk_assessment(
         "bank-account validation unavailable: no authoritative payment master",
     ]
     return RiskAssessment(
+        policy=policy,
         financial=financial,
         dates=dates,
         inventory=inventory,
