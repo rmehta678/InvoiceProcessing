@@ -230,6 +230,15 @@ def test_review_detail_shows_package_and_unbiased_form(
         assert kind in text
     assert "Forces final decision REJECT" in text
     assert "Record decision" in text
+    blockers = review.evidence_bundle["blocking_evidence"]
+    assert blockers
+    for blocker in blockers:
+        assert blocker["blocker_id"] in text
+        assert blocker["description"] in text
+    for kind in ("APPROVE", "ESTABLISH_MAPPING", "SUPERSEDE_REVISION"):
+        assert f'data-blocker-authorization-for="{kind}"' in text
+    for kind in ("REJECT", "REQUEST_CORRECTION"):
+        assert f'data-blocker-authorization-for="{kind}"' not in text
 
 
 def test_review_detail_missing_is_404(client: TestClient) -> None:
@@ -261,6 +270,30 @@ def test_decision_missing_reason_rejected(client: TestClient, settings: Settings
     assert response.status_code == 400
     assert "reviewer and reason are required" in response.text
     assert WorkflowStore(settings.workflow_db).load_review(review.review_id).status == "PENDING"
+
+
+def test_authorizing_decision_records_selected_blocker_ids(
+    client: TestClient, settings: Settings
+) -> None:
+    _, review = make_pending_review_case(settings)
+    blocker_ids = [
+        entry["blocker_id"] for entry in review.evidence_bundle["blocking_evidence"]
+    ]
+    assert blocker_ids
+    response = client.post(
+        f"/reviews/{review.review_id}/decision",
+        data={
+            "reviewer": "vp@example.com",
+            "decision": "APPROVE",
+            "reason": "explicitly authorizing the cited blockers",
+            "addressed_blocker_ids": blocker_ids,
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    stored = WorkflowStore(settings.workflow_db).load_review(review.review_id)
+    assert stored.human_decision is not None
+    assert stored.human_decision.addressed_blocker_ids == blocker_ids
 
 
 def test_mapping_decision_requires_mapping(client: TestClient, settings: Settings) -> None:

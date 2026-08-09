@@ -8,11 +8,14 @@ from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import (
     Critique,
     DecisionKind,
+    EvidenceBlocker,
+    HumanDecision,
     HumanDecisionKind,
     InventoryStatus,
     ReviewRequest,
     RiskAssessment,
 )
+from invoice_agents.tools.comparison import normalize_alias
 
 AUTHORIZING_HUMAN_DECISIONS = frozenset(
     {
@@ -30,23 +33,67 @@ BLOCKING_INVENTORY_STATUSES = frozenset(
         InventoryStatus.OUT_OF_STOCK,
         InventoryStatus.UNKNOWN,
         InventoryStatus.INVALID_QUANTITY,
+        InventoryStatus.ERROR,
     }
 )
 
 
-def blocking_evidence(risk: RiskAssessment) -> list[str]:
-    """List evidence that still blocks APPROVE regardless of an authorizing decision."""
+def _inventory_evidence_id(sku: str | None, raw_items: list[str]) -> str:
+    """Return an order-independent domain identity, never a display position or prose."""
 
-    blockers = [
-        f"inventory {item.status}: {item.raw_items} requested={item.requested_quantity} "
-        f"stock={item.available_stock}"
-        for item in risk.inventory
-        if item.status in BLOCKING_INVENTORY_STATUSES
-    ]
+    if sku and sku.strip():
+        return sku.strip()
+    normalized = sorted({value for raw in raw_items if (value := normalize_alias(raw))})
+    return "+".join(normalized) if normalized else "unidentified"
+
+
+def blocking_evidence(risk: RiskAssessment) -> list[EvidenceBlocker]:
+    """Build typed blockers whose IDs depend only on stable domain material."""
+
+    blockers: list[EvidenceBlocker] = []
+    for item in risk.inventory:
+        if item.status not in BLOCKING_INVENTORY_STATUSES:
+            continue
+        evidence_id = _inventory_evidence_id(item.sku, item.raw_items)
+        blockers.append(
+            EvidenceBlocker(
+                blocker_id=f"inventory:{evidence_id}:{item.status.value}",
+                kind="inventory",
+                evidence_id=evidence_id,
+                description=(
+                    f"inventory {item.status.value}: {', '.join(item.raw_items)} "
+                    f"requested={item.requested_quantity} stock={item.available_stock}"
+                ),
+            )
+        )
     total_delta = risk.financial.total_delta
     if total_delta is not None and total_delta != Decimal("0"):
-        blockers.append(f"declared/calculated total delta is {total_delta}")
+        blockers.append(
+            EvidenceBlocker(
+                blocker_id="financial:declared-total-delta",
+                kind="financial",
+                evidence_id="declared-total-delta",
+                description=f"declared/calculated total delta is {total_delta}",
+            )
+        )
     return blockers
+
+
+def unaddressed_blockers(
+    risk: RiskAssessment, human: HumanDecision | None
+) -> list[EvidenceBlocker]:
+    """Return current blockers unless one authorizing ruling names the exact current set.
+
+    Exact-set comparison is deliberate: an unknown, stale, or extra ID invalidates the
+    authorization rather than silently widening a prior human ruling to changed evidence.
+    """
+
+    current = blocking_evidence(risk)
+    if not current or human is None or human.decision not in AUTHORIZING_HUMAN_DECISIONS:
+        return current
+    current_ids = {blocker.blocker_id for blocker in current}
+    addressed_ids = set(human.addressed_blocker_ids)
+    return [] if addressed_ids == current_ids else current
 
 
 def assert_new_review_cycle_permitted(
@@ -102,10 +149,18 @@ def validate_final_decision(
             case_id=case_id,
             stop_reason="HUMAN_REVIEW_UNRESOLVED",
         )
-    human = review.human_decision if review else None
+    human = review.human_decision if review is not None and review.status == "RESOLVED" else None
+    remaining = unaddressed_blockers(risk, human)
+    if selected is DecisionKind.APPROVE and remaining:
+        raise InvoiceAgentsError(
+            ErrorCategory.TOOL,
+            "APPROVE requires explicit human authorization for every current blocking "
+            f"evidence ID: {[blocker.blocker_id for blocker in remaining]}",
+            case_id=case_id,
+            stop_reason="BLOCKING_EVIDENCE_UNRESOLVED",
+        )
     if human is not None:
         if human.decision in AUTHORIZING_HUMAN_DECISIONS:
-            remaining = blocking_evidence(risk)
             hold_permitted = selected is DecisionKind.HOLD and remaining
             if selected is not DecisionKind.APPROVE and not hold_permitted:
                 raise InvoiceAgentsError(

@@ -17,6 +17,7 @@ from autogen_ext.models.openai import OpenAIChatCompletionClient
 from invoice_agents.agents.decision_rules import (
     assert_new_review_cycle_permitted,
     blocking_evidence,
+    unaddressed_blockers,
     validate_final_decision,
 )
 from invoice_agents.config import XAI_BASE_URL, XAI_MODEL, Settings
@@ -321,6 +322,7 @@ def build_team(
         risk = context.risk()
         critique = context.store.load_critique(context.case_id)
         review = context.store.load_case_review(context.case_id)
+        human = review.human_decision if review is not None and review.status == "RESOLVED" else None
         return {
             "invoice_identity": {
                 "invoice_number": invoice.invoice_number.model_dump(mode="json"),
@@ -333,8 +335,13 @@ def build_team(
             "risk": risk.model_dump(mode="json"),
             "critique": critique.model_dump(mode="json"),
             "review": review.model_dump(mode="json") if review else None,
-            # Deterministically derived; an authorizing decision never clears these.
-            "unaddressed_blocking_evidence": blocking_evidence(risk),
+            "blocking_evidence": [
+                blocker.model_dump(mode="json") for blocker in blocking_evidence(risk)
+            ],
+            "unaddressed_blocking_evidence": [
+                blocker.model_dump(mode="json")
+                for blocker in unaddressed_blockers(risk, human)
+            ],
         }
 
     async def persist_human_review(
@@ -554,7 +561,8 @@ def build_team(
             "A resolved REQUEST_CORRECTION is final: call submit_final_decision with HOLD. Those rulings "
             "already account for every listed blocker; never request another review over them. Only after "
             "an AUTHORIZING decision (APPROVE, ESTABLISH_MAPPING, SUPERSEDE_REVISION): if "
-            "unaddressed_blocking_evidence is non-empty, that decision does not cover it - call "
+            "unaddressed_blocking_evidence is non-empty, the resolved human decision did not "
+            "identify the exact current blocker-ID set - call "
             "persist_human_review again recommending HOLD, citing that evidence, then handoff to "
             "human_reviewer; if it is empty, obey the authorizing decision and call submit_final_decision. "
             "Without review triggers or critic disagreement, independently call submit_final_decision. "

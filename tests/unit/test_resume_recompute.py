@@ -160,6 +160,11 @@ def test_mapping_recompute_with_exceeding_stock_stays_blocked_and_needs_second_r
         )
         is None
     )
+    with pytest.raises(InvoiceAgentsError) as approval_error:
+        validate_final_decision(
+            DecisionKind.APPROVE, True, risk, make_critique(DecisionKind.APPROVE), resolved
+        )
+    assert approval_error.value.stop_reason == "BLOCKING_EVIDENCE_UNRESOLVED"
     with pytest.raises(InvoiceAgentsError) as excinfo:
         validate_final_decision(
             DecisionKind.REJECT, False, risk, make_critique(DecisionKind.HOLD), resolved

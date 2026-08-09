@@ -44,6 +44,18 @@
       </ul>
     </section>
 
+    {% if blocking_evidence %}
+    <section class="card" id="blocking-evidence">
+      <h2>Blocking evidence ({{ blocking_evidence|length }})</h2>
+      <p class="small dim">APPROVE requires an authorizing human decision that explicitly identifies the exact current blocker-ID set.</p>
+      <ul class="plain">
+        {% for blocker in blocking_evidence %}
+        <li><code>{{ blocker.blocker_id }}</code> <span class="chip">{{ blocker.kind }}</span><br>{{ blocker.description }}</li>
+        {% endfor %}
+      </ul>
+    </section>
+    {% endif %}
+
     <section class="card" id="recommendation">
       <h2>Agent recommendation <span class="dim small">(attributed to the approval agent)</span></h2>
       <p>{{ m.decision_badge(review.agent_recommendation) }}</p>
@@ -103,6 +115,12 @@
           {% if review.human_decision.superseded_case_id %}
           <dt>Supersedes</dt><dd><a class="mono" href="/cases/{{ review.human_decision.superseded_case_id }}">{{ review.human_decision.superseded_case_id|middle }}</a></dd>
           {% endif %}
+          {% if review.human_decision.addressed_blocker_ids %}
+          <dt>Authorized blockers</dt>
+          <dd>{% for blocker_id in review.human_decision.addressed_blocker_ids %}
+            <div><code>{{ blocker_id }}</code></div>
+          {% endfor %}</dd>
+          {% endif %}
         </dl>
         {% if case_header and case_header.status == 'NEEDS_HUMAN' %}
           {% if running %}
@@ -138,6 +156,20 @@
               {{ kind.value }}
             </label>
             <p class="consequence">{{ consequences[kind] }}</p>
+
+            {% if blocking_evidence and kind in blocker_authorizing_decision_kinds %}
+            <fieldset class="subform" data-for="{{ kind.value }}" data-blocker-authorization-for="{{ kind.value }}">
+              <legend class="small">Explicit blocker authorization</legend>
+              <p class="small dim">Select every current blocker this decision explicitly authorizes. Missing or extra IDs cannot authorize APPROVE.</p>
+              {% for blocker in blocking_evidence %}
+              <label class="small">
+                <input type="checkbox" name="addressed_blocker_ids" value="{{ blocker.blocker_id }}"
+                       {% if blocker.blocker_id in form_values.get('addressed_blocker_ids', []) %}checked{% endif %}>
+                <code>{{ blocker.blocker_id }}</code> &mdash; {{ blocker.description }}
+              </label><br>
+              {% endfor %}
+            </fieldset>
+            {% endif %}
 
             {% if kind.value == 'ESTABLISH_MAPPING' %}
             <div class="subform" data-for="ESTABLISH_MAPPING">

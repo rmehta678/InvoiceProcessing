@@ -60,6 +60,8 @@ def create_review_request(
     critic/agent disposition disagreement); at least one reason must exist overall.
     """
 
+    from invoice_agents.agents.decision_rules import blocking_evidence
+
     reasons = list(dict.fromkeys([*risk.policy_review_reasons, *(extra_reasons or [])]))
     if not reasons:
         raise InvoiceAgentsError(
@@ -98,6 +100,9 @@ def create_review_request(
             "dates": [item.model_dump(mode="json") for item in risk.dates],
             "suspicious_signals": risk.suspicious_signals,
             "unavailable_reconciliations": risk.unavailable_reconciliations,
+            "blocking_evidence": [
+                blocker.model_dump(mode="json") for blocker in blocking_evidence(risk)
+            ],
             "rendered_pages": _render_review_pages(invoice.source, review_id),
         },
         agent_recommendation=agent_recommendation,
@@ -162,14 +167,34 @@ def record_human_decision(
     *,
     mappings: list[CanonicalMapping] | None = None,
     superseded_case_id: str | None = None,
+    addressed_blocker_ids: list[str] | None = None,
 ) -> ReviewRequest:
     """Validate and record an attributable decision; no decision defaults are supplied."""
+
+    from invoice_agents.agents.decision_rules import AUTHORIZING_HUMAN_DECISIONS
 
     if not reviewer.strip() or not reason.strip():
         raise InvoiceAgentsError(
             ErrorCategory.TOOL,
             "reviewer and reason are required",
             stop_reason="HUMAN_DECISION_INVALID",
+        )
+    selected_blocker_ids = list(dict.fromkeys(addressed_blocker_ids or []))
+    review = store.load_review(review_id)
+    package_blocker_ids = {
+        str(entry["blocker_id"])
+        for entry in review.evidence_bundle.get("blocking_evidence", [])
+        if isinstance(entry, dict) and isinstance(entry.get("blocker_id"), str)
+    }
+    unknown_blocker_ids = set(selected_blocker_ids) - package_blocker_ids
+    if selected_blocker_ids and (
+        decision not in AUTHORIZING_HUMAN_DECISIONS or unknown_blocker_ids
+    ):
+        raise InvoiceAgentsError(
+            ErrorCategory.TOOL,
+            "blocker authorization is permitted only for authorizing decisions and IDs "
+            f"in this review package; unknown IDs: {sorted(unknown_blocker_ids)}",
+            stop_reason="BLOCKER_AUTHORIZATION_INVALID",
         )
     selected_mappings = mappings or []
     if decision is HumanDecisionKind.ESTABLISH_MAPPING and not selected_mappings:
@@ -194,5 +219,6 @@ def record_human_decision(
         decided_at=datetime.now(UTC),
         mappings=selected_mappings,
         superseded_case_id=superseded_case_id,
+        addressed_blocker_ids=selected_blocker_ids,
     )
     return store.save_human_decision(human)

@@ -26,12 +26,16 @@ from invoice_agents.errors import (
     InvoiceAgentsError,
     SourceEvidenceError,
 )
+from invoice_agents.hitl.service import create_review_request, record_human_decision
 from invoice_agents.models import (
     CaseStatus,
     Critique,
     DecisionKind,
     FinalDecision,
     FinancialComparison,
+    HumanDecisionKind,
+    InventoryComparison,
+    InventoryStatus,
     ReviewRequest,
     RiskAssessment,
     SourceArtifact,
@@ -168,6 +172,101 @@ def _pending_review(case_id: str) -> ReviewRequest:
         questions=[],
         created_at=datetime.now(UTC),
     )
+
+
+def _blocking_inventory() -> InventoryComparison:
+    return InventoryComparison(
+        sku="SKU-WIDGET-A",
+        raw_items=["WidgetA"],
+        requested_quantity=Decimal("20"),
+        available_stock=15,
+        status=InventoryStatus.EXCEEDS_STOCK,
+        explanation="stock comparison",
+    )
+
+
+def _persist_blocking_review(invoice_dir: Path, settings: Settings) -> ReviewRequest:
+    case_id, _started_at = _prepare(invoice_dir, settings)
+    store = WorkflowStore(settings.workflow_db)
+    risk = _risk(["blocking evidence requires review"]).model_copy(
+        update={"inventory": [_blocking_inventory()]}, deep=True
+    )
+    return create_review_request(
+        case_id,
+        store.load_extraction(case_id),
+        risk,
+        _critique(DecisionKind.HOLD),
+        DecisionKind.HOLD,
+        ["blocking evidence requires review"],
+        store,
+    )
+
+
+def test_review_package_persists_typed_blocking_evidence(
+    invoice_dir: Path, settings: Settings
+) -> None:
+    review = _persist_blocking_review(invoice_dir, settings)
+    expected = [
+        {
+            "blocker_id": "inventory:SKU-WIDGET-A:EXCEEDS_STOCK",
+            "kind": "inventory",
+            "evidence_id": "SKU-WIDGET-A",
+            "description": "inventory EXCEEDS_STOCK: WidgetA requested=20 stock=15",
+        }
+    ]
+    assert review.evidence_bundle["blocking_evidence"] == expected
+    stored = WorkflowStore(settings.workflow_db).load_review(review.review_id)
+    assert stored.evidence_bundle["blocking_evidence"] == expected
+
+
+def test_review_decision_persists_explicit_blocker_authorization(
+    invoice_dir: Path, settings: Settings
+) -> None:
+    review = _persist_blocking_review(invoice_dir, settings)
+    blocker_ids = [
+        entry["blocker_id"] for entry in review.evidence_bundle["blocking_evidence"]
+    ]
+    resolved = record_human_decision(
+        review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.APPROVE,
+        "the cited stock exception is authorized",
+        WorkflowStore(settings.workflow_db),
+        settings.inventory_db,
+        addressed_blocker_ids=blocker_ids,
+    )
+    assert resolved.human_decision is not None
+    assert resolved.human_decision.addressed_blocker_ids == [
+        "inventory:SKU-WIDGET-A:EXCEEDS_STOCK"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("decision", "addressed"),
+    [
+        (HumanDecisionKind.APPROVE, ["inventory:STALE:UNKNOWN"]),
+        (HumanDecisionKind.REJECT, ["inventory:SKU-WIDGET-A:EXCEEDS_STOCK"]),
+    ],
+    ids=["unknown-id", "non-authorizing-decision"],
+)
+def test_review_service_rejects_invalid_blocker_authorization(
+    decision: HumanDecisionKind,
+    addressed: list[str],
+    invoice_dir: Path,
+    settings: Settings,
+) -> None:
+    review = _persist_blocking_review(invoice_dir, settings)
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        record_human_decision(
+            review.review_id,
+            "reviewer@example.com",
+            decision,
+            "submitted authorization",
+            WorkflowStore(settings.workflow_db),
+            settings.inventory_db,
+            addressed_blocker_ids=addressed,
+        )
+    assert excinfo.value.stop_reason == "BLOCKER_AUTHORIZATION_INVALID"
 
 
 @pytest.mark.asyncio

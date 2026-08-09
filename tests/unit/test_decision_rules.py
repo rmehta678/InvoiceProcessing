@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from invoice_agents.agents import decision_rules
 from invoice_agents.agents.decision_rules import (
     assert_new_review_cycle_permitted,
     blocking_evidence,
@@ -35,6 +36,7 @@ BLOCKING_STATUSES = [
     InventoryStatus.OUT_OF_STOCK,
     InventoryStatus.UNKNOWN,
     InventoryStatus.INVALID_QUANTITY,
+    InventoryStatus.ERROR,
 ]
 
 
@@ -95,7 +97,9 @@ def make_critique(disposition: DecisionKind) -> Critique:
     )
 
 
-def make_review(decision: HumanDecisionKind) -> ReviewRequest:
+def make_review(
+    decision: HumanDecisionKind, addressed_blocker_ids: list[str] | None = None
+) -> ReviewRequest:
     return ReviewRequest(
         review_id="rev_test",
         case_id="case_test",
@@ -125,6 +129,7 @@ def make_review(decision: HumanDecisionKind) -> ReviewRequest:
             superseded_case_id="case_prior"
             if decision is HumanDecisionKind.SUPERSEDE_REVISION
             else None,
+            addressed_blocker_ids=addressed_blocker_ids or [],
         ),
     )
 
@@ -269,13 +274,150 @@ def test_stricter_decision_than_critic_approve_is_never_blocked(selected: Decisi
 @pytest.mark.parametrize("status", BLOCKING_STATUSES)
 def test_blocking_evidence_flags_each_blocking_inventory_status(status: InventoryStatus) -> None:
     entries = blocking_evidence(make_risk(inventory=[make_comparison(status)]))
-    assert len(entries) == 1
-    assert str(status) in entries[0]
+    assert [entry.model_dump() for entry in entries] == [
+        {
+            "blocker_id": f"inventory:SKU-WIDGET-A:{status.value}",
+            "kind": "inventory",
+            "evidence_id": "SKU-WIDGET-A",
+            "description": (
+                f"inventory {status.value}: WidgetA requested=20 stock=15"
+            ),
+        }
+    ]
 
 
 def test_blocking_evidence_flags_nonzero_total_delta() -> None:
     entries = blocking_evidence(make_risk(total_delta=Decimal("12.50")))
-    assert entries == ["declared/calculated total delta is 12.50"]
+    assert [entry.model_dump() for entry in entries] == [
+        {
+            "blocker_id": "financial:declared-total-delta",
+            "kind": "financial",
+            "evidence_id": "declared-total-delta",
+            "description": "declared/calculated total delta is 12.50",
+        }
+    ]
+
+
+def test_blocker_ids_ignore_order_and_mutable_explanatory_prose() -> None:
+    first = make_comparison(InventoryStatus.EXCEEDS_STOCK)
+    changed = first.model_copy(
+        update={
+            "raw_items": ["Second description", "WidgetA"],
+            "requested_quantity": Decimal("999"),
+            "available_stock": 0,
+            "explanation": "model-generated prose changed",
+        }
+    )
+    first_id = blocking_evidence(make_risk(inventory=[first]))[0].blocker_id
+    changed_id = blocking_evidence(make_risk(inventory=[changed]))[0].blocker_id
+    assert first_id == changed_id == "inventory:SKU-WIDGET-A:EXCEEDS_STOCK"
+
+
+def test_blocker_id_uses_normalized_raw_domain_identity_when_sku_is_absent() -> None:
+    comparison = make_comparison(InventoryStatus.UNKNOWN, stock=None).model_copy(
+        update={"sku": None, "raw_items": ["  Widget A (rush)!  "]}
+    )
+    blocker = blocking_evidence(make_risk(inventory=[comparison]))[0]
+    assert blocker.blocker_id == "inventory:widgetarush:UNKNOWN"
+    assert blocker.evidence_id == "widgetarush"
+
+
+def test_financial_blocker_id_does_not_change_with_delta_value() -> None:
+    first = blocking_evidence(make_risk(total_delta=Decimal("1.00")))[0]
+    second = blocking_evidence(make_risk(total_delta=Decimal("999.00")))[0]
+    assert first.blocker_id == second.blocker_id == "financial:declared-total-delta"
+
+
+@pytest.mark.parametrize("status", BLOCKING_STATUSES)
+def test_approve_rejects_each_unaddressed_inventory_blocker(
+    status: InventoryStatus,
+) -> None:
+    risk = make_risk(
+        inventory=[make_comparison(status)], reasons=["policy trigger"]
+    )
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        validate_final_decision(
+            DecisionKind.APPROVE,
+            True,
+            risk,
+            make_critique(DecisionKind.APPROVE),
+            make_review(HumanDecisionKind.APPROVE),
+        )
+    assert excinfo.value.stop_reason == "BLOCKING_EVIDENCE_UNRESOLVED"
+
+
+def test_approve_rejects_unaddressed_nonzero_total_delta() -> None:
+    risk = make_risk(total_delta=Decimal("12.50"), reasons=["policy trigger"])
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        validate_final_decision(
+            DecisionKind.APPROVE,
+            True,
+            risk,
+            make_critique(DecisionKind.APPROVE),
+            make_review(HumanDecisionKind.APPROVE),
+        )
+    assert excinfo.value.stop_reason == "BLOCKING_EVIDENCE_UNRESOLVED"
+
+
+@pytest.mark.parametrize("decision", AUTHORIZING)
+def test_exact_current_blocker_ids_explicitly_authorize_approve(
+    decision: HumanDecisionKind,
+) -> None:
+    risk = make_risk(
+        inventory=[make_comparison(InventoryStatus.EXCEEDS_STOCK)],
+        total_delta=Decimal("12.50"),
+        reasons=["policy trigger"],
+    )
+    current_ids = [blocker.blocker_id for blocker in blocking_evidence(risk)]
+    review = make_review(decision, current_ids)
+    assert decision_rules.unaddressed_blockers(risk, review.human_decision) == []
+    assert (
+        validate_final_decision(
+            DecisionKind.APPROVE,
+            True,
+            risk,
+            make_critique(DecisionKind.HOLD),
+            review,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "addressed",
+    [
+        [],
+        ["inventory:SKU-WIDGET-A:OUT_OF_STOCK"],
+        [
+            "inventory:SKU-WIDGET-A:EXCEEDS_STOCK",
+            "financial:declared-total-delta",
+            "inventory:STALE:UNKNOWN",
+        ],
+    ],
+    ids=["missing", "stale", "extra"],
+)
+@pytest.mark.parametrize("decision", AUTHORIZING)
+def test_approve_mapping_or_supersession_needs_exact_current_blocker_ids(
+    addressed: list[str],
+    decision: HumanDecisionKind,
+) -> None:
+    risk = make_risk(
+        inventory=[make_comparison(InventoryStatus.EXCEEDS_STOCK)],
+        total_delta=Decimal("12.50"),
+        reasons=["policy trigger"],
+    )
+    review = make_review(decision, addressed)
+    remaining = decision_rules.unaddressed_blockers(risk, review.human_decision)
+    assert remaining
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        validate_final_decision(
+            DecisionKind.APPROVE,
+            True,
+            risk,
+            make_critique(DecisionKind.APPROVE),
+            review,
+        )
+    assert excinfo.value.stop_reason == "BLOCKING_EVIDENCE_UNRESOLVED"
 
 
 def test_blocking_evidence_ignores_non_blocking_statuses_and_zero_delta() -> None:

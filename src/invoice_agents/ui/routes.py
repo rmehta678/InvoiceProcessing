@@ -18,6 +18,7 @@ from fastapi import APIRouter, Form, Request, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from sse_starlette.sse import EventSourceResponse
 
+from invoice_agents.agents.decision_rules import AUTHORIZING_HUMAN_DECISIONS
 from invoice_agents.config import XAI_BASE_URL, XAI_MODEL, Settings
 from invoice_agents.db.core import DatabaseKind, verify_database
 from invoice_agents.db.store import WorkflowStore
@@ -335,9 +336,11 @@ def _review_context(request: Request, review: ReviewRequest) -> dict[str, Any]:
         "dates": bundle.get("dates") or [],
         "suspicious": bundle.get("suspicious_signals") or [],
         "unavailable": bundle.get("unavailable_reconciliations") or [],
+        "blocking_evidence": bundle.get("blocking_evidence") or [],
         "rendered_pages": bundle.get("rendered_pages") or [],
         "critique": review.critic,
         "decision_kinds": list(HumanDecisionKind),
+        "blocker_authorizing_decision_kinds": AUTHORIZING_HUMAN_DECISIONS,
         "consequences": DECISION_CONSEQUENCES,
         "unresolved_items": _unresolved_items(invoice),
         "inventory_rows": inventory_rows,
@@ -406,6 +409,7 @@ async def review_decide(
     mapping_raw: Annotated[list[str] | None, Form()] = None,
     mapping_sku: Annotated[list[str] | None, Form()] = None,
     superseded_case_id: Annotated[str | None, Form()] = None,
+    addressed_blocker_ids: Annotated[list[str] | None, Form()] = None,
 ) -> Response:
     settings = _settings(request)
     store = _store(request)
@@ -423,6 +427,7 @@ async def review_decide(
             "decision": decision or "",
             "reason": reason or "",
             "superseded_case_id": superseded_case_id or "",
+            "addressed_blocker_ids": addressed_blocker_ids or [],
         }
         return _render(request, "review_detail.html", context, status_code=400)
 
@@ -447,6 +452,7 @@ async def review_decide(
             settings.inventory_db,
             mappings=mappings,
             superseded_case_id=(superseded_case_id or "").strip() or None,
+            addressed_blocker_ids=addressed_blocker_ids,
         )
     except InvoiceAgentsError as exc:
         return rerender(str(exc))

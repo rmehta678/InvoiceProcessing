@@ -241,6 +241,15 @@ class RiskAssessment(StrictModel):
     policy_review_reasons: list[str]
 
 
+class EvidenceBlocker(StrictModel):
+    """Stable identity plus human-readable context for approval-blocking evidence."""
+
+    blocker_id: str
+    kind: Literal["inventory", "financial"]
+    evidence_id: str
+    description: str
+
+
 class Critique(StrictModel):
     supported_findings: list[str]
     challenged_findings: list[str]
@@ -258,6 +267,7 @@ class HumanDecision(StrictModel):
     decided_at: datetime
     mappings: list[CanonicalMapping] = Field(default_factory=list)
     superseded_case_id: str | None = None
+    addressed_blocker_ids: list[str] = Field(default_factory=list)
 
 
 class ReviewRequest(StrictModel):
