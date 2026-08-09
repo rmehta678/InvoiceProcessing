@@ -43,13 +43,25 @@ def _run_database_operation[OperationResult](
 def migrate_command(
     db: Annotated[Path, typer.Option("--db", help="Database file to create or migrate")],
     kind: Annotated[DatabaseKind | None, typer.Option()] = None,
+    inventory_db: Annotated[
+        Path | None,
+        typer.Option(
+            "--inventory-db",
+            help="Authoritative inventory database required for a legacy workflow v3 retrofit",
+        ),
+    ] = None,
 ) -> None:
     """Apply versioned migrations without seeding inferred data."""
 
     selected = kind or infer_kind(db)
+    settings = (
+        Settings(workflow_db=db, inventory_db=inventory_db)
+        if selected is DatabaseKind.WORKFLOW and inventory_db is not None
+        else None
+    )
     applied = _run_database_operation(
         "migrate",
-        lambda: migrate_database(db, selected),
+        lambda: migrate_database(db, selected, settings=settings),
     )
     typer.echo(f"database={db.resolve()} kind={selected.value} applied={applied}")
 

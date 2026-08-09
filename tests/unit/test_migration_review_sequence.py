@@ -432,6 +432,24 @@ def _durable_history_rows(path: Path) -> list[tuple[int, int, str, str]]:
         ]
 
 
+def _remove_durable_history(path: Path) -> None:
+    with connect_database(path) as connection:
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'trg_schema_migration_history_%'"
+        ).fetchall():
+            connection.execute(f'DROP TRIGGER "{row["name"]}"')
+        connection.execute("DROP TABLE schema_migration_history")
+        connection.commit()
+
+
+def _retrofit_settings(tmp_path: Path, workflow_db: Path) -> Settings:
+    inventory_db = tmp_path / "retrofit-inventory.db"
+    migrate_database(inventory_db, DatabaseKind.INVENTORY)
+    seed_inventory(inventory_db)
+    return Settings(workflow_db=workflow_db, inventory_db=inventory_db)
+
+
 def test_migration_003_backfills_digest_bound_immutable_durable_history(
     tmp_path: Path,
 ) -> None:
@@ -465,22 +483,122 @@ def test_existing_legitimate_v3_history_is_retrofitted_without_version_004(
 ) -> None:
     path = tmp_path / "existing-v3-history.db"
     migrate_database(path, DatabaseKind.WORKFLOW)
-    with connect_database(path) as connection:
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
-            "AND name LIKE 'trg_schema_migration_history_%'"
-        ).fetchall():
-            connection.execute(f'DROP TRIGGER "{row["name"]}"')
-        connection.execute("DROP TABLE schema_migration_history")
-        connection.commit()
+    _remove_durable_history(path)
+    settings = _retrofit_settings(tmp_path, path)
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == []
+    assert migrate_database(path, DatabaseKind.WORKFLOW, settings=settings) == []
     assert [row[:3] for row in _durable_history_rows(path)] == [
         (version, version, _packaged_workflow_hashes()[version]) for version in (1, 2, 3)
     ]
+    assert verify_database(path, DatabaseKind.WORKFLOW, settings=settings)["schema_version"] == 3
     assert not any(
         resource.name.startswith("004_") for resource in _migration_resources(DatabaseKind.WORKFLOW)
     )
+
+
+def test_legacy_v3_retrofit_rejects_missing_required_trigger_without_mutation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "false-v3-missing-trigger.db"
+    migrate_database(path, DatabaseKind.WORKFLOW)
+    _remove_durable_history(path)
+    settings = _retrofit_settings(tmp_path, path)
+    with connect_database(path) as connection:
+        connection.execute("DROP TRIGGER trg_payments_authorization_insert")
+        connection.commit()
+    before = path.read_bytes()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.WORKFLOW, settings=settings)
+
+    assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+    assert path.read_bytes() == before
+
+
+def test_legacy_v3_retrofit_requires_explicit_authorization_context_without_mutation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-v3-context-required.db"
+    migrate_database(path, DatabaseKind.WORKFLOW)
+    _remove_durable_history(path)
+    before = path.read_bytes()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.WORKFLOW)
+
+    assert excinfo.value.stop_reason == "DATABASE_AUTHORIZATION_CONTEXT_REQUIRED"
+    assert path.read_bytes() == before
+
+
+def test_legacy_v3_retrofit_rejects_invalid_authorization_before_history_install(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-v3-invalid-authorization.db"
+    migrate_database(path, DatabaseKind.WORKFLOW)
+    _remove_durable_history(path)
+    settings = _retrofit_settings(tmp_path, path)
+    at = "2026-08-09T12:00:00+00:00"
+    with connect_database(path) as connection:
+        connection.execute(
+            "INSERT INTO source_artifacts(source_id, canonical_path, source_hash, source_format, "
+            "size_bytes, modified_at, metadata_json, created_at) "
+            "VALUES ('src_invalid_retrofit', '/invalid/retrofit.txt', ?, 'txt', 1, ?, '{}', ?)",
+            ("a" * 64, at, at),
+        )
+        connection.execute(
+            "INSERT INTO cases(case_id, source_id, status, started_at, updated_at) "
+            "VALUES ('case_invalid_retrofit', 'src_invalid_retrofit', 'INCOMPLETE', ?, ?)",
+            (at, at),
+        )
+        connection.execute(
+            "INSERT INTO review_requests(review_id, case_id, sequence, status, payload_json, "
+            "created_at, execution_generation, evidence_snapshot_digest) "
+            "VALUES ('review_invalid_retrofit', 'case_invalid_retrofit', 1, 'PENDING', "
+            "'{}', ?, 1, ?)",
+            (at, "b" * 64),
+        )
+        connection.commit()
+    before = path.read_bytes()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.WORKFLOW, settings=settings)
+
+    assert excinfo.value.stop_reason == "DATABASE_AUTHORIZATION_PROVENANCE_INVALID"
+    assert excinfo.value.details["invalid_review_count"] == 1
+    assert path.read_bytes() == before
+
+
+def test_legacy_v3_retrofit_revalidates_contract_after_write_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "legacy-v3-retrofit-race.db"
+    migrate_database(path, DatabaseKind.WORKFLOW)
+    _remove_durable_history(path)
+    settings = _retrofit_settings(tmp_path, path)
+    real_preflight = core_module._preflight_existing_migration_history
+    raced_bytes: list[bytes] = []
+
+    def mutate_after_preflight(*args: object, **kwargs: object) -> object:
+        result = real_preflight(*args, **kwargs)  # type: ignore[arg-type]
+        with connect_database(path) as connection:
+            connection.execute("DROP TRIGGER trg_payments_authorization_insert")
+            connection.commit()
+        raced_bytes.append(path.read_bytes())
+        return result
+
+    monkeypatch.setattr(
+        core_module,
+        "_preflight_existing_migration_history",
+        mutate_after_preflight,
+    )
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.WORKFLOW, settings=settings)
+
+    assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+    assert len(raced_bytes) == 1
+    assert path.read_bytes() == raced_bytes[0]
 
 
 @pytest.mark.parametrize(

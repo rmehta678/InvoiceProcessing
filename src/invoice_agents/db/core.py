@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from functools import lru_cache
+from functools import cache
 from importlib.resources import files
 from importlib.resources.abc import Traversable
 from pathlib import Path
@@ -102,6 +102,37 @@ class TableSchemaManifest:
     foreign_keys: tuple[SchemaForeignKeyManifest, ...]
     indexes: tuple[SchemaIndexManifest, ...]
     triggers: tuple[SchemaTriggerManifest, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaObjectManifest:
+    object_type: str
+    name: str
+    table_name: str
+    normalized_sql: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowSchemaManifest:
+    tables: tuple[TableSchemaManifest, ...]
+    objects: tuple[SchemaObjectManifest, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MigrationPreflight:
+    history: tuple[int, ...]
+    version_neutral_install_required: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowVersionNeutralState:
+    applies: bool
+    durable_history_exists: bool
+    archive_install_required: bool
+
+    @property
+    def install_required(self) -> bool:
+        return self.applies and (self.archive_install_required or not self.durable_history_exists)
 
 
 # Required version per database kind; preflight rejects anything else, in either
@@ -559,25 +590,168 @@ def _backfill_durable_migration_history(
     )
 
 
+def _inspect_workflow_version_neutral_contract(
+    connection: sqlite3.Connection,
+    *,
+    history: tuple[int, ...],
+) -> WorkflowVersionNeutralState:
+    """Validate the installed migration prefix before any version-neutral write."""
+
+    if not history or history[-1] < 3:
+        return WorkflowVersionNeutralState(
+            applies=False,
+            durable_history_exists=False,
+            archive_install_required=False,
+        )
+    integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+    if integrity != "ok":
+        raise DatabaseVerificationError(
+            ErrorCategory.DATABASE,
+            f"SQLite integrity_check returned {integrity}",
+            stop_reason="DATABASE_INTEGRITY_FAILED",
+        )
+    durable_history_exists = bool(
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migration_history'"
+        ).fetchone()
+    )
+    archive_install_required = _verify_schema_manifest(
+        connection,
+        _expected_workflow_schema_manifest(
+            history,
+            include_durable_history=durable_history_exists,
+        ),
+        allow_partial_empty_archive=True,
+    )
+    return WorkflowVersionNeutralState(
+        applies=True,
+        durable_history_exists=durable_history_exists,
+        archive_install_required=archive_install_required,
+    )
+
+
+def _retrofit_inventory_path(
+    workflow_path: Path,
+    settings: Settings | None,
+) -> Path:
+    if settings is None:
+        raise DatabaseVerificationError(
+            ErrorCategory.CONFIGURATION,
+            "legacy workflow v3 retrofit requires explicit Settings authorization context",
+            stop_reason="DATABASE_AUTHORIZATION_CONTEXT_REQUIRED",
+        )
+    if settings.workflow_db.resolve() != workflow_path:
+        raise DatabaseVerificationError(
+            ErrorCategory.CONFIGURATION,
+            "legacy workflow v3 retrofit Settings do not identify the database being migrated",
+            stop_reason="DATABASE_AUTHORIZATION_CONTEXT_MISMATCH",
+        )
+    inventory_path = settings.inventory_db.resolve()
+    _assert_sqlite_file(inventory_path)
+    return inventory_path
+
+
+def _attach_retrofit_inventory(
+    connection: sqlite3.Connection,
+    inventory_path: Path,
+    *,
+    read_only: bool,
+) -> None:
+    target = f"{inventory_path.as_uri()}?mode=ro" if read_only else str(inventory_path)
+    connection.execute("ATTACH DATABASE ? AS authorization_inventory", (target,))
+
+
+def _audit_workflow_retrofit_authorization(
+    connection: sqlite3.Connection,
+    settings: Settings,
+    *,
+    archive_install_required: bool,
+) -> None:
+    _verify_attached_inventory_context(connection)
+    from invoice_agents.db.authorization_audit import audit_active_workflow_authorization
+
+    invalid = audit_active_workflow_authorization(
+        connection,
+        settings,
+        inventory_schema="authorization_inventory",
+    )
+    if not archive_install_required:
+        from invoice_agents.db.legacy_archive import audit_legacy_authorization_archives
+
+        invalid["invalid_quarantine_count"] = audit_legacy_authorization_archives(connection)
+    if any(invalid.values()):
+        raise DatabaseVerificationError(
+            ErrorCategory.DATABASE,
+            "legacy workflow v3 authorization provenance is incomplete or inconsistent",
+            stop_reason="DATABASE_AUTHORIZATION_PROVENANCE_INVALID",
+            details=invalid,
+        )
+
+
 def _preflight_existing_migration_history(
     path: Path,
     *,
     kind: DatabaseKind,
     packaged_versions: tuple[int, ...],
     packaged_hashes: dict[int, str],
-) -> tuple[int, ...] | None:
+    settings: Settings | None = None,
+) -> MigrationPreflight | None:
     """Validate a present SQLite file without opening any write transaction."""
 
     if not path.exists() or path.stat().st_size == 0:
         return None
     _assert_sqlite_file(path)
     with connect_database(path, read_only=True) as connection:
-        return _read_migration_history(
+        history = _read_migration_history(
             connection,
             kind=kind,
             packaged_versions=packaged_versions,
             packaged_hashes=packaged_hashes,
             allow_durable_retrofit=True,
+        )
+        version_neutral_state = (
+            _inspect_workflow_version_neutral_contract(connection, history=history)
+            if kind is DatabaseKind.WORKFLOW
+            else WorkflowVersionNeutralState(
+                applies=False,
+                durable_history_exists=False,
+                archive_install_required=False,
+            )
+        )
+        if kind is DatabaseKind.WORKFLOW and version_neutral_state.install_required:
+            inventory_path = _retrofit_inventory_path(path, settings)
+            _attach_retrofit_inventory(connection, inventory_path, read_only=True)
+            connection.execute("BEGIN")
+            connection.execute(
+                "SELECT (SELECT COUNT(*) FROM main.sqlite_schema), "
+                "(SELECT COUNT(*) FROM authorization_inventory.sqlite_schema)"
+            ).fetchone()
+            locked_history = _read_migration_history(
+                connection,
+                kind=kind,
+                packaged_versions=packaged_versions,
+                packaged_hashes=packaged_hashes,
+                allow_durable_retrofit=True,
+            )
+            locked_state = _inspect_workflow_version_neutral_contract(
+                connection,
+                history=locked_history,
+            )
+            if history != locked_history or not locked_state.install_required:
+                raise DatabaseVerificationError(
+                    ErrorCategory.DATABASE,
+                    "legacy workflow v3 changed during read-only retrofit preflight",
+                    stop_reason="DATABASE_SCHEMA_MISMATCH",
+                )
+            assert settings is not None
+            _audit_workflow_retrofit_authorization(
+                connection,
+                settings,
+                archive_install_required=locked_state.archive_install_required,
+            )
+        return MigrationPreflight(
+            history=history,
+            version_neutral_install_required=version_neutral_state.install_required,
         )
 
 
@@ -790,14 +964,14 @@ def _normalized_sql(sql: str) -> str:
                         exponent += 1
                     if exponent > digits:
                         end = exponent
-            tokens.append(("unquoted", sql[index:end].casefold()))
+            tokens.append(("unquoted", _ascii_lower(sql[index:end])))
             index = end
             continue
         if character.isalpha() or character in "_$":
             end = index + 1
             while end < length and (sql[end].isalnum() or sql[end] in "_$"):
                 end += 1
-            tokens.append(("unquoted", sql[index:end].casefold()))
+            tokens.append(("unquoted", _ascii_lower(sql[index:end])))
             index = end
             continue
         operator = next(
@@ -841,26 +1015,12 @@ def _normalized_sql(sql: str) -> str:
     return json.dumps(tokens, ensure_ascii=False, separators=(",", ":"))
 
 
-WORKFLOW_SCHEMA_MANIFEST_TABLES = (
-    "schema_version",
-    "schema_migration_history",
-    "source_artifacts",
-    "cases",
-    "extractions",
-    "identity_results",
-    "comparison_results",
-    "critique_results",
-    "review_requests",
-    "human_decisions",
-    "validated_evidence_snapshots",
-    "final_decisions",
-    "payments",
-    "legacy_authorization_reconciliations",
-    "legacy_authorization_database_snapshots",
-    "legacy_authorization_table_manifests",
-    "legacy_authorization_quarantine",
-    "events",
-)
+def _ascii_lower(value: str) -> str:
+    """Match SQLite's built-in identifier folding without changing Unicode bytes."""
+
+    return "".join(
+        chr(ord(character) + 32) if "A" <= character <= "Z" else character for character in value
+    )
 
 
 def _quote_identifier(value: str) -> str:
@@ -959,9 +1119,33 @@ def _table_schema_manifest(
     )
 
 
-@lru_cache(maxsize=1)
-def _expected_workflow_schema_manifest() -> tuple[TableSchemaManifest, ...]:
-    """Build the exact ordered contract from the packaged migration resources."""
+def _schema_object_manifest(
+    connection: sqlite3.Connection,
+) -> tuple[SchemaObjectManifest, ...]:
+    """Inventory every persistent SQLite schema object, including autoindexes."""
+
+    return tuple(
+        SchemaObjectManifest(
+            object_type=str(row["type"]),
+            name=str(row["name"]),
+            table_name=str(row["tbl_name"]),
+            normalized_sql=(_normalized_sql(str(row["sql"])) if row["sql"] is not None else None),
+        )
+        for row in connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE type IN ('table', 'index', 'trigger', 'view') "
+            "ORDER BY type, name, tbl_name"
+        ).fetchall()
+    )
+
+
+@cache
+def _expected_workflow_schema_manifest(
+    versions: tuple[int, ...] | None = None,
+    *,
+    include_durable_history: bool = True,
+) -> WorkflowSchemaManifest:
+    """Build the complete exact contract from the selected packaged migrations."""
 
     reference = sqlite3.connect(":memory:")
     reference.row_factory = sqlite3.Row
@@ -969,24 +1153,72 @@ def _expected_workflow_schema_manifest() -> tuple[TableSchemaManifest, ...]:
         reference.execute(
             "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
-        for resource in _migration_resources(DatabaseKind.WORKFLOW):
+        resources = _migration_resources(DatabaseKind.WORKFLOW)
+        selected_versions = (
+            versions
+            if versions is not None
+            else _migration_versions(resources, DatabaseKind.WORKFLOW)
+        )
+        for resource in resources:
+            version = int(resource.name.split("_", 1)[0])
+            if version not in selected_versions:
+                continue
             reference.executescript(resource.read_text(encoding="utf-8"))
+        if not include_durable_history:
+            reference.execute("DROP TABLE schema_migration_history")
         reference.executescript(
             files("invoice_agents.db")
             .joinpath("migrations", "workflow", "legacy_authorization_archive.sql")
             .read_text(encoding="utf-8")
         )
-        return tuple(
-            _table_schema_manifest(reference, table) for table in WORKFLOW_SCHEMA_MANIFEST_TABLES
+        table_names = tuple(
+            str(row["name"])
+            for row in reference.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        )
+        return WorkflowSchemaManifest(
+            tables=tuple(_table_schema_manifest(reference, table) for table in table_names),
+            objects=_schema_object_manifest(reference),
         )
     finally:
         reference.close()
 
 
-def _verify_workflow_schema_manifest(connection: sqlite3.Connection) -> None:
-    expected = _expected_workflow_schema_manifest()
+def _is_legacy_archive_table(name: str) -> bool:
+    return name.startswith("legacy_authorization_")
+
+
+def _is_legacy_archive_object(item: SchemaObjectManifest) -> bool:
+    return _is_legacy_archive_table(item.name) or _is_legacy_archive_table(item.table_name)
+
+
+def _verify_schema_manifest(
+    connection: sqlite3.Connection,
+    expected: WorkflowSchemaManifest,
+    *,
+    allow_partial_empty_archive: bool,
+) -> bool:
+    """Verify one exact schema; return whether optional archive objects are absent."""
+
+    expected_archive_tables = {
+        table.name for table in expected.tables if _is_legacy_archive_table(table.name)
+    }
+    actual_objects = _schema_object_manifest(connection)
+    actual_archive_tables = {
+        item.name
+        for item in actual_objects
+        if item.object_type == "table" and item.name in expected_archive_tables
+    }
+    missing_archive_tables = expected_archive_tables - actual_archive_tables
+    compared_tables = tuple(
+        table
+        for table in expected.tables
+        if not _is_legacy_archive_table(table.name) or table.name in actual_archive_tables
+    )
     invalid: list[str] = []
-    for table_manifest in expected:
+    for table_manifest in compared_tables:
         try:
             actual = _table_schema_manifest(connection, table_manifest.name)
         except ValueError:
@@ -997,10 +1229,62 @@ def _verify_workflow_schema_manifest(connection: sqlite3.Connection) -> None:
     if invalid:
         raise DatabaseVerificationError(
             ErrorCategory.DATABASE,
-            f"workflow schema definitions differ from the ordered manifest: {invalid}",
+            "workflow schema definitions differ from the complete packaged manifest",
             stop_reason="DATABASE_SCHEMA_MISMATCH",
             details={"invalid_schema_definitions": invalid},
         )
+    expected_by_identity = {
+        (item.object_type, item.name, item.table_name): item
+        for item in expected.objects
+        if not _is_legacy_archive_object(item) or item.table_name in actual_archive_tables
+    }
+    actual_by_identity = {
+        (item.object_type, item.name, item.table_name): item for item in actual_objects
+    }
+    missing_objects = sorted(set(expected_by_identity) - set(actual_by_identity))
+    unexpected_objects = sorted(set(actual_by_identity) - set(expected_by_identity))
+    changed_objects = sorted(
+        identity
+        for identity in set(expected_by_identity) & set(actual_by_identity)
+        if expected_by_identity[identity] != actual_by_identity[identity]
+    )
+    if missing_archive_tables and not allow_partial_empty_archive:
+        missing_objects.extend(("table", table, table) for table in sorted(missing_archive_tables))
+    if missing_objects or unexpected_objects or changed_objects:
+        raise DatabaseVerificationError(
+            ErrorCategory.DATABASE,
+            "workflow schema definitions differ from the complete packaged manifest",
+            stop_reason="DATABASE_SCHEMA_MISMATCH",
+            details={
+                "invalid_schema_definitions": [],
+                "missing_schema_objects": missing_objects,
+                "unexpected_schema_objects": unexpected_objects,
+                "changed_schema_objects": changed_objects,
+            },
+        )
+    if missing_archive_tables:
+        archived_rows = sum(
+            int(
+                connection.execute(f"SELECT COUNT(*) FROM {_quote_identifier(table)}").fetchone()[0]
+            )
+            for table in actual_archive_tables
+        )
+        if archived_rows:
+            raise DatabaseVerificationError(
+                ErrorCategory.DATABASE,
+                "an existing legacy authorization archive cannot be upgraded losslessly",
+                stop_reason="LEGACY_RECONCILIATION_ARCHIVE_UPGRADE_REQUIRED",
+                details={"missing_archive_tables": sorted(missing_archive_tables)},
+            )
+    return bool(missing_archive_tables)
+
+
+def _verify_workflow_schema_manifest(connection: sqlite3.Connection) -> None:
+    _verify_schema_manifest(
+        connection,
+        _expected_workflow_schema_manifest(),
+        allow_partial_empty_archive=False,
+    )
 
 
 def _require_reconciled_workflow_authorization(
@@ -1080,13 +1364,13 @@ def reconcile_legacy_authorization(
     resources = _migration_resources(DatabaseKind.WORKFLOW)
     packaged_versions = _migration_versions(resources, DatabaseKind.WORKFLOW)
     packaged_hashes = _migration_hashes(resources)
-    expected_history = _preflight_existing_migration_history(
+    preflight = _preflight_existing_migration_history(
         resolved,
         kind=DatabaseKind.WORKFLOW,
         packaged_versions=packaged_versions,
         packaged_hashes=packaged_hashes,
     )
-    assert expected_history is not None
+    assert preflight is not None
     with connect_database(resolved) as connection:
         try:
             current_history = _read_migration_history(
@@ -1095,7 +1379,7 @@ def reconcile_legacy_authorization(
                 packaged_versions=packaged_versions,
                 packaged_hashes=packaged_hashes,
             )
-            if current_history != expected_history:
+            if current_history != preflight.history:
                 raise DatabaseVerificationError(
                     ErrorCategory.DATABASE,
                     "workflow migration history changed during reconciliation preflight",
@@ -1367,7 +1651,12 @@ def reconcile_legacy_authorization(
             ) from exc
 
 
-def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
+def migrate_database(
+    path: Path,
+    kind: DatabaseKind | None = None,
+    *,
+    settings: Settings | None = None,
+) -> list[int]:
     """Apply unapplied migrations; this is never called by normal processing."""
 
     selected_kind = kind or infer_kind(path)
@@ -1375,16 +1664,17 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
     resources = _migration_resources(selected_kind)
     packaged_versions = _migration_versions(resources, selected_kind)
     packaged_hashes = _migration_hashes(resources)
-    expected_history = _preflight_existing_migration_history(
+    preflight = _preflight_existing_migration_history(
         path,
         kind=selected_kind,
         packaged_versions=packaged_versions,
         packaged_hashes=packaged_hashes,
+        settings=settings,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     applied: list[int] = []
     with connect_database(path) as connection:
-        if expected_history is None:
+        if preflight is None:
             connection.execute(
                 "CREATE TABLE schema_version ("
                 "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
@@ -1399,7 +1689,7 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
                 packaged_hashes=packaged_hashes,
                 allow_durable_retrofit=True,
             )
-            if history != expected_history:
+            if history != preflight.history:
                 raise DatabaseVerificationError(
                     ErrorCategory.DATABASE,
                     f"{selected_kind.value} migration history changed during preflight",
@@ -1408,10 +1698,33 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
         existing = set(history)
         if (
             selected_kind is DatabaseKind.WORKFLOW
-            and SCHEMA_VERSIONS[DatabaseKind.WORKFLOW] in existing
+            and preflight is not None
+            and preflight.version_neutral_install_required
         ):
             try:
+                inventory_path = _retrofit_inventory_path(path, settings)
+                _attach_retrofit_inventory(connection, inventory_path, read_only=False)
                 connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "SELECT (SELECT COUNT(*) FROM main.sqlite_schema), "
+                    "(SELECT COUNT(*) FROM authorization_inventory.sqlite_schema)"
+                ).fetchone()
+                version_neutral_state = _inspect_workflow_version_neutral_contract(
+                    connection,
+                    history=history,
+                )
+                if not version_neutral_state.install_required:
+                    raise DatabaseVerificationError(
+                        ErrorCategory.DATABASE,
+                        "workflow version-neutral schema changed during preflight",
+                        stop_reason="DATABASE_SCHEMA_MISMATCH",
+                    )
+                assert settings is not None
+                _audit_workflow_retrofit_authorization(
+                    connection,
+                    settings,
+                    archive_install_required=version_neutral_state.archive_install_required,
+                )
                 _install_legacy_archive_schema(connection)
                 durable_history_exists = connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' "
@@ -1425,6 +1738,14 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
                         packaged_hashes=packaged_hashes,
                         applied_at=utc_now(),
                     )
+                _verify_schema_manifest(
+                    connection,
+                    _expected_workflow_schema_manifest(
+                        history,
+                        include_durable_history=True,
+                    ),
+                    allow_partial_empty_archive=False,
+                )
                 _read_migration_history(
                     connection,
                     kind=selected_kind,
@@ -1550,7 +1871,11 @@ def ensure_databases(settings: Settings) -> dict[str, list[int]]:
     workflow_db = settings.workflow_db
     applied = {
         DatabaseKind.INVENTORY.value: migrate_database(inventory_db, DatabaseKind.INVENTORY),
-        DatabaseKind.WORKFLOW.value: migrate_database(workflow_db, DatabaseKind.WORKFLOW),
+        DatabaseKind.WORKFLOW.value: migrate_database(
+            workflow_db,
+            DatabaseKind.WORKFLOW,
+            settings=settings,
+        ),
     }
     seed_inventory(inventory_db)
     verify_database(inventory_db, DatabaseKind.INVENTORY)

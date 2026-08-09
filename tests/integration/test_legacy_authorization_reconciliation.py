@@ -846,7 +846,7 @@ def test_explicit_migrate_retrofits_version_neutral_archive_schema_on_existing_v
         connection.execute("DROP TABLE legacy_authorization_reconciliations")
         connection.commit()
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == []
+    assert migrate_database(path, DatabaseKind.WORKFLOW, settings=settings) == []
     assert verify_database(path, DatabaseKind.WORKFLOW, settings=settings)["schema_version"] == 3
 
 

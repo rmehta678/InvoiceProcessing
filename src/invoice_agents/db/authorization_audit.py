@@ -348,13 +348,13 @@ def _audit_payment_row(
     return payment
 
 
-def audit_workflow_authorization(
+def audit_active_workflow_authorization(
     connection: sqlite3.Connection,
     settings: Settings,
     *,
     inventory_schema: str,
 ) -> dict[str, int]:
-    """Enumerate and revalidate every active authorization row without mutation."""
+    """Enumerate and revalidate active authorization rows without archive assumptions."""
 
     counts = {key: 0 for key in AUDIT_COUNT_KEYS}
     counts["invalid_cardinality_count"] = _invalid_authorization_cardinality(connection)
@@ -414,8 +414,23 @@ def audit_workflow_authorization(
         except _AUDIT_ERRORS:
             counts["invalid_payment_count"] += 1
 
+    return counts
+
+
+def audit_workflow_authorization(
+    connection: sqlite3.Connection,
+    settings: Settings,
+    *,
+    inventory_schema: str,
+) -> dict[str, int]:
+    """Enumerate and revalidate every active and archived authorization record."""
+
+    counts = audit_active_workflow_authorization(
+        connection,
+        settings,
+        inventory_schema=inventory_schema,
+    )
     from invoice_agents.db.legacy_archive import audit_legacy_authorization_archives
 
     counts["invalid_quarantine_count"] = audit_legacy_authorization_archives(connection)
-
     return counts
