@@ -22,6 +22,24 @@ from invoice_agents.db.core import DatabaseKind, migrate_database
 from invoice_agents.errors import DatabaseVerificationError, ErrorCategory
 
 
+def _assert_processes_gone(process_ids: list[int]) -> None:
+    for process_id in process_ids:
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                os.kill(process_id, 0)
+            except ProcessLookupError:
+                break
+            assert time.monotonic() < deadline, f"worker process {process_id} survived"
+            time.sleep(0.01)
+
+
+def _kill_processes(process_ids: list[int]) -> None:
+    for process_id in process_ids:
+        with suppress(ProcessLookupError):
+            os.kill(process_id, 9)
+
+
 def _build_large_v2_workflow(path: Path) -> None:
     resources = core_module._migration_resources(DatabaseKind.WORKFLOW)
     with sqlite3.connect(path) as connection:
@@ -244,49 +262,132 @@ def test_worker_crash_reaps_descendants_that_keep_the_protocol_pipe_open(
         process_ids = [int(value) for value in pid_path.read_text().split()]
 
         assert excinfo.value.stop_reason == "MIGRATION_WORKER_CRASHED"
-        for process_id in process_ids:
-            deadline = time.monotonic() + 2
-            while True:
-                try:
-                    os.kill(process_id, 0)
-                except ProcessLookupError:
-                    break
-                assert time.monotonic() < deadline, f"worker descendant {process_id} survived"
-                time.sleep(0.01)
+        _assert_processes_gone(process_ids)
     finally:
-        for process_id in process_ids:
-            with suppress(ProcessLookupError):
-                os.kill(process_id, 9)
+        _kill_processes(process_ids)
+
+
+def test_worker_success_reaps_same_session_descendant_with_closed_stdio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid_path = tmp_path / "successful-worker-tree.pids"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import os,pathlib,subprocess,sys,time; "
+            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            f"pathlib.Path({str(pid_path)!r}).write_text(f'{{os.getpid()}} {{child.pid}}'); "
+            'print(\'{"ok":true,"applied":[]}\')'
+        ),
+    ]
+    monkeypatch.setattr(migration_process, "_worker_command", lambda: command)
+    process_ids: list[int] = []
+
+    try:
+        assert (
+            migration_process.run_migration_in_subprocess(
+                tmp_path / "success-tree.db",
+                DatabaseKind.INVENTORY,
+                settings=None,
+            )
+            == []
+        )
+        process_ids = [int(value) for value in pid_path.read_text().split()]
+        _assert_processes_gone(process_ids)
+    finally:
+        _kill_processes(process_ids)
+
+
+def test_worker_expected_error_reaps_same_session_descendant_with_closed_stdio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid_path = tmp_path / "expected-error-worker-tree.pids"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import json,os,pathlib,subprocess,sys; "
+            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            f"pathlib.Path({str(pid_path)!r}).write_text(f'{{os.getpid()}} {{child.pid}}'); "
+            "print(json.dumps({'ok':False,'error':{'category':'DATABASE',"
+            "'message':'schema audit failed','stop_reason':'MIGRATION_HISTORY_INVALID',"
+            "'details':None}}))"
+        ),
+    ]
+    monkeypatch.setattr(migration_process, "_worker_command", lambda: command)
+    process_ids: list[int] = []
+
+    try:
+        with pytest.raises(DatabaseVerificationError) as excinfo:
+            migration_process.run_migration_in_subprocess(
+                tmp_path / "expected-error-tree.db",
+                DatabaseKind.INVENTORY,
+                settings=None,
+            )
+        process_ids = [int(value) for value in pid_path.read_text().split()]
+
+        assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
+        _assert_processes_gone(process_ids)
+    finally:
+        _kill_processes(process_ids)
+
+
+def test_worker_normal_success_does_not_wait_for_shutdown_grace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = [sys.executable, "-c", 'print(\'{"ok":true,"applied":[]}\')']
+    monkeypatch.setattr(migration_process, "_worker_command", lambda: command)
+    started = time.monotonic()
+
+    result = migration_process.run_migration_in_subprocess(
+        tmp_path / "ordinary-success.db",
+        DatabaseKind.INVENTORY,
+        settings=None,
+    )
+
+    assert result == []
+    assert time.monotonic() - started < 1.0
 
 
 def test_worker_timeout_reaps_the_spawned_process(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pid_path = tmp_path / "worker.pid"
+    pid_path = tmp_path / "timeout-worker-tree.pids"
     command = [
         sys.executable,
         "-c",
         (
-            "import os,pathlib,time; "
-            f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+            "import os,pathlib,subprocess,sys,time; "
+            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            f"pathlib.Path({str(pid_path)!r}).write_text(f'{{os.getpid()}} {{child.pid}}'); "
             "time.sleep(60)"
         ),
     ]
     monkeypatch.setattr(migration_process, "_worker_command", lambda: command)
     monkeypatch.setattr(migration_process, "MIGRATION_WORKER_TIMEOUT_SECONDS", 0.1)
 
-    with pytest.raises(DatabaseVerificationError) as excinfo:
-        migration_process.run_migration_in_subprocess(
-            tmp_path / "timeout.db",
-            DatabaseKind.INVENTORY,
-            settings=None,
-        )
+    process_ids: list[int] = []
+    try:
+        with pytest.raises(DatabaseVerificationError) as excinfo:
+            migration_process.run_migration_in_subprocess(
+                tmp_path / "timeout.db",
+                DatabaseKind.INVENTORY,
+                settings=None,
+            )
 
-    assert excinfo.value.stop_reason == "MIGRATION_WORKER_TIMEOUT"
-    worker_pid = int(pid_path.read_text())
-    with pytest.raises(ProcessLookupError):
-        os.kill(worker_pid, 0)
+        assert excinfo.value.stop_reason == "MIGRATION_WORKER_TIMEOUT"
+        process_ids = [int(value) for value in pid_path.read_text().split()]
+        _assert_processes_gone(process_ids)
+    finally:
+        _kill_processes(process_ids)
 
 
 def test_worker_protocol_is_bounded_and_does_not_surface_raw_stdout(
@@ -294,13 +395,15 @@ def test_worker_protocol_is_bounded_and_does_not_surface_raw_stdout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     secret = "sk-proj-oversized-worker-output-secret"
-    pid_path = tmp_path / "oversized-worker.pid"
+    pid_path = tmp_path / "oversized-worker-tree.pids"
     command = [
         sys.executable,
         "-c",
         (
-            "import os,pathlib,time; "
-            f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+            "import os,pathlib,subprocess,sys,time; "
+            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            f"pathlib.Path({str(pid_path)!r}).write_text(f'{{os.getpid()}} {{child.pid}}'); "
             f"os.write(1, ({secret!r}.encode() * 2000)); "
             "time.sleep(60)"
         ),
@@ -308,18 +411,21 @@ def test_worker_protocol_is_bounded_and_does_not_surface_raw_stdout(
     monkeypatch.setattr(migration_process, "_worker_command", lambda: command)
     monkeypatch.setattr(migration_process, "MIGRATION_WORKER_TIMEOUT_SECONDS", 0.5)
 
-    with pytest.raises(DatabaseVerificationError) as excinfo:
-        migration_process.run_migration_in_subprocess(
-            tmp_path / "oversized.db",
-            DatabaseKind.INVENTORY,
-            settings=None,
-        )
+    process_ids: list[int] = []
+    try:
+        with pytest.raises(DatabaseVerificationError) as excinfo:
+            migration_process.run_migration_in_subprocess(
+                tmp_path / "oversized.db",
+                DatabaseKind.INVENTORY,
+                settings=None,
+            )
 
-    assert excinfo.value.stop_reason == "MIGRATION_WORKER_PROTOCOL_INVALID"
-    assert secret not in str(excinfo.value)
-    worker_pid = int(pid_path.read_text())
-    with pytest.raises(ProcessLookupError):
-        os.kill(worker_pid, 0)
+        assert excinfo.value.stop_reason == "MIGRATION_WORKER_PROTOCOL_INVALID"
+        assert secret not in str(excinfo.value)
+        process_ids = [int(value) for value in pid_path.read_text().split()]
+        _assert_processes_gone(process_ids)
+    finally:
+        _kill_processes(process_ids)
 
 
 def test_worker_request_serializes_explicit_settings_without_provider_secret(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import select
 import selectors
 import signal
 import subprocess
@@ -12,6 +13,7 @@ import sys
 import tempfile
 import time
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,61 @@ _SERIALIZED_SETTINGS_FIELDS = frozenset(
         "log_level",
     }
 )
+
+
+class _WorkerExitWatcher:
+    """Observe a child exit without reaping its identity before group cleanup."""
+
+    def __init__(self, process_id: int) -> None:
+        self._process_id = process_id
+        self._exited = False
+        self._kqueue: Any | None = None
+        self._pidfd: int | None = None
+        if sys.platform == "darwin" and hasattr(select, "kqueue"):
+            self._kqueue = select.kqueue()
+            event = select.kevent(
+                process_id,
+                filter=select.KQ_FILTER_PROC,
+                flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                fflags=select.KQ_NOTE_EXIT,
+            )
+            self._kqueue.control([event], 0, 0)
+            return
+        pidfd_open = getattr(os, "pidfd_open", None)
+        if sys.platform.startswith("linux") and pidfd_open is not None:
+            self._pidfd = int(pidfd_open(process_id))
+            return
+        raise OSError("platform cannot observe a worker exit without reaping it")
+
+    def wait(self, timeout: float) -> bool:
+        if self._exited:
+            return True
+        bounded_timeout = max(0.0, timeout)
+        if self._kqueue is not None:
+            self._exited = bool(self._kqueue.control(None, 1, bounded_timeout))
+        elif self._pidfd is not None:
+            readable, _, _ = select.select([self._pidfd], [], [], bounded_timeout)
+            self._exited = bool(readable)
+        return self._exited
+
+    def close(self) -> None:
+        if self._kqueue is not None:
+            self._kqueue.close()
+            self._kqueue = None
+        if self._pidfd is not None:
+            os.close(self._pidfd)
+            self._pidfd = None
+
+
+@dataclass(slots=True)
+class _WorkerSession:
+    """A dedicated child session whose leader remains unreaped during cleanup."""
+
+    process: subprocess.Popen[bytes]
+    process_id: int
+    process_group_id: int
+    session_id: int
+    exit_watcher: _WorkerExitWatcher
 
 
 def _worker_command() -> list[str]:
@@ -229,21 +286,131 @@ def _decode_response(encoded: bytes) -> list[int]:
     raise return_error
 
 
-def _stop_worker(process: subprocess.Popen[bytes]) -> None:
-    with suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGTERM)
-    if process.poll() is None:
-        with suppress(subprocess.TimeoutExpired):
+def _capture_worker_session(process: subprocess.Popen[bytes]) -> _WorkerSession:
+    """Capture the start_new_session identity before any operation can reap it."""
+
+    process_id = process.pid
+    exit_watcher = _WorkerExitWatcher(process_id)
+    try:
+        process_group_id = os.getpgid(process_id)
+        session_id = os.getsid(process_id)
+    except ProcessLookupError:
+        # Popen(start_new_session=True) completed setsid before exec. A fast child may
+        # already be an unreaped zombie on Darwin, where getpgid/getsid return ESRCH.
+        process_group_id = process_id
+        session_id = process_id
+    if process_group_id != process_id or session_id != process_id:
+        exit_watcher.close()
+        raise OSError("migration worker did not enter its dedicated session")
+    return _WorkerSession(
+        process=process,
+        process_id=process_id,
+        process_group_id=process_group_id,
+        session_id=session_id,
+        exit_watcher=exit_watcher,
+    )
+
+
+def _signal_worker_group(worker: _WorkerSession, signal_number: int) -> None:
+    """Signal only the captured group while its unreaped leader prevents ID reuse."""
+
+    # Darwin reports EPERM rather than ESRCH when the group contains only its
+    # already-exited, unreaped leader. In either case there is no live target.
+    with suppress(ProcessLookupError, PermissionError):
+        os.killpg(worker.process_group_id, signal_number)
+
+
+def _worker_group_members(worker: _WorkerSession) -> tuple[int, ...] | None:
+    """List still-present same-session members other than the unreaped leader."""
+
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,pgid=,stat="],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    members: list[int] = []
+    for line in completed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 3:
+            continue
+        try:
+            process_id = int(fields[0])
+            process_group_id = int(fields[1])
+        except ValueError:
+            continue
+        if process_id == worker.process_id or process_group_id != worker.process_group_id:
+            continue
+        try:
+            if (
+                os.getpgid(process_id) != worker.process_group_id
+                or os.getsid(process_id) != worker.session_id
+            ):
+                continue
+        except OSError:
+            continue
+        members.append(process_id)
+    return tuple(members)
+
+
+def _wait_for_worker_group_empty(worker: _WorkerSession, timeout: float) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        members = _worker_group_members(worker)
+        if members == ():
+            return True
+        if members is None or time.monotonic() >= deadline:
+            return False
+        time.sleep(min(_WORKER_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+
+
+def _stop_worker(worker: _WorkerSession) -> None:
+    """Terminate the dedicated group and reap its leader on every return path."""
+
+    process = worker.process
+    try:
+        if not worker.exit_watcher.wait(0):
+            _signal_worker_group(worker, signal.SIGTERM)
+            if not worker.exit_watcher.wait(_WORKER_SHUTDOWN_SECONDS):
+                _signal_worker_group(worker, signal.SIGKILL)
+                worker.exit_watcher.wait(_WORKER_SHUTDOWN_SECONDS)
+
+        # The leader is still unreaped here. Its PID therefore cannot be reused as
+        # an unrelated process group while these group-directed signals are sent.
+        _signal_worker_group(worker, signal.SIGTERM)
+        if not _wait_for_worker_group_empty(worker, _WORKER_SHUTDOWN_SECONDS):
+            _signal_worker_group(worker, signal.SIGKILL)
+            _wait_for_worker_group_empty(worker, _WORKER_SHUTDOWN_SECONDS)
+
+        try:
             process.wait(timeout=_WORKER_SHUTDOWN_SECONDS)
-    with suppress(ProcessLookupError):
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    finally:
+        worker.exit_watcher.close()
+
+
+def _stop_unwatched_worker(process: subprocess.Popen[bytes]) -> None:
+    """Best-effort cleanup when exit-watcher creation itself fails."""
+
+    with suppress(ProcessLookupError, PermissionError):
         os.killpg(process.pid, signal.SIGKILL)
-    if process.poll() is None:
+    with suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=_WORKER_SHUTDOWN_SECONDS)
+    if process.returncode is None:
+        process.kill()
         process.wait()
 
 
-def _read_bounded_worker_response(process: subprocess.Popen[bytes]) -> bytes:
+def _read_bounded_worker_response(worker: _WorkerSession) -> bytes:
     """Read at most one capped response while enforcing the whole-worker deadline."""
 
+    process = worker.process
     stdout = process.stdout
     if stdout is None:
         raise _protocol_error(
@@ -264,7 +431,7 @@ def _read_bounded_worker_response(process: subprocess.Popen[bytes]) -> bytes:
                     "database migration worker exceeded its execution deadline",
                 )
             if not selector.select(min(remaining, _WORKER_POLL_SECONDS)):
-                if process.poll() is not None:
+                if worker.exit_watcher.wait(0):
                     raise _protocol_error(
                         "MIGRATION_WORKER_CRASHED",
                         "database migration worker exited before returning a result",
@@ -291,19 +458,11 @@ def _read_bounded_worker_response(process: subprocess.Popen[bytes]) -> bytes:
                     "database migration worker returned an invalid bounded response",
                 )
     remaining = deadline - time.monotonic()
-    if process.poll() is None:
-        if remaining <= 0:
-            raise _protocol_error(
-                "MIGRATION_WORKER_TIMEOUT",
-                "database migration worker exceeded its execution deadline",
-            )
-        try:
-            process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired as exc:
-            raise _protocol_error(
-                "MIGRATION_WORKER_TIMEOUT",
-                "database migration worker exceeded its execution deadline",
-            ) from exc
+    if remaining <= 0 or not worker.exit_watcher.wait(remaining):
+        raise _protocol_error(
+            "MIGRATION_WORKER_TIMEOUT",
+            "database migration worker exceeded its execution deadline",
+        )
     return bytes(response)
 
 
@@ -318,6 +477,7 @@ def run_migration_in_subprocess(
     if settings is not None:
         settings.assert_delete_journal_mode()
     request = _encode_request(path, kind, settings)
+    process: subprocess.Popen[bytes] | None = None
     try:
         with tempfile.TemporaryFile() as request_stream:
             request_stream.write(request)
@@ -329,25 +489,26 @@ def run_migration_in_subprocess(
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
+        worker = _capture_worker_session(process)
     except OSError as exc:
+        if process is not None:
+            _stop_unwatched_worker(process)
         raise _protocol_error(
             "MIGRATION_WORKER_START_FAILED",
             "database migration worker could not be started",
         ) from exc
     try:
-        stdout = _read_bounded_worker_response(process)
-        if process.returncode != 0:
-            raise _protocol_error(
-                "MIGRATION_WORKER_CRASHED",
-                "database migration worker exited before returning a result",
-            )
-        return _decode_response(stdout)
-    except BaseException:
-        _stop_worker(process)
-        raise
+        stdout = _read_bounded_worker_response(worker)
     finally:
+        _stop_worker(worker)
         if process.stdout is not None:
             process.stdout.close()
+    if process.returncode != 0:
+        raise _protocol_error(
+            "MIGRATION_WORKER_CRASHED",
+            "database migration worker exited before returning a result",
+        )
+    return _decode_response(stdout)
 
 
 def decode_worker_request(encoded: bytes) -> tuple[Path, DatabaseKind, Settings | None]:

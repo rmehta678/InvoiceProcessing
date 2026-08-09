@@ -142,6 +142,17 @@ class SchemaObjectManifest:
 
 
 @dataclass(frozen=True, slots=True)
+class SQLiteSchemaEntry:
+    """One raw sqlite_schema row retained without coercing hostile storage types."""
+
+    object_type: object
+    name: object
+    table_name: object
+    root_page: object
+    sql: object
+
+
+@dataclass(frozen=True, slots=True)
 class WorkflowSchemaManifest:
     tables: tuple[TableSchemaManifest, ...]
     objects: tuple[SchemaObjectManifest, ...]
@@ -405,6 +416,91 @@ def _migration_versions(resources: list[Traversable], kind: DatabaseKind) -> tup
     return versions
 
 
+def _sqlite_schema_entries(connection: sqlite3.Connection) -> tuple[SQLiteSchemaEntry, ...]:
+    """Enumerate every persistent schema row; SQL pattern syntax is never involved."""
+
+    return tuple(
+        SQLiteSchemaEntry(
+            object_type=row["type"],
+            name=row["name"],
+            table_name=row["tbl_name"],
+            root_page=row["rootpage"],
+            sql=row["sql"],
+        )
+        for row in connection.execute(
+            "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema "
+            "ORDER BY type, name, tbl_name"
+        ).fetchall()
+    )
+
+
+def _is_sqlite_owned_autoindex(
+    connection: sqlite3.Connection,
+    entry: SQLiteSchemaEntry,
+    entries: tuple[SQLiteSchemaEntry, ...],
+) -> bool:
+    """Recognize only an actual SQLite-created constraint autoindex."""
+
+    if (
+        entry.object_type != "index"
+        or type(entry.name) is not str
+        or type(entry.table_name) is not str
+        or type(entry.root_page) is not int
+        or entry.root_page <= 0
+        or entry.sql is not None
+    ):
+        return False
+    prefix = f"sqlite_autoindex_{entry.table_name}_"
+    if not entry.name.startswith(prefix):
+        return False
+    suffix = entry.name[len(prefix) :]
+    if (
+        not suffix.isascii()
+        or not suffix.isdigit()
+        or int(suffix) < 1
+        or str(int(suffix)) != suffix
+    ):
+        return False
+    owners = tuple(
+        candidate
+        for candidate in entries
+        if candidate.object_type == "table"
+        and candidate.name == entry.table_name
+        and candidate.table_name == entry.table_name
+        and type(candidate.root_page) is int
+        and candidate.root_page > 0
+        and type(candidate.sql) is str
+    )
+    if len(owners) != 1:
+        return False
+    matching_indexes = connection.execute(
+        'SELECT name, "unique", origin, partial FROM pragma_index_list(?) WHERE name = ?',
+        (entry.table_name, entry.name),
+    ).fetchall()
+    return len(matching_indexes) == 1 and (
+        matching_indexes[0]["name"] == entry.name
+        and matching_indexes[0]["unique"] == 1
+        and matching_indexes[0]["origin"] in {"pk", "u"}
+        and matching_indexes[0]["partial"] == 0
+    )
+
+
+def _non_internal_schema_objects(
+    connection: sqlite3.Connection,
+    *,
+    allowed_names: frozenset[str] = frozenset(),
+) -> tuple[SQLiteSchemaEntry, ...]:
+    """Return every schema row except exact allowlisted rows and proven autoindexes."""
+
+    entries = _sqlite_schema_entries(connection)
+    return tuple(
+        entry
+        for entry in entries
+        if not (type(entry.name) is str and entry.name in allowed_names)
+        and not _is_sqlite_owned_autoindex(connection, entry, entries)
+    )
+
+
 def _read_migration_history(
     connection: sqlite3.Connection,
     *,
@@ -420,12 +516,7 @@ def _read_migration_history(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'"
         ).fetchone()
         if table is None:
-            user_objects = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
-                ).fetchone()[0]
-            )
-            if user_objects:
+            if _non_internal_schema_objects(connection):
                 raise ValueError("database has schema objects but no migration history")
             return ()
         rows = connection.execute("SELECT version FROM schema_version").fetchall()
@@ -442,15 +533,11 @@ def _read_migration_history(
             or versions != packaged_versions[: len(versions)]
         ):
             raise ValueError("migration versions are not a packaged contiguous prefix")
-        if not versions:
-            unexpected_objects = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM sqlite_master "
-                    "WHERE name NOT LIKE 'sqlite_%' AND name <> 'schema_version'"
-                ).fetchone()[0]
-            )
-            if unexpected_objects:
-                raise ValueError("empty migration history has unexpected schema objects")
+        if not versions and _non_internal_schema_objects(
+            connection,
+            allowed_names=frozenset({"schema_version"}),
+        ):
+            raise ValueError("empty migration history has unexpected schema objects")
         durable_table = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' "
             "AND name = 'schema_migration_history'"
@@ -789,18 +876,16 @@ def _preflight_existing_migration_history(
         database_label=kind.value,
     )
     with connect_database(path, read_only=True) as connection:
-        if header_info is not None and header_info.is_pre_schema:
-            user_schema_objects = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
-                ).fetchone()[0]
+        if (
+            header_info is not None
+            and header_info.is_pre_schema
+            and _non_internal_schema_objects(connection)
+        ):
+            raise DatabaseVerificationError(
+                ErrorCategory.DATABASE,
+                f"{kind.value} pre-schema header has existing schema objects",
+                stop_reason="MIGRATION_HISTORY_INVALID",
             )
-            if user_schema_objects:
-                raise DatabaseVerificationError(
-                    ErrorCategory.DATABASE,
-                    f"{kind.value} pre-schema header has existing schema objects",
-                    stop_reason="MIGRATION_HISTORY_INVALID",
-                )
         history = _read_migration_history(
             connection,
             kind=kind,
@@ -1281,11 +1366,11 @@ def _expected_workflow_schema_manifest(
             .read_text(encoding="utf-8")
         )
         table_names = tuple(
-            str(row["name"])
-            for row in reference.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' "
-                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
-            ).fetchall()
+            sorted(
+                str(entry.name)
+                for entry in _non_internal_schema_objects(reference)
+                if entry.object_type == "table" and type(entry.name) is str
+            )
         )
         return WorkflowSchemaManifest(
             tables=tuple(_table_schema_manifest(reference, table) for table in table_names),

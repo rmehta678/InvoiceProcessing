@@ -1032,6 +1032,110 @@ def test_zero_header_pair_with_user_schema_is_audited_and_rejected_before_migrat
     assert not Path(f"{path}-journal").exists()
 
 
+@pytest.mark.parametrize(
+    "object_name",
+    [
+        "sqliteXevil",
+        "SQLiteXevil",
+        "sqlite%evil",
+        "sqlite\uff3fevil",
+        "sqlite\U0001f600evil",
+        "sql\u0131te_evil",
+        "\u0455qlite_evil",
+    ],
+)
+def test_zero_header_pair_rejects_like_metacharacter_and_unicode_schema_names_without_mutation(
+    tmp_path: Path,
+    object_name: str,
+) -> None:
+    path = tmp_path / "forged-lookalike-schema.db"
+    quoted_name = object_name.replace('"', '""')
+    with sqlite3.connect(path) as connection:
+        connection.execute(f'CREATE TABLE "{quoted_name}" (value BLOB UNIQUE)')
+        connection.execute(f"INSERT INTO \"{quoted_name}\"(value) VALUES (X'CAFE')")
+        schema_names = {
+            str(row[0]) for row in connection.execute("SELECT name FROM sqlite_schema").fetchall()
+        }
+        connection.commit()
+    assert object_name in schema_names
+    assert f"sqlite_autoindex_{object_name}_1" in schema_names
+    data = bytearray(path.read_bytes())
+    data[44:48] = (0).to_bytes(4, "big")
+    data[56:60] = (0).to_bytes(4, "big")
+    path.write_bytes(data)
+    before = _directory_file_state(tmp_path)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.INVENTORY)
+
+    assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
+    assert _directory_file_state(tmp_path) == before
+
+
+def test_schema_classifier_excludes_only_a_proven_sqlite_owned_autoindex(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "schema-classification.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE ordinary (value BLOB UNIQUE)")
+        connection.execute("PRAGMA writable_schema = ON")
+        connection.execute(
+            "INSERT INTO sqlite_schema(type, name, tbl_name, rootpage, sql) "
+            "VALUES ('view', 'sqlite_forged', 'sqlite_forged', 0, "
+            "'CREATE VIEW sqlite_forged AS SELECT 1')"
+        )
+        connection.execute("PRAGMA writable_schema = RESET")
+        connection.commit()
+
+    with connect_database(path, read_only=True) as connection:
+        objects = core_module._non_internal_schema_objects(connection)
+
+    assert tuple((entry.object_type, entry.name) for entry in objects) == (
+        ("table", "ordinary"),
+        ("view", "sqlite_forged"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("object_name", "object_sql"),
+    [
+        ("sqlite_forged", 'CREATE VIEW "sqlite_forged" AS SELECT 1'),
+        (
+            "sqlite_autoindex_forged_1",
+            'CREATE VIEW "sqlite_autoindex_forged_1" AS SELECT 1',
+        ),
+    ],
+)
+def test_zero_header_pair_rejects_forged_reserved_sqlite_schema_rows_without_mutation(
+    tmp_path: Path,
+    object_name: str,
+    object_sql: str,
+) -> None:
+    path = tmp_path / "forged-reserved-schema.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE writable_schema_seed (value BLOB)")
+        connection.execute("PRAGMA writable_schema = ON")
+        connection.execute("DELETE FROM sqlite_schema")
+        connection.execute(
+            "INSERT INTO sqlite_schema(type, name, tbl_name, rootpage, sql) "
+            "VALUES ('view', ?, ?, 0, ?)",
+            (object_name, object_name, object_sql),
+        )
+        connection.execute("PRAGMA writable_schema = RESET")
+        connection.commit()
+    data = bytearray(path.read_bytes())
+    data[44:48] = (0).to_bytes(4, "big")
+    data[56:60] = (0).to_bytes(4, "big")
+    path.write_bytes(data)
+    before = _directory_file_state(tmp_path)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.INVENTORY)
+
+    assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
+    assert _directory_file_state(tmp_path) == before
+
+
 def test_zero_header_pair_with_schema_version_is_rejected_before_migration(
     tmp_path: Path,
 ) -> None:
