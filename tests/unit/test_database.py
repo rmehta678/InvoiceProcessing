@@ -1110,6 +1110,13 @@ def test_zero_header_pair_with_genuine_empty_sqlite_runtime_table_migrates(
     assert schema_row is not None
     assert schema_row[:3] == ("table", internal_name, internal_name)
     assert type(schema_row[3]) is int and schema_row[3] > 0
+    assert (
+        schema_row[4]
+        == {
+            "sqlite_sequence": "CREATE TABLE sqlite_sequence(name,seq)",
+            "sqlite_stat1": "CREATE TABLE sqlite_stat1(tbl,idx,stat)",
+        }[internal_name]
+    )
     assert columns == expected_columns
     data = bytearray(path.read_bytes())
     data[44:48] = (0).to_bytes(4, "big")
@@ -1221,6 +1228,102 @@ def test_zero_header_pair_rejects_forged_sqlite_runtime_table_without_mutation(
                 "VALUES ('view', 'runtime_table_reader', 'runtime_table_reader', 0, ?)",
                 (f"CREATE VIEW runtime_table_reader AS SELECT * FROM {internal_name}",),
             )
+        connection.execute("PRAGMA writable_schema = RESET")
+        connection.commit()
+    data = bytearray(path.read_bytes())
+    data[44:48] = (0).to_bytes(4, "big")
+    data[56:60] = (0).to_bytes(4, "big")
+    path.write_bytes(data)
+    before = _directory_file_state(tmp_path)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.INVENTORY)
+
+    assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
+    assert _directory_file_state(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    ("internal_name", "create_internal", "forged_sql"),
+    [
+        (
+            "sqlite_sequence",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE t",
+            "CREATE  TABLE sqlite_sequence(name,seq)",
+        ),
+        (
+            "sqlite_sequence",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE t",
+            "create table sqlite_sequence(name,seq)",
+        ),
+        (
+            "sqlite_sequence",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE t",
+            "CREATE/**/TABLE sqlite_sequence(name,seq)",
+        ),
+        (
+            "sqlite_sequence",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE t",
+            "CREATE TABLE sqlite_sequence (name,seq)",
+        ),
+        (
+            "sqlite_sequence",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE t",
+            "CREATE TABLE sqlite_sequence(name,seq);",
+        ),
+        (
+            "sqlite_stat1",
+            "ANALYZE",
+            "CREATE  TABLE sqlite_stat1(tbl,idx,stat)",
+        ),
+        (
+            "sqlite_stat1",
+            "ANALYZE",
+            "create table sqlite_stat1(tbl,idx,stat)",
+        ),
+        (
+            "sqlite_stat1",
+            "ANALYZE",
+            "CREATE/**/TABLE sqlite_stat1(tbl,idx,stat)",
+        ),
+        (
+            "sqlite_stat1",
+            "ANALYZE",
+            "CREATE TABLE sqlite_stat1 (tbl,idx,stat)",
+        ),
+        (
+            "sqlite_stat1",
+            "ANALYZE",
+            "CREATE TABLE sqlite_stat1(tbl,idx,stat);",
+        ),
+    ],
+    ids=[
+        "sequence-extra-whitespace",
+        "sequence-lowercase",
+        "sequence-comment",
+        "sequence-space-before-paren",
+        "sequence-trailing-semicolon",
+        "stat1-extra-whitespace",
+        "stat1-lowercase",
+        "stat1-comment",
+        "stat1-space-before-paren",
+        "stat1-trailing-semicolon",
+    ],
+)
+def test_zero_header_pair_rejects_non_runtime_catalog_sql_without_any_mutation(
+    tmp_path: Path,
+    internal_name: str,
+    create_internal: str,
+    forged_sql: str,
+) -> None:
+    path = tmp_path / f"forged-catalog-sql-{internal_name}.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(create_internal)
+        connection.execute("PRAGMA writable_schema = ON")
+        connection.execute(
+            "UPDATE sqlite_schema SET sql = ? WHERE type = 'table' AND name = ?",
+            (forged_sql, internal_name),
+        )
         connection.execute("PRAGMA writable_schema = RESET")
         connection.commit()
     data = bytearray(path.read_bytes())

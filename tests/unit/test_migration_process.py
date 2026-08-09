@@ -10,8 +10,12 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -39,6 +43,68 @@ def _kill_processes(process_ids: list[int]) -> None:
     for process_id in process_ids:
         with suppress(ProcessLookupError):
             os.kill(process_id, 9)
+
+
+def _install_member_signal_controller(
+    monkeypatch: pytest.MonkeyPatch,
+    should_deny: Callable[[int], bool],
+) -> list[int]:
+    """Record and optionally deny the platform's exact descendant signal primitive."""
+
+    signalled_targets: list[int] = []
+    if sys.platform.startswith("linux"):
+        pidfd_open = getattr(os, "pidfd_open", None)
+        pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+        assert callable(pidfd_open)
+        assert callable(pidfd_send_signal)
+        handle_process_ids: dict[int, int] = {}
+
+        def controlled_pidfd_open(process_id: int) -> int:
+            handle = int(pidfd_open(process_id))
+            handle_process_ids[handle] = process_id
+            return handle
+
+        def controlled_pidfd_send_signal(
+            handle: int,
+            signal_number: int,
+            info: object,
+            flags: int,
+        ) -> None:
+            process_id = handle_process_ids[handle]
+            signalled_targets.append(process_id)
+            if should_deny(signal_number):
+                raise PermissionError("injected worker cleanup denial")
+            pidfd_send_signal(handle, signal_number, info, flags)
+
+        monkeypatch.setattr(migration_process.os, "pidfd_open", controlled_pidfd_open)
+        monkeypatch.setattr(
+            migration_process.signal,
+            "pidfd_send_signal",
+            controlled_pidfd_send_signal,
+        )
+        return signalled_targets
+
+    real_killpg = os.killpg
+
+    def controlled_killpg(process_group_id: int, signal_number: int) -> None:
+        signalled_targets.append(process_group_id)
+        if should_deny(signal_number):
+            raise PermissionError("injected worker cleanup denial")
+        real_killpg(process_group_id, signal_number)
+
+    monkeypatch.setattr(migration_process.os, "killpg", controlled_killpg)
+    return signalled_targets
+
+
+def _exception_graph_text(error: BaseException) -> str:
+    nodes: list[str] = ["".join(traceback.format_exception(error)), repr(error.args)]
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        nodes.extend((repr(current.args), repr(current.__cause__), repr(current.__context__)))
+        current = current.__cause__ or current.__context__
+    return "\n".join(nodes)
 
 
 def _setpgrp_worker_command(
@@ -239,6 +305,25 @@ def test_worker_round_trips_expected_error_contract_with_json_safe_redaction() -
     assert secret not in str(response)
 
 
+def test_public_error_copy_discards_a_secret_bearing_exception_chain() -> None:
+    secret = "sk-proj-private-worker-exception-chain-secret"
+    private_error = migration_process._protocol_error(
+        "MIGRATION_WORKER_START_FAILED",
+        "database migration worker could not be started",
+    )
+    private_error.__cause__ = OSError(secret)
+
+    public_error = migration_process._copy_public_error(private_error)
+
+    assert public_error is not private_error
+    assert public_error.category is private_error.category
+    assert public_error.message == private_error.message
+    assert public_error.stop_reason == private_error.stop_reason
+    assert public_error.__cause__ is None
+    assert public_error.__context__ is None
+    assert secret not in _exception_graph_text(public_error)
+
+
 def test_worker_crash_has_stable_error_without_raw_child_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -260,6 +345,125 @@ def test_worker_crash_has_stable_error_without_raw_child_output(
 
     assert excinfo.value.stop_reason == "MIGRATION_WORKER_CRASHED"
     assert secret not in str(excinfo.value)
+
+
+def test_worker_spawn_failure_has_stable_chainless_secret_safe_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "sk-proj-worker-spawn-constructor-secret"
+
+    def fail_spawn(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        raise OSError(secret)
+
+    monkeypatch.setattr(migration_process.subprocess, "Popen", fail_spawn)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migration_process.run_migration_in_subprocess(
+            tmp_path / "spawn-failure.db",
+            DatabaseKind.INVENTORY,
+            settings=None,
+        )
+
+    error = excinfo.value
+    assert error.stop_reason == "MIGRATION_WORKER_START_FAILED"
+    assert error.message == "database migration worker could not be started"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert secret not in _exception_graph_text(error)
+
+
+def test_worker_watcher_constructor_failure_cleans_entire_reserved_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "sk-proj-worker-watcher-constructor-secret"
+    marker_path = tmp_path / "watcher-failure-worker-member.txt"
+    monkeypatch.setattr(
+        migration_process,
+        "_worker_command",
+        lambda: _setpgrp_worker_command(marker_path, '{"ok":true,"applied":[]}'),
+    )
+
+    def fail_watcher_after_child_creation(_process_id: int) -> Any:
+        deadline = time.monotonic() + 5
+        while not marker_path.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        raise OSError(secret)
+
+    monkeypatch.setattr(migration_process, "_WorkerExitWatcher", fail_watcher_after_child_creation)
+    process_ids: list[int] = []
+
+    try:
+        with pytest.raises(DatabaseVerificationError) as excinfo:
+            migration_process.run_migration_in_subprocess(
+                tmp_path / "watcher-constructor-failure.db",
+                DatabaseKind.INVENTORY,
+                settings=None,
+            )
+        child_pid, child_group, child_session = map(int, marker_path.read_text().split())
+        process_ids = [child_pid]
+
+        assert child_group == child_pid
+        assert child_session != child_group
+        assert excinfo.value.stop_reason == "MIGRATION_WORKER_START_FAILED"
+        _assert_processes_gone(process_ids)
+    finally:
+        _kill_processes(process_ids)
+
+
+def test_worker_watcher_constructor_failure_has_no_secret_bearing_exception_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "sk-proj-worker-watcher-chain-secret"
+    command = [sys.executable, "-c", 'print(\'{"ok":true,"applied":[]}\')']
+    monkeypatch.setattr(migration_process, "_worker_command", lambda: command)
+
+    def fail_watcher(_process_id: int) -> Any:
+        raise OSError(secret)
+
+    monkeypatch.setattr(migration_process, "_WorkerExitWatcher", fail_watcher)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migration_process.run_migration_in_subprocess(
+            tmp_path / "watcher-chain-failure.db",
+            DatabaseKind.INVENTORY,
+            settings=None,
+        )
+
+    error = excinfo.value
+    assert error.stop_reason == "MIGRATION_WORKER_START_FAILED"
+    assert error.message == "database migration worker could not be started"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert secret not in _exception_graph_text(error)
+
+
+def test_worker_watcher_initialization_closes_partial_kernel_resource(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "sk-proj-worker-watcher-initialization-secret"
+
+    class FailingKqueue:
+        closed = False
+
+        def control(self, *_args: object) -> list[object]:
+            raise OSError(secret)
+
+        def close(self) -> None:
+            self.closed = True
+
+    kernel_queue = FailingKqueue()
+    monkeypatch.setattr(migration_process.sys, "platform", "darwin")
+    monkeypatch.setattr(migration_process.select, "kqueue", lambda: kernel_queue)
+    monkeypatch.setattr(migration_process.select, "kevent", lambda *_args, **_kwargs: object())
+
+    with pytest.raises(OSError, match=secret):
+        migration_process._WorkerExitWatcher(12345)
+
+    assert kernel_queue.closed
 
 
 def test_worker_crash_reaps_descendants_that_keep_the_protocol_pipe_open(
@@ -420,6 +624,88 @@ def test_worker_reaps_same_session_descendant_that_escapes_leader_process_group(
         _kill_processes(process_ids)
 
 
+def test_worker_watcher_failure_quarantines_unreaped_session_until_cleanup_is_proven(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "sk-proj-worker-watcher-cleanup-secret"
+    marker_path = tmp_path / "watcher-cleanup-failure-member.txt"
+    monkeypatch.setattr(
+        migration_process,
+        "_worker_command",
+        lambda: _setpgrp_worker_command(marker_path, '{"ok":true,"applied":[]}'),
+    )
+    monkeypatch.setattr(migration_process, "_WORKER_SHUTDOWN_SECONDS", 0.02)
+    monkeypatch.setattr(migration_process, "_WORKER_QUARANTINE_RETRY_SECONDS", 0.1)
+    monkeypatch.setattr(migration_process, "_WORKER_QUARANTINE_RETRY_ATTEMPTS", 1)
+
+    def fail_watcher_after_child_creation(_process_id: int) -> Any:
+        deadline = time.monotonic() + 5
+        while not marker_path.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        raise OSError(secret)
+
+    monkeypatch.setattr(migration_process, "_WorkerExitWatcher", fail_watcher_after_child_creation)
+    deny_group_signals = True
+    signalled_targets = _install_member_signal_controller(
+        monkeypatch,
+        lambda _signal_number: deny_group_signals,
+    )
+    child_pid = 0
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+
+    try:
+        with pytest.raises(DatabaseVerificationError) as excinfo:
+            migration_process.run_migration_in_subprocess(
+                tmp_path / "watcher-cleanup-failure.db",
+                DatabaseKind.INVENTORY,
+                settings=None,
+            )
+        child_pid, child_group, _child_session = map(int, marker_path.read_text().split())
+
+        error = excinfo.value
+        assert error.stop_reason == "MIGRATION_WORKER_CLEANUP_FAILED"
+        assert error.message == "database migration worker session cleanup could not be verified"
+        assert error.__cause__ is None
+        assert error.__context__ is None
+        assert secret not in _exception_graph_text(error)
+        assert len(migration_process._QUARANTINED_WORKERS) == 1
+        quarantined_worker = next(iter(migration_process._QUARANTINED_WORKERS.values()))
+        assert quarantined_worker.process_id != child_pid
+        assert quarantined_worker.process.returncode is None
+        snapshot = migration_process._worker_session_snapshot(quarantined_worker)
+        assert snapshot.leader_state.startswith("Z")
+        assert snapshot.members == (migration_process._WorkerSessionMember(child_pid, child_group),)
+        assert unrelated.poll() is None
+        assert unrelated.pid not in signalled_targets
+
+        deny_group_signals = False
+        assert migration_process._retry_quarantined_workers()
+        assert quarantined_worker.process.returncode is not None
+        _assert_processes_gone([child_pid])
+        assert unrelated.poll() is None
+        expected_target = child_pid if sys.platform.startswith("linux") else child_group
+        assert signalled_targets and set(signalled_targets) == {expected_target}
+        deadline = time.monotonic() + 1
+        while migration_process._QUARANTINE_RETRY_THREAD_RUNNING:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert not [
+            thread
+            for thread in threading.enumerate()
+            if thread.name == "migration-worker-cleanup" and thread.is_alive()
+        ]
+    finally:
+        deny_group_signals = False
+        _kill_processes([child_pid] if child_pid else [])
+        unrelated.kill()
+        unrelated.wait()
+
+
 @pytest.mark.parametrize("denied_signal", [signal.SIGTERM, signal.SIGKILL])
 @pytest.mark.parametrize(
     "worker_response",
@@ -449,22 +735,17 @@ def test_worker_signal_permission_failure_overrides_response_and_can_be_retried(
         ),
     )
     monkeypatch.setattr(migration_process, "_WORKER_SHUTDOWN_SECONDS", 0.05)
-    real_killpg = os.killpg
     deny_signals = True
-    signalled_groups: list[int] = []
+    signalled_targets = _install_member_signal_controller(
+        monkeypatch,
+        lambda signal_number: deny_signals and signal_number == denied_signal,
+    )
     child_pid = 0
     unrelated = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"],
         start_new_session=True,
     )
 
-    def controlled_killpg(process_group_id: int, signal_number: int) -> None:
-        signalled_groups.append(process_group_id)
-        if deny_signals and signal_number == denied_signal:
-            raise PermissionError("injected worker cleanup denial")
-        real_killpg(process_group_id, signal_number)
-
-    monkeypatch.setattr(migration_process.os, "killpg", controlled_killpg)
     try:
         with pytest.raises(DatabaseVerificationError) as excinfo:
             migration_process.run_migration_in_subprocess(
@@ -476,7 +757,8 @@ def test_worker_signal_permission_failure_overrides_response_and_can_be_retried(
 
         assert excinfo.value.stop_reason == "MIGRATION_WORKER_CLEANUP_FAILED"
         assert unrelated.poll() is None
-        assert signalled_groups and set(signalled_groups) == {child_group}
+        expected_target = child_pid if sys.platform.startswith("linux") else child_group
+        assert signalled_targets and set(signalled_targets) == {expected_target}
 
         deny_signals = False
         assert migration_process._retry_quarantined_workers()
@@ -491,7 +773,17 @@ def test_worker_signal_permission_failure_overrides_response_and_can_be_retried(
 
 @pytest.mark.parametrize(
     "enumeration_fault",
-    ["process-failure", "malformed-output", "stderr-output", "nonzero-return"],
+    [
+        "process-failure",
+        "malformed-output",
+        "stderr-output",
+        "nonzero-return",
+        "empty-output",
+        "missing-leader",
+        "duplicate-leader",
+        "noncanonical-leader",
+        "invalid-stat",
+    ],
 )
 def test_worker_enumeration_failure_overrides_success_and_can_be_retried(
     tmp_path: Path,
@@ -502,17 +794,68 @@ def test_worker_enumeration_failure_overrides_success_and_can_be_retried(
     monkeypatch.setattr(migration_process, "_worker_command", lambda: command)
     monkeypatch.setattr(migration_process, "_WORKER_SHUTDOWN_SECONDS", 0.01)
     real_run = subprocess.run
+    real_capture = migration_process._capture_worker_session
     inject_fault = True
+    worker_pid = 0
+
+    def capture_worker(process: subprocess.Popen[bytes]) -> Any:
+        nonlocal worker_pid
+        worker = real_capture(process)
+        worker_pid = worker.process_id
+        return worker
+
+    monkeypatch.setattr(migration_process, "_capture_worker_session", capture_worker)
 
     def controlled_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        if inject_fault and args and args[0] == ["/bin/ps", "-axo", "pid=,pgid=,stat="]:
+        command_value = args[0] if args else None
+        is_process_enumeration = (
+            isinstance(command_value, list)
+            and len(command_value) == 3
+            and command_value[:2] == ["/bin/ps", "-axo"]
+            and isinstance(command_value[2], str)
+            and command_value[2].startswith("pid=,pgid=")
+            and command_value[2].endswith("stat=")
+        )
+        if inject_fault and is_process_enumeration:
             if enumeration_fault == "process-failure":
                 raise OSError("injected ps failure")
             if enumeration_fault == "stderr-output":
-                return subprocess.CompletedProcess(args[0], 0, stdout="", stderr="ps warning\n")
+                return subprocess.CompletedProcess(
+                    command_value, 0, stdout="", stderr="ps warning\n"
+                )
             if enumeration_fault == "nonzero-return":
-                return subprocess.CompletedProcess(args[0], 17, stdout="", stderr="")
-            return subprocess.CompletedProcess(args[0], 0, stdout="malformed\n", stderr="")
+                return subprocess.CompletedProcess(command_value, 17, stdout="", stderr="")
+            if enumeration_fault == "malformed-output":
+                return subprocess.CompletedProcess(
+                    command_value, 0, stdout="malformed\n", stderr=""
+                )
+            if enumeration_fault == "empty-output":
+                return subprocess.CompletedProcess(command_value, 0, stdout="", stderr="")
+            completed = real_run(*args, **kwargs)
+            assert worker_pid > 0
+            lines = completed.stdout.splitlines()
+            leader_at = next(
+                index
+                for index, line in enumerate(lines)
+                if line.split() and int(line.split()[0]) == worker_pid
+            )
+            leader_fields = lines[leader_at].split()
+            if enumeration_fault == "missing-leader":
+                del lines[leader_at]
+            elif enumeration_fault == "duplicate-leader":
+                lines.insert(leader_at, lines[leader_at])
+            elif enumeration_fault == "noncanonical-leader":
+                leader_fields[0] = f"0{leader_fields[0]}"
+                lines[leader_at] = " ".join(leader_fields)
+            else:
+                leader_fields[-1] = "NOT_A_PS_STATE"
+                lines[leader_at] = " ".join(leader_fields)
+            return subprocess.CompletedProcess(
+                command_value,
+                0,
+                stdout="\n".join(lines) + ("\n" if lines else ""),
+                stderr="",
+            )
         return real_run(*args, **kwargs)
 
     monkeypatch.setattr(migration_process.subprocess, "run", controlled_run)
@@ -528,32 +871,269 @@ def test_worker_enumeration_failure_overrides_success_and_can_be_retried(
     assert migration_process._retry_quarantined_workers()
 
 
+@pytest.mark.parametrize(
+    ("platform", "format_field", "leader_state", "member_state"),
+    [
+        ("darwin", "pid=,pgid=,stat=", "Zs", "S<+"),
+        ("darwin", "pid=,pgid=,stat=", "?s", "R+"),
+        ("linux", "pid=,pgid=,sid=,stat=", "Zs", "D<l+"),
+        ("linux", "pid=,pgid=,sid=,stat=", "Zs", "P"),
+        ("linux", "pid=,pgid=,sid=,stat=", "Zs", "K"),
+        ("linux", "pid=,pgid=,sid=,stat=", "Zs", "x"),
+    ],
+)
+def test_worker_process_enumeration_accepts_explicit_platform_stat_grammars(
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    format_field: str,
+    leader_state: str,
+    member_state: str,
+) -> None:
+    worker = cast(
+        Any,
+        SimpleNamespace(process_id=101, process_group_id=101, session_id=101),
+    )
+    command = ["/bin/ps", "-axo", format_field]
+    if platform == "darwin":
+        stdout = f"101 101 {leader_state}\n102 102 {member_state}\n"
+    else:
+        stdout = f"101 101 101 {leader_state}\n102 102 101 {member_state}\n"
+    monkeypatch.setattr(migration_process.sys, "platform", platform)
+    monkeypatch.setattr(
+        migration_process.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(command, 0, stdout=stdout, stderr=""),
+    )
+    monkeypatch.setattr(migration_process.os, "getsid", lambda process_id: 101)
+    monkeypatch.setattr(migration_process.os, "getpgid", lambda process_id: process_id)
+
+    members = migration_process._worker_session_members(worker)
+
+    assert members == (migration_process._WorkerSessionMember(102, 102),)
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "",
+        "101 101 101 NOT_A_PS_STATE\n",
+        "101 101 101 Z trailing\n",
+        "zero 101 101 Z\n",
+        "0 101 101 Z\n",
+        "-1 101 101 Z\n",
+        "0101 101 101 Z\n",
+        "101 101 101 Z\n101 101 101 Z\n",
+        "101 999 101 Z\n",
+        "101 101 999 Z\n",
+        "999 999 999 S\n",
+    ],
+    ids=[
+        "empty",
+        "invalid-stat",
+        "trailing-field",
+        "nonnumeric",
+        "zero",
+        "negative",
+        "leading-zero",
+        "duplicate",
+        "leader-group-mismatch",
+        "leader-session-mismatch",
+        "missing-leader",
+    ],
+)
+def test_worker_process_enumeration_rejects_uncertain_identity_grammar(
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: str,
+) -> None:
+    worker = cast(
+        Any,
+        SimpleNamespace(process_id=101, process_group_id=101, session_id=101),
+    )
+    command = ["/bin/ps", "-axo", "pid=,pgid=,sid=,stat="]
+    monkeypatch.setattr(migration_process.sys, "platform", "linux")
+    monkeypatch.setattr(
+        migration_process.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(command, 0, stdout=stdout, stderr=""),
+    )
+
+    with pytest.raises(migration_process._WorkerCleanupFailure):
+        migration_process._worker_session_members(worker)
+
+
+@pytest.mark.parametrize("identity_fault", ["changed-session", "esrch"])
+def test_worker_group_identity_uncertainty_never_signals_the_group(
+    monkeypatch: pytest.MonkeyPatch,
+    identity_fault: str,
+) -> None:
+    monkeypatch.setattr(migration_process.sys, "platform", "darwin")
+    worker = cast(Any, SimpleNamespace(session_id=101, process_group_id=101))
+    members = (migration_process._WorkerSessionMember(202, 202),)
+    signals: list[tuple[int, int]] = []
+    session_queries = 0
+
+    def controlled_getsid(_process_id: int) -> int:
+        nonlocal session_queries
+        session_queries += 1
+        if identity_fault == "esrch":
+            raise ProcessLookupError
+        return 101 if session_queries == 1 else 303
+
+    monkeypatch.setattr(migration_process.os, "getsid", controlled_getsid)
+    monkeypatch.setattr(migration_process.os, "getpgid", lambda _process_id: 202)
+    monkeypatch.setattr(
+        migration_process.os,
+        "killpg",
+        lambda group_id, signal_number: signals.append((group_id, signal_number)),
+    )
+
+    if identity_fault == "esrch":
+        migration_process._signal_worker_session_groups(worker, members, signal.SIGKILL)
+    else:
+        with pytest.raises(migration_process._WorkerCleanupFailure):
+            migration_process._signal_worker_session_groups(worker, members, signal.SIGKILL)
+
+    assert signals == []
+
+
+def test_worker_group_without_live_group_leader_is_never_signalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(migration_process.sys, "platform", "darwin")
+    worker = cast(Any, SimpleNamespace(session_id=101, process_group_id=101))
+    members = (migration_process._WorkerSessionMember(203, 202),)
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(migration_process.os, "getsid", lambda _process_id: 101)
+    monkeypatch.setattr(migration_process.os, "getpgid", lambda _process_id: 202)
+    monkeypatch.setattr(
+        migration_process.os,
+        "killpg",
+        lambda group_id, signal_number: signals.append((group_id, signal_number)),
+    )
+
+    with pytest.raises(migration_process._WorkerCleanupFailure):
+        migration_process._signal_worker_session_groups(worker, members, signal.SIGKILL)
+
+    assert signals == []
+
+
+def test_linux_worker_cleanup_signals_exact_pidfd_handles_without_numeric_group_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = cast(Any, SimpleNamespace(session_id=101, process_group_id=101))
+    members = (
+        migration_process._WorkerSessionMember(202, 202),
+        migration_process._WorkerSessionMember(203, 202),
+    )
+    opened: list[int] = []
+    sent: list[tuple[int, int, object, int]] = []
+    closed: list[int] = []
+    group_signals: list[tuple[int, int]] = []
+
+    def open_pid_handle(process_id: int) -> int:
+        opened.append(process_id)
+        return process_id + 1_000
+
+    monkeypatch.setattr(migration_process.sys, "platform", "linux")
+    monkeypatch.setattr(migration_process.os, "pidfd_open", open_pid_handle, raising=False)
+    monkeypatch.setattr(
+        migration_process.signal,
+        "pidfd_send_signal",
+        lambda handle, signal_number, info, flags: sent.append(
+            (handle, signal_number, info, flags)
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(migration_process.os, "getsid", lambda _process_id: 101)
+    monkeypatch.setattr(migration_process.os, "getpgid", lambda _process_id: 202)
+    monkeypatch.setattr(migration_process.os, "close", closed.append)
+    monkeypatch.setattr(
+        migration_process.os,
+        "killpg",
+        lambda group_id, signal_number: group_signals.append((group_id, signal_number)),
+    )
+
+    migration_process._signal_worker_session_groups(worker, members, signal.SIGKILL)
+
+    assert opened == [202, 203]
+    assert sent == [
+        (1_202, signal.SIGKILL, None, 0),
+        (1_203, signal.SIGKILL, None, 0),
+    ]
+    assert closed == [1_202, 1_203]
+    assert group_signals == []
+
+
+def test_linux_pidfd_identity_change_closes_handle_without_signalling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = cast(Any, SimpleNamespace(session_id=101, process_group_id=101))
+    members = (migration_process._WorkerSessionMember(202, 202),)
+    session_ids = iter((101, 303))
+    sent: list[int] = []
+    closed: list[int] = []
+    monkeypatch.setattr(migration_process.sys, "platform", "linux")
+    monkeypatch.setattr(
+        migration_process.os,
+        "pidfd_open",
+        lambda _process_id: 1_202,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        migration_process.signal,
+        "pidfd_send_signal",
+        lambda *_args: sent.append(1),
+        raising=False,
+    )
+    monkeypatch.setattr(migration_process.os, "getsid", lambda _process_id: next(session_ids))
+    monkeypatch.setattr(migration_process.os, "getpgid", lambda _process_id: 202)
+    monkeypatch.setattr(migration_process.os, "close", closed.append)
+
+    with pytest.raises(migration_process._WorkerCleanupFailure):
+        migration_process._signal_worker_session_groups(worker, members, signal.SIGTERM)
+
+    assert sent == []
+    assert closed == [1_202]
+
+
 def test_worker_identity_query_permission_failure_is_cleanup_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    command = [sys.executable, "-c", 'print(\'{"ok":true,"applied":[]}\')']
-    monkeypatch.setattr(migration_process, "_worker_command", lambda: command)
+    marker_path = tmp_path / "identity-denial-worker-member.txt"
+    monkeypatch.setattr(
+        migration_process,
+        "_worker_command",
+        lambda: _setpgrp_worker_command(marker_path, '{"ok":true,"applied":[]}'),
+    )
     real_getsid = os.getsid
     deny_identity = True
+    child_pid = 0
 
-    def deny_first_identity_query(process_id: int) -> int:
-        nonlocal deny_identity
-        if deny_identity:
-            deny_identity = False
-            raise PermissionError("injected identity-query denial")
+    def deny_member_identity_query(process_id: int) -> int:
+        if deny_identity and marker_path.exists():
+            member_pid = int(marker_path.read_text().split()[0])
+            if process_id == member_pid:
+                raise PermissionError("injected identity-query denial")
         return real_getsid(process_id)
 
-    monkeypatch.setattr(migration_process.os, "getsid", deny_first_identity_query)
+    monkeypatch.setattr(migration_process.os, "getsid", deny_member_identity_query)
+    try:
+        with pytest.raises(DatabaseVerificationError) as excinfo:
+            migration_process.run_migration_in_subprocess(
+                tmp_path / "identity-cleanup.db",
+                DatabaseKind.INVENTORY,
+                settings=None,
+            )
+        child_pid = int(marker_path.read_text().split()[0])
 
-    with pytest.raises(DatabaseVerificationError) as excinfo:
-        migration_process.run_migration_in_subprocess(
-            tmp_path / "identity-cleanup.db",
-            DatabaseKind.INVENTORY,
-            settings=None,
-        )
-
-    assert excinfo.value.stop_reason == "MIGRATION_WORKER_CLEANUP_FAILED"
+        assert excinfo.value.stop_reason == "MIGRATION_WORKER_CLEANUP_FAILED"
+        deny_identity = False
+        assert migration_process._retry_quarantined_workers()
+        _assert_processes_gone([child_pid])
+    finally:
+        deny_identity = False
+        _kill_processes([child_pid] if child_pid else [])
 
 
 def test_worker_normal_success_does_not_wait_for_shutdown_grace(

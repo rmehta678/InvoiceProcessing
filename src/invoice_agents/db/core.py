@@ -558,7 +558,7 @@ def _is_sqlite_runtime_table(
         or type(entry.root_page) is not int
         or entry.root_page <= 0
         or type(entry.sql) is not str
-        or _normalized_sql(entry.sql) != _normalized_sql(canonical_sql)
+        or entry.sql != canonical_sql
     ):
         return False
     columns = tuple(
