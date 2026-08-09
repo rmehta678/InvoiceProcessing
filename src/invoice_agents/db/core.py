@@ -485,6 +485,100 @@ def _is_sqlite_owned_autoindex(
     )
 
 
+_SQLITE_RUNTIME_TABLE_CONTRACTS: dict[
+    str,
+    tuple[str, tuple[tuple[int, str, str, int, None, int, int], ...]],
+] = {
+    "sqlite_sequence": (
+        "CREATE TABLE sqlite_sequence(name,seq)",
+        (
+            (0, "name", "", 0, None, 0, 0),
+            (1, "seq", "", 0, None, 0, 0),
+        ),
+    ),
+    "sqlite_stat1": (
+        "CREATE TABLE sqlite_stat1(tbl,idx,stat)",
+        (
+            (0, "tbl", "", 0, None, 0, 0),
+            (1, "idx", "", 0, None, 0, 0),
+            (2, "stat", "", 0, None, 0, 0),
+        ),
+    ),
+}
+
+
+def _protected_identifier(token: str) -> str | None:
+    """Decode one SQLite quoted-identifier token, never a string literal."""
+
+    if len(token) < 2:
+        return None
+    if token[0] == '"' and token[-1] == '"':
+        return token[1:-1].replace('""', '"')
+    if token[0] == "`" and token[-1] == "`":
+        return token[1:-1].replace("``", "`")
+    if token[0] == "[" and token[-1] == "]":
+        return token[1:-1]
+    return None
+
+
+def _sql_references_identifier(sql: object, identifier: str) -> bool:
+    """Match an identifier token without substring or SQL-pattern semantics."""
+
+    if type(sql) is not str:
+        return False
+    tokens = json.loads(_normalized_sql(sql))
+    for kind, token in tokens:
+        if kind == "unquoted" and token == identifier:
+            return True
+        if kind == "protected":
+            protected = _protected_identifier(token)
+            if protected is not None and _ascii_lower(protected) == identifier:
+                return True
+    return False
+
+
+def _is_sqlite_runtime_table(
+    connection: sqlite3.Connection,
+    entry: SQLiteSchemaEntry,
+    entries: tuple[SQLiteSchemaEntry, ...],
+) -> bool:
+    """Recognize only the exact runtime tables this SQLite build proves it creates."""
+
+    if type(entry.name) is not str:
+        return False
+    contract = _SQLITE_RUNTIME_TABLE_CONTRACTS.get(entry.name)
+    if contract is None:
+        return False
+    canonical_sql, expected_columns = contract
+    if (
+        type(entry.object_type) is not str
+        or entry.object_type != "table"
+        or type(entry.table_name) is not str
+        or entry.table_name != entry.name
+        or type(entry.root_page) is not int
+        or entry.root_page <= 0
+        or type(entry.sql) is not str
+        or _normalized_sql(entry.sql) != _normalized_sql(canonical_sql)
+    ):
+        return False
+    columns = tuple(
+        tuple(row)
+        for row in connection.execute(
+            f"PRAGMA table_xinfo({_quote_identifier(entry.name)})"
+        ).fetchall()
+    )
+    if columns != expected_columns:
+        return False
+    for candidate in entries:
+        if candidate is entry or candidate.object_type not in {"index", "trigger", "view"}:
+            continue
+        if candidate.table_name == entry.name or _sql_references_identifier(
+            candidate.sql, entry.name
+        ):
+            return False
+    return True
+
+
 def _non_internal_schema_objects(
     connection: sqlite3.Connection,
     *,
@@ -497,6 +591,7 @@ def _non_internal_schema_objects(
         entry
         for entry in entries
         if not (type(entry.name) is str and entry.name in allowed_names)
+        and not _is_sqlite_runtime_table(connection, entry, entries)
         and not _is_sqlite_owned_autoindex(connection, entry, entries)
     )
 
@@ -1316,20 +1411,18 @@ def _table_schema_manifest(
 def _schema_object_manifest(
     connection: sqlite3.Connection,
 ) -> tuple[SchemaObjectManifest, ...]:
-    """Inventory every persistent SQLite schema object, including autoindexes."""
+    """Inventory persistent application objects and constraint autoindexes."""
 
+    entries = _sqlite_schema_entries(connection)
     return tuple(
         SchemaObjectManifest(
-            object_type=str(row["type"]),
-            name=str(row["name"]),
-            table_name=str(row["tbl_name"]),
-            normalized_sql=(_normalized_sql(str(row["sql"])) if row["sql"] is not None else None),
+            object_type=str(entry.object_type),
+            name=str(entry.name),
+            table_name=str(entry.table_name),
+            normalized_sql=(_normalized_sql(str(entry.sql)) if entry.sql is not None else None),
         )
-        for row in connection.execute(
-            "SELECT type, name, tbl_name, sql FROM sqlite_master "
-            "WHERE type IN ('table', 'index', 'trigger', 'view') "
-            "ORDER BY type, name, tbl_name"
-        ).fetchall()
+        for entry in entries
+        if not _is_sqlite_runtime_table(connection, entry, entries)
     )
 
 

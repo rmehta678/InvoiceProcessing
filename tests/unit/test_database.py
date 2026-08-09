@@ -1072,6 +1072,170 @@ def test_zero_header_pair_rejects_like_metacharacter_and_unicode_schema_names_wi
     assert _directory_file_state(tmp_path) == before
 
 
+@pytest.mark.parametrize(
+    ("internal_name", "create_internal", "expected_columns"),
+    [
+        (
+            "sqlite_sequence",
+            "CREATE TABLE discarded (id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE discarded;",
+            ((0, "name", "", 0, None, 0, 0), (1, "seq", "", 0, None, 0, 0)),
+        ),
+        (
+            "sqlite_stat1",
+            "ANALYZE;",
+            (
+                (0, "tbl", "", 0, None, 0, 0),
+                (1, "idx", "", 0, None, 0, 0),
+                (2, "stat", "", 0, None, 0, 0),
+            ),
+        ),
+    ],
+    ids=["create-drop-autoincrement", "analyze-empty-database"],
+)
+def test_zero_header_pair_with_genuine_empty_sqlite_runtime_table_migrates(
+    tmp_path: Path,
+    internal_name: str,
+    create_internal: str,
+    expected_columns: tuple[tuple[object, ...], ...],
+) -> None:
+    path = tmp_path / f"genuine-{internal_name}.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(create_internal)
+        schema_row = connection.execute(
+            "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema WHERE name = ?",
+            (internal_name,),
+        ).fetchone()
+        columns = tuple(connection.execute(f"PRAGMA table_xinfo({internal_name})").fetchall())
+        connection.commit()
+    assert schema_row is not None
+    assert schema_row[:3] == ("table", internal_name, internal_name)
+    assert type(schema_row[3]) is int and schema_row[3] > 0
+    assert columns == expected_columns
+    data = bytearray(path.read_bytes())
+    data[44:48] = (0).to_bytes(4, "big")
+    data[56:60] = (0).to_bytes(4, "big")
+    path.write_bytes(data)
+
+    assert migrate_database(path, DatabaseKind.INVENTORY) == [1]
+
+    with connect_database(path, read_only=True) as connection:
+        assert connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("internal_name", "create_internal", "forgery"),
+    [
+        (
+            "sqlite_sequence",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE t",
+            "type-case",
+        ),
+        (
+            "sqlite_sequence",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE t",
+            "name-case",
+        ),
+        (
+            "sqlite_sequence",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE t",
+            "table-name-case",
+        ),
+        (
+            "sqlite_sequence",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE t",
+            "blob-rootpage",
+        ),
+        (
+            "sqlite_sequence",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE t",
+            "quoted-sql",
+        ),
+        (
+            "sqlite_sequence",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE t",
+            "extra-column",
+        ),
+        (
+            "sqlite_sequence",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE t",
+            "referencing-view",
+        ),
+        ("sqlite_stat1", "ANALYZE", "type-case"),
+        ("sqlite_stat1", "ANALYZE", "name-case"),
+        ("sqlite_stat1", "ANALYZE", "table-name-case"),
+        ("sqlite_stat1", "ANALYZE", "blob-rootpage"),
+        ("sqlite_stat1", "ANALYZE", "quoted-sql"),
+        ("sqlite_stat1", "ANALYZE", "extra-column"),
+        ("sqlite_stat1", "ANALYZE", "referencing-view"),
+    ],
+)
+def test_zero_header_pair_rejects_forged_sqlite_runtime_table_without_mutation(
+    tmp_path: Path,
+    internal_name: str,
+    create_internal: str,
+    forgery: str,
+) -> None:
+    path = tmp_path / f"forged-{internal_name}-{forgery}.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(create_internal)
+        connection.execute("PRAGMA writable_schema = ON")
+        if forgery == "type-case":
+            connection.execute(
+                "UPDATE sqlite_schema SET type = 'TABLE' WHERE name = ?", (internal_name,)
+            )
+        elif forgery == "name-case":
+            connection.execute(
+                "UPDATE sqlite_schema SET name = upper(name) WHERE name = ?", (internal_name,)
+            )
+        elif forgery == "table-name-case":
+            connection.execute(
+                "UPDATE sqlite_schema SET tbl_name = upper(tbl_name) WHERE name = ?",
+                (internal_name,),
+            )
+        elif forgery == "blob-rootpage":
+            connection.execute(
+                "UPDATE sqlite_schema SET rootpage = CAST(rootpage AS BLOB) WHERE name = ?",
+                (internal_name,),
+            )
+        elif forgery == "quoted-sql":
+            canonical_sql = {
+                "sqlite_sequence": 'CREATE TABLE "sqlite_sequence"(name,seq)',
+                "sqlite_stat1": 'CREATE TABLE "sqlite_stat1"(tbl,idx,stat)',
+            }[internal_name]
+            connection.execute(
+                "UPDATE sqlite_schema SET sql = ? WHERE name = ?",
+                (canonical_sql, internal_name),
+            )
+        elif forgery == "extra-column":
+            decorated_sql = {
+                "sqlite_sequence": "CREATE TABLE sqlite_sequence(name,seq,extra)",
+                "sqlite_stat1": "CREATE TABLE sqlite_stat1(tbl,idx,stat,extra)",
+            }[internal_name]
+            connection.execute(
+                "UPDATE sqlite_schema SET sql = ? WHERE name = ?",
+                (decorated_sql, internal_name),
+            )
+        else:
+            connection.execute(
+                "INSERT INTO sqlite_schema(type, name, tbl_name, rootpage, sql) "
+                "VALUES ('view', 'runtime_table_reader', 'runtime_table_reader', 0, ?)",
+                (f"CREATE VIEW runtime_table_reader AS SELECT * FROM {internal_name}",),
+            )
+        connection.execute("PRAGMA writable_schema = RESET")
+        connection.commit()
+    data = bytearray(path.read_bytes())
+    data[44:48] = (0).to_bytes(4, "big")
+    data[56:60] = (0).to_bytes(4, "big")
+    path.write_bytes(data)
+    before = _directory_file_state(tmp_path)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.INVENTORY)
+
+    assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
+    assert _directory_file_state(tmp_path) == before
+
+
 def test_schema_classifier_excludes_only_a_proven_sqlite_owned_autoindex(
     tmp_path: Path,
 ) -> None:
@@ -1085,6 +1249,7 @@ def test_schema_classifier_excludes_only_a_proven_sqlite_owned_autoindex(
             "'CREATE VIEW sqlite_forged AS SELECT 1')"
         )
         connection.execute("PRAGMA writable_schema = RESET")
+        connection.execute("ANALYZE")
         connection.commit()
 
     with connect_database(path, read_only=True) as connection:
@@ -1094,6 +1259,55 @@ def test_schema_classifier_excludes_only_a_proven_sqlite_owned_autoindex(
         ("table", "ordinary"),
         ("view", "sqlite_forged"),
     )
+
+
+@pytest.mark.parametrize(
+    "create_internal",
+    [
+        "CREATE TABLE discarded (id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE discarded",
+        "ANALYZE",
+    ],
+    ids=["sqlite-sequence", "sqlite-stat1"],
+)
+def test_workflow_manifest_accepts_only_genuine_runtime_internal_tables(
+    settings: Settings,
+    create_internal: str,
+) -> None:
+    with connect_database(settings.workflow_db) as connection:
+        connection.executescript(create_internal)
+        connection.commit()
+
+    result = verify_database(
+        settings.workflow_db,
+        DatabaseKind.WORKFLOW,
+        settings=settings,
+    )
+
+    assert result["schema_version"] == core_module.SCHEMA_VERSIONS[DatabaseKind.WORKFLOW]
+
+
+def test_workflow_manifest_rejects_wrong_storage_type_on_runtime_internal_table(
+    settings: Settings,
+) -> None:
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute("ANALYZE")
+        connection.execute("PRAGMA writable_schema = ON")
+        connection.execute(
+            "UPDATE sqlite_schema SET type = CAST(type AS BLOB) WHERE name = 'sqlite_stat1'"
+        )
+        connection.execute("PRAGMA writable_schema = RESET")
+        connection.commit()
+    before = settings.workflow_db.read_bytes()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(
+            settings.workflow_db,
+            DatabaseKind.WORKFLOW,
+            settings=settings,
+        )
+
+    assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+    assert settings.workflow_db.read_bytes() == before
 
 
 @pytest.mark.parametrize(

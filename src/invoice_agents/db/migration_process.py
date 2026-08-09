@@ -11,9 +11,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,8 @@ MIGRATION_WORKER_MAX_MESSAGE_BYTES = 65_536
 MIGRATION_WORKER_TIMEOUT_SECONDS = 120.0
 _WORKER_SHUTDOWN_SECONDS = 2.0
 _WORKER_POLL_SECONDS = 0.05
+_WORKER_QUARANTINE_RETRY_ATTEMPTS = 3
+_WORKER_QUARANTINE_RETRY_SECONDS = 0.1
 _SERIALIZED_SETTINGS_FIELDS = frozenset(
     {
         "xai_api_key",
@@ -106,6 +108,24 @@ class _WorkerSession:
     process_group_id: int
     session_id: int
     exit_watcher: _WorkerExitWatcher
+    identity_verified: bool = True
+    cleanup_lock: threading.Lock = field(default_factory=threading.Lock)
+    cleaned: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkerSessionMember:
+    process_id: int
+    process_group_id: int
+
+
+class _WorkerCleanupFailure(Exception):
+    """Private marker whose platform details must never cross the boundary."""
+
+
+_QUARANTINED_WORKERS: dict[int, _WorkerSession] = {}
+_QUARANTINED_WORKERS_LOCK = threading.Lock()
+_QUARANTINE_RETRY_THREAD_RUNNING = False
 
 
 def _worker_command() -> list[str]:
@@ -291,6 +311,7 @@ def _capture_worker_session(process: subprocess.Popen[bytes]) -> _WorkerSession:
 
     process_id = process.pid
     exit_watcher = _WorkerExitWatcher(process_id)
+    identity_verified = True
     try:
         process_group_id = os.getpgid(process_id)
         session_id = os.getsid(process_id)
@@ -299,6 +320,12 @@ def _capture_worker_session(process: subprocess.Popen[bytes]) -> _WorkerSession:
         # already be an unreaped zombie on Darwin, where getpgid/getsid return ESRCH.
         process_group_id = process_id
         session_id = process_id
+    except OSError:
+        # Popen completed start_new_session=True before returning. Retain that
+        # reserved identity for strict cleanup, but never accept the worker result.
+        process_group_id = process_id
+        session_id = process_id
+        identity_verified = False
     if process_group_id != process_id or session_id != process_id:
         exit_watcher.close()
         raise OSError("migration worker did not enter its dedicated session")
@@ -308,103 +335,279 @@ def _capture_worker_session(process: subprocess.Popen[bytes]) -> _WorkerSession:
         process_group_id=process_group_id,
         session_id=session_id,
         exit_watcher=exit_watcher,
+        identity_verified=identity_verified,
     )
 
 
-def _signal_worker_group(worker: _WorkerSession, signal_number: int) -> None:
-    """Signal only the captured group while its unreaped leader prevents ID reuse."""
-
-    # Darwin reports EPERM rather than ESRCH when the group contains only its
-    # already-exited, unreaped leader. In either case there is no live target.
-    with suppress(ProcessLookupError, PermissionError):
-        os.killpg(worker.process_group_id, signal_number)
+def _cleanup_protocol_error() -> DatabaseVerificationError:
+    return _protocol_error(
+        "MIGRATION_WORKER_CLEANUP_FAILED",
+        "database migration worker session cleanup could not be verified",
+    )
 
 
-def _worker_group_members(worker: _WorkerSession) -> tuple[int, ...] | None:
-    """List still-present same-session members other than the unreaped leader."""
+def _canonical_process_identifier(value: str) -> int:
+    if not value.isascii() or not value.isdigit():
+        raise _WorkerCleanupFailure
+    parsed = int(value)
+    if parsed <= 0 or str(parsed) != value:
+        raise _WorkerCleanupFailure
+    return parsed
 
+
+def _worker_session_members(worker: _WorkerSession) -> tuple[_WorkerSessionMember, ...]:
+    """Strictly enumerate every nonleader process still in the reserved session."""
+
+    command = ["/bin/ps", "-axo", "pid=,pgid=,stat="]
     try:
         completed = subprocess.run(
-            ["/bin/ps", "-axo", "pid=,pgid=,stat="],
+            command,
             check=True,
             capture_output=True,
             text=True,
             timeout=1.0,
         )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    members: list[int] = []
-    for line in completed.stdout.splitlines():
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _WorkerCleanupFailure from exc
+    if (
+        completed.args != command
+        or type(completed.returncode) is not int
+        or completed.returncode != 0
+        or type(completed.stdout) is not str
+        or type(completed.stderr) is not str
+        or completed.stderr
+    ):
+        raise _WorkerCleanupFailure
+    seen: set[int] = set()
+    members: list[_WorkerSessionMember] = []
+    for raw_line in completed.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
         fields = line.split()
-        if len(fields) != 3:
+        if len(fields) != 3 or not fields[2]:
+            raise _WorkerCleanupFailure
+        process_id = _canonical_process_identifier(fields[0])
+        listed_group_id = _canonical_process_identifier(fields[1])
+        if process_id in seen:
+            raise _WorkerCleanupFailure
+        seen.add(process_id)
+        if process_id == worker.process_id:
             continue
         try:
-            process_id = int(fields[0])
-            process_group_id = int(fields[1])
-        except ValueError:
+            session_id = os.getsid(process_id)
+        except ProcessLookupError:
             continue
-        if process_id == worker.process_id or process_group_id != worker.process_group_id:
+        except OSError as exc:
+            raise _WorkerCleanupFailure from exc
+        if session_id != worker.session_id:
             continue
         try:
-            if (
-                os.getpgid(process_id) != worker.process_group_id
-                or os.getsid(process_id) != worker.session_id
-            ):
+            process_group_id = os.getpgid(process_id)
+        except ProcessLookupError:
+            continue
+        except OSError as exc:
+            raise _WorkerCleanupFailure from exc
+        if process_group_id <= 0:
+            raise _WorkerCleanupFailure
+        # A group change after the ps snapshot is legal; the identity queries are
+        # authoritative and the later pre-signal validation closes this race again.
+        if process_group_id != listed_group_id:
+            listed_group_id = process_group_id
+        members.append(_WorkerSessionMember(process_id, listed_group_id))
+    return tuple(sorted(members, key=lambda member: member.process_id))
+
+
+def _signal_worker_leader(worker: _WorkerSession, signal_number: int) -> None:
+    """Signal the unreaped, therefore non-reusable, leader PID when still running."""
+
+    if worker.exit_watcher.wait(0):
+        return
+    try:
+        os.kill(worker.process_id, signal_number)
+    except ProcessLookupError:
+        return
+    except OSError as exc:
+        raise _WorkerCleanupFailure from exc
+
+
+def _signal_worker_session_groups(
+    worker: _WorkerSession,
+    members: tuple[_WorkerSessionMember, ...],
+    signal_number: int,
+) -> None:
+    """Signal each group only after an immediate reserved-session identity check."""
+
+    groups: dict[int, list[int]] = {}
+    for member in members:
+        groups.setdefault(member.process_group_id, []).append(member.process_id)
+    for process_group_id in sorted(groups):
+        verified = False
+        for process_id in groups[process_group_id]:
+            try:
+                first_session_id = os.getsid(process_id)
+                current_group_id = os.getpgid(process_id)
+                current_session_id = os.getsid(process_id)
+            except ProcessLookupError:
                 continue
-        except OSError:
+            except OSError as exc:
+                raise _WorkerCleanupFailure from exc
+            if (
+                first_session_id == worker.session_id
+                and current_session_id == worker.session_id
+                and current_group_id == process_group_id
+            ):
+                verified = True
+                break
+        if not verified:
             continue
-        members.append(process_id)
-    return tuple(members)
+        try:
+            os.killpg(process_group_id, signal_number)
+        except ProcessLookupError:
+            continue
+        except OSError as exc:
+            raise _WorkerCleanupFailure from exc
 
 
-def _wait_for_worker_group_empty(worker: _WorkerSession, timeout: float) -> bool:
+def _run_worker_cleanup_phase(
+    worker: _WorkerSession,
+    signal_number: int,
+    timeout: float,
+) -> bool:
+    """Signal and re-enumerate until two consecutive session-empty snapshots."""
+
     deadline = time.monotonic() + max(0.0, timeout)
+    empty_snapshots = 0
     while True:
-        members = _worker_group_members(worker)
-        if members == ():
-            return True
-        if members is None or time.monotonic() >= deadline:
+        members = _worker_session_members(worker)
+        leader_exited = worker.exit_watcher.wait(0)
+        if leader_exited and not members:
+            empty_snapshots += 1
+            if empty_snapshots == 2:
+                return True
+            continue
+        empty_snapshots = 0
+        _signal_worker_leader(worker, signal_number)
+        _signal_worker_session_groups(worker, members, signal_number)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             return False
-        time.sleep(min(_WORKER_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+        wait_seconds = min(_WORKER_POLL_SECONDS, remaining)
+        if leader_exited:
+            time.sleep(wait_seconds)
+        else:
+            worker.exit_watcher.wait(wait_seconds)
+
+
+def _cleanup_worker_session(worker: _WorkerSession) -> None:
+    """Empty the reserved session before releasing its leader PID/SID identity."""
+
+    with worker.cleanup_lock:
+        if worker.cleaned:
+            return
+        session_empty = _run_worker_cleanup_phase(
+            worker,
+            signal.SIGTERM,
+            _WORKER_SHUTDOWN_SECONDS,
+        )
+        if not session_empty:
+            session_empty = _run_worker_cleanup_phase(
+                worker,
+                signal.SIGKILL,
+                _WORKER_SHUTDOWN_SECONDS,
+            )
+        final_members = _worker_session_members(worker)
+        if not session_empty or final_members or not worker.exit_watcher.wait(0):
+            raise _WorkerCleanupFailure
+        try:
+            worker.process.wait(timeout=max(_WORKER_POLL_SECONDS, _WORKER_SHUTDOWN_SECONDS))
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise _WorkerCleanupFailure from exc
+        worker.exit_watcher.close()
+        worker.cleaned = True
+
+
+def _remove_quarantined_worker(worker: _WorkerSession) -> None:
+    with _QUARANTINED_WORKERS_LOCK:
+        if _QUARANTINED_WORKERS.get(worker.process_id) is worker:
+            del _QUARANTINED_WORKERS[worker.process_id]
+
+
+def _retry_quarantined_workers() -> bool:
+    """Boundedly retry retained sessions without ever signaling a released SID."""
+
+    with _QUARANTINED_WORKERS_LOCK:
+        workers = tuple(_QUARANTINED_WORKERS.values())
+    for worker in workers:
+        try:
+            _cleanup_worker_session(worker)
+        except _WorkerCleanupFailure:
+            continue
+        _remove_quarantined_worker(worker)
+    with _QUARANTINED_WORKERS_LOCK:
+        return not _QUARANTINED_WORKERS
+
+
+def _background_quarantine_retry() -> None:
+    global _QUARANTINE_RETRY_THREAD_RUNNING
+
+    try:
+        for _attempt in range(_WORKER_QUARANTINE_RETRY_ATTEMPTS):
+            time.sleep(_WORKER_QUARANTINE_RETRY_SECONDS)
+            if _retry_quarantined_workers():
+                return
+    finally:
+        with _QUARANTINED_WORKERS_LOCK:
+            _QUARANTINE_RETRY_THREAD_RUNNING = False
+
+
+def _quarantine_worker(worker: _WorkerSession) -> None:
+    global _QUARANTINE_RETRY_THREAD_RUNNING
+
+    start_retry_thread = False
+    with _QUARANTINED_WORKERS_LOCK:
+        _QUARANTINED_WORKERS[worker.process_id] = worker
+        if not _QUARANTINE_RETRY_THREAD_RUNNING:
+            _QUARANTINE_RETRY_THREAD_RUNNING = True
+            start_retry_thread = True
+    if start_retry_thread:
+        try:
+            threading.Thread(
+                target=_background_quarantine_retry,
+                name="migration-worker-cleanup",
+                daemon=True,
+            ).start()
+        except RuntimeError:
+            with _QUARANTINED_WORKERS_LOCK:
+                _QUARANTINE_RETRY_THREAD_RUNNING = False
 
 
 def _stop_worker(worker: _WorkerSession) -> None:
-    """Terminate the dedicated group and reap its leader on every return path."""
+    """Strictly clean or retain the worker; never decode through uncertainty."""
 
-    process = worker.process
     try:
-        if not worker.exit_watcher.wait(0):
-            _signal_worker_group(worker, signal.SIGTERM)
-            if not worker.exit_watcher.wait(_WORKER_SHUTDOWN_SECONDS):
-                _signal_worker_group(worker, signal.SIGKILL)
-                worker.exit_watcher.wait(_WORKER_SHUTDOWN_SECONDS)
-
-        # The leader is still unreaped here. Its PID therefore cannot be reused as
-        # an unrelated process group while these group-directed signals are sent.
-        _signal_worker_group(worker, signal.SIGTERM)
-        if not _wait_for_worker_group_empty(worker, _WORKER_SHUTDOWN_SECONDS):
-            _signal_worker_group(worker, signal.SIGKILL)
-            _wait_for_worker_group_empty(worker, _WORKER_SHUTDOWN_SECONDS)
-
-        try:
-            process.wait(timeout=_WORKER_SHUTDOWN_SECONDS)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-    finally:
-        worker.exit_watcher.close()
+        _cleanup_worker_session(worker)
+    except _WorkerCleanupFailure:
+        _quarantine_worker(worker)
+        raise _cleanup_protocol_error() from None
+    _remove_quarantined_worker(worker)
+    if not worker.identity_verified:
+        raise _cleanup_protocol_error() from None
 
 
 def _stop_unwatched_worker(process: subprocess.Popen[bytes]) -> None:
-    """Best-effort cleanup when exit-watcher creation itself fails."""
+    """Strictly terminate a worker when an exit watcher could not be created."""
 
-    with suppress(ProcessLookupError, PermissionError):
-        os.killpg(process.pid, signal.SIGKILL)
-    with suppress(subprocess.TimeoutExpired):
-        process.wait(timeout=_WORKER_SHUTDOWN_SECONDS)
-    if process.returncode is None:
+    try:
         process.kill()
-        process.wait()
+    except ProcessLookupError:
+        pass
+    except OSError:
+        raise _cleanup_protocol_error() from None
+    try:
+        process.wait(timeout=_WORKER_SHUTDOWN_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        raise _cleanup_protocol_error() from None
 
 
 def _read_bounded_worker_response(worker: _WorkerSession) -> bytes:
@@ -476,6 +679,8 @@ def run_migration_in_subprocess(
 
     if settings is not None:
         settings.assert_delete_journal_mode()
+    if not _retry_quarantined_workers():
+        raise _cleanup_protocol_error()
     request = _encode_request(path, kind, settings)
     process: subprocess.Popen[bytes] | None = None
     try:
@@ -500,9 +705,11 @@ def run_migration_in_subprocess(
     try:
         stdout = _read_bounded_worker_response(worker)
     finally:
-        _stop_worker(worker)
-        if process.stdout is not None:
-            process.stdout.close()
+        try:
+            _stop_worker(worker)
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
     if process.returncode != 0:
         raise _protocol_error(
             "MIGRATION_WORKER_CRASHED",

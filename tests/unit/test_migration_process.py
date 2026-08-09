@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -38,6 +39,34 @@ def _kill_processes(process_ids: list[int]) -> None:
     for process_id in process_ids:
         with suppress(ProcessLookupError):
             os.kill(process_id, 9)
+
+
+def _setpgrp_worker_command(
+    marker_path: Path,
+    response: str,
+    *,
+    ignore_term: bool = False,
+) -> list[str]:
+    child_script = (
+        "import os,pathlib,signal,time;"
+        "os.setpgrp();"
+        + ("signal.signal(signal.SIGTERM,signal.SIG_IGN);" if ignore_term else "")
+        + f"pathlib.Path({str(marker_path)!r}).write_text("
+        "f'{os.getpid()} {os.getpgrp()} {os.getsid(0)}');"
+        "time.sleep(60)"
+    )
+    worker_script = (
+        "import pathlib,subprocess,sys,time;"
+        f"marker=pathlib.Path({str(marker_path)!r});"
+        f"subprocess.Popen([sys.executable,'-c',{child_script!r}],"
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
+        "deadline=time.monotonic()+5;"
+        "\nwhile not marker.exists():\n"
+        "    assert time.monotonic() < deadline\n"
+        "    time.sleep(0.001)\n"
+        f"print({response!r})"
+    )
+    return [sys.executable, "-c", worker_script]
 
 
 def _build_large_v2_workflow(path: Path) -> None:
@@ -335,6 +364,196 @@ def test_worker_expected_error_reaps_same_session_descendant_with_closed_stdio(
         _assert_processes_gone(process_ids)
     finally:
         _kill_processes(process_ids)
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_stop_reason"),
+    [
+        ('{"ok":true,"applied":[]}', None),
+        (
+            '{"ok":false,"error":{"category":"DATABASE","message":"schema audit failed",'
+            '"stop_reason":"MIGRATION_HISTORY_INVALID","details":null}}',
+            "MIGRATION_HISTORY_INVALID",
+        ),
+    ],
+    ids=["success", "expected-domain-error"],
+)
+def test_worker_reaps_same_session_descendant_that_escapes_leader_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    response: str,
+    expected_stop_reason: str | None,
+) -> None:
+    marker_path = tmp_path / "escaped-worker-member.txt"
+    monkeypatch.setattr(
+        migration_process,
+        "_worker_command",
+        lambda: _setpgrp_worker_command(marker_path, response),
+    )
+    process_ids: list[int] = []
+
+    try:
+        if expected_stop_reason is None:
+            assert (
+                migration_process.run_migration_in_subprocess(
+                    tmp_path / "escaped-success.db",
+                    DatabaseKind.INVENTORY,
+                    settings=None,
+                )
+                == []
+            )
+        else:
+            with pytest.raises(DatabaseVerificationError) as excinfo:
+                migration_process.run_migration_in_subprocess(
+                    tmp_path / "escaped-domain-error.db",
+                    DatabaseKind.INVENTORY,
+                    settings=None,
+                )
+            assert excinfo.value.stop_reason == expected_stop_reason
+        child_pid, child_group, child_session = map(int, marker_path.read_text().split())
+        process_ids = [child_pid]
+
+        assert child_group == child_pid
+        assert child_session != child_group
+        _assert_processes_gone(process_ids)
+    finally:
+        _kill_processes(process_ids)
+
+
+@pytest.mark.parametrize("denied_signal", [signal.SIGTERM, signal.SIGKILL])
+@pytest.mark.parametrize(
+    "worker_response",
+    [
+        '{"ok":true,"applied":[]}',
+        (
+            '{"ok":false,"error":{"category":"DATABASE","message":"schema audit failed",'
+            '"stop_reason":"MIGRATION_HISTORY_INVALID","details":null}}'
+        ),
+    ],
+    ids=["success-response", "domain-error-response"],
+)
+def test_worker_signal_permission_failure_overrides_response_and_can_be_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    denied_signal: int,
+    worker_response: str,
+) -> None:
+    marker_path = tmp_path / "permission-worker-member.txt"
+    monkeypatch.setattr(
+        migration_process,
+        "_worker_command",
+        lambda: _setpgrp_worker_command(
+            marker_path,
+            worker_response,
+            ignore_term=denied_signal == signal.SIGKILL,
+        ),
+    )
+    monkeypatch.setattr(migration_process, "_WORKER_SHUTDOWN_SECONDS", 0.05)
+    real_killpg = os.killpg
+    deny_signals = True
+    signalled_groups: list[int] = []
+    child_pid = 0
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+
+    def controlled_killpg(process_group_id: int, signal_number: int) -> None:
+        signalled_groups.append(process_group_id)
+        if deny_signals and signal_number == denied_signal:
+            raise PermissionError("injected worker cleanup denial")
+        real_killpg(process_group_id, signal_number)
+
+    monkeypatch.setattr(migration_process.os, "killpg", controlled_killpg)
+    try:
+        with pytest.raises(DatabaseVerificationError) as excinfo:
+            migration_process.run_migration_in_subprocess(
+                tmp_path / "permission-cleanup.db",
+                DatabaseKind.INVENTORY,
+                settings=None,
+            )
+        child_pid, child_group, _child_session = map(int, marker_path.read_text().split())
+
+        assert excinfo.value.stop_reason == "MIGRATION_WORKER_CLEANUP_FAILED"
+        assert unrelated.poll() is None
+        assert signalled_groups and set(signalled_groups) == {child_group}
+
+        deny_signals = False
+        assert migration_process._retry_quarantined_workers()
+        _assert_processes_gone([child_pid])
+        assert unrelated.poll() is None
+    finally:
+        deny_signals = False
+        _kill_processes([child_pid] if child_pid else [])
+        unrelated.kill()
+        unrelated.wait()
+
+
+@pytest.mark.parametrize(
+    "enumeration_fault",
+    ["process-failure", "malformed-output", "stderr-output", "nonzero-return"],
+)
+def test_worker_enumeration_failure_overrides_success_and_can_be_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    enumeration_fault: str,
+) -> None:
+    command = [sys.executable, "-c", 'print(\'{"ok":true,"applied":[]}\')']
+    monkeypatch.setattr(migration_process, "_worker_command", lambda: command)
+    monkeypatch.setattr(migration_process, "_WORKER_SHUTDOWN_SECONDS", 0.01)
+    real_run = subprocess.run
+    inject_fault = True
+
+    def controlled_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if inject_fault and args and args[0] == ["/bin/ps", "-axo", "pid=,pgid=,stat="]:
+            if enumeration_fault == "process-failure":
+                raise OSError("injected ps failure")
+            if enumeration_fault == "stderr-output":
+                return subprocess.CompletedProcess(args[0], 0, stdout="", stderr="ps warning\n")
+            if enumeration_fault == "nonzero-return":
+                return subprocess.CompletedProcess(args[0], 17, stdout="", stderr="")
+            return subprocess.CompletedProcess(args[0], 0, stdout="malformed\n", stderr="")
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(migration_process.subprocess, "run", controlled_run)
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migration_process.run_migration_in_subprocess(
+            tmp_path / "enumeration-cleanup.db",
+            DatabaseKind.INVENTORY,
+            settings=None,
+        )
+
+    assert excinfo.value.stop_reason == "MIGRATION_WORKER_CLEANUP_FAILED"
+    inject_fault = False
+    assert migration_process._retry_quarantined_workers()
+
+
+def test_worker_identity_query_permission_failure_is_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = [sys.executable, "-c", 'print(\'{"ok":true,"applied":[]}\')']
+    monkeypatch.setattr(migration_process, "_worker_command", lambda: command)
+    real_getsid = os.getsid
+    deny_identity = True
+
+    def deny_first_identity_query(process_id: int) -> int:
+        nonlocal deny_identity
+        if deny_identity:
+            deny_identity = False
+            raise PermissionError("injected identity-query denial")
+        return real_getsid(process_id)
+
+    monkeypatch.setattr(migration_process.os, "getsid", deny_first_identity_query)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migration_process.run_migration_in_subprocess(
+            tmp_path / "identity-cleanup.db",
+            DatabaseKind.INVENTORY,
+            settings=None,
+        )
+
+    assert excinfo.value.stop_reason == "MIGRATION_WORKER_CLEANUP_FAILED"
 
 
 def test_worker_normal_success_does_not_wait_for_shutdown_grace(
