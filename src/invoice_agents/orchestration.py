@@ -52,6 +52,7 @@ from invoice_agents.tools.evidence import extract_invoice_evidence
 # AutoGen's MaxMessageTermination phrasing, matched exactly so an upgrade that changes
 # it fails the pinned contract test instead of silently misclassifying stops.
 MAX_MESSAGES_STOP_PHRASE = "maximum number of messages"
+EXECUTION_LEASE_SECONDS = 21_600
 
 
 def is_max_messages_stop(stop_reason: str) -> bool:
@@ -149,12 +150,14 @@ def prepare_case(path: Path, settings: Settings) -> tuple[str, datetime] | CaseR
     started_at = _now()
     case_id = f"case_{uuid4().hex}"
     source_id: str | None = None
+    case_created = False
     try:
         source = snapshot_source(path, settings.source_archive_dir, settings.source_max_bytes)
         source_id = source.source_id
         store = WorkflowStore(settings.workflow_db)
         store.register_source(source)
         store.create_case(case_id, source, started_at)
+        case_created = True
         invoice = extract_invoice_evidence(source)
         store.save_extraction(case_id, invoice)
         AuditRecorder(settings.workflow_db, case_id).record(
@@ -169,9 +172,15 @@ def prepare_case(path: Path, settings: Settings) -> tuple[str, datetime] | CaseR
         return case_id, started_at
     except BaseException as exc:
         result = _failed_result(case_id, source_id, started_at, exc)
-        if source_id is not None:
+        if source_id is not None and case_created:
             try:
-                WorkflowStore(settings.workflow_db).finish_case(result)
+                failed_store = WorkflowStore(settings.workflow_db)
+                claim = failed_store.claim_case_execution(
+                    case_id,
+                    frozenset({CaseStatus.INCOMPLETE}),
+                    EXECUTION_LEASE_SECONDS,
+                )
+                failed_store.finish_case(result, claim)
             except BaseException as persistence_exc:
                 # Preserve both the original case failure and the secondary audit-write
                 # failure; neither may disappear behind the other.
@@ -325,6 +334,11 @@ async def run_prepared_case(case_id: str, started_at: datetime, settings: Settin
     """Run one fresh Swarm and convert every terminal path to an explicit case status."""
 
     store = WorkflowStore(settings.workflow_db)
+    claim = store.claim_case_execution(
+        case_id,
+        frozenset({CaseStatus.INCOMPLETE}),
+        EXECUTION_LEASE_SECONDS,
+    )
     invoice = store.load_extraction(case_id)
     audit = AuditRecorder(settings.workflow_db, case_id)
     audit.record(
@@ -348,6 +362,7 @@ async def run_prepared_case(case_id: str, started_at: datetime, settings: Settin
         settings=settings,
         store=store,
         audit=audit,
+        claim=claim,
     )
     usage = UsageSummary()
     clock = monotonic()
@@ -366,7 +381,7 @@ async def run_prepared_case(case_id: str, started_at: datetime, settings: Settin
             )
         # State is saved only after run_stream has yielded its TaskResult and stopped.
         state = await team.save_state()
-        store.save_team_state(case_id, dict(state))
+        store.save_team_state(case_id, dict(state), claim)
         usage.latency_ms = int((monotonic() - clock) * 1000)
         result = _result_from_stop(context, task_result, started_at, usage)
     except BaseException as exc:
@@ -384,7 +399,7 @@ async def run_prepared_case(case_id: str, started_at: datetime, settings: Settin
     # Retries are counted from persisted provider.retry audit events so the summary
     # reflects what actually happened, not an in-memory counter that can be lost.
     result.usage.retries = store.count_events(case_id, "provider.retry")
-    store.finish_case(result)
+    store.finish_case(result, claim)
     _write_result(result)
     audit.record(
         "case.finished", result.model_dump(mode="json"), source_id=invoice.source.source_id
@@ -521,8 +536,31 @@ async def resume_case(case_id: str, settings: Settings) -> CaseResult:
 
     preflight(settings)
     store = WorkflowStore(settings.workflow_db)
+    try:
+        claim = store.claim_case_execution(
+            case_id,
+            frozenset({CaseStatus.NEEDS_HUMAN}),
+            EXECUTION_LEASE_SECONDS,
+        )
+    except InvoiceAgentsError as exc:
+        if exc.stop_reason == "CASE_STATUS_NOT_CLAIMABLE":
+            raise InvoiceAgentsError(
+                ErrorCategory.ORCHESTRATION,
+                f"case {case_id} is not waiting for human review",
+                case_id=case_id,
+                stop_reason="CASE_NOT_RESUMABLE",
+            ) from exc
+        raise
     previous = store.load_result(case_id)
-    if previous is None or previous.status is not CaseStatus.NEEDS_HUMAN:
+    if previous is None:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            f"case {case_id} has no persisted result to resume",
+            case_id=case_id,
+            stop_reason="CASE_RESULT_MISSING",
+        )
+    if previous.status is not CaseStatus.NEEDS_HUMAN:
+        store.finish_case(previous, claim)
         raise InvoiceAgentsError(
             ErrorCategory.ORCHESTRATION,
             f"case {case_id} is not waiting for human review",
@@ -531,6 +569,7 @@ async def resume_case(case_id: str, settings: Settings) -> CaseResult:
         )
     review = store.load_case_review(case_id)
     if review is None or review.status != "RESOLVED" or review.human_decision is None:
+        store.finish_case(previous, claim)
         raise InvoiceAgentsError(
             ErrorCategory.ORCHESTRATION,
             "a persisted human decision is required before resume",
@@ -539,6 +578,7 @@ async def resume_case(case_id: str, settings: Settings) -> CaseResult:
         )
     state = store.load_team_state(case_id)
     if state is None:
+        store.finish_case(previous, claim)
         raise InvoiceAgentsError(
             ErrorCategory.ORCHESTRATION,
             "stopped AutoGen team state is missing",
@@ -551,7 +591,7 @@ async def resume_case(case_id: str, settings: Settings) -> CaseResult:
     if human.decision is HumanDecisionKind.ESTABLISH_MAPPING:
         _recompute_after_mapping(case_id, human, settings, store, audit)
         invoice = store.load_extraction(case_id)
-    context = AgentCaseContext(case_id, settings, store, audit)
+    context = AgentCaseContext(case_id, settings, store, audit, claim)
     client = create_model_client(settings)
     team = build_team(context, client)
     usage = previous.usage.model_copy(deep=True)
@@ -576,7 +616,7 @@ async def resume_case(case_id: str, settings: Settings) -> CaseResult:
         with bind_audit_recorder(audit):
             task_result = await _stream_team(team, context, task=message, usage=usage)
         new_state = await team.save_state()
-        store.save_team_state(case_id, dict(new_state))
+        store.save_team_state(case_id, dict(new_state), claim)
         usage.latency_ms += int((monotonic() - clock) * 1000)
         result = _result_from_stop(context, task_result, previous.started_at, usage)
     except BaseException as exc:
@@ -586,7 +626,7 @@ async def resume_case(case_id: str, settings: Settings) -> CaseResult:
     finally:
         await client.close()
     result.usage.retries = store.count_events(case_id, "provider.retry")
-    store.finish_case(result)
+    store.finish_case(result, claim)
     _write_result(result)
     audit.record(
         "case.resumed_finished", result.model_dump(mode="json"), source_id=invoice.source.source_id

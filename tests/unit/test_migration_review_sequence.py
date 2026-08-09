@@ -128,9 +128,9 @@ def test_v1_database_is_rejected_until_migrated_and_rows_gain_sequence(tmp_path:
     with pytest.raises(DatabaseVerificationError) as excinfo:
         verify_database(path, DatabaseKind.WORKFLOW)
     assert excinfo.value.stop_reason == "DATABASE_VERSION_MISMATCH"
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [2]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [2, 3]
     report = verify_database(path, DatabaseKind.WORKFLOW)
-    assert report["schema_version"] == 2
+    assert report["schema_version"] == 3
     with connect_database(path, read_only=True) as connection:
         row = connection.execute(
             "SELECT sequence FROM review_requests WHERE review_id = ?", (REVIEW_ID,)

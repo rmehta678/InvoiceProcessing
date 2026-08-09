@@ -13,11 +13,12 @@ from typer.testing import CliRunner
 from invoice_agents import cli
 from invoice_agents.config import Settings
 from invoice_agents.db.core import connect_database
-from invoice_agents.db.store import WorkflowStore
+from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.errors import InvoiceAgentsError
 from invoice_agents.hitl.service import create_review_request, record_human_decision
 from invoice_agents.models import (
     CanonicalMapping,
+    CaseStatus,
     Critique,
     DecisionKind,
     FinalDecision,
@@ -68,7 +69,25 @@ def critique(disposition: DecisionKind = DecisionKind.HOLD) -> Critique:
     )
 
 
-def approve_final(store: WorkflowStore, case_id: str) -> None:
+def record_payment_evidence(
+    store: WorkflowStore,
+    case_id: str,
+    invoice: Any,
+    settings: Settings,
+    disposition: DecisionKind = DecisionKind.APPROVE,
+) -> None:
+    comparisons, _ = compare_inventory(invoice, InventoryReader(settings.inventory_db))
+    risk = build_risk_assessment(
+        invoice, comparisons, [], compute_invoice_totals(invoice), settings
+    )
+    store.save_comparison(case_id, "risk", risk.model_dump(mode="json"))
+    store.save_critique(case_id, critique(disposition))
+
+
+def approve_final(store: WorkflowStore, case_id: str) -> ExecutionClaim:
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
     store.save_final_decision(
         case_id,
         FinalDecision(
@@ -77,7 +96,9 @@ def approve_final(store: WorkflowStore, case_id: str) -> None:
             critic_disposition=DecisionKind.APPROVE,
             payment_eligible=True,
         ),
+        claim,
     )
+    return claim
 
 
 def pending_review(
@@ -888,18 +909,21 @@ def test_cli_accepts_repeatable_address_blocker_options(
 
 
 def test_mock_payment_pays_once_across_duplicate_representations(
-    invoice_dir: Path, workflow_db: Path
+    invoice_dir: Path, settings: Settings
 ) -> None:
+    workflow_db = settings.workflow_db
     store = WorkflowStore(workflow_db)
     text = load(invoice_dir, "invoice_1011.txt", workflow_db.parent / "sources")
     pdf = load(invoice_dir, "invoice_1011.pdf", workflow_db.parent / "sources")
     persist_case(store, "case_text", text)
-    approve_final(store, "case_text")
-    first = mock_payment("case_text", text, store, workflow_db)
+    record_payment_evidence(store, "case_text", text, settings)
+    text_claim = approve_final(store, "case_text")
+    first = mock_payment("case_text", text, store, workflow_db, text_claim)
     assert first.status is PaymentStatus.PAID
     persist_case(store, "case_pdf", pdf)
-    approve_final(store, "case_pdf")
-    duplicate = mock_payment("case_pdf", pdf, store, workflow_db)
+    record_payment_evidence(store, "case_pdf", pdf, settings)
+    pdf_claim = approve_final(store, "case_pdf")
+    duplicate = mock_payment("case_pdf", pdf, store, workflow_db, pdf_claim)
     assert duplicate.status is PaymentStatus.DUPLICATE
     assert duplicate.case_id == "case_pdf"
     assert duplicate.duplicate_of == first.payment_id
@@ -908,11 +932,16 @@ def test_mock_payment_pays_once_across_duplicate_representations(
 
 
 def test_rejected_and_injected_failure_never_report_payment_success(
-    invoice_dir: Path, workflow_db: Path
+    invoice_dir: Path, settings: Settings
 ) -> None:
+    workflow_db = settings.workflow_db
     store = WorkflowStore(workflow_db)
     rejected_invoice = load(invoice_dir, "invoice_1001.txt", workflow_db.parent / "sources")
     persist_case(store, "case_rejected", rejected_invoice)
+    record_payment_evidence(store, "case_rejected", rejected_invoice, settings)
+    rejected_claim = store.claim_case_execution(
+        "case_rejected", frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
     store.save_final_decision(
         "case_rejected",
         FinalDecision(
@@ -921,15 +950,81 @@ def test_rejected_and_injected_failure_never_report_payment_success(
             critic_disposition=DecisionKind.REJECT,
             payment_eligible=False,
         ),
+        rejected_claim,
     )
-    rejected = mock_payment("case_rejected", rejected_invoice, store, workflow_db)
+    rejected = mock_payment(
+        "case_rejected", rejected_invoice, store, workflow_db, rejected_claim
+    )
     assert rejected.status is PaymentStatus.NOT_ELIGIBLE
 
     failed_invoice = load(invoice_dir, "invoice_1004.json", workflow_db.parent / "sources")
     persist_case(store, "case_failed_payment", failed_invoice)
-    approve_final(store, "case_failed_payment")
+    record_payment_evidence(store, "case_failed_payment", failed_invoice, settings)
+    failed_claim = approve_final(store, "case_failed_payment")
     failed = mock_payment(
-        "case_failed_payment", failed_invoice, store, workflow_db, inject_failure=True
+        "case_failed_payment",
+        failed_invoice,
+        store,
+        workflow_db,
+        failed_claim,
+        inject_failure=True,
     )
     assert failed.status is PaymentStatus.FAILED
     assert failed.error == "injected mock-payment failure"
+
+
+def test_payment_rejects_missing_risk_snapshot(
+    invoice_dir: Path, settings: Settings
+) -> None:
+    store = WorkflowStore(settings.workflow_db)
+    invoice = load(invoice_dir, "invoice_1001.txt", settings.source_archive_dir)
+    persist_case(store, "case_missing_payment_risk", invoice)
+    claim = approve_final(store, "case_missing_payment_risk")
+
+    result = mock_payment(
+        "case_missing_payment_risk",
+        invoice,
+        store,
+        settings.workflow_db,
+        claim,
+    )
+
+    assert result.status is PaymentStatus.NOT_ELIGIBLE
+    assert result.error == "latest risk assessment is missing"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 0
+
+
+def test_payment_rejects_final_decision_from_prior_execution_generation(
+    invoice_dir: Path, settings: Settings
+) -> None:
+    store = WorkflowStore(settings.workflow_db)
+    invoice = load(invoice_dir, "invoice_1001.txt", settings.source_archive_dir)
+    persist_case(store, "case_stale_payment_decision", invoice)
+    record_payment_evidence(store, "case_stale_payment_decision", invoice, settings)
+    stale = approve_final(store, "case_stale_payment_decision")
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "UPDATE cases SET lease_expires_at = ? WHERE case_id = ?",
+            ("2000-01-01T00:00:00+00:00", "case_stale_payment_decision"),
+        )
+        connection.commit()
+    current = store.claim_case_execution(
+        "case_stale_payment_decision",
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+    assert current.generation == stale.generation + 1
+
+    result = mock_payment(
+        "case_stale_payment_decision",
+        invoice,
+        store,
+        settings.workflow_db,
+        current,
+    )
+
+    assert result.status is PaymentStatus.NOT_ELIGIBLE
+    assert result.error == "final decision is missing or stale for the current execution generation"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 0

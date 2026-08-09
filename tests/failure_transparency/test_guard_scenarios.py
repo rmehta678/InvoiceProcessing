@@ -420,6 +420,10 @@ def test_payment_ledger_write_failure(invoice_dir: Path, settings: Settings) -> 
     store = WorkflowStore(settings.workflow_db)
     case_id, _ = _prepare(invoice_dir, settings)
     invoice = store.load_extraction(case_id)
+    store.save_comparison(case_id, "risk", _risk([]).model_dump(mode="json"))
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
     store.save_final_decision(
         case_id,
         FinalDecision(
@@ -428,11 +432,12 @@ def test_payment_ledger_write_failure(invoice_dir: Path, settings: Settings) -> 
             critic_disposition=DecisionKind.APPROVE,
             payment_eligible=True,
         ),
+        claim,
     )
     os.chmod(settings.workflow_db, stat.S_IREAD)
     try:
         with pytest.raises(sqlite3.OperationalError):
-            mock_payment(case_id, invoice, store, settings.workflow_db)
+            mock_payment(case_id, invoice, store, settings.workflow_db, claim)
     finally:
         os.chmod(settings.workflow_db, stat.S_IWRITE | stat.S_IREAD)
     # The failed write recorded nothing: no PAID row may exist.

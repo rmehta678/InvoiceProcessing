@@ -53,6 +53,9 @@ def server_url(
     async def fake_run(case_id: str, started_at: datetime, run_settings: Settings) -> CaseResult:
         store = WorkflowStore(run_settings.workflow_db)
         invoice = store.load_extraction(case_id)
+        claim = store.claim_case_execution(
+            case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+        )
         result = CaseResult(
             case_id=case_id,
             source_id=invoice.source.source_id,
@@ -61,11 +64,14 @@ def server_url(
             started_at=started_at,
             finished_at=datetime.now(UTC),
         )
-        store.finish_case(result)
+        store.finish_case(result, claim)
         return result
 
     async def fake_resume(case_id: str, run_settings: Settings) -> CaseResult:
         store = WorkflowStore(run_settings.workflow_db)
+        claim = store.claim_case_execution(
+            case_id, frozenset({CaseStatus.NEEDS_HUMAN}), lease_seconds=60
+        )
         previous = store.load_result(case_id)
         assert previous is not None
         result = previous.model_copy(
@@ -76,7 +82,7 @@ def server_url(
             },
             deep=True,
         )
-        store.finish_case(result)
+        store.finish_case(result, claim)
         return result
 
     monkeypatch.setattr("invoice_agents.ui.runs.run_prepared_case", fake_run)

@@ -19,7 +19,7 @@ def test_ensure_databases_creates_seeds_and_is_repeatable(tmp_path: Path) -> Non
     inventory = tmp_path / "inventory.db"
     workflow = tmp_path / "workflow.db"
     first = ensure_databases(inventory, workflow)
-    assert first == {"inventory": [1], "workflow": [1, 2]}
+    assert first == {"inventory": [1], "workflow": [1, 2, 3]}
     assert verify_database(inventory, DatabaseKind.INVENTORY)["integrity"] == "ok"
     assert verify_database(workflow, DatabaseKind.WORKFLOW)["integrity"] == "ok"
     second = ensure_databases(inventory, workflow)

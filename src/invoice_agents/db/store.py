@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar, cast
 from uuid import uuid4
@@ -28,6 +29,16 @@ from invoice_agents.models import (
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 ROLLBACK_JOURNAL_MODES = frozenset({"delete", "persist", "truncate"})
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionClaim:
+    """Database-issued fencing authority for one case execution generation."""
+
+    case_id: str
+    token: str
+    generation: int
+    expires_at: datetime
 
 
 def now_iso() -> str:
@@ -315,6 +326,126 @@ class WorkflowStore:
             )
             connection.commit()
 
+    def claim_case_execution(
+        self,
+        case_id: str,
+        expected_statuses: frozenset[CaseStatus],
+        lease_seconds: int,
+    ) -> ExecutionClaim:
+        """Atomically claim one fresh or resumable case and return its fencing token."""
+
+        if not expected_statuses:
+            raise ValueError("expected_statuses must not be empty")
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        claimed_at = datetime.now(UTC)
+        expires_at = claimed_at + timedelta(seconds=lease_seconds)
+        token = f"exec_{uuid4().hex}"
+        placeholders = ", ".join("?" for _ in expected_statuses)
+        statuses = tuple(str(status) for status in sorted(expected_statuses))
+        with connect_database(self.path) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                updated = connection.execute(
+                    "UPDATE cases SET execution_token = ?, "
+                    "execution_generation = execution_generation + 1, "
+                    "execution_state = 'RUNNING', lease_expires_at = ?, updated_at = ? "
+                    f"WHERE case_id = ? AND status IN ({placeholders}) "
+                    "AND (execution_token IS NULL OR execution_state <> 'RUNNING' "
+                    "OR lease_expires_at IS NULL OR lease_expires_at <= ?)",
+                    (
+                        token,
+                        expires_at.isoformat(),
+                        claimed_at.isoformat(),
+                        case_id,
+                        *statuses,
+                        claimed_at.isoformat(),
+                    ),
+                )
+                if updated.rowcount != 1:
+                    row = connection.execute(
+                        "SELECT status, execution_state, lease_expires_at FROM cases "
+                        "WHERE case_id = ?",
+                        (case_id,),
+                    ).fetchone()
+                    connection.rollback()
+                    if row is None:
+                        raise InvoiceAgentsError(
+                            ErrorCategory.DATABASE,
+                            f"case does not exist: {case_id}",
+                            case_id=case_id,
+                            stop_reason="CASE_NOT_FOUND",
+                        )
+                    if str(row["status"]) not in statuses:
+                        raise InvoiceAgentsError(
+                            ErrorCategory.ORCHESTRATION,
+                            f"case {case_id} has status {row['status']} and is not claimable",
+                            case_id=case_id,
+                            stop_reason="CASE_STATUS_NOT_CLAIMABLE",
+                        )
+                    raise InvoiceAgentsError(
+                        ErrorCategory.ORCHESTRATION,
+                        f"case {case_id} already has an active execution claim",
+                        case_id=case_id,
+                        stop_reason="CASE_ALREADY_CLAIMED",
+                    )
+                row = connection.execute(
+                    "SELECT execution_generation FROM cases WHERE case_id = ?", (case_id,)
+                ).fetchone()
+                if row is None:
+                    raise InvoiceAgentsError(
+                        ErrorCategory.DATABASE,
+                        f"case disappeared while claiming execution: {case_id}",
+                        case_id=case_id,
+                        stop_reason="CASE_NOT_FOUND",
+                    )
+                generation = int(row["execution_generation"])
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return ExecutionClaim(case_id, token, generation, expires_at)
+
+    def renew_case_execution(
+        self, claim: ExecutionClaim, lease_seconds: int
+    ) -> ExecutionClaim:
+        """Renew only the still-current, unexpired execution claim."""
+
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        renewed_at = datetime.now(UTC)
+        expires_at = renewed_at + timedelta(seconds=lease_seconds)
+        with connect_database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                "UPDATE cases SET lease_expires_at = ?, updated_at = ? "
+                "WHERE case_id = ? AND execution_token = ? AND execution_generation = ? "
+                "AND execution_state = 'RUNNING' AND lease_expires_at > ?",
+                (
+                    expires_at.isoformat(),
+                    renewed_at.isoformat(),
+                    claim.case_id,
+                    claim.token,
+                    claim.generation,
+                    renewed_at.isoformat(),
+                ),
+            )
+            if updated.rowcount != 1:
+                connection.rollback()
+                self._raise_stale_execution_claim(claim)
+            connection.commit()
+        return ExecutionClaim(claim.case_id, claim.token, claim.generation, expires_at)
+
+    @staticmethod
+    def _raise_stale_execution_claim(claim: ExecutionClaim) -> None:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            f"execution claim is stale for case {claim.case_id}",
+            case_id=claim.case_id,
+            stop_reason="STALE_EXECUTION_CLAIM",
+            details={"execution_generation": claim.generation},
+        )
+
     def save_extraction(self, case_id: str, invoice: ExtractedInvoice) -> str:
         extraction_id = f"ext_{uuid4().hex}"
         with connect_database(self.path) as connection:
@@ -575,14 +706,43 @@ class WorkflowStore:
                 connection.rollback()
                 raise
 
-    def save_final_decision(self, case_id: str, decision: FinalDecision) -> None:
+    def save_final_decision(
+        self, case_id: str, decision: FinalDecision, claim: ExecutionClaim
+    ) -> None:
+        if claim.case_id != case_id:
+            self._raise_stale_execution_claim(claim)
+        written_at = now_iso()
         with connect_database(self.path) as connection:
-            connection.execute(
-                "INSERT INTO final_decisions(decision_id, case_id, payload_json, created_at) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT(case_id) DO UPDATE SET "
-                "payload_json=excluded.payload_json, created_at=excluded.created_at",
-                (f"fdec_{uuid4().hex}", case_id, decision.model_dump_json(), now_iso()),
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                "INSERT INTO final_decisions("
+                "decision_id, case_id, payload_json, created_at, decision_generation) "
+                "SELECT ?, case_id, ?, ?, ? FROM cases WHERE case_id = ? "
+                "AND execution_token = ? AND execution_generation = ? "
+                "AND execution_state = 'RUNNING' AND lease_expires_at > ? "
+                "ON CONFLICT(case_id) DO UPDATE SET payload_json=excluded.payload_json, "
+                "created_at=excluded.created_at, "
+                "decision_generation=excluded.decision_generation WHERE EXISTS ("
+                "SELECT 1 FROM cases WHERE cases.case_id = excluded.case_id "
+                "AND execution_token = ? AND execution_generation = ? "
+                "AND execution_state = 'RUNNING' AND lease_expires_at > ?)",
+                (
+                    f"fdec_{uuid4().hex}",
+                    decision.model_dump_json(),
+                    written_at,
+                    claim.generation,
+                    case_id,
+                    claim.token,
+                    claim.generation,
+                    written_at,
+                    claim.token,
+                    claim.generation,
+                    written_at,
+                ),
             )
+            if updated.rowcount != 1:
+                connection.rollback()
+                self._raise_stale_execution_claim(claim)
             connection.commit()
 
     def load_final_decision(self, case_id: str) -> FinalDecision | None:
@@ -592,12 +752,30 @@ class WorkflowStore:
             ).fetchone()
         return FinalDecision.model_validate_json(row["payload_json"]) if row else None
 
-    def save_team_state(self, case_id: str, state: dict[str, Any]) -> None:
+    def save_team_state(
+        self, case_id: str, state: dict[str, Any], claim: ExecutionClaim
+    ) -> None:
+        if claim.case_id != case_id:
+            self._raise_stale_execution_claim(claim)
+        written_at = now_iso()
         with connect_database(self.path) as connection:
-            connection.execute(
-                "UPDATE cases SET team_state_json = ?, updated_at = ? WHERE case_id = ?",
-                (encode(state), now_iso(), case_id),
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                "UPDATE cases SET team_state_json = ?, updated_at = ? WHERE case_id = ? "
+                "AND execution_token = ? AND execution_generation = ? "
+                "AND execution_state = 'RUNNING' AND lease_expires_at > ?",
+                (
+                    encode(state),
+                    written_at,
+                    case_id,
+                    claim.token,
+                    claim.generation,
+                    written_at,
+                ),
             )
+            if updated.rowcount != 1:
+                connection.rollback()
+                self._raise_stale_execution_claim(claim)
             connection.commit()
 
     def load_team_state(self, case_id: str) -> dict[str, Any] | None:
@@ -614,20 +792,32 @@ class WorkflowStore:
             )
         return json.loads(row["team_state_json"]) if row["team_state_json"] else None
 
-    def finish_case(self, result: CaseResult) -> None:
+    def finish_case(self, result: CaseResult, claim: ExecutionClaim) -> None:
+        if claim.case_id != result.case_id:
+            self._raise_stale_execution_claim(claim)
+        written_at = now_iso()
         with connect_database(self.path) as connection:
-            connection.execute(
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
                 "UPDATE cases SET status = ?, stop_reason = ?, result_json = ?, updated_at = ?, "
-                "finished_at = ? WHERE case_id = ?",
+                "finished_at = ?, execution_state = 'FINISHED', lease_expires_at = NULL "
+                "WHERE case_id = ? AND execution_token = ? AND execution_generation = ? "
+                "AND execution_state = 'RUNNING' AND lease_expires_at > ?",
                 (
                     result.status,
                     result.stop_reason,
                     result.model_dump_json(),
-                    now_iso(),
+                    written_at,
                     result.finished_at.isoformat(),
                     result.case_id,
+                    claim.token,
+                    claim.generation,
+                    written_at,
                 ),
             )
+            if updated.rowcount != 1:
+                connection.rollback()
+                self._raise_stale_execution_claim(claim)
             connection.commit()
 
     def load_result(self, case_id: str) -> CaseResult | None:

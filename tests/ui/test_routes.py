@@ -82,6 +82,9 @@ def stub_runs(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> None:
         calls.append(case_id)
         store = WorkflowStore(settings.workflow_db)
         invoice = store.load_extraction(case_id)
+        claim = store.claim_case_execution(
+            case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+        )
         result = CaseResult(
             case_id=case_id,
             source_id=invoice.source.source_id,
@@ -90,7 +93,7 @@ def stub_runs(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> None:
             started_at=started_at,
             finished_at=datetime.now(UTC),
         )
-        store.finish_case(result)
+        store.finish_case(result, claim)
         return result
 
     monkeypatch.setattr("invoice_agents.ui.runs.run_prepared_case", fake_run)
@@ -104,7 +107,7 @@ def test_dashboard_empty_state(client: TestClient) -> None:
     assert response.status_code == 200
     assert "No cases yet" in response.text
     assert "invoice-agents process" in response.text
-    assert "schema v2, integrity ok" in response.text
+    assert "schema v3, integrity ok" in response.text
 
 
 def test_dashboard_lists_stored_case(client: TestClient, settings: Settings) -> None:
@@ -515,6 +518,9 @@ def test_reject_decision_recorded_and_resumable(
     async def fake_resume(resume_case_id: str, resume_settings: Settings) -> CaseResult:
         resumed.append(resume_case_id)
         store = WorkflowStore(resume_settings.workflow_db)
+        claim = store.claim_case_execution(
+            resume_case_id, frozenset({CaseStatus.NEEDS_HUMAN}), lease_seconds=60
+        )
         result = store.load_result(resume_case_id)
         assert result is not None
         finished = result.model_copy(
@@ -525,7 +531,7 @@ def test_reject_decision_recorded_and_resumable(
             },
             deep=True,
         )
-        store.finish_case(finished)
+        store.finish_case(finished, claim)
         return finished
 
     monkeypatch.setattr("invoice_agents.ui.runs.resume_case", fake_resume)

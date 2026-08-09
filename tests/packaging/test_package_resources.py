@@ -12,4 +12,5 @@ def test_each_database_kind_has_packaged_migrations() -> None:
     assert [item.name for item in _migration_resources(DatabaseKind.WORKFLOW)] == [
         "001_initial.sql",
         "002_review_sequence.sql",
+        "003_execution_fencing.sql",
     ]

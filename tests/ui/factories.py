@@ -93,14 +93,17 @@ def make_succeeded_case(settings: Settings, name: str = "invoice_1001.txt") -> s
     store = WorkflowStore(settings.workflow_db)
     invoice = store.load_extraction(case_id)
     record_case_evidence(settings, case_id, DecisionKind.APPROVE)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
     decision = FinalDecision(
         decision=DecisionKind.APPROVE,
         reasons=["all deterministic checks passed"],
         critic_disposition=DecisionKind.APPROVE,
         payment_eligible=True,
     )
-    store.save_final_decision(case_id, decision)
-    payment = mock_payment(case_id, invoice, store, settings.workflow_db)
+    store.save_final_decision(case_id, decision, claim)
+    payment = mock_payment(case_id, invoice, store, settings.workflow_db, claim)
     result = CaseResult(
         case_id=case_id,
         source_id=invoice.source.source_id,
@@ -112,7 +115,7 @@ def make_succeeded_case(settings: Settings, name: str = "invoice_1001.txt") -> s
         started_at=started_at,
         finished_at=_now(),
     )
-    store.finish_case(result)
+    store.finish_case(result, claim)
     return case_id
 
 
@@ -135,7 +138,10 @@ def make_pending_review_case(
         ["policy triggers require human review"],
         store,
     )
-    store.save_team_state(case_id, {"fixture": "stopped-team-state"})
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.save_team_state(case_id, {"fixture": "stopped-team-state"}, claim)
     result = CaseResult(
         case_id=case_id,
         source_id=invoice.source.source_id,
@@ -145,7 +151,7 @@ def make_pending_review_case(
         started_at=started_at,
         finished_at=_now(),
     )
-    store.finish_case(result)
+    store.finish_case(result, claim)
     return case_id, review
 
 
@@ -155,6 +161,9 @@ def make_failed_case(settings: Settings, name: str = "invoice_1001.txt") -> str:
     case_id, started_at = prepare_fixture_case(settings, DATA_DIR / name)
     store = WorkflowStore(settings.workflow_db)
     invoice = store.load_extraction(case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
     result = CaseResult(
         case_id=case_id,
         source_id=invoice.source.source_id,
@@ -172,5 +181,5 @@ def make_failed_case(settings: Settings, name: str = "invoice_1001.txt") -> str:
         started_at=started_at,
         finished_at=_now(),
     )
-    store.finish_case(result)
+    store.finish_case(result, claim)
     return case_id

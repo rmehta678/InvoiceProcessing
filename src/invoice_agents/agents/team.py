@@ -21,7 +21,7 @@ from invoice_agents.agents.decision_rules import (
     validate_final_decision,
 )
 from invoice_agents.config import XAI_BASE_URL, XAI_MODEL, Settings
-from invoice_agents.db.store import WorkflowStore
+from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.hitl.service import create_review_request
 from invoice_agents.models import (
@@ -56,6 +56,7 @@ class AgentCaseContext:
     settings: Settings
     store: WorkflowStore
     audit: AuditRecorder
+    claim: ExecutionClaim
     payment_result: PaymentResult | None = None
     tool_failures: list[str] = field(default_factory=list)
 
@@ -423,7 +424,7 @@ def build_team(
             human_outcome=human,
             payment_eligible=payment_eligible,
         )
-        context.store.save_final_decision(context.case_id, final)
+        context.store.save_final_decision(context.case_id, final, context.claim)
         payload = final.model_dump(mode="json")
         context.audit.record(
             "workflow.final_decision",
@@ -441,6 +442,7 @@ def build_team(
             context.invoice(),
             context.store,
             context.settings.workflow_db,
+            context.claim,
         )
         context.payment_result = payment
         context.audit.record(

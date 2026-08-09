@@ -31,7 +31,7 @@ class DatabaseKind(StrEnum):
 # direction, so an unmigrated or future database never silently processes cases.
 SCHEMA_VERSIONS: dict[DatabaseKind, int] = {
     DatabaseKind.INVENTORY: 1,
-    DatabaseKind.WORKFLOW: 2,
+    DatabaseKind.WORKFLOW: 3,
 }
 
 # Named indexes created by the migrations; verification fails when one is missing.
@@ -45,6 +45,7 @@ REQUIRED_INDEXES: dict[DatabaseKind, frozenset[str]] = {
             "idx_payments_case_id",
             "idx_events_case_created",
             "idx_review_requests_case_sequence",
+            "idx_cases_execution_lease",
         }
     ),
 }
@@ -217,14 +218,23 @@ def verify_database(
         required = {
             "schema_version": {"version", "applied_at"},
             "source_artifacts": {"source_id", "source_hash", "metadata_json"},
-            "cases": {"case_id", "source_id", "status", "team_state_json"},
+            "cases": {
+                "case_id",
+                "source_id",
+                "status",
+                "team_state_json",
+                "execution_token",
+                "execution_generation",
+                "execution_state",
+                "lease_expires_at",
+            },
             "extractions": {"case_id", "payload_json"},
             "identity_results": {"case_id", "payload_json"},
             "comparison_results": {"case_id", "comparison_type", "payload_json"},
             "critique_results": {"case_id", "payload_json"},
             "review_requests": {"review_id", "case_id", "sequence", "status", "payload_json"},
             "human_decisions": {"review_id", "reviewer", "decision"},
-            "final_decisions": {"case_id", "payload_json"},
+            "final_decisions": {"case_id", "payload_json", "decision_generation"},
             "payments": {"case_id", "idempotency_key", "status"},
             "events": {"case_id", "event_type", "payload_json"},
         }

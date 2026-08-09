@@ -2,7 +2,8 @@
 
 Runs are keyed by case ID and reuse the same bounded-concurrency semantics as
 ``process_batch``. The registry only knows whether a task is in flight; case
-status always comes from storage.
+status and execution authority always come from the workflow database claim
+acquired by the orchestration entrypoint used by both CLI and UI callers.
 """
 
 from __future__ import annotations
@@ -123,7 +124,7 @@ class RunRegistry:
         return case_id
 
     def start_resume(self, case_id: str, settings: Settings) -> RunHandle:
-        """Launch resume_case for a case unless it is already in flight."""
+        """Launch resume; the registry hint never replaces resume_case's DB claim."""
 
         existing = self._runs.get(case_id)
         if existing is not None and existing.state != "done":
