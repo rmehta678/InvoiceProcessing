@@ -34,8 +34,6 @@ from invoice_agents.models import (
     FinalDecision,
     FinancialComparison,
     HumanDecisionKind,
-    InventoryComparison,
-    InventoryStatus,
     ReviewRequest,
     RiskAssessment,
     SourceArtifact,
@@ -50,6 +48,12 @@ from invoice_agents.orchestration import (
 )
 from invoice_agents.payment.service import mock_payment
 from invoice_agents.source_store import snapshot_source
+from invoice_agents.tools.comparison import (
+    InventoryReader,
+    build_risk_assessment,
+    compare_inventory,
+    compute_invoice_totals,
+)
 from invoice_agents.tools.evidence import extract_invoice_evidence
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
@@ -174,32 +178,38 @@ def _pending_review(case_id: str) -> ReviewRequest:
     )
 
 
-def _blocking_inventory() -> InventoryComparison:
-    return InventoryComparison(
-        sku="SKU-WIDGET-A",
-        raw_items=["WidgetA"],
-        requested_quantity=Decimal("20"),
-        available_stock=15,
-        status=InventoryStatus.EXCEEDS_STOCK,
-        explanation="stock comparison",
-    )
-
-
 def _persist_blocking_review(invoice_dir: Path, settings: Settings) -> ReviewRequest:
     case_id, _started_at = _prepare(invoice_dir, settings)
     store = WorkflowStore(settings.workflow_db)
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    store.promote_predecessor_extraction(claim)
-    risk = _risk(["blocking evidence requires review"]).model_copy(
-        update={"inventory": [_blocking_inventory()]}, deep=True
+    invoice = store.promote_predecessor_extraction(claim)
+    with connect_database(settings.inventory_db) as connection:
+        connection.execute(
+            "UPDATE inventory SET available_stock = ? WHERE sku = ?",
+            (5, "SKU-WIDGET-A"),
+        )
+        connection.commit()
+    comparisons, _unresolved = compare_inventory(invoice, InventoryReader(settings.inventory_db))
+    risk = build_risk_assessment(
+        invoice, comparisons, [], compute_invoice_totals(invoice), settings
     )
+    case_critique = _critique(DecisionKind.HOLD)
+    store.save_identity(case_id, [], claim)
+    store.save_comparison(
+        case_id,
+        "inventory",
+        {"comparisons": [item.model_dump(mode="json") for item in comparisons]},
+        claim,
+    )
+    store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim)
+    store.save_critique(case_id, case_critique, claim)
     review = create_review_request(
         case_id,
-        store.load_extraction(case_id),
+        invoice,
         risk,
-        _critique(DecisionKind.HOLD),
+        case_critique,
         DecisionKind.HOLD,
         ["blocking evidence requires review"],
         store,
@@ -218,7 +228,7 @@ def test_review_package_persists_typed_blocking_evidence(
             "blocker_id": "inventory:SKU-WIDGET-A:EXCEEDS_STOCK",
             "kind": "inventory",
             "evidence_id": "SKU-WIDGET-A",
-            "description": "inventory EXCEEDS_STOCK: WidgetA requested=20 stock=15",
+            "description": "inventory EXCEEDS_STOCK: WidgetA requested=10 stock=5",
         }
     ]
     assert review.evidence_bundle["blocking_evidence"] == expected
@@ -424,15 +434,24 @@ async def test_malformed_provider_response_categorized(
 
 def test_payment_ledger_write_failure(invoice_dir: Path, settings: Settings) -> None:
     store = WorkflowStore(settings.workflow_db)
-    case_id, _ = _prepare(invoice_dir, settings)
+    case_id, _ = _prepare(invoice_dir, settings, "invoice_1004.json")
     invoice = store.load_extraction(case_id)
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    store.promote_predecessor_extraction(claim)
+    invoice = store.promote_predecessor_extraction(claim)
+    comparisons, _unresolved = compare_inventory(invoice, InventoryReader(settings.inventory_db))
+    risk = build_risk_assessment(
+        invoice, comparisons, [], compute_invoice_totals(invoice), settings
+    )
     store.save_identity(case_id, [], claim)
-    store.save_comparison(case_id, "inventory", {"comparisons": []}, claim)
-    store.save_comparison(case_id, "risk", _risk([]).model_dump(mode="json"), claim)
+    store.save_comparison(
+        case_id,
+        "inventory",
+        {"comparisons": [item.model_dump(mode="json") for item in comparisons]},
+        claim,
+    )
+    store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim)
     store.save_critique(case_id, _critique(DecisionKind.APPROVE), claim)
     store.save_final_decision(
         case_id,

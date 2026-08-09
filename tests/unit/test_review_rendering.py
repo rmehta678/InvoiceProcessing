@@ -47,11 +47,21 @@ def build_review(name: str, settings: Settings) -> ReviewRequest:
         invoice, comparisons, [], compute_invoice_totals(invoice), settings
     )
     assert risk.policy_review_reasons
+    case_critique = make_critique()
+    store.save_identity(case_id, [], claim)
+    store.save_comparison(
+        case_id,
+        "inventory",
+        {"comparisons": [item.model_dump(mode="json") for item in comparisons]},
+        claim,
+    )
+    store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim)
+    store.save_critique(case_id, case_critique, claim)
     review = create_review_request(
         case_id,
         invoice,
         risk,
-        make_critique(),
+        case_critique,
         DecisionKind.HOLD,
         ["deterministic review rationale"],
         store,

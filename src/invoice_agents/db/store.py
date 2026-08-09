@@ -14,6 +14,12 @@ from pydantic import BaseModel
 
 from invoice_agents.db.core import connect_database
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
+from invoice_agents.evidence_snapshot import (
+    EvidenceSnapshot,
+    EvidenceSnapshotError,
+    build_evidence_snapshot,
+    validate_review_snapshot,
+)
 from invoice_agents.models import (
     CaseResult,
     CaseStatus,
@@ -23,7 +29,6 @@ from invoice_agents.models import (
     HumanDecision,
     HumanDecisionKind,
     ReviewRequest,
-    RiskAssessment,
     SourceArtifact,
 )
 
@@ -58,6 +63,115 @@ def parse_canonical_utc(value: object) -> datetime | None:
     if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
         return None
     return parsed if parsed.isoformat() == value else None
+
+
+def _authoritative_source_for_case(connection: sqlite3.Connection, case_id: str) -> SourceArtifact:
+    row = connection.execute(
+        "SELECT c.source_id AS case_source_id, s.source_id, s.canonical_path, "
+        "s.source_hash, s.source_format, s.size_bytes, s.modified_at, s.metadata_json "
+        "FROM cases c JOIN source_artifacts s ON s.source_id = c.source_id "
+        "WHERE c.case_id = ?",
+        (case_id,),
+    ).fetchone()
+    if row is None:
+        raise EvidenceSnapshotError("case has no authoritative source_artifact")
+    try:
+        source = SourceArtifact.model_validate_json(row["metadata_json"])
+    except ValueError as exc:
+        raise EvidenceSnapshotError(f"source_artifacts metadata is invalid: {exc}") from exc
+    relationally_coherent = (
+        row["case_source_id"] == source.source_id
+        and row["source_id"] == source.source_id
+        and row["canonical_path"] == str(source.canonical_path)
+        and row["source_hash"] == source.sha256
+        and row["source_format"] == source.source_format
+        and int(row["size_bytes"]) == source.size_bytes
+        and row["modified_at"] == source.modified_at.isoformat()
+    )
+    if not relationally_coherent:
+        raise EvidenceSnapshotError(
+            "source_artifacts relational columns do not match their metadata_json"
+        )
+    return source
+
+
+def load_generation_evidence_snapshot(
+    connection: sqlite3.Connection,
+    case_id: str,
+    generation: int,
+    *,
+    require_latest: bool = True,
+) -> EvidenceSnapshot:
+    """Load one generation's latest component rows and validate them as one snapshot."""
+
+    specifications = {
+        "extraction": (
+            "SELECT payload_json FROM extractions WHERE case_id = ? "
+            "AND execution_generation = ? ORDER BY version DESC LIMIT 1",
+            "extractions",
+            "execution_generation",
+            "",
+        ),
+        "identity": (
+            "SELECT payload_json FROM identity_results WHERE case_id = ? "
+            "AND execution_generation = ? ORDER BY rowid DESC LIMIT 1",
+            "identity_results",
+            "execution_generation",
+            "",
+        ),
+        "inventory": (
+            "SELECT payload_json FROM comparison_results WHERE case_id = ? "
+            "AND execution_generation = ? AND comparison_type = 'inventory' "
+            "ORDER BY rowid DESC LIMIT 1",
+            "comparison_results",
+            "execution_generation",
+            "AND comparison_type = 'inventory'",
+        ),
+        "risk": (
+            "SELECT payload_json FROM comparison_results WHERE case_id = ? "
+            "AND execution_generation = ? AND comparison_type = 'risk' "
+            "ORDER BY rowid DESC LIMIT 1",
+            "comparison_results",
+            "execution_generation",
+            "AND comparison_type = 'risk'",
+        ),
+        "critique": (
+            "SELECT payload_json FROM critique_results WHERE case_id = ? "
+            "AND execution_generation = ? ORDER BY rowid DESC LIMIT 1",
+            "critique_results",
+            "execution_generation",
+            "",
+        ),
+    }
+    payloads: dict[str, str] = {}
+    missing: list[str] = []
+    stale: list[str] = []
+    for name, (sql, table, column, predicate) in specifications.items():
+        row = connection.execute(sql, (case_id, generation)).fetchone()
+        if row is None:
+            missing.append(name)
+            continue
+        payloads[name] = str(row["payload_json"])
+        if require_latest:
+            latest = connection.execute(
+                f"SELECT MAX({column}) AS generation FROM {table} WHERE case_id = ? {predicate}",
+                (case_id,),
+            ).fetchone()["generation"]
+            if latest is None or int(latest) != generation:
+                stale.append(f"{name}:{latest}")
+    if missing or stale:
+        raise EvidenceSnapshotError(
+            f"generation {generation} evidence is missing={sorted(missing)} stale={sorted(stale)}"
+        )
+    return build_evidence_snapshot(
+        case_id,
+        _authoritative_source_for_case(connection, case_id),
+        payloads["extraction"],
+        payloads["identity"],
+        payloads["inventory"],
+        payloads["risk"],
+        payloads["critique"],
+    )
 
 
 def encode(value: BaseModel | dict[str, Any] | list[Any]) -> str:
@@ -309,23 +423,41 @@ class WorkflowStore:
 
     def register_source(self, source: SourceArtifact) -> None:
         with connect_database(self.path) as connection:
-            connection.execute(
-                "INSERT INTO source_artifacts("
-                "source_id, canonical_path, source_hash, source_format, size_bytes, modified_at, "
-                "metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(source_id) DO UPDATE SET metadata_json=excluded.metadata_json",
-                (
-                    source.source_id,
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                existing = connection.execute(
+                    "SELECT canonical_path, source_hash, source_format, size_bytes, modified_at, "
+                    "metadata_json FROM source_artifacts WHERE source_id = ?",
+                    (source.source_id,),
+                ).fetchone()
+                expected = (
                     str(source.canonical_path),
                     source.sha256,
                     source.source_format,
                     source.size_bytes,
                     source.modified_at.isoformat(),
                     source.model_dump_json(),
-                    now_iso(),
-                ),
-            )
-            connection.commit()
+                )
+                if existing is not None:
+                    actual = tuple(existing[index] for index in range(6))
+                    if actual != expected:
+                        raise InvoiceAgentsError(
+                            ErrorCategory.DATABASE,
+                            f"source artifact {source.source_id} is immutable and conflicts",
+                            stop_reason="SOURCE_ARTIFACT_IMMUTABLE",
+                        )
+                    connection.commit()
+                    return
+                connection.execute(
+                    "INSERT INTO source_artifacts("
+                    "source_id, canonical_path, source_hash, source_format, size_bytes, "
+                    "modified_at, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (source.source_id, *expected, now_iso()),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
     def create_case(self, case_id: str, source: SourceArtifact, started_at: datetime) -> None:
         with connect_database(self.path) as connection:
@@ -540,6 +672,35 @@ class WorkflowStore:
             self._raise_stale_execution_claim(claim)
 
     @staticmethod
+    def _assert_evidence_generation_mutable(
+        connection: sqlite3.Connection, case_id: str, generation: int
+    ) -> None:
+        locked = connection.execute(
+            "SELECT 'final' AS reason FROM final_decisions WHERE case_id = ? "
+            "AND decision_generation = ? UNION ALL "
+            "SELECT 'paid' FROM payments WHERE case_id = ? AND status = 'PAID' LIMIT 1",
+            (case_id, generation, case_id),
+        ).fetchone()
+        if locked is not None:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                f"authorization evidence is immutable after {locked['reason']} for case {case_id}",
+                case_id=case_id,
+                stop_reason="AUTHORIZATION_EVIDENCE_IMMUTABLE",
+                details={"execution_generation": generation},
+            )
+
+    @staticmethod
+    def _raise_snapshot_invalid(case_id: str, generation: int, reason: str) -> Never:
+        raise InvoiceAgentsError(
+            ErrorCategory.DATABASE,
+            f"authorization evidence snapshot is invalid for case {case_id}: {reason}",
+            case_id=case_id,
+            stop_reason="EVIDENCE_SNAPSHOT_INVALID",
+            details={"execution_generation": generation, "reason": reason},
+        )
+
+    @staticmethod
     def _raise_stale_execution_claim(claim: ExecutionClaim) -> None:
         raise InvoiceAgentsError(
             ErrorCategory.ORCHESTRATION,
@@ -559,6 +720,7 @@ class WorkflowStore:
             connection.execute("BEGIN IMMEDIATE")
             written_at = datetime.now(UTC)
             self._require_current_claim(connection, claim, written_at)
+            self._assert_evidence_generation_mutable(connection, case_id, claim.generation)
             version_row = connection.execute(
                 "SELECT COALESCE(MAX(version), 0) AS version FROM extractions WHERE case_id = ?",
                 (case_id,),
@@ -656,6 +818,7 @@ class WorkflowStore:
             connection.execute("BEGIN IMMEDIATE")
             written_at = datetime.now(UTC)
             self._require_current_claim(connection, claim, written_at)
+            self._assert_evidence_generation_mutable(connection, case_id, claim.generation)
             connection.execute(
                 "INSERT INTO comparison_results("
                 "comparison_id, case_id, comparison_type, payload_json, created_at, "
@@ -729,65 +892,19 @@ class WorkflowStore:
                 connection.execute("BEGIN IMMEDIATE")
                 adopted_at = datetime.now(UTC)
                 self._require_current_claim(connection, claim, adopted_at)
+                self._assert_evidence_generation_mutable(
+                    connection, claim.case_id, claim.generation
+                )
                 predecessor = claim.generation - 1
                 if predecessor < 1:
                     self._raise_evidence_provenance(claim, "no predecessor generation exists")
                 self._reject_future_evidence(connection, claim)
-                extraction = connection.execute(
-                    "SELECT payload_json, version FROM extractions WHERE case_id = ? "
-                    "AND execution_generation = ? ORDER BY version DESC LIMIT 1",
-                    (claim.case_id, predecessor),
-                ).fetchone()
-                identity = connection.execute(
-                    "SELECT payload_json FROM identity_results WHERE case_id = ? "
-                    "AND execution_generation = ? ORDER BY rowid DESC LIMIT 1",
-                    (claim.case_id, predecessor),
-                ).fetchone()
-                inventory = connection.execute(
-                    "SELECT payload_json FROM comparison_results WHERE case_id = ? "
-                    "AND execution_generation = ? AND comparison_type = 'inventory' "
-                    "ORDER BY rowid DESC LIMIT 1",
-                    (claim.case_id, predecessor),
-                ).fetchone()
-                risk = connection.execute(
-                    "SELECT payload_json FROM comparison_results WHERE case_id = ? "
-                    "AND execution_generation = ? AND comparison_type = 'risk' "
-                    "ORDER BY rowid DESC LIMIT 1",
-                    (claim.case_id, predecessor),
-                ).fetchone()
-                critique = connection.execute(
-                    "SELECT payload_json FROM critique_results WHERE case_id = ? "
-                    "AND execution_generation = ? ORDER BY rowid DESC LIMIT 1",
-                    (claim.case_id, predecessor),
-                ).fetchone()
-                required = {
-                    "extraction": extraction,
-                    "identity": identity,
-                    "inventory": inventory,
-                    "risk": risk,
-                    "critique": critique,
-                }
-                missing = sorted(name for name, row in required.items() if row is None)
-                if missing:
-                    self._raise_evidence_provenance(
-                        claim,
-                        f"predecessor generation {predecessor} is incomplete: {missing}",
+                try:
+                    snapshot = load_generation_evidence_snapshot(
+                        connection, claim.case_id, predecessor
                     )
-                assert extraction is not None
-                assert identity is not None
-                assert inventory is not None
-                assert risk is not None
-                assert critique is not None
-                invoice = self._validate_predecessor_snapshot(
-                    connection,
-                    claim,
-                    extraction["payload_json"],
-                    identity["payload_json"],
-                    inventory["payload_json"],
-                    risk["payload_json"],
-                    critique["payload_json"],
-                    predecessor,
-                )
+                except EvidenceSnapshotError as exc:
+                    self._raise_evidence_provenance(claim, str(exc))
                 next_version = (
                     int(
                         connection.execute(
@@ -804,14 +921,24 @@ class WorkflowStore:
                         f"ext_{uuid4().hex}",
                         claim.case_id,
                         next_version,
-                        invoice.model_dump_json(),
+                        snapshot.invoice.model_dump_json(),
                         adopted_at.isoformat(),
                         claim.generation,
                     ),
                 )
-                for table, id_column, prefix, row in (
-                    ("identity_results", "identity_id", "ident", identity),
-                    ("critique_results", "critique_id", "crit", critique),
+                for table, id_column, prefix, payload_json in (
+                    (
+                        "identity_results",
+                        "identity_id",
+                        "ident",
+                        encode([item.model_dump(mode="json") for item in snapshot.identity]),
+                    ),
+                    (
+                        "critique_results",
+                        "critique_id",
+                        "crit",
+                        snapshot.critique.model_dump_json(),
+                    ),
                 ):
                     connection.execute(
                         f"INSERT INTO {table}({id_column}, case_id, payload_json, created_at, "
@@ -819,12 +946,15 @@ class WorkflowStore:
                         (
                             f"{prefix}_{uuid4().hex}",
                             claim.case_id,
-                            row["payload_json"],
+                            payload_json,
                             adopted_at.isoformat(),
                             claim.generation,
                         ),
                     )
-                for comparison_type, row in (("inventory", inventory), ("risk", risk)):
+                for comparison_type, payload_json in (
+                    ("inventory", encode(snapshot.inventory_payload)),
+                    ("risk", snapshot.risk.model_dump_json()),
+                ):
                     connection.execute(
                         "INSERT INTO comparison_results(comparison_id, case_id, "
                         "comparison_type, payload_json, created_at, execution_generation) "
@@ -833,17 +963,29 @@ class WorkflowStore:
                             f"cmp_{uuid4().hex}",
                             claim.case_id,
                             comparison_type,
-                            row["payload_json"],
+                            payload_json,
                             adopted_at.isoformat(),
                             claim.generation,
                         ),
                     )
                 review = connection.execute(
-                    "SELECT review_id FROM review_requests WHERE case_id = ? "
+                    "SELECT review_id, payload_json, evidence_snapshot_digest "
+                    "FROM review_requests WHERE case_id = ? "
                     "AND execution_generation = ? ORDER BY sequence DESC LIMIT 1",
                     (claim.case_id, predecessor),
                 ).fetchone()
                 if review is not None:
+                    try:
+                        predecessor_review = ReviewRequest.model_validate_json(
+                            review["payload_json"]
+                        )
+                        validate_review_snapshot(predecessor_review, snapshot)
+                    except (EvidenceSnapshotError, ValueError) as exc:
+                        self._raise_evidence_provenance(claim, str(exc))
+                    if review["evidence_snapshot_digest"] != snapshot.digest:
+                        self._raise_evidence_provenance(
+                            claim, "predecessor review snapshot digest does not match evidence"
+                        )
                     updated = connection.execute(
                         "UPDATE review_requests SET execution_generation = ? "
                         "WHERE review_id = ? AND execution_generation = ?",
@@ -866,6 +1008,9 @@ class WorkflowStore:
                 connection.execute("BEGIN IMMEDIATE")
                 promoted_at = datetime.now(UTC)
                 self._require_current_claim(connection, claim, promoted_at)
+                self._assert_evidence_generation_mutable(
+                    connection, claim.case_id, claim.generation
+                )
                 predecessor = claim.generation - 1
                 if predecessor < 1:
                     self._raise_evidence_provenance(claim, "no predecessor generation exists")
@@ -942,13 +1087,18 @@ class WorkflowStore:
             invoice = ExtractedInvoice.model_validate_json(payload_json)
         except ValueError as exc:
             self._raise_evidence_provenance(claim, f"invalid predecessor extraction: {exc}")
+        try:
+            authoritative_source = _authoritative_source_for_case(connection, claim.case_id)
+        except EvidenceSnapshotError as exc:
+            self._raise_evidence_provenance(claim, str(exc))
         row = connection.execute(
             "SELECT source_id, invoice_number, vendor, revision FROM cases WHERE case_id = ?",
             (claim.case_id,),
         ).fetchone()
         revision = invoice.revision.normalized_value if invoice.revision else None
         if row is None or (
-            invoice.source.source_id != row["source_id"]
+            invoice.source != authoritative_source
+            or invoice.source.source_id != row["source_id"]
             or invoice.invoice_number.normalized_value != row["invoice_number"]
             or invoice.vendor.normalized_value != row["vendor"]
             or revision != row["revision"]
@@ -956,72 +1106,6 @@ class WorkflowStore:
             self._raise_evidence_provenance(
                 claim, "predecessor extraction does not match the case identity"
             )
-        return invoice
-
-    def _validate_predecessor_snapshot(
-        self,
-        connection: sqlite3.Connection,
-        claim: ExecutionClaim,
-        extraction_json: str,
-        identity_json: str,
-        inventory_json: str,
-        risk_json: str,
-        critique_json: str,
-        predecessor: int,
-    ) -> ExtractedInvoice:
-        invoice = self._validate_case_invoice(connection, claim, extraction_json)
-        try:
-            identity = json.loads(identity_json)
-            inventory = json.loads(inventory_json)
-            risk = RiskAssessment.model_validate_json(risk_json)
-            critique = Critique.model_validate_json(critique_json)
-        except (TypeError, ValueError) as exc:
-            self._raise_evidence_provenance(
-                claim, f"predecessor evidence payload is invalid: {exc}"
-            )
-        if not isinstance(identity, list) or not isinstance(inventory, dict):
-            self._raise_evidence_provenance(
-                claim, "predecessor identity or inventory payload has the wrong shape"
-            )
-        comparisons = inventory.get("comparisons")
-        if comparisons != [item.model_dump(mode="json") for item in risk.inventory] or identity != [
-            item.model_dump(mode="json") for item in risk.identity_candidates
-        ]:
-            self._raise_evidence_provenance(
-                claim, "predecessor risk does not match its identity and inventory evidence"
-            )
-        review_row = connection.execute(
-            "SELECT payload_json, execution_generation FROM review_requests "
-            "WHERE case_id = ? ORDER BY sequence DESC LIMIT 1",
-            (claim.case_id,),
-        ).fetchone()
-        if review_row is not None:
-            if int(review_row["execution_generation"]) != predecessor:
-                self._raise_evidence_provenance(
-                    claim, "latest review does not belong to the predecessor generation"
-                )
-            try:
-                review = ReviewRequest.model_validate_json(review_row["payload_json"])
-            except ValueError as exc:
-                self._raise_evidence_provenance(
-                    claim, f"predecessor review payload is invalid: {exc}"
-                )
-            bundle = review.evidence_bundle
-            coherent_review = (
-                review.case_id == claim.case_id
-                and review.source == invoice.source
-                and bundle.get("invoice") == invoice.model_dump(mode="json")
-                and bundle.get("financial") == risk.financial.model_dump(mode="json")
-                and bundle.get("inventory")
-                == [item.model_dump(mode="json") for item in risk.inventory]
-                and bundle.get("identity_candidates")
-                == [item.model_dump(mode="json") for item in risk.identity_candidates]
-                and review.critic == critique
-            )
-            if not coherent_review:
-                self._raise_evidence_provenance(
-                    claim, "predecessor review does not match the promoted evidence"
-                )
         return invoice
 
     @staticmethod
@@ -1045,8 +1129,16 @@ class WorkflowStore:
             connection.execute("BEGIN IMMEDIATE")
             written_at = datetime.now(UTC)
             self._require_current_claim(connection, claim, written_at)
+            self._assert_evidence_generation_mutable(connection, review.case_id, claim.generation)
             if claim.case_id != review.case_id:
                 self._raise_stale_execution_claim(claim)
+            try:
+                snapshot = load_generation_evidence_snapshot(
+                    connection, review.case_id, claim.generation
+                )
+                validate_review_snapshot(review, snapshot)
+            except EvidenceSnapshotError as exc:
+                self._raise_snapshot_invalid(review.case_id, claim.generation, str(exc))
             row = connection.execute(
                 "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM review_requests "
                 "WHERE case_id = ?",
@@ -1056,7 +1148,8 @@ class WorkflowStore:
             connection.execute(
                 "INSERT INTO review_requests("
                 "review_id, case_id, sequence, status, payload_json, created_at, "
-                "execution_generation) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "execution_generation, evidence_snapshot_digest) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     sequenced.review_id,
                     sequenced.case_id,
@@ -1065,6 +1158,7 @@ class WorkflowStore:
                     sequenced.model_dump_json(),
                     sequenced.created_at.isoformat(),
                     claim.generation,
+                    snapshot.digest,
                 ),
             )
             connection.commit()
@@ -1126,10 +1220,31 @@ class WorkflowStore:
         attached write transaction must reload it before validation or mutation.
         """
 
-        review = self.load_review(review_id)
-        if review.status == "PENDING":
-            return None
-        return _resolved_human_decision_replay(review, decision)
+        with connect_database(self.path, read_only=True) as connection:
+            connection.execute("BEGIN")
+            row = connection.execute(
+                "SELECT case_id, payload_json, execution_generation, "
+                "evidence_snapshot_digest FROM review_requests WHERE review_id = ?",
+                (review_id,),
+            ).fetchone()
+            review = _review_from_row(row, review_id)
+            if review.status == "PENDING":
+                return None
+            generation = int(row["execution_generation"])
+            try:
+                snapshot = load_generation_evidence_snapshot(
+                    connection, str(row["case_id"]), generation
+                )
+                validate_review_snapshot(review, snapshot)
+            except EvidenceSnapshotError as exc:
+                self._raise_snapshot_invalid(str(row["case_id"]), generation, str(exc))
+            if row["evidence_snapshot_digest"] != snapshot.digest:
+                self._raise_snapshot_invalid(
+                    str(row["case_id"]),
+                    generation,
+                    "resolved review digest does not match evidence",
+                )
+            return _resolved_human_decision_replay(review, decision)
 
     def save_human_decision(self, decision: HumanDecision, inventory_db: Path) -> ReviewRequest:
         """Atomically commit a validated decision and its aliases across both DB files."""
@@ -1158,10 +1273,23 @@ class WorkflowStore:
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
-                    "SELECT payload_json FROM review_requests WHERE review_id = ?",
+                    "SELECT case_id, payload_json, execution_generation, "
+                    "evidence_snapshot_digest FROM review_requests WHERE review_id = ?",
                     (decision.review_id,),
                 ).fetchone()
                 review = _review_from_row(row, decision.review_id)
+                case_id = str(row["case_id"])
+                generation = int(row["execution_generation"])
+                self._assert_evidence_generation_mutable(connection, case_id, generation)
+                try:
+                    snapshot = load_generation_evidence_snapshot(connection, case_id, generation)
+                    validate_review_snapshot(review, snapshot)
+                except EvidenceSnapshotError as exc:
+                    self._raise_snapshot_invalid(case_id, generation, str(exc))
+                if row["evidence_snapshot_digest"] != snapshot.digest:
+                    self._raise_snapshot_invalid(
+                        case_id, generation, "review digest does not match current evidence"
+                    )
                 if review.status == "RESOLVED":
                     replay = _resolved_human_decision_replay(review, decision)
                     connection.rollback()
@@ -1241,25 +1369,61 @@ class WorkflowStore:
                     case_id=case_id,
                     stop_reason="PAID_FINAL_DECISION_IMMUTABLE",
                 )
-            missing = self._missing_generation_evidence(connection, case_id, claim.generation)
-            if missing:
-                connection.rollback()
-                raise InvoiceAgentsError(
-                    ErrorCategory.DATABASE,
-                    f"final decision requires current-generation evidence: {missing}",
-                    case_id=case_id,
-                    stop_reason="EVIDENCE_GENERATION_MISMATCH",
-                    details={"missing_or_stale": missing},
+            try:
+                snapshot = load_generation_evidence_snapshot(connection, case_id, claim.generation)
+            except EvidenceSnapshotError as exc:
+                self._raise_snapshot_invalid(case_id, claim.generation, str(exc))
+            review_row = connection.execute(
+                "SELECT payload_json, execution_generation, evidence_snapshot_digest "
+                "FROM review_requests WHERE case_id = ? ORDER BY sequence DESC LIMIT 1",
+                (case_id,),
+            ).fetchone()
+            review = None
+            if review_row is not None:
+                if int(review_row["execution_generation"]) != claim.generation:
+                    self._raise_snapshot_invalid(
+                        case_id, claim.generation, "latest review belongs to another generation"
+                    )
+                try:
+                    review = ReviewRequest.model_validate_json(review_row["payload_json"])
+                    validate_review_snapshot(review, snapshot)
+                except (EvidenceSnapshotError, ValueError) as exc:
+                    self._raise_snapshot_invalid(case_id, claim.generation, str(exc))
+                if review_row["evidence_snapshot_digest"] != snapshot.digest:
+                    self._raise_snapshot_invalid(
+                        case_id, claim.generation, "review digest does not match current evidence"
+                    )
+            from invoice_agents.agents.decision_rules import validate_final_decision
+
+            validate_final_decision(
+                decision.decision,
+                decision.payment_eligible,
+                snapshot.risk,
+                snapshot.critique,
+                review,
+                case_id=case_id,
+            )
+            human = review.human_decision if review is not None else None
+            if (
+                decision.human_outcome != human
+                or decision.critic_disposition is not snapshot.critique.recommended_disposition
+            ):
+                self._raise_snapshot_invalid(
+                    case_id,
+                    claim.generation,
+                    "final decision does not match review or critique snapshot",
                 )
             updated = connection.execute(
                 "INSERT INTO final_decisions("
-                "decision_id, case_id, payload_json, created_at, decision_generation) "
-                "SELECT ?, case_id, ?, ?, ? FROM cases WHERE case_id = ? "
+                "decision_id, case_id, payload_json, created_at, decision_generation, "
+                "evidence_snapshot_digest) "
+                "SELECT ?, case_id, ?, ?, ?, ? FROM cases WHERE case_id = ? "
                 "AND execution_token = ? AND execution_generation = ? "
                 "AND execution_state = 'RUNNING' AND lease_expires_at > ? "
                 "ON CONFLICT(case_id) DO UPDATE SET payload_json=excluded.payload_json, "
                 "created_at=excluded.created_at, "
-                "decision_generation=excluded.decision_generation WHERE EXISTS ("
+                "decision_generation=excluded.decision_generation, "
+                "evidence_snapshot_digest=excluded.evidence_snapshot_digest WHERE EXISTS ("
                 "SELECT 1 FROM cases WHERE cases.case_id = excluded.case_id "
                 "AND execution_token = ? AND execution_generation = ? "
                 "AND execution_state = 'RUNNING' AND lease_expires_at > ?)",
@@ -1268,6 +1432,7 @@ class WorkflowStore:
                     decision.model_dump_json(),
                     written_at,
                     claim.generation,
+                    snapshot.digest,
                     case_id,
                     claim.token,
                     claim.generation,
@@ -1369,51 +1534,6 @@ class WorkflowStore:
                 self._raise_stale_execution_claim(claim)
             connection.commit()
 
-    @staticmethod
-    def _missing_generation_evidence(
-        connection: sqlite3.Connection, case_id: str, generation: int
-    ) -> list[str]:
-        required = {
-            "extraction": (
-                "SELECT execution_generation FROM extractions WHERE case_id = ? "
-                "ORDER BY version DESC LIMIT 1",
-                (case_id,),
-            ),
-            "identity": (
-                "SELECT execution_generation FROM identity_results WHERE case_id = ? "
-                "ORDER BY created_at DESC LIMIT 1",
-                (case_id,),
-            ),
-            "inventory": (
-                "SELECT execution_generation FROM comparison_results WHERE case_id = ? "
-                "AND comparison_type = 'inventory' ORDER BY created_at DESC LIMIT 1",
-                (case_id,),
-            ),
-            "risk": (
-                "SELECT execution_generation FROM comparison_results WHERE case_id = ? "
-                "AND comparison_type = 'risk' ORDER BY created_at DESC LIMIT 1",
-                (case_id,),
-            ),
-            "critique": (
-                "SELECT execution_generation FROM critique_results WHERE case_id = ? "
-                "ORDER BY created_at DESC LIMIT 1",
-                (case_id,),
-            ),
-        }
-        missing: list[str] = []
-        for name, (sql, parameters) in required.items():
-            row = connection.execute(sql, parameters).fetchone()
-            if row is None or int(row["execution_generation"]) != generation:
-                missing.append(name)
-        review = connection.execute(
-            "SELECT execution_generation FROM review_requests WHERE case_id = ? "
-            "ORDER BY sequence DESC LIMIT 1",
-            (case_id,),
-        ).fetchone()
-        if review is not None and int(review["execution_generation"]) != generation:
-            missing.append("review")
-        return missing
-
     def load_result(self, case_id: str) -> CaseResult | None:
         with connect_database(self.path, read_only=True) as connection:
             row = connection.execute(
@@ -1468,6 +1588,7 @@ class WorkflowStore:
             connection.execute("BEGIN IMMEDIATE")
             written_at = datetime.now(UTC)
             self._require_current_claim(connection, claim, written_at)
+            self._assert_evidence_generation_mutable(connection, case_id, claim.generation)
             connection.execute(
                 f"INSERT INTO {table}("
                 f"{id_column}, case_id, payload_json, created_at, execution_generation) "

@@ -14,17 +14,21 @@ from invoice_agents.db.core import (
     migrate_database,
     verify_database,
 )
-from invoice_agents.db.store import WorkflowStore
+from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.errors import DatabaseVerificationError, InvoiceAgentsError
 from invoice_agents.hitl.service import record_human_decision
 from invoice_agents.models import (
     CaseStatus,
     Critique,
     DecisionKind,
+    EvidenceValue,
+    ExtractedInvoice,
     HumanDecisionKind,
     ReviewRequest,
+    RiskAssessment,
     SourceArtifact,
 )
+from invoice_agents.tools.comparison import compute_invoice_totals
 
 CASE_ID = "case_v1_legacy"
 REVIEW_ID = "rev_v1_legacy"
@@ -70,6 +74,75 @@ def make_review(review_id: str, created_at: datetime) -> ReviewRequest:
     )
 
 
+def make_invoice() -> ExtractedInvoice:
+    missing = EvidenceValue(raw_value=None, normalized_value=None)
+    return ExtractedInvoice(
+        source=make_source(),
+        invoice_number=EvidenceValue(raw_value="INV-LEGACY", normalized_value="INV-LEGACY"),
+        vendor=EvidenceValue(raw_value="Legacy Vendor", normalized_value="Legacy Vendor"),
+        invoice_date=missing,
+        due_date=missing,
+        payment_terms=missing,
+        currency=missing,
+        lines=[],
+        missing_fields=["invoice_date", "due_date", "payment_terms", "currency"],
+    )
+
+
+def persist_bound_review_evidence(
+    store: WorkflowStore, claim: ExecutionClaim
+) -> tuple[ExtractedInvoice, RiskAssessment, Critique]:
+    invoice = make_invoice()
+    risk = RiskAssessment(
+        financial=compute_invoice_totals(invoice),
+        dates=[],
+        inventory=[],
+        identity_candidates=[],
+        suspicious_signals=[],
+        unavailable_reconciliations=[],
+        policy_review_reasons=["legacy policy trigger"],
+    )
+    case_critique = make_critique()
+    store.save_extraction(CASE_ID, invoice, claim)
+    store.save_identity(CASE_ID, [], claim)
+    store.save_comparison(CASE_ID, "inventory", {"comparisons": []}, claim)
+    store.save_comparison(CASE_ID, "risk", risk.model_dump(mode="json"), claim)
+    store.save_critique(CASE_ID, case_critique, claim)
+    return invoice, risk, case_critique
+
+
+def make_bound_review(
+    review_id: str,
+    created_at: datetime,
+    invoice: ExtractedInvoice,
+    risk: RiskAssessment,
+    case_critique: Critique,
+) -> ReviewRequest:
+    return ReviewRequest(
+        review_id=review_id,
+        case_id=CASE_ID,
+        status="PENDING",
+        reasons=["legacy policy trigger"],
+        amount=None,
+        source=invoice.source,
+        evidence_bundle={
+            "invoice": invoice.model_dump(mode="json"),
+            "financial": risk.financial.model_dump(mode="json"),
+            "inventory": [],
+            "identity_candidates": [],
+            "dates": [],
+            "suspicious_signals": [],
+            "unavailable_reconciliations": [],
+            "blocking_evidence": [],
+        },
+        agent_recommendation=DecisionKind.HOLD,
+        agent_rationale=["legacy review"],
+        critic=case_critique,
+        questions=[],
+        created_at=created_at,
+    )
+
+
 def v1_review_payload() -> str:
     """A valid pre-schema-v2 review payload: no 'sequence' key at all."""
 
@@ -90,11 +163,21 @@ def build_v1_workflow_db(tmp_path: Path) -> Path:
             "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
         connection.execute("INSERT INTO schema_version(version, applied_at) VALUES (1, ?)", (at,))
+        source = make_source()
         connection.execute(
             "INSERT INTO source_artifacts("
             "source_id, canonical_path, source_hash, source_format, size_bytes, modified_at, "
             "metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ("src_v1_legacy", "invoice_legacy.txt", "f" * 64, "txt", 1, at, "{}", at),
+            (
+                source.source_id,
+                str(source.canonical_path),
+                source.sha256,
+                source.source_format,
+                source.size_bytes,
+                source.modified_at.isoformat(),
+                source.model_dump_json(),
+                at,
+            ),
         )
         connection.execute(
             "INSERT INTO cases(case_id, source_id, status, stop_reason, started_at, updated_at) "
@@ -152,7 +235,13 @@ def test_second_review_cycle_is_sequenced_and_duplicates_are_rejected(tmp_path: 
     claim = store.claim_case_execution(
         CASE_ID, frozenset({CaseStatus.NEEDS_HUMAN}), lease_seconds=60
     )
-    saved = store.save_review(make_review("rev_v2_cycle", datetime(2026, 2, 1, tzinfo=UTC)), claim)
+    invoice, risk, case_critique = persist_bound_review_evidence(store, claim)
+    saved = store.save_review(
+        make_bound_review(
+            "rev_v2_cycle", datetime(2026, 2, 1, tzinfo=UTC), invoice, risk, case_critique
+        ),
+        claim,
+    )
     store.release_case_execution(claim)
     assert saved.sequence == 2
     latest = store.load_case_review(CASE_ID)
@@ -205,7 +294,10 @@ def test_atomic_human_decision_preflight_rejects_wal_without_mutation(
     claim = store.claim_case_execution(
         CASE_ID, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    review = store.save_review(make_review("rev_journal_mode", LEGACY_AT), claim)
+    invoice, risk, case_critique = persist_bound_review_evidence(store, claim)
+    review = store.save_review(
+        make_bound_review("rev_journal_mode", LEGACY_AT, invoice, risk, case_critique), claim
+    )
     store.release_case_execution(claim)
     target = workflow_db if wal_database == "workflow" else inventory_db
     with connect_database(target) as connection:

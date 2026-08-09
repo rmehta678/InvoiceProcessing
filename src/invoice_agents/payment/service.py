@@ -16,10 +16,15 @@ from pathlib import Path
 from uuid import uuid4
 
 from invoice_agents.db.core import connect_database
-from invoice_agents.db.store import ExecutionClaim, WorkflowStore, parse_canonical_utc
+from invoice_agents.db.store import (
+    ExecutionClaim,
+    WorkflowStore,
+    load_generation_evidence_snapshot,
+    parse_canonical_utc,
+)
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
+from invoice_agents.evidence_snapshot import EvidenceSnapshotError, validate_review_snapshot
 from invoice_agents.models import (
-    Critique,
     DecisionKind,
     ExtractedInvoice,
     FinalDecision,
@@ -38,6 +43,7 @@ class _AuthorizationSnapshot:
     decision: FinalDecision
     risk: RiskAssessment
     review: ReviewRequest | None
+    evidence_snapshot_digest: str
 
 
 class _AuthorizationSnapshotError(Exception):
@@ -119,53 +125,17 @@ def _load_authorization_snapshot(
 
     from invoice_agents.agents.decision_rules import validate_final_decision
 
-    extraction_row = connection.execute(
-        "SELECT payload_json, execution_generation FROM extractions WHERE case_id = ? "
-        "ORDER BY version DESC LIMIT 1",
-        (case_id,),
-    ).fetchone()
-    if extraction_row is None or int(extraction_row["execution_generation"]) != generation:
-        raise _AuthorizationSnapshotError("latest extraction is missing or stale")
-    invoice = ExtractedInvoice.model_validate_json(extraction_row["payload_json"])
-
-    for table, extra_predicate, label in (
-        ("identity_results", "", "identity evidence"),
-        (
-            "comparison_results",
-            "AND comparison_type = 'inventory'",
-            "inventory comparison",
-        ),
-        ("critique_results", "", "critique"),
-    ):
-        row = connection.execute(
-            f"SELECT execution_generation FROM {table} WHERE case_id = ? "
-            f"{extra_predicate} ORDER BY created_at DESC LIMIT 1",
-            (case_id,),
-        ).fetchone()
-        if row is None or int(row["execution_generation"]) != generation:
-            raise _AuthorizationSnapshotError(f"latest {label} is missing or stale")
-
-    risk_row = connection.execute(
-        "SELECT payload_json, execution_generation FROM comparison_results "
-        "WHERE case_id = ? AND comparison_type = 'risk' ORDER BY created_at DESC LIMIT 1",
-        (case_id,),
-    ).fetchone()
-    if risk_row is None or int(risk_row["execution_generation"]) != generation:
-        raise _AuthorizationSnapshotError("latest risk assessment is missing or stale")
-    risk = RiskAssessment.model_validate_json(risk_row["payload_json"])
-
-    critique_row = connection.execute(
-        "SELECT payload_json FROM critique_results WHERE case_id = ? "
-        "ORDER BY created_at DESC LIMIT 1",
-        (case_id,),
-    ).fetchone()
-    if critique_row is None:
-        raise _AuthorizationSnapshotError("latest critique is missing")
-    critique = Critique.model_validate_json(critique_row["payload_json"])
+    try:
+        evidence = load_generation_evidence_snapshot(connection, case_id, generation)
+    except EvidenceSnapshotError as exc:
+        raise _AuthorizationSnapshotError(f"evidence snapshot is invalid: {exc}") from exc
+    invoice = evidence.invoice
+    risk = evidence.risk
+    critique = evidence.critique
 
     review_row = connection.execute(
         "SELECT review_id, case_id, status, payload_json, resolved_at, "
-        "execution_generation FROM review_requests WHERE case_id = ? "
+        "execution_generation, evidence_snapshot_digest FROM review_requests WHERE case_id = ? "
         "ORDER BY sequence DESC LIMIT 1",
         (case_id,),
     ).fetchone()
@@ -176,13 +146,23 @@ def _load_authorization_snapshot(
         if review_row is not None
         else None
     )
+    if review is not None:
+        try:
+            validate_review_snapshot(review, evidence)
+        except EvidenceSnapshotError as exc:
+            raise _AuthorizationSnapshotError(str(exc)) from exc
+        if review_row["evidence_snapshot_digest"] != evidence.digest:
+            raise _AuthorizationSnapshotError("review snapshot digest does not match evidence")
 
     decision_row = connection.execute(
-        "SELECT payload_json, decision_generation FROM final_decisions WHERE case_id = ?",
+        "SELECT payload_json, decision_generation, evidence_snapshot_digest "
+        "FROM final_decisions WHERE case_id = ?",
         (case_id,),
     ).fetchone()
     if decision_row is None or int(decision_row["decision_generation"]) != generation:
         raise _AuthorizationSnapshotError("final decision is missing or stale")
+    if decision_row["evidence_snapshot_digest"] != evidence.digest:
+        raise _AuthorizationSnapshotError("final decision snapshot digest does not match evidence")
     decision = FinalDecision.model_validate_json(decision_row["payload_json"])
     if decision.decision is not DecisionKind.APPROVE or not decision.payment_eligible:
         raise _AuthorizationSnapshotError(
@@ -208,7 +188,7 @@ def _load_authorization_snapshot(
         raise _AuthorizationSnapshotError(
             "final decision does not match the latest independent critique"
         )
-    return _AuthorizationSnapshot(invoice, decision, risk, review)
+    return _AuthorizationSnapshot(invoice, decision, risk, review, evidence.digest)
 
 
 def _validate_paid_ledger_source(connection: sqlite3.Connection, row: sqlite3.Row) -> None:
@@ -228,7 +208,9 @@ def _validate_paid_ledger_source(connection: sqlite3.Connection, row: sqlite3.Ro
         ) from exc
     invoice = snapshot.invoice
     valid = (
-        payment_idempotency_key(invoice) == str(row["idempotency_key"])
+        snapshot.evidence_snapshot_digest == row["evidence_snapshot_digest"]
+        and isinstance(row["evidence_snapshot_digest"], str)
+        and payment_idempotency_key(invoice) == str(row["idempotency_key"])
         and invoice.vendor.normalized_value == str(row["vendor"])
         and invoice.currency.normalized_value == str(row["currency"])
         and invoice.declared_total is not None
@@ -393,7 +375,8 @@ def mock_payment(
             connection.execute(
                 "INSERT INTO payments("
                 "payment_id, case_id, idempotency_key, vendor, amount, currency, status, error, "
-                "created_at, decision_generation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "created_at, decision_generation, evidence_snapshot_digest) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     payment_id,
                     case_id,
@@ -405,6 +388,7 @@ def mock_payment(
                     error,
                     created_at.isoformat(),
                     claim.generation,
+                    snapshot.evidence_snapshot_digest,
                 ),
             )
             connection.commit()

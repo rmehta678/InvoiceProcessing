@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import threading
 from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -148,6 +150,10 @@ def _approve_with_resolved_review(
         claim,
     )
     return invoice, claim
+
+
+def _tampered_total(invoice: ExtractedInvoice) -> ExtractedInvoice:
+    return invoice.model_copy(update={"declared_total": Decimal("88888.00")}, deep=True)
 
 
 def test_two_resume_claims_have_exactly_one_database_owner(settings: Settings) -> None:
@@ -478,9 +484,12 @@ def test_payment_and_competing_final_decision_cannot_commit_impossible_state(
         "trg_final_decisions_no_insert_after_paid",
         "trg_final_decisions_no_update_after_paid",
         "trg_final_decisions_no_delete_after_paid",
+        "trg_review_requests_snapshot_digest_insert",
+        "trg_extractions_immutable_after_final_insert",
+        "trg_human_decisions_immutable_update",
     ],
 )
-def test_preflight_rejects_missing_or_drifted_paid_decision_trigger(
+def test_preflight_rejects_missing_or_drifted_required_trigger(
     settings: Settings, trigger_name: str
 ) -> None:
     with connect_database(settings.workflow_db) as connection:
@@ -557,6 +566,9 @@ def test_duplicate_payment_revalidates_source_case_snapshot(settings: Settings) 
     )
     _approve(second_store, "case_duplicate_attempt", second_claim)
     with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "DROP TRIGGER IF EXISTS trg_comparison_results_immutable_after_final_delete"
+        )
         connection.execute(
             "DELETE FROM comparison_results WHERE case_id = ? AND comparison_type = 'risk'",
             ("case_paid_source",),
@@ -654,8 +666,10 @@ def test_corrupt_future_lease_tuple_is_not_reclaimed(settings: Settings) -> None
     [
         "2000-01-01 00:00:00",
         "2000-01-01T00:00:00.0+00:00",
+        "2000-01-01T00:00:00.000000+00:00",
         "2000-02-30T00:00:00+00:00",
         "2000-01-01T24:00:00+00:00",
+        "0000-01-01T00:00:00+00:00",
     ],
 )
 def test_schema_rejects_noncanonical_execution_lease(settings: Settings, lease: str) -> None:
@@ -705,7 +719,11 @@ def test_claim_rejects_noncanonical_expired_lease_before_cas_adoption(
     assert row["lease_expires_at"] == "2000-01-01 00:00:00"
 
 
-def test_canonical_expired_lease_is_taken_over(settings: Settings) -> None:
+@pytest.mark.parametrize(
+    "expired_lease",
+    ["2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00.000001+00:00"],
+)
+def test_canonical_expired_lease_is_taken_over(settings: Settings, expired_lease: str) -> None:
     case_id = "case_canonical_expired_lease"
     store = _persist_case(settings, case_id)
     first = store.claim_case_execution(
@@ -714,7 +732,7 @@ def test_canonical_expired_lease_is_taken_over(settings: Settings) -> None:
     with connect_database(settings.workflow_db) as connection:
         connection.execute(
             "UPDATE cases SET lease_expires_at = ? WHERE case_id = ?",
-            ("2000-01-01T00:00:00+00:00", case_id),
+            (expired_lease, case_id),
         )
         connection.commit()
 
@@ -824,6 +842,235 @@ def test_adoption_rejects_partial_predecessor_snapshot(settings: Settings) -> No
     assert adopted == 0
 
 
+@pytest.mark.parametrize("tampering", ["declared_total", "source_metadata"])
+def test_adoption_rejects_semantically_incoherent_predecessor_snapshot(
+    settings: Settings, tampering: str
+) -> None:
+    case_id = f"case_incoherent_predecessor_{tampering}"
+    store = _persist_case(settings, case_id)
+    invoice = store.load_extraction(case_id)
+    if tampering == "declared_total":
+        forged = _tampered_total(invoice)
+    else:
+        forged = invoice.model_copy(
+            update={
+                "source": invoice.source.model_copy(
+                    update={"canonical_path": Path("/forged/source/invoice.txt")}
+                )
+            },
+            deep=True,
+        )
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "INSERT INTO extractions(extraction_id, case_id, version, payload_json, "
+            "created_at, execution_generation) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                f"ext_incoherent_{tampering}",
+                case_id,
+                2,
+                forged.model_dump_json(),
+                datetime.now(UTC).isoformat(),
+                1,
+            ),
+        )
+        connection.commit()
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.adopt_latest_evidence(claim)
+
+    assert excinfo.value.stop_reason == "EVIDENCE_PROVENANCE_INVALID"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        adopted = connection.execute(
+            "SELECT COUNT(*) FROM extractions WHERE case_id = ? AND execution_generation = ?",
+            (case_id, claim.generation),
+        ).fetchone()[0]
+    assert adopted == 0
+
+
+def test_adoption_rejects_inventory_relationship_tamper(settings: Settings) -> None:
+    case_id = "case_incoherent_predecessor_inventory"
+    store = _persist_case(settings, case_id)
+    with connect_database(settings.workflow_db) as connection:
+        inventory_row = connection.execute(
+            "SELECT comparison_id, payload_json FROM comparison_results "
+            "WHERE case_id = ? AND comparison_type = 'inventory'",
+            (case_id,),
+        ).fetchone()
+        risk_row = connection.execute(
+            "SELECT comparison_id, payload_json FROM comparison_results "
+            "WHERE case_id = ? AND comparison_type = 'risk'",
+            (case_id,),
+        ).fetchone()
+        inventory = json.loads(str(inventory_row["payload_json"]))
+        risk = json.loads(str(risk_row["payload_json"]))
+        forged = {
+            **inventory["comparisons"][0],
+            "sku": None,
+            "available_stock": None,
+            "queried_row": None,
+            "status": "AVAILABLE",
+        }
+        inventory["comparisons"][0] = forged
+        risk["inventory"][0] = forged
+        connection.execute(
+            "UPDATE comparison_results SET payload_json = ? WHERE comparison_id = ?",
+            (json.dumps(inventory), inventory_row["comparison_id"]),
+        )
+        connection.execute(
+            "UPDATE comparison_results SET payload_json = ? WHERE comparison_id = ?",
+            (json.dumps(risk), risk_row["comparison_id"]),
+        )
+        connection.commit()
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.adopt_latest_evidence(claim)
+
+    assert excinfo.value.stop_reason == "EVIDENCE_PROVENANCE_INVALID"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        adopted = connection.execute(
+            "SELECT COUNT(*) FROM extractions WHERE case_id = ? AND execution_generation = ?",
+            (case_id, claim.generation),
+        ).fetchone()[0]
+    assert adopted == 0
+
+
+def test_human_approval_cannot_pay_a_later_same_generation_total(settings: Settings) -> None:
+    case_id = "case_reviewed_total_changed_before_payment"
+    store = _persist_case(settings, case_id)
+    invoice, claim = _approve_with_resolved_review(store, case_id, settings)
+    forged = _tampered_total(invoice)
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute("DROP TRIGGER IF EXISTS trg_extractions_immutable_after_final_insert")
+        next_version = connection.execute(
+            "SELECT MAX(version) + 1 FROM extractions WHERE case_id = ?", (case_id,)
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO extractions(extraction_id, case_id, version, payload_json, "
+            "created_at, execution_generation) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "ext_changed_after_human_approval",
+                case_id,
+                next_version,
+                forged.model_dump_json(),
+                datetime.now(UTC).isoformat(),
+                claim.generation,
+            ),
+        )
+        connection.commit()
+
+    result = mock_payment(case_id, forged, store, settings.workflow_db, claim)
+
+    assert result.status is PaymentStatus.NOT_ELIGIBLE
+    assert result.error is not None
+    assert "snapshot" in result.error
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "write_kind",
+    ["extraction", "identity", "inventory", "risk", "critique", "review"],
+)
+def test_store_rejects_every_authorization_evidence_write_after_final_decision(
+    settings: Settings, write_kind: str
+) -> None:
+    case_id = f"case_post_final_store_write_{write_kind}"
+    store = _persist_case(settings, case_id)
+    invoice, claim = _approve_with_resolved_review(store, case_id, settings)
+    risk = RiskAssessment.model_validate(store.load_current_comparison(claim, "risk"))
+    review = store.load_current_review(claim)
+    assert review is not None
+    writes = {
+        "extraction": lambda: store.save_extraction(case_id, invoice, claim),
+        "identity": lambda: store.save_identity(case_id, [], claim),
+        "inventory": lambda: store.save_comparison(
+            case_id, "inventory", store.load_current_comparison(claim, "inventory"), claim
+        ),
+        "risk": lambda: store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim),
+        "critique": lambda: store.save_critique(case_id, store.load_current_critique(claim), claim),
+        "review": lambda: store.save_review(
+            review.model_copy(
+                update={"review_id": f"rev_post_final_{write_kind}", "status": "PENDING"},
+                deep=True,
+            ),
+            claim,
+        ),
+    }
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        writes[write_kind]()
+
+    assert excinfo.value.stop_reason == "AUTHORIZATION_EVIDENCE_IMMUTABLE"
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        "extractions",
+        "identity_results",
+        "comparison_results",
+        "critique_results",
+        "review_requests",
+    ],
+)
+def test_schema_rejects_authorization_evidence_update_after_final_decision(
+    settings: Settings, table: str
+) -> None:
+    case_id = f"case_post_final_schema_write_{table}"
+    store = _persist_case(settings, case_id)
+    _invoice, _claim = _approve_with_resolved_review(store, case_id, settings)
+
+    with (
+        connect_database(settings.workflow_db) as connection,
+        pytest.raises(
+            sqlite3.IntegrityError,
+            match=r"(?:AUTHORIZATION_EVIDENCE|RESOLVED_REVIEW)_IMMUTABLE",
+        ),
+    ):
+        connection.execute(
+            f"UPDATE {table} SET payload_json = payload_json WHERE case_id = ?",
+            (case_id,),
+        )
+
+
+def test_schema_rejects_human_decision_update_after_final_decision(
+    settings: Settings,
+) -> None:
+    case_id = "case_post_final_schema_write_human_decision"
+    store = _persist_case(settings, case_id)
+    _invoice, claim = _approve_with_resolved_review(store, case_id, settings)
+    review = store.load_current_review(claim)
+    assert review is not None
+
+    with (
+        connect_database(settings.workflow_db) as connection,
+        pytest.raises(sqlite3.IntegrityError, match="HUMAN_DECISION_IMMUTABLE"),
+    ):
+        connection.execute(
+            "UPDATE human_decisions SET reason = reason WHERE review_id = ?",
+            (review.review_id,),
+        )
+
+
+def test_public_extraction_write_fails_after_paid_state(settings: Settings) -> None:
+    case_id = "case_paid_extraction_freeze"
+    store = _persist_case(settings, case_id)
+    invoice, claim = _approve_with_resolved_review(store, case_id, settings)
+    paid = mock_payment(case_id, invoice, store, settings.workflow_db, claim)
+    assert paid.status is PaymentStatus.PAID
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.save_extraction(case_id, _tampered_total(invoice), claim)
+
+    assert excinfo.value.stop_reason == "AUTHORIZATION_EVIDENCE_IMMUTABLE"
+
+
 def test_fresh_extraction_promotion_rejects_future_generation(
     settings: Settings,
 ) -> None:
@@ -872,15 +1119,21 @@ def test_payment_reconciles_review_with_authoritative_human_decision_rows(
     with connect_database(settings.workflow_db) as connection:
         if corruption == "pending":
             connection.execute(
+                "DROP TRIGGER IF EXISTS trg_review_requests_immutable_after_final_update"
+            )
+            connection.execute("DROP TRIGGER IF EXISTS trg_resolved_review_immutable_update")
+            connection.execute(
                 "UPDATE review_requests SET status = 'PENDING', resolved_at = NULL "
                 "WHERE review_id = ?",
                 (review.review_id,),
             )
         elif corruption == "missing":
+            connection.execute("DROP TRIGGER IF EXISTS trg_human_decisions_immutable_delete")
             connection.execute(
                 "DELETE FROM human_decisions WHERE review_id = ?", (review.review_id,)
             )
         else:
+            connection.execute("DROP TRIGGER IF EXISTS trg_human_decisions_immutable_update")
             connection.execute(
                 "UPDATE human_decisions SET reason = ? WHERE review_id = ?",
                 ("contradictory relational reason", review.review_id),
@@ -918,6 +1171,7 @@ def test_duplicate_reconciles_paid_source_human_decision_rows(settings: Settings
     review = store.load_current_review(source_claim)
     assert review is not None
     with connect_database(settings.workflow_db) as connection:
+        connection.execute("DROP TRIGGER IF EXISTS trg_human_decisions_immutable_delete")
         connection.execute("DELETE FROM human_decisions WHERE review_id = ?", (review.review_id,))
         connection.commit()
 

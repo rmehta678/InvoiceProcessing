@@ -95,11 +95,13 @@ REQUIRED_WORKFLOW_TRIGGERS: dict[str, str] = {
                 AND NEW.execution_generation >= 0)
             OR (NEW.execution_state = 'RUNNING' AND NEW.execution_token IS NOT NULL
                 AND NEW.execution_token <> '' AND NEW.lease_expires_at IS NOT NULL
+                AND substr(NEW.lease_expires_at, 1, 4) <> '0000'
                 AND (
                     (length(NEW.lease_expires_at) = 25 AND NEW.lease_expires_at GLOB
                         '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00')
                     OR (length(NEW.lease_expires_at) = 32 AND NEW.lease_expires_at GLOB
-                        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00')
+                        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'
+                        AND substr(NEW.lease_expires_at, 21, 6) <> '000000')
                 )
                 AND datetime(NEW.lease_expires_at) IS NOT NULL
                 AND strftime('%Y-%m-%dT%H:%M:%S', NEW.lease_expires_at) =
@@ -129,11 +131,13 @@ REQUIRED_WORKFLOW_TRIGGERS: dict[str, str] = {
                 AND NEW.execution_generation >= 0)
             OR (NEW.execution_state = 'RUNNING' AND NEW.execution_token IS NOT NULL
                 AND NEW.execution_token <> '' AND NEW.lease_expires_at IS NOT NULL
+                AND substr(NEW.lease_expires_at, 1, 4) <> '0000'
                 AND (
                     (length(NEW.lease_expires_at) = 25 AND NEW.lease_expires_at GLOB
                         '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00')
                     OR (length(NEW.lease_expires_at) = 32 AND NEW.lease_expires_at GLOB
-                        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00')
+                        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'
+                        AND substr(NEW.lease_expires_at, 21, 6) <> '000000')
                 )
                 AND datetime(NEW.lease_expires_at) IS NOT NULL
                 AND strftime('%Y-%m-%dT%H:%M:%S', NEW.lease_expires_at) =
@@ -153,6 +157,30 @@ REQUIRED_WORKFLOW_TRIGGERS: dict[str, str] = {
         END
     """,
 }
+
+
+def _packaged_workflow_trigger_definitions() -> dict[str, str]:
+    """Use migration 003 itself as the exact preflight trigger contract."""
+
+    script = (
+        files("invoice_agents.db")
+        .joinpath("migrations", "workflow", "003_execution_fencing.sql")
+        .read_text(encoding="utf-8")
+    )
+    definitions = {
+        match.group(1): match.group(0)
+        for match in re.finditer(
+            r"CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\b.*?\bEND\s*;",
+            script,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    }
+    if not definitions:
+        raise RuntimeError("workflow migration 003 defines no triggers")
+    return definitions
+
+
+REQUIRED_WORKFLOW_TRIGGERS.update(_packaged_workflow_trigger_definitions())
 
 
 def utc_now() -> str:
@@ -394,10 +422,22 @@ def verify_database(
                 "status",
                 "payload_json",
                 "execution_generation",
+                "evidence_snapshot_digest",
             },
             "human_decisions": {"review_id", "reviewer", "decision"},
-            "final_decisions": {"case_id", "payload_json", "decision_generation"},
-            "payments": {"case_id", "idempotency_key", "status", "decision_generation"},
+            "final_decisions": {
+                "case_id",
+                "payload_json",
+                "decision_generation",
+                "evidence_snapshot_digest",
+            },
+            "payments": {
+                "case_id",
+                "idempotency_key",
+                "status",
+                "decision_generation",
+                "evidence_snapshot_digest",
+            },
             "events": {"case_id", "event_type", "payload_json"},
         }
     try:

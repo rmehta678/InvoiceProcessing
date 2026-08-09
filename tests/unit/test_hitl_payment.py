@@ -223,28 +223,6 @@ def mapping(raw_item: str, sku: str = "SKU-WIDGET-A") -> CanonicalMapping:
     return CanonicalMapping(raw_item=raw_item, sku=sku, basis="human_decision")
 
 
-def replace_review_evidence(
-    workflow_db: Path,
-    review: ReviewRequest,
-    *,
-    inventory: list[dict[str, Any]] | None = None,
-    blocking_evidence: list[dict[str, Any]] | None = None,
-) -> ReviewRequest:
-    bundle = review.evidence_bundle.copy()
-    if inventory is not None:
-        bundle["inventory"] = inventory
-    if blocking_evidence is not None:
-        bundle["blocking_evidence"] = blocking_evidence
-    changed = review.model_copy(update={"evidence_bundle": bundle}, deep=True)
-    with connect_database(workflow_db) as connection:
-        connection.execute(
-            "UPDATE review_requests SET payload_json = ? WHERE review_id = ?",
-            (changed.model_dump_json(), changed.review_id),
-        )
-        connection.commit()
-    return changed
-
-
 def test_review_request_and_human_decision_are_persisted(
     invoice_dir: Path,
     inventory_db: Path,
@@ -496,32 +474,10 @@ def test_workflow_write_failure_rolls_back_alias_and_decision_across_both_files(
     )
 
 
-def test_semantic_replay_ignores_timestamp_order_and_normalized_whitespace(
+def test_semantic_replay_ignores_timestamp_and_normalized_whitespace(
     settings: Settings, mapping_review: ReviewRequest
 ) -> None:
-    first_inventory = list(mapping_review.evidence_bundle["inventory"])
-    second_inventory = dict(first_inventory[0])
-    second_inventory["raw_items"] = ["WidgetA (wholesale)"]
-    blockers = [
-        {
-            "blocker_id": "inventory:bulk:UNKNOWN",
-            "kind": "inventory",
-            "evidence_id": "bulk",
-            "description": "bulk alias requires authorization",
-        },
-        {
-            "blocker_id": "financial:declared-total-delta",
-            "kind": "financial",
-            "evidence_id": "declared-total-delta",
-            "description": "declared total differs",
-        },
-    ]
-    mapping_review = replace_review_evidence(
-        settings.workflow_db,
-        mapping_review,
-        inventory=[*first_inventory, second_inventory],
-        blocking_evidence=blockers,
-    )
+    blockers = list(mapping_review.evidence_bundle["blocking_evidence"])
     first = record_human_decision(
         mapping_review.review_id,
         "reviewer@example.com",
@@ -529,8 +485,8 @@ def test_semantic_replay_ignores_timestamp_order_and_normalized_whitespace(
         "bulk aliases are authorized",
         WorkflowStore(settings.workflow_db),
         settings.inventory_db,
-        mappings=[mapping("WidgetA (bulk)"), mapping("WidgetA (wholesale)", "SKU-WIDGET-B")],
-        addressed_blocker_ids=[blockers[0]["blocker_id"], blockers[1]["blocker_id"]],
+        mappings=[mapping("WidgetA (bulk)")],
+        addressed_blocker_ids=[str(item["blocker_id"]) for item in blockers],
     )
     before_retry = persisted_decision_state(
         settings.workflow_db, settings.inventory_db, mapping_review.review_id
@@ -543,11 +499,8 @@ def test_semantic_replay_ignores_timestamp_order_and_normalized_whitespace(
         "  bulk   aliases\nare authorized  ",
         WorkflowStore(settings.workflow_db),
         settings.inventory_db,
-        mappings=[
-            mapping("WidgetA (wholesale)", "SKU-WIDGET-B"),
-            mapping("WidgetA (bulk)"),
-        ],
-        addressed_blocker_ids=[blockers[1]["blocker_id"], blockers[0]["blocker_id"]],
+        mappings=[mapping("WidgetA (bulk)")],
+        addressed_blocker_ids=[str(item["blocker_id"]) for item in reversed(blockers)],
     )
 
     assert replayed == first
@@ -897,7 +850,11 @@ def test_supersession_requires_distinct_earlier_review_candidate_for_same_invoic
     )
     store.promote_predecessor_extraction(claim)
     candidates = [candidate("case_prior_revision"), candidate("case_later_revision")]
-    store.save_identity("case_current_revision", candidates, claim)
+    store.save_identity(
+        "case_current_revision",
+        [item.model_dump(mode="json") for item in candidates],
+        claim,
+    )
     store.save_comparison(
         "case_current_revision",
         "inventory",
@@ -1055,6 +1012,9 @@ def test_payment_rejects_missing_risk_snapshot(invoice_dir: Path, settings: Sett
     approve_final(store, "case_missing_payment_risk", claim)
     with connect_database(settings.workflow_db) as connection:
         connection.execute(
+            "DROP TRIGGER IF EXISTS trg_comparison_results_immutable_after_final_delete"
+        )
+        connection.execute(
             "DELETE FROM comparison_results WHERE case_id = ? AND comparison_type = 'risk'",
             ("case_missing_payment_risk",),
         )
@@ -1069,7 +1029,9 @@ def test_payment_rejects_missing_risk_snapshot(invoice_dir: Path, settings: Sett
     )
 
     assert result.status is PaymentStatus.NOT_ELIGIBLE
-    assert result.error == "latest risk assessment is missing or stale"
+    assert result.error is not None
+    assert "evidence snapshot is invalid" in result.error
+    assert "missing=['risk']" in result.error
     with connect_database(settings.workflow_db, read_only=True) as connection:
         assert connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 0
 
