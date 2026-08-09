@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from invoice_agents.config import Settings
 from invoice_agents.db import cli as database_cli
 from invoice_agents.db.core import (
     DatabaseKind,
+    _migrate_database_in_process,
     _normalized_sql,
     connect_database,
     ensure_databases,
@@ -398,6 +400,74 @@ def test_workflow_verify_cli_requires_explicit_inventory_context(tmp_path: Path)
     assert "'schema_version': 3" in verified.stdout
 
 
+@pytest.mark.parametrize("journal_mode", ["PERSIST", "TRUNCATE", "WAL"])
+@pytest.mark.parametrize(
+    "operation",
+    ["migrate", "verify", "seed", "reconcile-legacy-authorization"],
+)
+def test_every_database_cli_operation_rejects_unsupported_journal_mode_before_filesystem_action(
+    tmp_path: Path,
+    journal_mode: str,
+    operation: str,
+) -> None:
+    target = tmp_path / f"{operation}.db"
+    arguments = [operation, "--db", str(target)]
+    if operation in {"migrate", "verify"}:
+        arguments.extend(("--kind", "inventory"))
+    elif operation == "reconcile-legacy-authorization":
+        arguments.extend(
+            (
+                "--reviewer",
+                "operator@example.test",
+                "--reason",
+                "permanent quarantine",
+                "--disposition",
+                "PERMANENTLY_QUARANTINED_NON_AUTHORIZING",
+                "--confirm",
+            )
+        )
+    secret = "sk-proj-database-cli-must-not-leak"
+
+    result = CliRunner().invoke(
+        database_cli.app,
+        arguments,
+        env={
+            "INVOICE_SQLITE_JOURNAL_MODE": journal_mode,
+            "XAI_API_KEY": secret,
+        },
+    )
+
+    assert result.exit_code == 1
+    assert "error_code=SQLITE_JOURNAL_MODE_UNSUPPORTED" in result.stderr
+    assert secret not in result.output
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_database_cli_operations_accept_delete_mode(tmp_path: Path) -> None:
+    target = tmp_path / "delete-mode-inventory.db"
+    runner = CliRunner()
+    environment = {"INVOICE_SQLITE_JOURNAL_MODE": " delete "}
+
+    migrated = runner.invoke(
+        database_cli.app,
+        ["migrate", "--db", str(target), "--kind", "inventory"],
+        env=environment,
+    )
+    seeded = runner.invoke(database_cli.app, ["seed", "--db", str(target)], env=environment)
+    verified = runner.invoke(
+        database_cli.app,
+        ["verify", "--db", str(target), "--kind", "inventory"],
+        env=environment,
+    )
+
+    assert migrated.exit_code == 0
+    assert "applied=[1]" in migrated.stdout
+    assert seeded.exit_code == 0
+    assert "seeded_rows=4" in seeded.stdout
+    assert verified.exit_code == 0
+    assert "'integrity': 'ok'" in verified.stdout
+
+
 def test_workflow_migrate_cli_binds_legacy_v3_retrofit_to_inventory_context(
     tmp_path: Path,
 ) -> None:
@@ -563,6 +633,56 @@ def test_authoritative_verification_rejects_symlink_database_path_without_artifa
     assert {candidate.name for candidate in tmp_path.iterdir()} == before_names | {link.name} | (
         {"real-parent"} if link_kind == "parent" else set()
     )
+
+
+def test_authoritative_verification_rejects_parent_replacement_before_leaf_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_parent = tmp_path / "authoritative"
+    replacement_parent = tmp_path / "replacement"
+    moved_original = tmp_path / "moved-authoritative"
+    original_parent.mkdir()
+    replacement_parent.mkdir()
+    supplied = original_parent / "inventory.db"
+    replacement = replacement_parent / supplied.name
+    migrate_database(supplied, DatabaseKind.INVENTORY)
+    migrate_database(replacement, DatabaseKind.INVENTORY)
+    seed_inventory(replacement)
+    original_bytes = supplied.read_bytes()
+    replacement_bytes = replacement.read_bytes()
+    real_open = os.open
+    replaced = False
+
+    def replace_parent_before_leaf_open(
+        target: str | bytes | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal replaced
+        target_text = os.fsdecode(target)
+        is_source_leaf = Path(target_text) == supplied or (
+            target_text == supplied.name
+            and dir_fd is not None
+            and not flags & getattr(os, "O_DIRECTORY", 0)
+        )
+        if is_source_leaf and not replaced:
+            original_parent.rename(moved_original)
+            replacement_parent.rename(original_parent)
+            replaced = True
+        return real_open(target, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(sqlite_source_module.os, "open", replace_parent_before_leaf_open)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(supplied, DatabaseKind.INVENTORY)
+
+    assert replaced
+    assert excinfo.value.stop_reason == "DATABASE_CHANGED_DURING_VERIFICATION"
+    assert (moved_original / supplied.name).read_bytes() == original_bytes
+    assert supplied.read_bytes() == replacement_bytes
 
 
 def test_workflow_verification_rejects_symlink_inventory_context_without_audit(
@@ -820,6 +940,9 @@ def test_twenty_byte_sqlite_lookalike_is_signature_invalid(tmp_path: Path) -> No
         "text-encoding-zero-only",
         "page-count",
         "file-size",
+        "first-freelist-page",
+        "freelist-page-count",
+        "largest-root-page",
         "reserved-header-bytes",
     ],
 )
@@ -852,6 +975,12 @@ def test_complete_sqlite_header_contract_rejects_each_invalid_invariant(
         data[28:32] = (page_count + 1).to_bytes(4, "big")
     elif corruption == "file-size":
         data.extend(b"x")
+    elif corruption == "first-freelist-page":
+        data[32:36] = (2**32 - 1).to_bytes(4, "big")
+    elif corruption == "freelist-page-count":
+        data[36:40] = (2**32 - 1).to_bytes(4, "big")
+    elif corruption == "largest-root-page":
+        data[52:56] = (2**32 - 1).to_bytes(4, "big")
     else:
         data[72] = 1
     path = tmp_path / f"invalid-header-{corruption}.db"
@@ -901,6 +1030,125 @@ def test_zero_header_pair_with_user_schema_is_audited_and_rejected_before_migrat
     assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
     assert path.read_bytes() == before
     assert not Path(f"{path}-journal").exists()
+
+
+def test_zero_header_pair_with_schema_version_is_rejected_before_migration(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "forged-pre-schema-history.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        connection.commit()
+    data = bytearray(path.read_bytes())
+    data[44:48] = (0).to_bytes(4, "big")
+    data[56:60] = (0).to_bytes(4, "big")
+    path.write_bytes(data)
+    before = path.read_bytes()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.INVENTORY)
+
+    assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
+    assert path.read_bytes() == before
+    assert not Path(f"{path}-journal").exists()
+
+
+@pytest.mark.parametrize("initial_state", ["missing", "zero-length"])
+@pytest.mark.parametrize(
+    "sidecar_suffix",
+    ["-journal", "-wal", "-shm", "-mj 123456789", "-mj123456789"],
+)
+def test_new_database_migration_rejects_retained_sidecars_without_mutation(
+    tmp_path: Path,
+    initial_state: str,
+    sidecar_suffix: str,
+) -> None:
+    path = tmp_path / f"{initial_state}.db"
+    if initial_state == "zero-length":
+        path.touch()
+    sidecar = Path(f"{path}{sidecar_suffix}")
+    sidecar.write_bytes(b"retained-sidecar-evidence")
+    before = _directory_file_state(tmp_path)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.INVENTORY)
+
+    assert excinfo.value.stop_reason == "DATABASE_SIDECAR_UNSUPPORTED"
+    assert _directory_file_state(tmp_path) == before
+    if initial_state == "missing":
+        assert not path.exists()
+    else:
+        assert path.read_bytes() == b""
+
+
+def test_private_migration_rechecks_sidecars_after_lock_before_sqlite_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "late-sidecar.db"
+    path.touch()
+    sidecar = Path(f"{path}-journal")
+    real_maintenance = core_module.exclusive_database_maintenance
+    injected = False
+
+    @contextmanager
+    def inject_sidecar_after_lock(
+        paths: tuple[Path, ...],
+        *,
+        create_paths: tuple[Path, ...] = (),
+    ) -> Any:
+        nonlocal injected
+        with real_maintenance(paths, create_paths=create_paths) as locks:
+            sidecar.write_bytes(b"appeared-after-lock")
+            injected = True
+            yield locks
+
+    monkeypatch.setattr(core_module, "exclusive_database_maintenance", inject_sidecar_after_lock)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        _migrate_database_in_process(path, DatabaseKind.INVENTORY)
+
+    assert injected
+    assert excinfo.value.stop_reason == "DATABASE_SIDECAR_UNSUPPORTED"
+    assert path.read_bytes() == b""
+    assert sidecar.read_bytes() == b"appeared-after-lock"
+
+
+def test_private_migration_does_not_forget_sidecar_removed_before_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "removed-before-snapshot.db"
+    migrate_database(path, DatabaseKind.INVENTORY)
+    before = path.read_bytes()
+    sidecar = Path(f"{path}-journal")
+    sidecar.write_bytes(b"preflight-sidecar")
+    real_snapshots = core_module.authoritative_database_snapshots
+    removed = False
+
+    @contextmanager
+    def remove_sidecar_before_snapshot(sources: Any) -> Any:
+        nonlocal removed
+        sidecar.unlink()
+        removed = True
+        with real_snapshots(sources) as snapshots:
+            yield snapshots
+
+    monkeypatch.setattr(
+        core_module,
+        "authoritative_database_snapshots",
+        remove_sidecar_before_snapshot,
+    )
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        _migrate_database_in_process(path, DatabaseKind.INVENTORY)
+
+    assert removed
+    assert excinfo.value.stop_reason == "DATABASE_SIDECAR_UNSUPPORTED"
+    assert path.read_bytes() == before
+    assert not sidecar.exists()
 
 
 def test_migration_accepts_nonexistent_and_zero_length_new_database_paths(

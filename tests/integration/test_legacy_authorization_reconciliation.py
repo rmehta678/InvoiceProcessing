@@ -461,8 +461,9 @@ def test_database_cli_reconciliation_failure_is_sanitized_with_invalid_settings_
     assert completed.returncode == 1
     assert (
         "database_operation=reconcile-legacy-authorization status=FAILED "
-        "error_code=DATABASE_MISSING"
+        "error_code=DATABASE_OPERATION_FAILED"
     ) in output
+    assert not (tmp_path / "missing-workflow.db").exists()
     assert secret not in output
     assert "Traceback" not in output
     assert "ValidationError" not in output

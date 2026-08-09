@@ -27,6 +27,7 @@ from invoice_agents.db.authorization_audit import audit_workflow_authorization
 from invoice_agents.db.core import (
     REQUIRED_WORKFLOW_TRIGGERS,
     DatabaseKind,
+    _migrate_database_in_process,
     _migration_resources,
     connect_database,
     migrate_database,
@@ -2621,7 +2622,7 @@ def test_migration_003_rolls_back_and_is_retryable_after_mid_migration_failure(
 
     monkeypatch.setattr(core_module, "connect_database", failing_connect)
     with pytest.raises(DatabaseVerificationError) as excinfo:
-        migrate_database(path, DatabaseKind.WORKFLOW)
+        _migrate_database_in_process(path, DatabaseKind.WORKFLOW)
     assert excinfo.value.stop_reason == "MIGRATION_FAILED"
     with real_connect(path, read_only=True) as connection:
         columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(cases)")}

@@ -21,6 +21,7 @@ from invoice_agents.agents.decision_rules import blocking_evidence
 from invoice_agents.config import Settings
 from invoice_agents.db.core import (
     DatabaseKind,
+    _migrate_database_in_process,
     _migration_resources,
     connect_database,
     migrate_database,
@@ -628,7 +629,7 @@ def test_legacy_v3_retrofit_holds_cross_process_sqlite_lock_before_begin_immedia
 
     monkeypatch.setattr(core_module, "connect_database", observed_connect)
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW, settings=settings) == []
+    assert _migrate_database_in_process(path, DatabaseKind.WORKFLOW, settings=settings) == []
     assert len(rival_results) == 1
     assert rival_results[0].startswith("LOCKED:database is locked")
     assert [row[:3] for row in _durable_history_rows(path)] == [
@@ -664,7 +665,7 @@ def test_legacy_v3_retrofit_aborts_when_same_process_raw_sqlite_switches_to_wal(
 
     try:
         with pytest.raises(DatabaseVerificationError) as excinfo:
-            migrate_database(path, DatabaseKind.WORKFLOW, settings=settings)
+            _migrate_database_in_process(path, DatabaseKind.WORKFLOW, settings=settings)
 
         assert excinfo.value.stop_reason == "WORKFLOW_WAL_MODE_UNSUPPORTED"
         assert keeper is not None
@@ -727,7 +728,7 @@ def test_legacy_v3_retrofit_rejects_application_id_change_after_begin_before_wri
     monkeypatch.setattr(core_module, "connect_database", racing_connect)
 
     with pytest.raises(DatabaseVerificationError) as excinfo:
-        migrate_database(path, DatabaseKind.WORKFLOW, settings=settings)
+        _migrate_database_in_process(path, DatabaseKind.WORKFLOW, settings=settings)
 
     assert mutated
     assert excinfo.value.stop_reason == "DATABASE_CHANGED_DURING_VERIFICATION"
@@ -839,7 +840,7 @@ def test_legacy_v3_retrofit_revalidates_contract_after_write_lock(
     )
 
     with pytest.raises(DatabaseVerificationError) as excinfo:
-        migrate_database(path, DatabaseKind.WORKFLOW, settings=settings)
+        _migrate_database_in_process(path, DatabaseKind.WORKFLOW, settings=settings)
 
     assert excinfo.value.stop_reason == "DATABASE_CHANGED_DURING_VERIFICATION"
     assert len(raced_bytes) == 1
@@ -907,7 +908,7 @@ def test_legacy_v3_retrofit_rereads_durable_history_after_write_lock_before_writ
     monkeypatch.setattr(core_module, "connect_database", racing_connect)
 
     with pytest.raises(DatabaseVerificationError) as excinfo:
-        migrate_database(path, DatabaseKind.WORKFLOW, settings=settings)
+        _migrate_database_in_process(path, DatabaseKind.WORKFLOW, settings=settings)
 
     assert excinfo.value.stop_reason == "DATABASE_CHANGED_DURING_VERIFICATION"
     assert race_completed
@@ -1044,7 +1045,7 @@ def test_future_synthetic_migration_appends_one_digest_bound_history_row(
 
     monkeypatch.setattr(core_module, "_migration_resources", resources)
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [4]
+    assert _migrate_database_in_process(path, DatabaseKind.WORKFLOW) == [4]
     rows = _durable_history_rows(path)
     assert rows[-1][:3] == (
         4,
@@ -1063,7 +1064,7 @@ def test_future_synthetic_migration_appends_one_digest_bound_history_row(
     before = path.read_bytes()
 
     with pytest.raises(DatabaseVerificationError) as excinfo:
-        migrate_database(path, DatabaseKind.WORKFLOW)
+        _migrate_database_in_process(path, DatabaseKind.WORKFLOW)
 
     assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
     assert path.read_bytes() == before
@@ -1133,7 +1134,7 @@ def test_normal_migration_rejects_application_id_change_after_begin_before_write
     monkeypatch.setattr(core_module, "connect_database", racing_connect)
 
     with pytest.raises(DatabaseVerificationError) as excinfo:
-        migrate_database(path, kind)
+        _migrate_database_in_process(path, kind)
 
     assert mutated
     assert excinfo.value.stop_reason == "DATABASE_CHANGED_DURING_VERIFICATION"
@@ -1199,7 +1200,7 @@ def test_migration_rejects_non_delete_runtime_journal_mode_before_schema_writes(
     monkeypatch.setattr(core_module, "connect_database", non_delete_connect)
 
     with pytest.raises(DatabaseVerificationError) as excinfo:
-        migrate_database(path, DatabaseKind.INVENTORY)
+        _migrate_database_in_process(path, DatabaseKind.INVENTORY)
 
     assert forced
     assert excinfo.value.stop_reason == "INVENTORY_WAL_MODE_UNSUPPORTED"
@@ -1248,7 +1249,7 @@ def test_failed_migration_rolls_back_and_cleans_private_journal_directory(
     monkeypatch.setattr(core_module, "_migration_resources", resources)
 
     with pytest.raises(DatabaseVerificationError) as excinfo:
-        migrate_database(path, DatabaseKind.INVENTORY)
+        _migrate_database_in_process(path, DatabaseKind.INVENTORY)
 
     assert excinfo.value.stop_reason == "MIGRATION_FAILED"
     assert path.read_bytes() == before
@@ -1315,7 +1316,7 @@ def test_migration_rejects_byte_identical_lexical_replacement_without_writing_ei
     monkeypatch.setattr(core_module, "connect_database", racing_connect)
 
     with pytest.raises(DatabaseVerificationError) as excinfo:
-        migrate_database(path, DatabaseKind.INVENTORY)
+        _migrate_database_in_process(path, DatabaseKind.INVENTORY)
 
     assert swapped
     assert excinfo.value.stop_reason == "DATABASE_CHANGED_DURING_VERIFICATION"
@@ -1389,7 +1390,7 @@ def test_swap_away_and_back_cannot_redirect_migration_connection(
     monkeypatch.setattr(core_module, "_migration_resources", resources)
     monkeypatch.setattr(core_module, "connect_database", racing_connect)
 
-    assert migrate_database(path, DatabaseKind.INVENTORY) == [2]
+    assert _migrate_database_in_process(path, DatabaseKind.INVENTORY) == [2]
 
     assert swapped_away
     assert swapped_back

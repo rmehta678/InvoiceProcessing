@@ -19,9 +19,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from invoice_agents.db.sqlite_source import (
+    HeaderInfo,
     SQLiteMaintenanceLocks,
     SQLiteSourceIdentity,
     SQLiteSourceRole,
+    assert_no_sqlite_sidecars,
     authoritative_database_snapshots,
     coordinated_production_connection,
     exclusive_database_maintenance,
@@ -771,6 +773,7 @@ def _preflight_existing_migration_history(
     packaged_versions: tuple[int, ...],
     packaged_hashes: dict[int, str],
     settings: Settings | None = None,
+    header_info: HeaderInfo | None = None,
 ) -> MigrationPreflight | None:
     """Validate a present SQLite file without opening any write transaction."""
 
@@ -786,6 +789,18 @@ def _preflight_existing_migration_history(
         database_label=kind.value,
     )
     with connect_database(path, read_only=True) as connection:
+        if header_info is not None and header_info.is_pre_schema:
+            user_schema_objects = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+                ).fetchone()[0]
+            )
+            if user_schema_objects:
+                raise DatabaseVerificationError(
+                    ErrorCategory.DATABASE,
+                    f"{kind.value} pre-schema header has existing schema objects",
+                    stop_reason="MIGRATION_HISTORY_INVALID",
+                )
         history = _read_migration_history(
             connection,
             kind=kind,
@@ -1763,7 +1778,16 @@ def _migration_preflight_from_source_snapshots(
 ) -> tuple[MigrationPreflight | None, dict[str, SQLiteSourceIdentity]]:
     """Audit existing migration inputs through raw copies, never through source SQLite opens."""
 
+    sidecar_error: DatabaseVerificationError | None = None
+    try:
+        assert_no_sqlite_sidecars(path, missing_ok=True)
+    except DatabaseVerificationError as exc:
+        if exc.stop_reason != "DATABASE_SIDECAR_UNSUPPORTED":
+            raise
+        sidecar_error = exc
     if not _is_nonempty_database_path(path):
+        if sidecar_error is not None:
+            raise sidecar_error
         return None, {}
     role = WORKFLOW_SOURCE_ROLE if kind is DatabaseKind.WORKFLOW else INVENTORY_SOURCE_ROLE
     sources: list[tuple[Path, SQLiteSourceRole]] = [(path, role)]
@@ -1773,6 +1797,8 @@ def _migration_preflight_from_source_snapshots(
         if _is_nonempty_database_path(inventory_original):
             sources.append((inventory_original, AUTHORIZATION_INVENTORY_SOURCE_ROLE))
     with authoritative_database_snapshots(sources) as snapshots:
+        if sidecar_error is not None:
+            raise sidecar_error
         main_copy = lexical_absolute_path(snapshots[role.key].copy_path)
         audit_settings = settings
         if settings is not None:
@@ -1793,6 +1819,11 @@ def _migration_preflight_from_source_snapshots(
             packaged_versions=packaged_versions,
             packaged_hashes=packaged_hashes,
             settings=audit_settings,
+            header_info=validate_complete_sqlite_header(
+                snapshots[role.key].identity.resolved_path,
+                snapshots[role.key].identity.header,
+                snapshots[role.key].identity.size,
+            ),
         )
         if (
             preflight is not None
@@ -1863,7 +1894,7 @@ def _assert_connection_rollback_mode(
         )
 
 
-def migrate_database(
+def _migrate_database_in_process(
     path: Path,
     kind: DatabaseKind | None = None,
     *,
@@ -1930,6 +1961,8 @@ def migrate_database(
                         inventory_identity,
                         AUTHORIZATION_INVENTORY_SOURCE_ROLE,
                     )
+                    maintenance_locks.assert_no_sidecars(path)
+                    maintenance_locks.assert_no_sidecars(inventory_path)
                     workflow_sqlite_path = maintenance_locks.sqlite_path(path)
                     inventory_sqlite_path = maintenance_locks.sqlite_path(inventory_path)
                     with connect_database(workflow_sqlite_path) as connection:
@@ -2110,6 +2143,7 @@ def migrate_database(
                         identities[main_role.key],
                         main_role,
                     )
+                maintenance_locks.assert_no_sidecars(path)
                 sqlite_path = maintenance_locks.sqlite_path(path)
                 with connect_database(sqlite_path) as connection:
                     if disable_foreign_keys:
@@ -2256,6 +2290,22 @@ def migrate_database(
                 stop_reason="MIGRATION_FAILED",
             ) from exc
         applied.append(version)
+
+
+def migrate_database(
+    path: Path,
+    kind: DatabaseKind | None = None,
+    *,
+    settings: Settings | None = None,
+) -> list[int]:
+    """Apply migrations in a fresh helper process that owns every SQLite descriptor."""
+
+    if settings is not None:
+        settings.assert_delete_journal_mode()
+    selected_kind = kind or infer_kind(path)
+    from invoice_agents.db.migration_process import run_migration_in_subprocess
+
+    return run_migration_in_subprocess(path, selected_kind, settings=settings)
 
 
 def seed_inventory(path: Path) -> int:
