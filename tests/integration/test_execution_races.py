@@ -21,6 +21,7 @@ from autogen_agentchat.base import TaskResult
 import invoice_agents.db.store as store_module
 import invoice_agents.payment.service as payment_module
 from invoice_agents import orchestration
+from invoice_agents.agents.decision_rules import blocking_evidence
 from invoice_agents.config import Settings
 from invoice_agents.db.core import DatabaseKind, connect_database, migrate_database, verify_database
 from invoice_agents.db.store import (
@@ -31,6 +32,7 @@ from invoice_agents.db.store import (
 from invoice_agents.errors import DatabaseVerificationError, InvoiceAgentsError
 from invoice_agents.hitl.service import create_review_request, record_human_decision
 from invoice_agents.models import (
+    CanonicalMapping,
     CaseResult,
     CaseStatus,
     Critique,
@@ -43,6 +45,7 @@ from invoice_agents.models import (
     PaymentStatus,
     RiskAssessment,
 )
+from invoice_agents.observability.audit import AuditRecorder
 from invoice_agents.orchestration import resume_case
 from invoice_agents.payment.service import mock_payment
 from invoice_agents.source_store import snapshot_source
@@ -57,9 +60,13 @@ from invoice_agents.tools.comparison import (
 from invoice_agents.tools.evidence import extract_invoice_evidence
 
 
-def _persist_case(settings: Settings, case_id: str) -> WorkflowStore:
+def _persist_case(
+    settings: Settings,
+    case_id: str,
+    source_path: Path = Path("data/invoices/invoice_1001.txt"),
+) -> WorkflowStore:
     source = snapshot_source(
-        Path("data/invoices/invoice_1001.txt"),
+        source_path,
         settings.source_archive_dir,
         max_bytes=settings.source_max_bytes,
     )
@@ -179,6 +186,76 @@ def _tampered_total(invoice: ExtractedInvoice) -> ExtractedInvoice:
     return invoice.model_copy(update={"declared_total": Decimal("88888.00")}, deep=True)
 
 
+def _finish_needs_human(
+    store: WorkflowStore,
+    case_id: str,
+    claim: ExecutionClaim,
+    review: Any,
+) -> None:
+    invoice = store.load_current_extraction(claim)
+    finished_at = datetime.now(UTC)
+    store.finish_case(
+        CaseResult(
+            case_id=case_id,
+            source_id=invoice.source.source_id,
+            status=CaseStatus.NEEDS_HUMAN,
+            stop_reason="HUMAN_REVIEW_REQUESTED",
+            review_request=review,
+            started_at=finished_at,
+            finished_at=finished_at,
+        ),
+        claim,
+    )
+
+
+def _insert_shape_consistent_approval(
+    connection: sqlite3.Connection,
+    *,
+    case_id: str,
+    generation: int,
+    digest: str,
+    review_id: str | None,
+    human_outcome: Any | None = None,
+) -> ExtractedInvoice:
+    extraction = connection.execute(
+        "SELECT payload_json FROM extractions WHERE case_id = ? "
+        "AND execution_generation = ? ORDER BY version DESC LIMIT 1",
+        (case_id, generation),
+    ).fetchone()
+    assert extraction is not None
+    invoice = ExtractedInvoice.model_validate_json(extraction["payload_json"])
+    decision = FinalDecision(
+        decision=DecisionKind.APPROVE,
+        reasons=["shape-consistent relational fixture"],
+        critic_disposition=DecisionKind.APPROVE,
+        human_outcome=human_outcome,
+        payment_eligible=True,
+    )
+    connection.execute(
+        "INSERT INTO final_decisions("
+        "decision_id, case_id, payload_json, created_at, decision_generation, "
+        "evidence_snapshot_digest, source_id, invoice_number, vendor, authorized_amount, "
+        "authorized_currency, payment_idempotency_key, review_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            f"fdec_direct_{case_id}",
+            case_id,
+            decision.model_dump_json(),
+            datetime.now(UTC).isoformat(),
+            generation,
+            digest,
+            invoice.source.source_id,
+            invoice.invoice_number.normalized_value,
+            invoice.vendor.normalized_value,
+            str(invoice.declared_total) if invoice.declared_total is not None else None,
+            invoice.currency.normalized_value,
+            payment_module.payment_idempotency_key(invoice),
+            review_id,
+        ),
+    )
+    return invoice
+
+
 def _source_inaccurate_price_snapshot(invoice: ExtractedInvoice) -> ExtractedInvoice:
     """Rewrite source-derived prices and totals into a self-consistent $88,888 claim."""
 
@@ -194,9 +271,10 @@ def _source_inaccurate_price_snapshot(invoice: ExtractedInvoice) -> ExtractedInv
     first.raw_unit_price = f"${first_price:.2f}"
     first.unit_price = first_price
     first.calculated_line_total = first_total
-    first.evidence[0].raw_value = (
-        f"{first.raw_item}|{first.raw_quantity}|${first_price:.2f}|"
-        f"{first.raw_declared_line_total}"
+    first.evidence[
+        0
+    ].raw_value = (
+        f"{first.raw_item}|{first.raw_quantity}|${first_price:.2f}|{first.raw_declared_line_total}"
     )
     forged.declared_subtotal = target_total
     forged.declared_tax_amount = Decimal("0.00")
@@ -538,6 +616,8 @@ def test_payment_and_competing_final_decision_cannot_commit_impossible_state(
         "trg_payments_authorization_insert",
         "trg_payments_immutable_update",
         "trg_payments_immutable_delete",
+        "trg_validated_evidence_snapshots_insert",
+        "trg_validated_evidence_snapshots_update",
         "trg_review_requests_snapshot_digest_insert",
         "trg_extractions_immutable_after_final_insert",
         "trg_human_decisions_immutable_update",
@@ -562,6 +642,19 @@ def test_preflight_rejects_missing_or_drifted_required_trigger(
     with pytest.raises(DatabaseVerificationError) as drifted:
         verify_database(settings.workflow_db, DatabaseKind.WORKFLOW)
     assert drifted.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+
+
+def test_preflight_rejects_missing_validated_evidence_anchor_table(
+    settings: Settings,
+) -> None:
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute("DROP TABLE validated_evidence_snapshots")
+        connection.commit()
+
+    with pytest.raises(DatabaseVerificationError, match="validated_evidence_snapshots") as excinfo:
+        verify_database(settings.workflow_db, DatabaseKind.WORKFLOW)
+
+    assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
 
 
 def test_store_rejects_post_paid_decision_mutation_even_if_triggers_were_dropped(
@@ -733,9 +826,12 @@ def test_paid_entry_cannot_coexist_with_rejected_final_or_arbitrary_amount(
 
     assert store.load_final_decision(case_id) == approved
     with connect_database(settings.workflow_db, read_only=True) as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM payments WHERE case_id = ?", (case_id,)
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM payments WHERE case_id = ?", (case_id,)
+            ).fetchone()[0]
+            == 0
+        )
 
 
 @pytest.mark.parametrize("inject_failure", [False, True], ids=["paid", "failed"])
@@ -772,9 +868,12 @@ def test_payment_row_is_immutable_after_insert(
         connection.execute(sql, (payment.payment_id,))
 
     with connect_database(settings.workflow_db, read_only=True) as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM payments WHERE payment_id = ?", (payment.payment_id,)
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM payments WHERE payment_id = ?", (payment.payment_id,)
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_duplicate_payment_revalidates_source_case_snapshot(settings: Settings) -> None:
@@ -1194,9 +1293,7 @@ def test_adoption_rejects_self_consistent_snapshot_that_disagrees_with_source_by
             if line.raw_item in comparison.raw_items
             for reference in line.evidence
         ]
-    inventory_payload["comparisons"] = [
-        item.model_dump(mode="json") for item in comparisons
-    ]
+    inventory_payload["comparisons"] = [item.model_dump(mode="json") for item in comparisons]
     inaccurate_risk = build_risk_assessment(
         inaccurate,
         comparisons,
@@ -1278,9 +1375,7 @@ def test_adoption_rejects_omitted_authoritative_identity_candidate(
         InventoryComparison.model_validate(item)
         for item in store.load_comparison(case_id, "inventory")["comparisons"]
     ]
-    risk = build_risk_assessment(
-        invoice, inventory, [], compute_invoice_totals(invoice), settings
-    )
+    risk = build_risk_assessment(invoice, inventory, [], compute_invoice_totals(invoice), settings)
     with connect_database(settings.workflow_db) as connection:
         connection.execute(
             "UPDATE identity_results SET payload_json = '[]' WHERE case_id = ? "
@@ -1347,9 +1442,7 @@ def test_adoption_rejects_inventory_row_not_in_authoritative_database(
         f"aggregate quantity {comparison.requested_quantity} compared with exact row "
         f"{comparison.queried_row.model_dump()}"
     )
-    inventory_payload["comparisons"] = [
-        item.model_dump(mode="json") for item in comparisons
-    ]
+    inventory_payload["comparisons"] = [item.model_dump(mode="json") for item in comparisons]
     risk = build_risk_assessment(
         invoice, comparisons, [], compute_invoice_totals(invoice), settings
     )
@@ -1654,6 +1747,763 @@ def test_duplicate_reconciles_paid_source_human_decision_rows(settings: Settings
     assert excinfo.value.stop_reason == "PAYMENT_LEDGER_INCONSISTENT"
 
 
+def test_mapping_review_authorizes_only_its_exact_recomputed_successor_and_payment(
+    settings: Settings,
+) -> None:
+    """The approved alias may change inventory evidence only through its exact successor."""
+
+    case_id = "case_mapping_successor_payment"
+    with connect_database(settings.inventory_db) as connection:
+        connection.execute("UPDATE inventory SET available_stock = 25 WHERE sku = 'SKU-WIDGET-A'")
+        connection.commit()
+    store = _persist_case(
+        settings,
+        case_id,
+        Path("tests/fixtures/invoice_2001_bulk_alias.txt"),
+    )
+    review_claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(review_claim)
+    reviewed_invoice = store.load_current_extraction(review_claim)
+    reviewed_risk = RiskAssessment.model_validate(
+        store.load_current_comparison(review_claim, "risk")
+    )
+    review = create_review_request(
+        case_id,
+        reviewed_invoice,
+        reviewed_risk,
+        store.load_current_critique(review_claim),
+        DecisionKind.HOLD,
+        ["the bulk alias requires an exact human mapping"],
+        store,
+        review_claim,
+    )
+    _finish_needs_human(store, case_id, review_claim, review)
+    resolved = record_human_decision(
+        review.review_id,
+        "mapping-reviewer@example.com",
+        HumanDecisionKind.ESTABLISH_MAPPING,
+        "WidgetA bulk is exactly SKU-WIDGET-A",
+        store,
+        settings.inventory_db,
+        mappings=[
+            CanonicalMapping(
+                raw_item="WidgetA (bulk)",
+                sku="SKU-WIDGET-A",
+                basis="human_decision",
+            )
+        ],
+    )
+    assert resolved.human_decision is not None
+
+    successor_claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.NEEDS_HUMAN}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(successor_claim)
+    orchestration._recompute_after_mapping(
+        case_id,
+        resolved.human_decision,
+        settings,
+        store,
+        AuditRecorder(settings.workflow_db, case_id),
+        successor_claim,
+    )
+    successor = store.load_current_extraction(successor_claim)
+    successor_risk = RiskAssessment.model_validate(
+        store.load_current_comparison(successor_claim, "risk")
+    )
+    mapped_line = next(line for line in successor.lines if line.raw_item == "WidgetA (bulk)")
+    assert mapped_line.canonical_sku == "SKU-WIDGET-A"
+    assert successor_risk.policy_review_reasons == []
+    assert blocking_evidence(successor_risk) == []
+    final = FinalDecision(
+        decision=DecisionKind.APPROVE,
+        reasons=["the exact mapped successor is coherent"],
+        critic_disposition=store.load_current_critique(successor_claim).recommended_disposition,
+        human_outcome=resolved.human_decision,
+        payment_eligible=True,
+    )
+    authoritative_alias_source = f"human_review:{review.review_id}"
+    with connect_database(settings.inventory_db) as connection:
+        connection.execute(
+            "UPDATE item_aliases SET source = 'forged-direct-write' "
+            "WHERE alias_normalized = 'widgetabulk'"
+        )
+        connection.commit()
+    with pytest.raises(InvoiceAgentsError) as final_error:
+        store.save_final_decision(case_id, final, successor_claim)
+    assert final_error.value.stop_reason == "EVIDENCE_SNAPSHOT_INVALID"
+    assert "mapping outcomes do not derive" in str(final_error.value)
+    with connect_database(settings.inventory_db) as connection:
+        connection.execute(
+            "UPDATE item_aliases SET source = ? WHERE alias_normalized = 'widgetabulk'",
+            (authoritative_alias_source,),
+        )
+        connection.commit()
+    store.save_final_decision(case_id, final, successor_claim)
+
+    with connect_database(settings.inventory_db) as connection:
+        connection.execute(
+            "UPDATE item_aliases SET source = 'forged-after-final' "
+            "WHERE alias_normalized = 'widgetabulk'"
+        )
+        connection.commit()
+    tampered = mock_payment(
+        case_id,
+        successor,
+        store,
+        settings.workflow_db,
+        successor_claim,
+    )
+    assert tampered.status is PaymentStatus.NOT_ELIGIBLE
+    assert tampered.error is not None
+    assert "mapping outcomes do not derive" in tampered.error
+    with connect_database(settings.inventory_db) as connection:
+        connection.execute(
+            "UPDATE item_aliases SET source = ? WHERE alias_normalized = 'widgetabulk'",
+            (authoritative_alias_source,),
+        )
+        connection.commit()
+
+    paid = mock_payment(
+        case_id,
+        successor,
+        store,
+        settings.workflow_db,
+        successor_claim,
+    )
+    duplicate = mock_payment(
+        case_id,
+        successor,
+        store,
+        settings.workflow_db,
+        successor_claim,
+    )
+
+    assert paid.status is PaymentStatus.PAID
+    assert duplicate.status is PaymentStatus.DUPLICATE
+    assert duplicate.duplicate_of == paid.payment_id
+    with connect_database(settings.inventory_db, read_only=True) as connection:
+        alias = connection.execute(
+            "SELECT sku, source FROM item_aliases WHERE alias_normalized = 'widgetabulk'"
+        ).fetchone()
+    assert tuple(alias) == ("SKU-WIDGET-A", authoritative_alias_source)
+
+
+def test_bulk_alias_mapping_then_stock_review_authorizes_final_and_payment(
+    settings: Settings,
+) -> None:
+    """The real stock-15 fixture keeps mapping and later blocker rulings distinct."""
+
+    case_id = "case_mapping_then_stock_review_payment"
+    store = _persist_case(
+        settings,
+        case_id,
+        Path("tests/fixtures/invoice_2001_bulk_alias.txt"),
+    )
+    mapping_claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(mapping_claim)
+    mapping_risk = RiskAssessment.model_validate(
+        store.load_current_comparison(mapping_claim, "risk")
+    )
+    mapping_review = create_review_request(
+        case_id,
+        store.load_current_extraction(mapping_claim),
+        mapping_risk,
+        store.load_current_critique(mapping_claim),
+        DecisionKind.HOLD,
+        ["the bulk alias requires an exact human mapping"],
+        store,
+        mapping_claim,
+    )
+    _finish_needs_human(store, case_id, mapping_claim, mapping_review)
+    mapped_review = record_human_decision(
+        mapping_review.review_id,
+        "mapping-reviewer@example.com",
+        HumanDecisionKind.ESTABLISH_MAPPING,
+        "WidgetA bulk is exactly SKU-WIDGET-A",
+        store,
+        settings.inventory_db,
+        mappings=[
+            CanonicalMapping(
+                raw_item="WidgetA (bulk)",
+                sku="SKU-WIDGET-A",
+                basis="human_decision",
+            )
+        ],
+    )
+    assert mapped_review.human_decision is not None
+
+    stock_claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.NEEDS_HUMAN}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(stock_claim)
+    orchestration._recompute_after_mapping(
+        case_id,
+        mapped_review.human_decision,
+        settings,
+        store,
+        AuditRecorder(settings.workflow_db, case_id),
+        stock_claim,
+    )
+    stock_risk = RiskAssessment.model_validate(store.load_current_comparison(stock_claim, "risk"))
+    blockers = blocking_evidence(stock_risk)
+    assert [blocker.blocker_id for blocker in blockers] == ["inventory:SKU-WIDGET-A:EXCEEDS_STOCK"]
+    stock_review = create_review_request(
+        case_id,
+        store.load_current_extraction(stock_claim),
+        stock_risk,
+        store.load_current_critique(stock_claim),
+        DecisionKind.HOLD,
+        ["stock is lower than the mapped invoice quantity"],
+        store,
+        stock_claim,
+    )
+    _finish_needs_human(store, case_id, stock_claim, stock_review)
+    resolved_stock_review = record_human_decision(
+        stock_review.review_id,
+        "stock-reviewer@example.com",
+        HumanDecisionKind.APPROVE,
+        "the exact stock exception is approved",
+        store,
+        settings.inventory_db,
+        addressed_blocker_ids=[blocker.blocker_id for blocker in blockers],
+    )
+    assert resolved_stock_review.human_decision is not None
+
+    final_claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.NEEDS_HUMAN}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(final_claim)
+    final_invoice = store.load_current_extraction(final_claim)
+    store.save_final_decision(
+        case_id,
+        FinalDecision(
+            decision=DecisionKind.APPROVE,
+            reasons=["the exact mapped stock exception has a second human ruling"],
+            critic_disposition=store.load_current_critique(final_claim).recommended_disposition,
+            human_outcome=resolved_stock_review.human_decision,
+            payment_eligible=True,
+        ),
+        final_claim,
+    )
+
+    paid = mock_payment(
+        case_id,
+        final_invoice,
+        store,
+        settings.workflow_db,
+        final_claim,
+    )
+
+    assert paid.status is PaymentStatus.PAID
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        review_rows = connection.execute(
+            "SELECT review_id, execution_generation, evidence_snapshot_digest "
+            "FROM review_requests WHERE case_id = ? ORDER BY sequence",
+            (case_id,),
+        ).fetchall()
+        anchor = connection.execute(
+            "SELECT review_id, review_snapshot_digest FROM validated_evidence_snapshots "
+            "WHERE case_id = ? AND execution_generation = ?",
+            (case_id, final_claim.generation),
+        ).fetchone()
+    assert [(row["review_id"], row["execution_generation"]) for row in review_rows] == [
+        (mapping_review.review_id, stock_claim.generation),
+        (stock_review.review_id, final_claim.generation),
+    ]
+    assert anchor is not None
+    assert anchor["review_id"] == stock_review.review_id
+    assert anchor["review_snapshot_digest"] == review_rows[-1]["evidence_snapshot_digest"]
+
+
+def test_final_application_rejects_embedded_review_without_relational_human_decision(
+    settings: Settings,
+) -> None:
+    case_id = "case_final_missing_relational_human"
+    store = _persist_case(settings, case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
+    invoice = store.load_current_extraction(claim)
+    risk = RiskAssessment.model_validate(store.load_current_comparison(claim, "risk"))
+    review = create_review_request(
+        case_id,
+        invoice,
+        risk,
+        store.load_current_critique(claim),
+        DecisionKind.HOLD,
+        ["an attributable ruling is required"],
+        store,
+        claim,
+        extra_reasons=["an attributable ruling is required"],
+    )
+    resolved = record_human_decision(
+        review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.APPROVE,
+        "the current evidence is approved",
+        store,
+        settings.inventory_db,
+    )
+    assert resolved.human_decision is not None
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute("DROP TRIGGER trg_human_decisions_immutable_delete")
+        connection.execute("DELETE FROM human_decisions WHERE review_id = ?", (review.review_id,))
+        connection.commit()
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.save_final_decision(
+            case_id,
+            FinalDecision(
+                decision=DecisionKind.APPROVE,
+                reasons=["embedded review alone must not authorize"],
+                critic_disposition=DecisionKind.APPROVE,
+                human_outcome=resolved.human_decision,
+                payment_eligible=True,
+            ),
+            claim,
+        )
+
+    assert excinfo.value.stop_reason == "EVIDENCE_SNAPSHOT_INVALID"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM final_decisions WHERE case_id = ?", (case_id,)
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_schema_rejects_policy_review_evidence_with_only_a_pending_review(
+    settings: Settings,
+) -> None:
+    case_id = "case_policy_pending_direct_final"
+    store = _persist_case(settings, case_id, Path("data/invoices/invoice_1002.txt"))
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
+    risk = RiskAssessment.model_validate(store.load_current_comparison(claim, "risk"))
+    assert risk.policy_review_reasons
+    review = create_review_request(
+        case_id,
+        store.load_current_extraction(claim),
+        risk,
+        store.load_current_critique(claim),
+        DecisionKind.HOLD,
+        ["stored policy reasons require a resolved ruling"],
+        store,
+        claim,
+    )
+    with connect_database(settings.workflow_db) as connection:
+        row = connection.execute(
+            "SELECT evidence_snapshot_digest FROM review_requests WHERE review_id = ?",
+            (review.review_id,),
+        ).fetchone()
+        with pytest.raises(sqlite3.IntegrityError, match="EVIDENCE_SNAPSHOT_DIGEST_INVALID"):
+            _insert_shape_consistent_approval(
+                connection,
+                case_id=case_id,
+                generation=claim.generation,
+                digest=str(row["evidence_snapshot_digest"]),
+                review_id=review.review_id,
+            )
+
+
+def test_payment_schema_independently_rejects_resolved_review_without_human_decision(
+    settings: Settings,
+) -> None:
+    case_id = "case_policy_missing_human_direct_payment"
+    store = _persist_case(settings, case_id, Path("data/invoices/invoice_1002.txt"))
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
+    risk = RiskAssessment.model_validate(store.load_current_comparison(claim, "risk"))
+    assert risk.policy_review_reasons
+    review = create_review_request(
+        case_id,
+        store.load_current_extraction(claim),
+        risk,
+        store.load_current_critique(claim),
+        DecisionKind.HOLD,
+        ["stored policy reasons require a relational human decision"],
+        store,
+        claim,
+    )
+    forged_resolved = review.model_copy(update={"status": "RESOLVED"}, deep=True)
+    with connect_database(settings.workflow_db) as connection:
+        digest = str(
+            connection.execute(
+                "SELECT evidence_snapshot_digest FROM review_requests WHERE review_id = ?",
+                (review.review_id,),
+            ).fetchone()["evidence_snapshot_digest"]
+        )
+        connection.execute(
+            "UPDATE review_requests SET status = 'RESOLVED', payload_json = ?, resolved_at = ? "
+            "WHERE review_id = ?",
+            (forged_resolved.model_dump_json(), datetime.now(UTC).isoformat(), review.review_id),
+        )
+        connection.execute("DROP TRIGGER trg_final_decisions_authorization_insert")
+        connection.execute("DROP TRIGGER trg_final_decisions_snapshot_digest_insert")
+        invoice = _insert_shape_consistent_approval(
+            connection,
+            case_id=case_id,
+            generation=claim.generation,
+            digest=digest,
+            review_id=review.review_id,
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="EVIDENCE_SNAPSHOT_DIGEST_INVALID"):
+            connection.execute(
+                "INSERT INTO payments("
+                "payment_id, case_id, idempotency_key, vendor, amount, currency, status, error, "
+                "created_at, decision_generation, evidence_snapshot_digest, source_id, "
+                "invoice_number, review_id) VALUES (?, ?, ?, ?, ?, ?, 'PAID', NULL, ?, ?, ?, ?, ?, ?)",
+                (
+                    "pay_policy_missing_human",
+                    case_id,
+                    payment_module.payment_idempotency_key(invoice),
+                    invoice.vendor.normalized_value,
+                    str(invoice.declared_total),
+                    invoice.currency.normalized_value,
+                    datetime.now(UTC).isoformat(),
+                    claim.generation,
+                    digest,
+                    invoice.source.source_id,
+                    invoice.invoice_number.normalized_value,
+                    review.review_id,
+                ),
+            )
+
+
+def test_final_application_still_rejects_policy_review_evidence_without_schema_triggers(
+    settings: Settings,
+) -> None:
+    case_id = "case_policy_application_without_triggers"
+    store = _persist_case(settings, case_id, Path("data/invoices/invoice_1002.txt"))
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute("DROP TRIGGER trg_final_decisions_authorization_insert")
+        connection.execute("DROP TRIGGER trg_final_decisions_snapshot_digest_insert")
+        connection.commit()
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.save_final_decision(
+            case_id,
+            FinalDecision(
+                decision=DecisionKind.APPROVE,
+                reasons=["policy evidence remains unreviewed"],
+                critic_disposition=DecisionKind.APPROVE,
+                payment_eligible=True,
+            ),
+            claim,
+        )
+
+    assert excinfo.value.stop_reason == "HUMAN_REVIEW_UNRESOLVED"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM final_decisions WHERE case_id = ?", (case_id,)
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_schema_rejects_forged_validated_evidence_digest_anchor(
+    settings: Settings,
+) -> None:
+    case_id = "case_forged_validated_anchor"
+    store = _persist_case(settings, case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
+    with connect_database(settings.workflow_db) as connection:
+        snapshot = load_generation_evidence_snapshot(
+            connection,
+            case_id,
+            claim.generation,
+            settings,
+        )
+        forged_digest = "f" * 64
+        assert forged_digest != snapshot.digest
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="VALIDATED_EVIDENCE_SNAPSHOT_INVALID",
+        ):
+            connection.execute(
+                "INSERT INTO validated_evidence_snapshots("
+                "case_id, execution_generation, evidence_snapshot_digest, "
+                "policy_review_required, unresolved_blocker_count, critique_disposition, "
+                "review_id, review_snapshot_digest, validated_at) "
+                "VALUES (?, ?, ?, 0, 0, ?, NULL, NULL, ?)",
+                (
+                    case_id,
+                    claim.generation,
+                    forged_digest,
+                    str(snapshot.critique.recommended_disposition),
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM validated_evidence_snapshots WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_schema_derives_unresolved_blocker_count_for_validated_anchor(
+    settings: Settings,
+) -> None:
+    case_id = "case_forged_zero_unresolved_blockers"
+    store = _persist_case(settings, case_id, Path("data/invoices/invoice_1002.txt"))
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
+    risk = RiskAssessment.model_validate(store.load_current_comparison(claim, "risk"))
+    blockers = blocking_evidence(risk)
+    assert blockers
+    review = create_review_request(
+        case_id,
+        store.load_current_extraction(claim),
+        risk,
+        store.load_current_critique(claim),
+        DecisionKind.HOLD,
+        ["blocking evidence requires an exact addressed-blocker ruling"],
+        store,
+        claim,
+    )
+    resolved = record_human_decision(
+        review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.APPROVE,
+        "approval without selecting any blocker must remain blocked",
+        store,
+        settings.inventory_db,
+    )
+    assert resolved.human_decision is not None
+    assert resolved.human_decision.addressed_blocker_ids == []
+
+    with connect_database(settings.workflow_db) as connection:
+        snapshot = load_generation_evidence_snapshot(
+            connection,
+            case_id,
+            claim.generation,
+            settings,
+        )
+        review_row = connection.execute(
+            "SELECT evidence_snapshot_digest FROM review_requests WHERE review_id = ?",
+            (review.review_id,),
+        ).fetchone()
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="VALIDATED_EVIDENCE_SNAPSHOT_INVALID",
+        ):
+            connection.execute(
+                "INSERT INTO validated_evidence_snapshots("
+                "case_id, execution_generation, evidence_snapshot_digest, "
+                "policy_review_required, unresolved_blocker_count, critique_disposition, "
+                "review_id, review_snapshot_digest, validated_at) "
+                "VALUES (?, ?, ?, 1, 0, ?, ?, ?, ?)",
+                (
+                    case_id,
+                    claim.generation,
+                    snapshot.digest,
+                    str(snapshot.critique.recommended_disposition),
+                    review.review_id,
+                    str(review_row["evidence_snapshot_digest"]),
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+
+
+def test_schema_binds_non_mapping_review_digest_to_current_evidence(
+    settings: Settings,
+) -> None:
+    case_id = "case_review_digest_not_current_evidence"
+    store = _persist_case(settings, case_id, Path("data/invoices/invoice_1002.txt"))
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
+    risk = RiskAssessment.model_validate(store.load_current_comparison(claim, "risk"))
+    blockers = blocking_evidence(risk)
+    assert blockers
+    review = create_review_request(
+        case_id,
+        store.load_current_extraction(claim),
+        risk,
+        store.load_current_critique(claim),
+        DecisionKind.HOLD,
+        ["the review digest must identify this exact evidence"],
+        store,
+        claim,
+    )
+    forged_review_digest = "d" * 64
+    resolved = record_human_decision(
+        review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.APPROVE,
+        "the exact blockers are approved",
+        store,
+        settings.inventory_db,
+        addressed_blocker_ids=[blocker.blocker_id for blocker in blockers],
+    )
+    assert resolved.human_decision is not None
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute("DROP TRIGGER trg_review_requests_snapshot_digest_update")
+        connection.execute("DROP TRIGGER trg_resolved_review_immutable_update")
+        connection.execute(
+            "UPDATE review_requests SET evidence_snapshot_digest = ? WHERE review_id = ?",
+            (forged_review_digest, review.review_id),
+        )
+        connection.commit()
+
+    with connect_database(settings.workflow_db) as connection:
+        snapshot = load_generation_evidence_snapshot(
+            connection,
+            case_id,
+            claim.generation,
+            settings,
+        )
+        assert snapshot.digest != forged_review_digest
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="VALIDATED_EVIDENCE_SNAPSHOT_INVALID",
+        ):
+            connection.execute(
+                "INSERT INTO validated_evidence_snapshots("
+                "case_id, execution_generation, evidence_snapshot_digest, "
+                "policy_review_required, unresolved_blocker_count, critique_disposition, "
+                "review_id, review_snapshot_digest, validated_at) "
+                "VALUES (?, ?, ?, 1, 0, ?, ?, ?, ?)",
+                (
+                    case_id,
+                    claim.generation,
+                    snapshot.digest,
+                    str(snapshot.critique.recommended_disposition),
+                    review.review_id,
+                    forged_review_digest,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+
+
+def test_schema_rejects_approval_that_conflicts_with_matching_human_rejection(
+    settings: Settings,
+) -> None:
+    case_id = "case_direct_approval_conflicts_with_human_reject"
+    store = _persist_case(settings, case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
+    risk = RiskAssessment.model_validate(store.load_current_comparison(claim, "risk"))
+    assert risk.policy_review_reasons == []
+    review = create_review_request(
+        case_id,
+        store.load_current_extraction(claim),
+        risk,
+        store.load_current_critique(claim),
+        DecisionKind.HOLD,
+        ["an extra clean-evidence review was requested"],
+        store,
+        claim,
+        extra_reasons=["an extra clean-evidence review was requested"],
+    )
+    resolved = record_human_decision(
+        review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.REJECT,
+        "the reviewer rejects payment",
+        store,
+        settings.inventory_db,
+    )
+    assert resolved.human_decision is not None
+
+    with connect_database(settings.workflow_db) as connection:
+        snapshot = load_generation_evidence_snapshot(
+            connection,
+            case_id,
+            claim.generation,
+            settings,
+        )
+        review_digest = str(
+            connection.execute(
+                "SELECT evidence_snapshot_digest FROM review_requests WHERE review_id = ?",
+                (review.review_id,),
+            ).fetchone()["evidence_snapshot_digest"]
+        )
+        connection.execute(
+            "INSERT INTO validated_evidence_snapshots("
+            "case_id, execution_generation, evidence_snapshot_digest, "
+            "policy_review_required, unresolved_blocker_count, critique_disposition, "
+            "review_id, review_snapshot_digest, validated_at) "
+            "VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?)",
+            (
+                case_id,
+                claim.generation,
+                snapshot.digest,
+                str(snapshot.critique.recommended_disposition),
+                review.review_id,
+                review_digest,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="FINAL_DECISION_AUTHORIZATION_INVALID",
+        ):
+            _insert_shape_consistent_approval(
+                connection,
+                case_id=case_id,
+                generation=claim.generation,
+                digest=snapshot.digest,
+                review_id=review.review_id,
+                human_outcome=resolved.human_decision,
+            )
+
+
+def test_payment_application_revalidates_anchor_without_payment_schema_triggers(
+    settings: Settings,
+) -> None:
+    case_id = "case_payment_anchor_without_triggers"
+    store = _persist_case(settings, case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    _approve(store, case_id, claim)
+    invoice = store.load_current_extraction(claim)
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute("DROP TRIGGER trg_payments_authorization_insert")
+        connection.execute("DROP TRIGGER trg_payments_snapshot_digest_insert")
+        connection.execute("DROP TRIGGER trg_validated_evidence_snapshots_update")
+        connection.execute(
+            "UPDATE validated_evidence_snapshots SET policy_review_required = 1 "
+            "WHERE case_id = ? AND execution_generation = ?",
+            (case_id, claim.generation),
+        )
+        connection.commit()
+
+    result = mock_payment(case_id, invoice, store, settings.workflow_db, claim)
+
+    assert result.status is PaymentStatus.NOT_ELIGIBLE
+    assert result.error == "validated evidence snapshot anchor does not match current evidence"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 0
+
+
 def test_migration_003_rolls_back_and_is_retryable_after_mid_migration_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1727,9 +2577,7 @@ def test_migration_003_rolls_back_and_is_retryable_after_mid_migration_failure(
         }
         trigger_names = {
             str(row["name"])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
-            )
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
         }
         backfilled_at = connection.execute(
             "SELECT evaluated_at FROM identity_results WHERE identity_id = 'ident_v2'"

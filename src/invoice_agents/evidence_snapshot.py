@@ -14,6 +14,7 @@ from invoice_agents.errors import InvoiceAgentsError
 from invoice_agents.models import (
     Critique,
     ExtractedInvoice,
+    HumanDecision,
     IdentityCandidate,
     InventoryComparison,
     InventoryStatus,
@@ -58,6 +59,77 @@ def _digest_snapshot_envelope(envelope: dict[str, Any]) -> str:
         + payload
     )
     return hashlib.sha256(preimage).hexdigest()
+
+
+def stored_evidence_snapshot_digest(
+    case_id: object,
+    extraction_json: object,
+    identity_json: object,
+    identity_evaluated_at: object,
+    inventory_json: object,
+    risk_json: object,
+    critique_json: object,
+) -> str:
+    """Digest exact stored components for SQLite's relational provenance checks."""
+
+    if not all(
+        isinstance(value, str)
+        for value in (
+            case_id,
+            extraction_json,
+            identity_json,
+            identity_evaluated_at,
+            inventory_json,
+            risk_json,
+            critique_json,
+        )
+    ):
+        raise ValueError("stored evidence snapshot inputs must all be text")
+    assert isinstance(case_id, str)
+    assert isinstance(extraction_json, str)
+    assert isinstance(identity_json, str)
+    assert isinstance(identity_evaluated_at, str)
+    assert isinstance(inventory_json, str)
+    assert isinstance(risk_json, str)
+    assert isinstance(critique_json, str)
+    invoice = ExtractedInvoice.model_validate_json(extraction_json)
+    raw_identity = json.loads(identity_json)
+    raw_inventory = json.loads(inventory_json)
+    if not isinstance(raw_identity, list) or not isinstance(raw_inventory, dict):
+        raise ValueError("stored identity or inventory evidence has the wrong shape")
+    identity = tuple(IdentityCandidate.model_validate(item) for item in raw_identity)
+    risk = RiskAssessment.model_validate_json(risk_json)
+    critique = Critique.model_validate_json(critique_json)
+    evaluated_at = datetime.fromisoformat(identity_evaluated_at)
+    if evaluated_at.isoformat() != identity_evaluated_at:
+        raise ValueError("identity evaluation boundary is not canonical")
+    envelope = {
+        "case_id": case_id,
+        "invoice": invoice.model_dump(mode="json"),
+        "identity": [item.model_dump(mode="json") for item in identity],
+        "identity_evaluated_at": identity_evaluated_at,
+        "inventory": raw_inventory,
+        "risk": risk.model_dump(mode="json"),
+        "critique": critique.model_dump(mode="json"),
+    }
+    return _digest_snapshot_envelope(envelope)
+
+
+def stored_unresolved_blocker_count(risk_json: object, human_json: object) -> int:
+    """Derive the exact remaining blocker count for SQLite authorization triggers."""
+
+    from invoice_agents.agents.decision_rules import unaddressed_blockers
+
+    if not isinstance(risk_json, str):
+        raise ValueError("stored risk evidence must be text")
+    risk = RiskAssessment.model_validate_json(risk_json)
+    if human_json is None:
+        human = None
+    elif isinstance(human_json, str):
+        human = HumanDecision.model_validate_json(human_json)
+    else:
+        raise ValueError("stored human decision must be text or null")
+    return len(unaddressed_blockers(risk, human))
 
 
 def _without_mapping_results(invoice: ExtractedInvoice) -> ExtractedInvoice:
@@ -205,9 +277,7 @@ def build_evidence_snapshot(
     )
     mappings, expected_inventory, unresolved = compare_inventory_evidence(source_invoice, reader)
     inventory_errors = [
-        result.error
-        for result in unresolved.values()
-        if result.status is ToolStatus.ERROR
+        result.error for result in unresolved.values() if result.status is ToolStatus.ERROR
     ]
     if inventory_errors:
         raise EvidenceSnapshotError(

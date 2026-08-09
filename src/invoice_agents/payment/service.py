@@ -19,16 +19,17 @@ from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import (
     ExecutionClaim,
     WorkflowStore,
-    load_generation_evidence_snapshot,
+    load_authoritative_review_authorization,
+    load_authorization_evidence_snapshot,
     parse_canonical_utc,
+    validated_evidence_facts,
 )
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
-from invoice_agents.evidence_snapshot import EvidenceSnapshotError, validate_review_snapshot
+from invoice_agents.evidence_snapshot import EvidenceSnapshotError
 from invoice_agents.models import (
     DecisionKind,
     ExtractedInvoice,
     FinalDecision,
-    HumanDecision,
     Money,
     PaymentResult,
     PaymentStatus,
@@ -51,74 +52,6 @@ class _AuthorizationSnapshotError(Exception):
     pass
 
 
-def _reconcile_review_authorization(
-    connection: sqlite3.Connection,
-    row: sqlite3.Row,
-    case_id: str,
-) -> ReviewRequest:
-    """Reconcile embedded review JSON with authoritative relational HITL rows."""
-
-    from invoice_agents.agents.decision_rules import AUTHORIZING_HUMAN_DECISIONS
-
-    inconsistent = _AuthorizationSnapshotError("review authorization records are inconsistent")
-    try:
-        review = ReviewRequest.model_validate_json(row["payload_json"])
-    except ValueError as exc:
-        raise inconsistent from exc
-    human = review.human_decision
-    if (
-        review.case_id != case_id
-        or review.review_id != row["review_id"]
-        or row["case_id"] != case_id
-        or row["status"] != "RESOLVED"
-        or review.status != "RESOLVED"
-        or row["resolved_at"] is None
-        or human is None
-    ):
-        raise inconsistent
-    human_rows = connection.execute(
-        "SELECT review_id, reviewer, decision, reason, payload_json, decided_at "
-        "FROM human_decisions WHERE review_id = ?",
-        (review.review_id,),
-    ).fetchall()
-    if len(human_rows) != 1:
-        raise inconsistent
-    human_row = human_rows[0]
-    try:
-        relational_human = HumanDecision.model_validate_json(human_row["payload_json"])
-    except ValueError as exc:
-        raise inconsistent from exc
-    relational_columns_match = (
-        human_row["review_id"] == review.review_id
-        and human_row["reviewer"] == relational_human.reviewer
-        and human_row["decision"] == relational_human.decision
-        and human_row["reason"] == relational_human.reason
-        and human_row["decided_at"] == relational_human.decided_at.isoformat()
-        and row["resolved_at"] == relational_human.decided_at.isoformat()
-    )
-    raw_blockers = review.evidence_bundle.get("blocking_evidence")
-    if not isinstance(raw_blockers, list):
-        raise inconsistent
-    package_blocker_ids = [
-        entry.get("blocker_id") if isinstance(entry, dict) else None for entry in raw_blockers
-    ]
-    blocker_linkage_valid = (
-        all(isinstance(blocker_id, str) and blocker_id for blocker_id in package_blocker_ids)
-        and len(set(package_blocker_ids)) == len(package_blocker_ids)
-        and len(set(human.addressed_blocker_ids)) == len(human.addressed_blocker_ids)
-        and set(human.addressed_blocker_ids).issubset(set(package_blocker_ids))
-        and (not human.addressed_blocker_ids or human.decision in AUTHORIZING_HUMAN_DECISIONS)
-    )
-    if (
-        relational_human != human
-        or relational_human.review_id != review.review_id
-        or not relational_columns_match
-        or not blocker_linkage_valid
-    ):
-        raise inconsistent
-    return review
-
-
 def _load_authorization_snapshot(
     connection: sqlite3.Connection,
     case_id: str,
@@ -130,11 +63,20 @@ def _load_authorization_snapshot(
     from invoice_agents.agents.decision_rules import validate_final_decision
 
     try:
-        evidence = load_generation_evidence_snapshot(
+        review_authorization = load_authoritative_review_authorization(
+            connection,
+            case_id,
+            generation,
+        )
+    except EvidenceSnapshotError as exc:
+        raise _AuthorizationSnapshotError(str(exc)) from exc
+    try:
+        evidence = load_authorization_evidence_snapshot(
             connection,
             case_id,
             generation,
             settings,
+            review_authorization,
         )
     except EvidenceSnapshotError as exc:
         raise _AuthorizationSnapshotError(f"evidence snapshot is invalid: {exc}") from exc
@@ -142,27 +84,7 @@ def _load_authorization_snapshot(
     risk = evidence.risk
     critique = evidence.critique
 
-    review_row = connection.execute(
-        "SELECT review_id, case_id, status, payload_json, resolved_at, "
-        "execution_generation, evidence_snapshot_digest FROM review_requests WHERE case_id = ? "
-        "ORDER BY sequence DESC LIMIT 1",
-        (case_id,),
-    ).fetchone()
-    if review_row is not None and int(review_row["execution_generation"]) != generation:
-        raise _AuthorizationSnapshotError("latest review is stale")
-    review = (
-        _reconcile_review_authorization(connection, review_row, case_id)
-        if review_row is not None
-        else None
-    )
-    if review is not None:
-        try:
-            validate_review_snapshot(review, evidence)
-        except EvidenceSnapshotError as exc:
-            raise _AuthorizationSnapshotError(str(exc)) from exc
-        if review_row["evidence_snapshot_digest"] != evidence.digest:
-            raise _AuthorizationSnapshotError("review snapshot digest does not match evidence")
-
+    review = review_authorization.review if review_authorization is not None else None
     decision_row = connection.execute(
         "SELECT payload_json, decision_generation, evidence_snapshot_digest, source_id, "
         "invoice_number, vendor, authorized_amount, authorized_currency, "
@@ -172,6 +94,28 @@ def _load_authorization_snapshot(
     ).fetchone()
     if decision_row is None or int(decision_row["decision_generation"]) != generation:
         raise _AuthorizationSnapshotError("final decision is missing or stale")
+    facts = validated_evidence_facts(evidence, review_authorization)
+    anchor = connection.execute(
+        "SELECT evidence_snapshot_digest, policy_review_required, unresolved_blocker_count, "
+        "critique_disposition, review_id, review_snapshot_digest, validated_at "
+        "FROM validated_evidence_snapshots WHERE case_id = ? AND execution_generation = ?",
+        (case_id, generation),
+    ).fetchone()
+    anchor_is_exact = (
+        anchor is not None
+        and anchor["evidence_snapshot_digest"] == evidence.digest
+        and int(anchor["policy_review_required"]) == facts.policy_review_required
+        and int(anchor["unresolved_blocker_count"]) == facts.unresolved_blocker_count
+        and anchor["critique_disposition"] == facts.critique_disposition
+        and anchor["review_id"] == facts.review_id
+        and anchor["review_snapshot_digest"] == facts.review_snapshot_digest
+        and parse_canonical_utc(anchor["validated_at"]) is not None
+    )
+    if not anchor_is_exact:
+        raise _AuthorizationSnapshotError(
+            "validated evidence snapshot anchor does not match current evidence"
+        )
+
     if decision_row["evidence_snapshot_digest"] != evidence.digest:
         raise _AuthorizationSnapshotError("final decision snapshot digest does not match evidence")
     decision = FinalDecision.model_validate_json(decision_row["payload_json"])
@@ -247,8 +191,7 @@ def _validate_paid_ledger_source(
         and invoice.declared_total == Decimal(str(row["amount"]))
         and row["source_id"] == invoice.source.source_id
         and row["invoice_number"] == invoice.invoice_number.normalized_value
-        and row["review_id"]
-        == (snapshot.review.review_id if snapshot.review is not None else None)
+        and row["review_id"] == (snapshot.review.review_id if snapshot.review is not None else None)
         and str(row["status"]) in {PaymentStatus.PAID, PaymentStatus.FAILED}
         and (
             (str(row["status"]) == PaymentStatus.PAID and row["error"] is None)

@@ -49,6 +49,26 @@ class ExecutionClaim:
     expires_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class ReviewAuthorization:
+    """Relationally reconciled review state and its review-time snapshot digest."""
+
+    review: ReviewRequest
+    evidence_snapshot_digest: str
+    execution_generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedEvidenceFacts:
+    """Values independently derived before sealing one final/payment snapshot."""
+
+    policy_review_required: int
+    unresolved_blocker_count: int
+    critique_disposition: str
+    review_id: str | None
+    review_snapshot_digest: str | None
+
+
 def now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -324,6 +344,270 @@ def _review_alias_sources(review: ReviewRequest | None) -> frozenset[str]:
     ):
         return frozenset({f"human_review:{review.review_id}"})
     return frozenset()
+
+
+def _reconcile_review_authorization(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    case_id: str,
+) -> ReviewAuthorization:
+    """Reconcile one review JSON document with every authoritative relational column."""
+
+    from invoice_agents.agents.decision_rules import AUTHORIZING_HUMAN_DECISIONS
+
+    inconsistent = EvidenceSnapshotError("review authorization records are inconsistent")
+    try:
+        review = ReviewRequest.model_validate_json(row["payload_json"])
+    except ValueError as exc:
+        raise inconsistent from exc
+    human_rows = connection.execute(
+        "SELECT review_id, reviewer, decision, reason, payload_json, decided_at "
+        "FROM human_decisions WHERE review_id = ?",
+        (review.review_id,),
+    ).fetchall()
+    base_columns_match = (
+        review.case_id == case_id
+        and review.review_id == row["review_id"]
+        and row["case_id"] == case_id
+        and int(row["sequence"]) == review.sequence
+        and row["status"] == review.status
+        and row["created_at"] == review.created_at.isoformat()
+        and int(row["execution_generation"]) >= 1
+        and isinstance(row["evidence_snapshot_digest"], str)
+    )
+    if not base_columns_match:
+        raise inconsistent
+    if review.status == "PENDING":
+        if review.human_decision is not None or row["resolved_at"] is not None or human_rows:
+            raise inconsistent
+        return ReviewAuthorization(
+            review,
+            str(row["evidence_snapshot_digest"]),
+            int(row["execution_generation"]),
+        )
+
+    human = review.human_decision
+    if row["resolved_at"] is None or human is None or len(human_rows) != 1:
+        raise inconsistent
+    human_row = human_rows[0]
+    try:
+        relational_human = HumanDecision.model_validate_json(human_row["payload_json"])
+    except ValueError as exc:
+        raise inconsistent from exc
+    relational_columns_match = (
+        human_row["review_id"] == review.review_id
+        and human_row["reviewer"] == relational_human.reviewer
+        and human_row["decision"] == relational_human.decision
+        and human_row["reason"] == relational_human.reason
+        and human_row["decided_at"] == relational_human.decided_at.isoformat()
+        and row["resolved_at"] == relational_human.decided_at.isoformat()
+    )
+    raw_blockers = review.evidence_bundle.get("blocking_evidence")
+    if not isinstance(raw_blockers, list):
+        raise inconsistent
+    package_blocker_ids = [
+        entry.get("blocker_id") if isinstance(entry, dict) else None for entry in raw_blockers
+    ]
+    blocker_linkage_valid = (
+        all(isinstance(blocker_id, str) and blocker_id for blocker_id in package_blocker_ids)
+        and len(set(package_blocker_ids)) == len(package_blocker_ids)
+        and len(set(human.addressed_blocker_ids)) == len(human.addressed_blocker_ids)
+        and set(human.addressed_blocker_ids).issubset(set(package_blocker_ids))
+        and (not human.addressed_blocker_ids or human.decision in AUTHORIZING_HUMAN_DECISIONS)
+    )
+    if (
+        relational_human != human
+        or relational_human.review_id != review.review_id
+        or not relational_columns_match
+        or not blocker_linkage_valid
+    ):
+        raise inconsistent
+    return ReviewAuthorization(
+        review,
+        str(row["evidence_snapshot_digest"]),
+        int(row["execution_generation"]),
+    )
+
+
+def load_authoritative_review_authorization(
+    connection: sqlite3.Connection,
+    case_id: str,
+    generation: int,
+) -> ReviewAuthorization | None:
+    """Load the latest review and require it to belong exactly to this generation."""
+
+    row = connection.execute(
+        "SELECT review_id, case_id, sequence, status, payload_json, created_at, resolved_at, "
+        "execution_generation, evidence_snapshot_digest FROM review_requests WHERE case_id = ? "
+        "ORDER BY sequence DESC LIMIT 1",
+        (case_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    if int(row["execution_generation"]) != generation:
+        raise EvidenceSnapshotError("latest review belongs to another generation")
+    return _reconcile_review_authorization(connection, row, case_id)
+
+
+def _mapping_review_authorizations(
+    connection: sqlite3.Connection,
+    case_id: str,
+    generation: int,
+) -> tuple[ReviewAuthorization, ...]:
+    rows = connection.execute(
+        "SELECT review_id, case_id, sequence, status, payload_json, created_at, resolved_at, "
+        "execution_generation, evidence_snapshot_digest FROM review_requests WHERE case_id = ? "
+        "AND execution_generation <= ? ORDER BY sequence",
+        (case_id, generation),
+    ).fetchall()
+    authorizations = tuple(
+        _reconcile_review_authorization(connection, row, case_id) for row in rows
+    )
+    return tuple(
+        authorization
+        for authorization in authorizations
+        if authorization.review.status == "RESOLVED"
+        and authorization.review.human_decision is not None
+        and authorization.review.human_decision.decision is HumanDecisionKind.ESTABLISH_MAPPING
+    )
+
+
+def _validate_mapping_successor(
+    snapshot: EvidenceSnapshot,
+    mapping_authorizations: tuple[ReviewAuthorization, ...],
+    settings: Settings,
+) -> None:
+    """Require exact persisted alias provenance and its exact mapped successor evidence."""
+
+    expected: dict[str, tuple[str, str, str, str]] = {}
+    for authorization in mapping_authorizations:
+        human = authorization.review.human_decision
+        if human is None:
+            raise EvidenceSnapshotError("mapping review has no authoritative human decision")
+        source = f"human_review:{authorization.review.review_id}"
+        for mapping in human.mappings:
+            alias = _normalize_alias(mapping.raw_item)
+            value = (mapping.sku, source, human.reviewer, human.decided_at.isoformat())
+            previous = expected.get(alias)
+            if not alias or (previous is not None and previous != value):
+                raise EvidenceSnapshotError(
+                    "mapping reviews contain conflicting alias authorization"
+                )
+            expected[alias] = value
+    if not expected:
+        return
+    with connect_database(settings.inventory_db, read_only=True) as inventory:
+        rows = inventory.execute(
+            "SELECT alias_normalized, sku, source, approved_by, approved_at FROM item_aliases "
+            f"WHERE alias_normalized IN ({', '.join('?' for _ in expected)})",
+            tuple(expected),
+        ).fetchall()
+    actual = {
+        str(row["alias_normalized"]): (
+            str(row["sku"]),
+            str(row["source"]),
+            str(row["approved_by"]),
+            str(row["approved_at"]),
+        )
+        for row in rows
+    }
+    if actual != expected:
+        raise EvidenceSnapshotError("approved mapping alias provenance is not exact")
+    for alias, (sku, _source, _reviewer, _approved_at) in expected.items():
+        mapped_lines = [
+            line for line in snapshot.invoice.lines if _normalize_alias(line.raw_item) == alias
+        ]
+        if not mapped_lines or any(line.canonical_sku != sku for line in mapped_lines):
+            raise EvidenceSnapshotError(
+                "recomputed successor does not include the exact approved mapping"
+            )
+        if not any(
+            comparison.sku == sku
+            and any(_normalize_alias(raw_item) == alias for raw_item in comparison.raw_items)
+            for comparison in snapshot.inventory
+        ):
+            raise EvidenceSnapshotError(
+                "recomputed inventory successor does not include the exact approved mapping"
+            )
+
+
+def _validate_mapping_review_snapshots(
+    connection: sqlite3.Connection,
+    case_id: str,
+    settings: Settings,
+    authorizations: tuple[ReviewAuthorization, ...],
+) -> None:
+    """Bind every persisted mapping ruling to its exact review-time predecessor."""
+
+    for authorization in authorizations:
+        predecessor = authorization.execution_generation - 1
+        if predecessor < 1:
+            raise EvidenceSnapshotError("mapping review has no predecessor evidence generation")
+        review_snapshot = load_generation_evidence_snapshot(
+            connection,
+            case_id,
+            predecessor,
+            settings,
+            require_latest=False,
+            excluded_alias_sources=_review_alias_sources(authorization.review),
+        )
+        validate_review_snapshot(authorization.review, review_snapshot)
+        if authorization.evidence_snapshot_digest != review_snapshot.digest:
+            raise EvidenceSnapshotError("mapping review digest does not match review-time evidence")
+
+
+def load_authorization_evidence_snapshot(
+    connection: sqlite3.Connection,
+    case_id: str,
+    generation: int,
+    settings: Settings,
+    review_authorization: ReviewAuthorization | None,
+) -> EvidenceSnapshot:
+    """Revalidate review-time evidence and the exact current authorization successor."""
+
+    mapping_authorizations = _mapping_review_authorizations(connection, case_id, generation)
+    _validate_mapping_review_snapshots(
+        connection,
+        case_id,
+        settings,
+        mapping_authorizations,
+    )
+    current = load_generation_evidence_snapshot(connection, case_id, generation, settings)
+    mapping_review_ids = {
+        authorization.review.review_id for authorization in mapping_authorizations
+    }
+    if (
+        review_authorization is not None
+        and review_authorization.review.review_id not in mapping_review_ids
+    ):
+        validate_review_snapshot(review_authorization.review, current)
+        if review_authorization.evidence_snapshot_digest != current.digest:
+            raise EvidenceSnapshotError("review digest does not match current evidence")
+    _validate_mapping_successor(current, mapping_authorizations, settings)
+    return current
+
+
+def validated_evidence_facts(
+    snapshot: EvidenceSnapshot,
+    review_authorization: ReviewAuthorization | None,
+) -> ValidatedEvidenceFacts:
+    """Derive the relational facts that final and payment triggers enforce."""
+
+    from invoice_agents.agents.decision_rules import unaddressed_blockers
+
+    review = review_authorization.review if review_authorization is not None else None
+    human = review.human_decision if review is not None and review.status == "RESOLVED" else None
+    return ValidatedEvidenceFacts(
+        policy_review_required=int(bool(snapshot.risk.policy_review_reasons)),
+        unresolved_blocker_count=len(unaddressed_blockers(snapshot.risk, human)),
+        critique_disposition=str(snapshot.critique.recommended_disposition),
+        review_id=review.review_id if review is not None else None,
+        review_snapshot_digest=(
+            review_authorization.evidence_snapshot_digest
+            if review_authorization is not None
+            else None
+        ),
+    )
 
 
 def _normalized_invoice_field(invoice: dict[str, Any], name: str) -> str | None:
@@ -991,17 +1275,17 @@ class WorkflowStore:
                 if predecessor < 1:
                     self._raise_evidence_provenance(claim, "no predecessor generation exists")
                 self._reject_future_evidence(connection, claim)
-                predecessor_review_row = connection.execute(
-                    "SELECT payload_json FROM review_requests WHERE case_id = ? "
-                    "AND execution_generation = ? ORDER BY sequence DESC LIMIT 1",
-                    (claim.case_id, predecessor),
-                ).fetchone()
-                predecessor_review = (
-                    ReviewRequest.model_validate_json(predecessor_review_row["payload_json"])
-                    if predecessor_review_row is not None
-                    else None
-                )
                 try:
+                    predecessor_review_authorization = load_authoritative_review_authorization(
+                        connection,
+                        claim.case_id,
+                        predecessor,
+                    )
+                    predecessor_review = (
+                        predecessor_review_authorization.review
+                        if predecessor_review_authorization is not None
+                        else None
+                    )
                     snapshot = load_generation_evidence_snapshot(
                         connection,
                         claim.case_id,
@@ -1088,28 +1372,20 @@ class WorkflowStore:
                             claim.generation,
                         ),
                     )
-                review = connection.execute(
-                    "SELECT review_id, payload_json, evidence_snapshot_digest "
-                    "FROM review_requests WHERE case_id = ? "
-                    "AND execution_generation = ? ORDER BY sequence DESC LIMIT 1",
-                    (claim.case_id, predecessor),
-                ).fetchone()
-                if review is not None:
+                if predecessor_review_authorization is not None:
                     try:
-                        predecessor_review = ReviewRequest.model_validate_json(
-                            review["payload_json"]
-                        )
+                        predecessor_review = predecessor_review_authorization.review
                         validate_review_snapshot(predecessor_review, snapshot)
                     except (EvidenceSnapshotError, ValueError) as exc:
                         self._raise_evidence_provenance(claim, str(exc))
-                    if review["evidence_snapshot_digest"] != snapshot.digest:
+                    if predecessor_review_authorization.evidence_snapshot_digest != snapshot.digest:
                         self._raise_evidence_provenance(
                             claim, "predecessor review snapshot digest does not match evidence"
                         )
                     updated = connection.execute(
                         "UPDATE review_requests SET execution_generation = ? "
                         "WHERE review_id = ? AND execution_generation = ?",
-                        (claim.generation, review["review_id"], predecessor),
+                        (claim.generation, predecessor_review.review_id, predecessor),
                     )
                     if updated.rowcount != 1:
                         self._raise_evidence_provenance(
@@ -1515,34 +1791,21 @@ class WorkflowStore:
                     stop_reason="FINAL_DECISION_IMMUTABLE",
                 )
             try:
-                snapshot = load_generation_evidence_snapshot(
+                review_authorization = load_authoritative_review_authorization(
+                    connection,
+                    case_id,
+                    claim.generation,
+                )
+                snapshot = load_authorization_evidence_snapshot(
                     connection,
                     case_id,
                     claim.generation,
                     self._snapshot_settings(),
+                    review_authorization,
                 )
             except EvidenceSnapshotError as exc:
                 self._raise_snapshot_invalid(case_id, claim.generation, str(exc))
-            review_row = connection.execute(
-                "SELECT payload_json, execution_generation, evidence_snapshot_digest "
-                "FROM review_requests WHERE case_id = ? ORDER BY sequence DESC LIMIT 1",
-                (case_id,),
-            ).fetchone()
-            review = None
-            if review_row is not None:
-                if int(review_row["execution_generation"]) != claim.generation:
-                    self._raise_snapshot_invalid(
-                        case_id, claim.generation, "latest review belongs to another generation"
-                    )
-                try:
-                    review = ReviewRequest.model_validate_json(review_row["payload_json"])
-                    validate_review_snapshot(review, snapshot)
-                except (EvidenceSnapshotError, ValueError) as exc:
-                    self._raise_snapshot_invalid(case_id, claim.generation, str(exc))
-                if review_row["evidence_snapshot_digest"] != snapshot.digest:
-                    self._raise_snapshot_invalid(
-                        case_id, claim.generation, "review digest does not match current evidence"
-                    )
+            review = review_authorization.review if review_authorization is not None else None
             from invoice_agents.agents.decision_rules import validate_final_decision
 
             validate_final_decision(
@@ -1573,6 +1836,36 @@ class WorkflowStore:
             )
             authorized_currency = invoice.currency.normalized_value
             idempotency_key = payment_identity_key(vendor, invoice_number)
+            facts = validated_evidence_facts(snapshot, review_authorization)
+            existing_anchor = connection.execute(
+                "SELECT 1 FROM validated_evidence_snapshots WHERE case_id = ? "
+                "AND execution_generation = ?",
+                (case_id, claim.generation),
+            ).fetchone()
+            if existing_anchor is not None:
+                self._raise_snapshot_invalid(
+                    case_id,
+                    claim.generation,
+                    "validated evidence snapshot anchor already exists",
+                )
+            connection.execute(
+                "INSERT INTO validated_evidence_snapshots("
+                "case_id, execution_generation, evidence_snapshot_digest, "
+                "policy_review_required, unresolved_blocker_count, critique_disposition, "
+                "review_id, review_snapshot_digest, validated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    case_id,
+                    claim.generation,
+                    snapshot.digest,
+                    facts.policy_review_required,
+                    facts.unresolved_blocker_count,
+                    facts.critique_disposition,
+                    facts.review_id,
+                    facts.review_snapshot_digest,
+                    written_at,
+                ),
+            )
             updated = connection.execute(
                 "INSERT INTO final_decisions("
                 "decision_id, case_id, payload_json, created_at, decision_generation, "

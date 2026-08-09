@@ -201,12 +201,28 @@ def connect_database(path: Path, *, read_only: bool = False) -> Iterator[sqlite3
     else:
         connection = sqlite3.connect(path, timeout=5)
     connection.row_factory = sqlite3.Row
+    from invoice_agents.evidence_snapshot import (
+        stored_evidence_snapshot_digest,
+        stored_unresolved_blocker_count,
+    )
     from invoice_agents.payment.identity import payment_identity_key
 
     connection.create_function(
         "payment_identity_key",
         2,
         payment_identity_key,
+        deterministic=True,
+    )
+    connection.create_function(
+        "stored_evidence_snapshot_digest",
+        7,
+        stored_evidence_snapshot_digest,
+        deterministic=True,
+    )
+    connection.create_function(
+        "stored_unresolved_blocker_count",
+        2,
+        stored_unresolved_blocker_count,
         deterministic=True,
     )
     connection.execute("PRAGMA foreign_keys = ON")
@@ -438,6 +454,17 @@ def verify_database(
                 "evidence_snapshot_digest",
             },
             "human_decisions": {"review_id", "reviewer", "decision"},
+            "validated_evidence_snapshots": {
+                "case_id",
+                "execution_generation",
+                "evidence_snapshot_digest",
+                "policy_review_required",
+                "unresolved_blocker_count",
+                "critique_disposition",
+                "review_id",
+                "review_snapshot_digest",
+                "validated_at",
+            },
             "final_decisions": {
                 "case_id",
                 "payload_json",
