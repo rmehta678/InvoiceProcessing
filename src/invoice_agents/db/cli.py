@@ -44,7 +44,7 @@ def migrate_command(
     db: Annotated[Path, typer.Option("--db", help="Database file to create or migrate")],
     kind: Annotated[DatabaseKind | None, typer.Option()] = None,
     inventory_db: Annotated[
-        Path | None,
+        str | None,
         typer.Option(
             "--inventory-db",
             help="Authoritative inventory database required for a legacy workflow v3 retrofit",
@@ -53,16 +53,17 @@ def migrate_command(
 ) -> None:
     """Apply versioned migrations without seeding inferred data."""
 
-    selected = kind or infer_kind(db)
-    settings = (
-        Settings(workflow_db=db, inventory_db=inventory_db)
-        if selected is DatabaseKind.WORKFLOW and inventory_db is not None
-        else None
-    )
-    applied = _run_database_operation(
-        "migrate",
-        lambda: migrate_database(db, selected, settings=settings),
-    )
+    def migrate() -> tuple[DatabaseKind, list[int]]:
+        selected = kind or infer_kind(db)
+        inventory_path = Path(inventory_db) if inventory_db is not None else None
+        settings = (
+            Settings(workflow_db=db, inventory_db=inventory_path)
+            if selected is DatabaseKind.WORKFLOW and inventory_path is not None
+            else None
+        )
+        return selected, migrate_database(db, selected, settings=settings)
+
+    selected, applied = _run_database_operation("migrate", migrate)
     typer.echo(f"database={db.resolve()} kind={selected.value} applied={applied}")
 
 
@@ -81,7 +82,7 @@ def verify_command(
     db: Annotated[Path, typer.Option("--db", help="Database file to verify")],
     kind: Annotated[DatabaseKind | None, typer.Option()] = None,
     inventory_db: Annotated[
-        Path | None,
+        str | None,
         typer.Option(
             "--inventory-db",
             help="Authoritative inventory database required for workflow verification",
@@ -97,8 +98,9 @@ def verify_command(
         )
 
     def verify() -> dict[str, object]:
+        inventory_path = Path(inventory_db) if inventory_db is not None else None
         settings = (
-            Settings(workflow_db=db, inventory_db=inventory_db)
+            Settings(workflow_db=db, inventory_db=inventory_path)
             if selected is DatabaseKind.WORKFLOW
             else None
         )

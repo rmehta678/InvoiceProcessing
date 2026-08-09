@@ -1,5 +1,7 @@
 """Database setup and failure-transparency tests."""
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,14 @@ from invoice_agents.db.core import (
     verify_database,
 )
 from invoice_agents.errors import DatabaseVerificationError
+
+
+def _directory_file_hashes(directory: Path) -> dict[str, str]:
+    return {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in directory.iterdir()
+        if path.is_file()
+    }
 
 
 @pytest.mark.parametrize(
@@ -71,6 +81,61 @@ def test_sql_canonicalization_preserves_non_ascii_codepoints(
     assert _normalized_sql(left) != _normalized_sql(right)
 
 
+@pytest.mark.parametrize(
+    "separator",
+    ["\u000b", "\u0085", "\u00a0", "\u1680", "\u2003", "\u2028", "\u202f", "\u3000"],
+    ids=[
+        "vertical-tab",
+        "next-line",
+        "no-break-space",
+        "ogham-space-mark",
+        "em-space",
+        "line-separator",
+        "narrow-no-break-space",
+        "ideographic-space",
+    ],
+)
+def test_sql_canonicalization_preserves_non_sqlite_whitespace_codepoints(
+    separator: str,
+) -> None:
+    normalized = _normalized_sql(f"SELECT{separator}payments")
+
+    assert normalized != _normalized_sql("SELECT payments")
+    assert any(separator in value for _kind, value in json.loads(normalized))
+
+
+def test_sql_canonicalization_ignores_exact_sqlite_ascii_whitespace_bytes() -> None:
+    assert _normalized_sql("SELECT\u0020\u0009\u000d\u000a\u000cpayments") == _normalized_sql(
+        "SELECT payments"
+    )
+
+
+def test_sql_canonicalization_ignores_unicode_inside_comments_only() -> None:
+    assert _normalized_sql(
+        "SELECT/* comment contains \u00a0 \u2003 \u2028 */payments"
+    ) == _normalized_sql("SELECT payments")
+    assert _normalized_sql("SELECT -- comment contains \u00a0 \u2003\npayments") == _normalized_sql(
+        "SELECT payments"
+    )
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("SELECT '\u00a0'", "SELECT ' '"),
+        ('SELECT "paid\u2003status"', 'SELECT "paid status"'),
+        ("SELECT `paid\u202fstatus`", "SELECT `paid status`"),
+        ("SELECT [paid\u3000status]", "SELECT [paid status]"),
+    ],
+    ids=["literal", "double-quoted", "backtick-quoted", "bracket-quoted"],
+)
+def test_sql_canonicalization_preserves_unicode_whitespace_in_protected_tokens(
+    left: str,
+    right: str,
+) -> None:
+    assert _normalized_sql(left) != _normalized_sql(right)
+
+
 def test_sql_canonicalization_ignores_only_comments_spacing_keyword_case_and_creation_guard() -> (
     None
 ):
@@ -119,6 +184,43 @@ def test_workflow_manifest_rejects_unicode_lookalike_trigger_redirect(
             )
         }
     assert names == {"payments", "payment\u017f"}
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(
+            settings.workflow_db,
+            DatabaseKind.WORKFLOW,
+            settings=settings,
+        )
+
+    assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    "separator",
+    ["\u00a0", "\u2003", "\u202f"],
+    ids=["no-break-space", "em-space", "narrow-no-break-space"],
+)
+def test_workflow_manifest_rejects_required_trigger_with_unicode_separator(
+    settings: Settings,
+    separator: str,
+) -> None:
+    trigger_name = "trg_final_decisions_no_insert_after_paid"
+    with connect_database(settings.workflow_db) as connection:
+        original = str(
+            connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+                (trigger_name,),
+            ).fetchone()[0]
+        )
+        modified = original.replace(
+            "SELECT 1 FROM payments",
+            f"SELECT 1 {separator} FROM payments",
+            1,
+        )
+        assert modified != original
+        connection.execute(f"DROP TRIGGER {trigger_name}")
+        connection.execute(modified)
+        connection.commit()
 
     with pytest.raises(DatabaseVerificationError) as excinfo:
         verify_database(
@@ -268,6 +370,53 @@ def test_workflow_verification_validates_attached_inventory_schema_in_same_snaps
         )
 
     assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    ("wal_target", "expected_stop_reason"),
+    [
+        ("workflow", "WORKFLOW_WAL_MODE_UNSUPPORTED"),
+        ("inventory", "AUTHORIZATION_INVENTORY_WAL_MODE_UNSUPPORTED"),
+    ],
+)
+def test_authoritative_workflow_verification_rejects_wal_header_without_artifacts(
+    settings: Settings,
+    wal_target: str,
+    expected_stop_reason: str,
+) -> None:
+    target = settings.workflow_db if wal_target == "workflow" else settings.inventory_db
+    with connect_database(target) as connection:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+    assert target.read_bytes()[18:20] == b"\x02\x02"
+    assert not Path(f"{target}-wal").exists()
+    assert not Path(f"{target}-shm").exists()
+    before = _directory_file_hashes(target.parent)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(
+            settings.workflow_db,
+            DatabaseKind.WORKFLOW,
+            settings=settings,
+        )
+
+    assert excinfo.value.stop_reason == expected_stop_reason
+    assert _directory_file_hashes(target.parent) == before
+
+
+def test_standalone_inventory_verification_rejects_wal_without_persistent_artifacts(
+    inventory_db: Path,
+) -> None:
+    with connect_database(inventory_db) as connection:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+    assert not Path(f"{inventory_db}-wal").exists()
+    assert not Path(f"{inventory_db}-shm").exists()
+    before = _directory_file_hashes(inventory_db.parent)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(inventory_db, DatabaseKind.INVENTORY)
+
+    assert excinfo.value.stop_reason == "INVENTORY_WAL_MODE_UNSUPPORTED"
+    assert _directory_file_hashes(inventory_db.parent) == before
 
 
 def test_missing_and_corrupt_database_fail_visibly(tmp_path: Path) -> None:

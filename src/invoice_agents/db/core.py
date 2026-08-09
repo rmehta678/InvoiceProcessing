@@ -119,8 +119,15 @@ class WorkflowSchemaManifest:
 
 
 @dataclass(frozen=True, slots=True)
+class MigrationHistorySnapshot:
+    schema_version_rows: tuple[tuple[object, ...], ...]
+    durable_history_rows: tuple[tuple[object, ...], ...] | None
+
+
+@dataclass(frozen=True, slots=True)
 class MigrationPreflight:
     history: tuple[int, ...]
+    history_snapshot: MigrationHistorySnapshot
     version_neutral_install_required: bool
 
 
@@ -457,6 +464,42 @@ def _migration_hashes(resources: list[Traversable]) -> dict[int, str]:
     }
 
 
+def _migration_history_snapshot(connection: sqlite3.Connection) -> MigrationHistorySnapshot:
+    """Capture every migration-history value so a valid-looking rewrite is still a race."""
+
+    schema_version_exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'"
+    ).fetchone()
+    schema_version_rows = (
+        tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT version, applied_at FROM schema_version ORDER BY version"
+            ).fetchall()
+        )
+        if schema_version_exists is not None
+        else ()
+    )
+    durable_history_exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migration_history'"
+    ).fetchone()
+    durable_history_rows = (
+        tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT ordinal, version, migration_sha256, applied_at "
+                "FROM schema_migration_history ORDER BY ordinal"
+            ).fetchall()
+        )
+        if durable_history_exists is not None
+        else None
+    )
+    return MigrationHistorySnapshot(
+        schema_version_rows=schema_version_rows,
+        durable_history_rows=durable_history_rows,
+    )
+
+
 def _migration_history_schema_contract() -> tuple[str, dict[str, str]]:
     migration = next(
         (
@@ -648,6 +691,11 @@ def _retrofit_inventory_path(
         )
     inventory_path = settings.inventory_db.resolve()
     _assert_sqlite_file(inventory_path)
+    _assert_rollback_journal_header(
+        inventory_path,
+        stop_reason="AUTHORIZATION_INVENTORY_WAL_MODE_UNSUPPORTED",
+        database_label="authorization inventory",
+    )
     return inventory_path
 
 
@@ -701,6 +749,12 @@ def _preflight_existing_migration_history(
     if not path.exists() or path.stat().st_size == 0:
         return None
     _assert_sqlite_file(path)
+    if kind is DatabaseKind.WORKFLOW:
+        _assert_rollback_journal_header(
+            path,
+            stop_reason="WORKFLOW_WAL_MODE_UNSUPPORTED",
+            database_label="workflow",
+        )
     with connect_database(path, read_only=True) as connection:
         history = _read_migration_history(
             connection,
@@ -709,6 +763,7 @@ def _preflight_existing_migration_history(
             packaged_hashes=packaged_hashes,
             allow_durable_retrofit=True,
         )
+        history_snapshot = _migration_history_snapshot(connection)
         version_neutral_state = (
             _inspect_workflow_version_neutral_contract(connection, history=history)
             if kind is DatabaseKind.WORKFLOW
@@ -733,11 +788,16 @@ def _preflight_existing_migration_history(
                 packaged_hashes=packaged_hashes,
                 allow_durable_retrofit=True,
             )
+            locked_history_snapshot = _migration_history_snapshot(connection)
             locked_state = _inspect_workflow_version_neutral_contract(
                 connection,
                 history=locked_history,
             )
-            if history != locked_history or not locked_state.install_required:
+            if (
+                history != locked_history
+                or history_snapshot != locked_history_snapshot
+                or not locked_state.install_required
+            ):
                 raise DatabaseVerificationError(
                     ErrorCategory.DATABASE,
                     "legacy workflow v3 changed during read-only retrofit preflight",
@@ -749,8 +809,12 @@ def _preflight_existing_migration_history(
                 settings,
                 archive_install_required=locked_state.archive_install_required,
             )
+            history = locked_history
+            history_snapshot = locked_history_snapshot
+            version_neutral_state = locked_state
         return MigrationPreflight(
             history=history,
+            history_snapshot=history_snapshot,
             version_neutral_install_required=version_neutral_state.install_required,
         )
 
@@ -914,7 +978,7 @@ def _normalized_sql(sql: str) -> str:
 
     while index < length:
         character = sql[index]
-        if character.isspace():
+        if character in " \t\r\n\f":
             index += 1
             continue
         if sql.startswith("--", index):
@@ -1689,13 +1753,13 @@ def migrate_database(
                 packaged_hashes=packaged_hashes,
                 allow_durable_retrofit=True,
             )
-            if history != preflight.history:
+            history_snapshot = _migration_history_snapshot(connection)
+            if history != preflight.history or history_snapshot != preflight.history_snapshot:
                 raise DatabaseVerificationError(
                     ErrorCategory.DATABASE,
                     f"{selected_kind.value} migration history changed during preflight",
                     stop_reason="MIGRATION_HISTORY_INVALID",
                 )
-        existing = set(history)
         if (
             selected_kind is DatabaseKind.WORKFLOW
             and preflight is not None
@@ -1709,9 +1773,26 @@ def migrate_database(
                     "SELECT (SELECT COUNT(*) FROM main.sqlite_schema), "
                     "(SELECT COUNT(*) FROM authorization_inventory.sqlite_schema)"
                 ).fetchone()
+                locked_history = _read_migration_history(
+                    connection,
+                    kind=selected_kind,
+                    packaged_versions=packaged_versions,
+                    packaged_hashes=packaged_hashes,
+                    allow_durable_retrofit=True,
+                )
+                locked_history_snapshot = _migration_history_snapshot(connection)
+                if (
+                    locked_history != preflight.history
+                    or locked_history_snapshot != preflight.history_snapshot
+                ):
+                    raise DatabaseVerificationError(
+                        ErrorCategory.DATABASE,
+                        "workflow migration history changed after the retrofit write lock",
+                        stop_reason="MIGRATION_HISTORY_INVALID",
+                    )
                 version_neutral_state = _inspect_workflow_version_neutral_contract(
                     connection,
-                    history=history,
+                    history=locked_history,
                 )
                 if not version_neutral_state.install_required:
                     raise DatabaseVerificationError(
@@ -1734,14 +1815,14 @@ def migrate_database(
                     _install_durable_migration_history_schema(connection)
                     _backfill_durable_migration_history(
                         connection,
-                        versions=history,
+                        versions=locked_history,
                         packaged_hashes=packaged_hashes,
                         applied_at=utc_now(),
                     )
                 _verify_schema_manifest(
                     connection,
                     _expected_workflow_schema_manifest(
-                        history,
+                        locked_history,
                         include_durable_history=True,
                     ),
                     allow_partial_empty_archive=False,
@@ -1753,6 +1834,10 @@ def migrate_database(
                     packaged_hashes=packaged_hashes,
                 )
                 connection.commit()
+                history = locked_history
+            except DatabaseVerificationError:
+                connection.rollback()
+                raise
             except (sqlite3.Error, ValueError) as exc:
                 connection.rollback()
                 raise DatabaseVerificationError(
@@ -1760,6 +1845,7 @@ def migrate_database(
                     "version-neutral workflow schema installation failed",
                     stop_reason="MIGRATION_FAILED",
                 ) from exc
+        existing = set(history)
         for resource in resources:
             version = int(resource.name.split("_", 1)[0])
             if version in existing:
@@ -1883,7 +1969,7 @@ def ensure_databases(settings: Settings) -> dict[str, list[int]]:
     return applied
 
 
-def _assert_sqlite_file(path: Path) -> None:
+def _assert_sqlite_file(path: Path) -> bytes:
     if not path.is_file():
         raise DatabaseVerificationError(
             ErrorCategory.DATABASE,
@@ -1891,12 +1977,34 @@ def _assert_sqlite_file(path: Path) -> None:
             stop_reason="DATABASE_MISSING",
         )
     with path.open("rb") as handle:
-        if handle.read(len(SQLITE_SIGNATURE)) != SQLITE_SIGNATURE:
-            raise DatabaseVerificationError(
-                ErrorCategory.DATABASE,
-                f"file is not a SQLite database: {path}",
-                stop_reason="DATABASE_SIGNATURE_INVALID",
-            )
+        header = handle.read(20)
+    if len(header) < 20 or header[: len(SQLITE_SIGNATURE)] != SQLITE_SIGNATURE:
+        raise DatabaseVerificationError(
+            ErrorCategory.DATABASE,
+            f"file is not a SQLite database: {path}",
+            stop_reason="DATABASE_SIGNATURE_INVALID",
+        )
+    return header
+
+
+def _assert_rollback_journal_header(
+    path: Path,
+    *,
+    stop_reason: str,
+    database_label: str,
+) -> None:
+    """Reject WAL from header bytes without opening SQLite or touching its sidecars."""
+
+    header = _assert_sqlite_file(path)
+    write_version = header[18]
+    read_version = header[19]
+    if write_version == 2 or read_version == 2:
+        raise DatabaseVerificationError(
+            ErrorCategory.DATABASE,
+            f"{database_label} database uses WAL file-format header bytes; "
+            "rollback-journal mode is required",
+            stop_reason=stop_reason,
+        )
 
 
 def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
@@ -1975,6 +2083,15 @@ def verify_database(
     selected_kind = kind or infer_kind(path)
     resolved = path.resolve()
     _assert_sqlite_file(resolved)
+    _assert_rollback_journal_header(
+        resolved,
+        stop_reason=(
+            "WORKFLOW_WAL_MODE_UNSUPPORTED"
+            if selected_kind is DatabaseKind.WORKFLOW
+            else "INVENTORY_WAL_MODE_UNSUPPORTED"
+        ),
+        database_label=selected_kind.value,
+    )
     migration_resources = _migration_resources(selected_kind)
     packaged_versions = _migration_versions(migration_resources, selected_kind)
     packaged_hashes = _migration_hashes(migration_resources)
@@ -1994,6 +2111,11 @@ def verify_database(
             )
         inventory_resolved = settings.inventory_db.resolve()
         _assert_sqlite_file(inventory_resolved)
+        _assert_rollback_journal_header(
+            inventory_resolved,
+            stop_reason="AUTHORIZATION_INVENTORY_WAL_MODE_UNSUPPORTED",
+            database_label="authorization inventory",
+        )
     required: dict[str, set[str]]
     if selected_kind is DatabaseKind.INVENTORY:
         required = {

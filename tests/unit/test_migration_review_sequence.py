@@ -3,8 +3,11 @@
 import hashlib
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -450,6 +453,14 @@ def _retrofit_settings(tmp_path: Path, workflow_db: Path) -> Settings:
     return Settings(workflow_db=workflow_db, inventory_db=inventory_db)
 
 
+def _directory_file_hashes(directory: Path) -> dict[str, str]:
+    return {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in directory.iterdir()
+        if path.is_file()
+    }
+
+
 def test_migration_003_backfills_digest_bound_immutable_durable_history(
     tmp_path: Path,
 ) -> None:
@@ -494,6 +505,54 @@ def test_existing_legitimate_v3_history_is_retrofitted_without_version_004(
     assert not any(
         resource.name.startswith("004_") for resource in _migration_resources(DatabaseKind.WORKFLOW)
     )
+
+
+def test_legacy_v3_retrofit_rejects_main_file_wal_header_without_artifacts_or_mutation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-v3-main-only-wal.db"
+    migrate_database(path, DatabaseKind.WORKFLOW)
+    _remove_durable_history(path)
+    settings = _retrofit_settings(tmp_path, path)
+    with connect_database(path) as connection:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+    assert path.read_bytes()[18:20] == b"\x02\x02"
+    assert not Path(f"{path}-wal").exists()
+    assert not Path(f"{path}-shm").exists()
+    before = _directory_file_hashes(tmp_path)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.WORKFLOW, settings=settings)
+
+    assert excinfo.value.stop_reason == "WORKFLOW_WAL_MODE_UNSUPPORTED"
+    assert _directory_file_hashes(tmp_path) == before
+
+
+def test_legacy_v3_retrofit_rejects_wal_without_touching_existing_sidecars(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-v3-existing-wal-sidecars.db"
+    migrate_database(path, DatabaseKind.WORKFLOW)
+    _remove_durable_history(path)
+    settings = _retrofit_settings(tmp_path, path)
+    keeper = sqlite3.connect(path)
+    try:
+        assert keeper.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+        keeper.execute("PRAGMA wal_autocheckpoint = 0")
+        keeper.execute("UPDATE schema_version SET applied_at = applied_at WHERE version = 1")
+        keeper.commit()
+        assert path.read_bytes()[18:20] == b"\x02\x02"
+        assert Path(f"{path}-wal").is_file()
+        assert Path(f"{path}-shm").is_file()
+        before = _directory_file_hashes(tmp_path)
+
+        with pytest.raises(DatabaseVerificationError) as excinfo:
+            migrate_database(path, DatabaseKind.WORKFLOW, settings=settings)
+
+        assert excinfo.value.stop_reason == "WORKFLOW_WAL_MODE_UNSUPPORTED"
+        assert _directory_file_hashes(tmp_path) == before
+    finally:
+        keeper.close()
 
 
 def test_legacy_v3_retrofit_rejects_missing_required_trigger_without_mutation(
@@ -599,6 +658,122 @@ def test_legacy_v3_retrofit_revalidates_contract_after_write_lock(
     assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
     assert len(raced_bytes) == 1
     assert path.read_bytes() == raced_bytes[0]
+
+
+def test_legacy_v3_retrofit_rereads_durable_history_after_write_lock_before_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "legacy-v3-durable-history-race.db"
+    migrate_database(path, DatabaseKind.WORKFLOW)
+    settings = _retrofit_settings(tmp_path, path)
+    with connect_database(path) as connection:
+        connection.execute("DROP TABLE legacy_authorization_quarantine")
+        connection.execute("DROP TABLE legacy_authorization_reconciliations")
+        connection.commit()
+
+    real_connect = core_module.connect_database
+    race_completed = False
+    raced_bytes: list[bytes] = []
+    post_race_mutations: list[str] = []
+
+    class RacingConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self.connection = connection
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.connection, name)
+
+        def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+            nonlocal race_completed
+            if sql == "BEGIN IMMEDIATE" and not race_completed:
+                with real_connect(path) as rival:
+                    trigger_name = "trg_schema_migration_history_immutable_update"
+                    trigger_sql = str(
+                        rival.execute(
+                            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+                            (trigger_name,),
+                        ).fetchone()[0]
+                    )
+                    rival.execute(f"DROP TRIGGER {trigger_name}")
+                    rival.execute(
+                        "UPDATE schema_migration_history SET applied_at = ? WHERE version = 2",
+                        ("2030-01-01T00:00:00+00:00",),
+                    )
+                    rival.execute(trigger_sql)
+                    rival.commit()
+                raced_bytes.append(path.read_bytes())
+                race_completed = True
+            elif race_completed and sql.lstrip().upper().startswith(
+                ("ALTER ", "CREATE ", "DELETE ", "DROP ", "INSERT ", "REPLACE ", "UPDATE ")
+            ):
+                post_race_mutations.append(sql)
+            return self.connection.execute(sql, parameters)
+
+    @contextmanager
+    def racing_connect(target: Path, *, read_only: bool = False) -> Iterator[Any]:
+        with real_connect(target, read_only=read_only) as connection:
+            if target.resolve() == path.resolve() and not read_only:
+                yield RacingConnection(connection)
+            else:
+                yield connection
+
+    monkeypatch.setattr(core_module, "connect_database", racing_connect)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.WORKFLOW, settings=settings)
+
+    assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
+    assert race_completed
+    assert post_race_mutations == []
+    assert path.read_bytes() == raced_bytes[0]
+    with real_connect(path, read_only=True) as connection:
+        assert (
+            connection.execute(
+                "SELECT applied_at FROM schema_migration_history WHERE version = 2"
+            ).fetchone()[0]
+            == "2030-01-01T00:00:00+00:00"
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name IN ("
+                "'legacy_authorization_quarantine', "
+                "'legacy_authorization_reconciliations')"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_durable_history_verifier_rejects_noncanonical_applied_at(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "durable-history-noncanonical-applied-at.db"
+    migrate_database(path, DatabaseKind.WORKFLOW)
+    with connect_database(path) as connection:
+        trigger_name = "trg_schema_migration_history_immutable_update"
+        trigger_sql = str(
+            connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+                (trigger_name,),
+            ).fetchone()[0]
+        )
+        connection.execute(f"DROP TRIGGER {trigger_name}")
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE schema_migration_history SET applied_at = ? WHERE version = 2",
+            ("not-a-canonical-applied-at",),
+        )
+        connection.execute("PRAGMA ignore_check_constraints = OFF")
+        connection.execute(trigger_sql)
+        connection.commit()
+    before = path.read_bytes()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.WORKFLOW)
+
+    assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
+    assert path.read_bytes() == before
 
 
 @pytest.mark.parametrize(

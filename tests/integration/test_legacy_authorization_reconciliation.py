@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import struct
 import subprocess
@@ -393,6 +394,79 @@ def test_database_cli_subprocess_reports_only_stable_code_for_secret_bearing_dri
     assert "Traceback" not in output
     assert "sqlite3" not in output
     assert "DatabaseVerificationError" not in output
+
+
+@pytest.mark.parametrize("operation", ["migrate", "verify"])
+def test_database_cli_settings_failures_are_sanitized_in_real_subprocess(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    secret = "sk-proj-task8-invalid-decimal-must-never-reach-operator-output"
+    completed = subprocess.run(
+        [
+            str(Path(__file__).parents[2] / ".venv" / "bin" / "invoice-agents"),
+            "db",
+            operation,
+            "--db",
+            str(tmp_path / "workflow.db"),
+            "--kind",
+            "workflow",
+            "--inventory-db",
+            str(tmp_path / "inventory.db"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "INVOICE_REVIEW_THRESHOLD_AMOUNT": secret},
+    )
+    output = completed.stdout + completed.stderr
+
+    assert completed.returncode == 1
+    assert (
+        f"database_operation={operation} status=FAILED error_code=DATABASE_OPERATION_FAILED"
+    ) in output
+    assert secret not in output
+    assert "Traceback" not in output
+    assert "ValidationError" not in output
+    assert "pydantic" not in output.lower()
+    assert "decimal_parsing" not in output
+
+
+def test_database_cli_reconciliation_failure_is_sanitized_with_invalid_settings_environment(
+    tmp_path: Path,
+) -> None:
+    secret = "sk-proj-task8-invalid-decimal-must-never-reach-operator-output"
+    completed = subprocess.run(
+        [
+            str(Path(__file__).parents[2] / ".venv" / "bin" / "invoice-agents"),
+            "db",
+            "reconcile-legacy-authorization",
+            "--db",
+            str(tmp_path / "missing-workflow.db"),
+            "--reviewer",
+            REVIEWER,
+            "--reason",
+            REASON,
+            "--disposition",
+            DISPOSITION,
+            "--confirm",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "INVOICE_REVIEW_THRESHOLD_AMOUNT": secret},
+    )
+    output = completed.stdout + completed.stderr
+
+    assert completed.returncode == 1
+    assert (
+        "database_operation=reconcile-legacy-authorization status=FAILED "
+        "error_code=DATABASE_MISSING"
+    ) in output
+    assert secret not in output
+    assert "Traceback" not in output
+    assert "ValidationError" not in output
+    assert "pydantic" not in output.lower()
 
 
 def test_reconciliation_archives_exact_rows_and_hashes_before_removing_active_authority(
