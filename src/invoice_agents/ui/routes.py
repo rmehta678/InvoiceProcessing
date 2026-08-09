@@ -409,7 +409,9 @@ async def review_decide(
     mapping_raw: Annotated[list[str] | None, Form()] = None,
     mapping_sku: Annotated[list[str] | None, Form()] = None,
     superseded_case_id: Annotated[str | None, Form()] = None,
-    addressed_blocker_ids: Annotated[list[str] | None, Form()] = None,
+    addressed_blocker_ids_approve: Annotated[list[str] | None, Form()] = None,
+    addressed_blocker_ids_establish_mapping: Annotated[list[str] | None, Form()] = None,
+    addressed_blocker_ids_supersede_revision: Annotated[list[str] | None, Form()] = None,
 ) -> Response:
     settings = _settings(request)
     store = _store(request)
@@ -427,7 +429,15 @@ async def review_decide(
             "decision": decision or "",
             "reason": reason or "",
             "superseded_case_id": superseded_case_id or "",
-            "addressed_blocker_ids": addressed_blocker_ids or [],
+            "addressed_blocker_ids_by_decision": {
+                HumanDecisionKind.APPROVE: addressed_blocker_ids_approve or [],
+                HumanDecisionKind.ESTABLISH_MAPPING: (
+                    addressed_blocker_ids_establish_mapping or []
+                ),
+                HumanDecisionKind.SUPERSEDE_REVISION: (
+                    addressed_blocker_ids_supersede_revision or []
+                ),
+            },
         }
         return _render(request, "review_detail.html", context, status_code=400)
 
@@ -437,6 +447,11 @@ async def review_decide(
         selected = HumanDecisionKind(decision)
     except ValueError:
         return rerender(f"decision must be one of {[kind.value for kind in HumanDecisionKind]}")
+    addressed_blocker_ids_by_decision = {
+        HumanDecisionKind.APPROVE: addressed_blocker_ids_approve or [],
+        HumanDecisionKind.ESTABLISH_MAPPING: addressed_blocker_ids_establish_mapping or [],
+        HumanDecisionKind.SUPERSEDE_REVISION: addressed_blocker_ids_supersede_revision or [],
+    }
     mappings = [
         CanonicalMapping(raw_item=raw.strip(), sku=sku.strip(), basis="human_decision")
         for raw, sku in zip(mapping_raw or [], mapping_sku or [], strict=False)
@@ -452,7 +467,7 @@ async def review_decide(
             settings.inventory_db,
             mappings=mappings,
             superseded_case_id=(superseded_case_id or "").strip() or None,
-            addressed_blocker_ids=addressed_blocker_ids,
+            addressed_blocker_ids=addressed_blocker_ids_by_decision.get(selected, []),
         )
     except InvoiceAgentsError as exc:
         return rerender(str(exc))

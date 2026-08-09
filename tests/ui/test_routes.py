@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -22,10 +23,11 @@ from factories import (
 from fastapi.testclient import TestClient
 from markupsafe import escape
 
+from invoice_agents.agents.decision_rules import unaddressed_blockers
 from invoice_agents.config import Settings
 from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import WorkflowStore
-from invoice_agents.models import CaseResult, CaseStatus
+from invoice_agents.models import CaseResult, CaseStatus, RiskAssessment
 from invoice_agents.ui import queries
 
 
@@ -36,6 +38,41 @@ def wait_for(predicate, timeout: float = 5.0) -> None:
             return
         time.sleep(0.05)
     raise AssertionError("condition was not reached in time")
+
+
+class BlockerAuthorizationControls(HTMLParser):
+    """Collect real blocker checkbox names under each rendered decision group."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_decision: str | None = None
+        self.names_by_decision: dict[str, list[str]] = {}
+        self.disabled_by_decision: dict[str, list[bool]] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if tag == "fieldset" and attributes.get("data-blocker-authorization-for"):
+            self.active_decision = str(attributes["data-blocker-authorization-for"])
+            self.names_by_decision[self.active_decision] = []
+            self.disabled_by_decision[self.active_decision] = []
+        elif (
+            tag == "input"
+            and self.active_decision is not None
+            and attributes.get("type") == "checkbox"
+            and attributes.get("name")
+        ):
+            self.names_by_decision[self.active_decision].append(str(attributes["name"]))
+            self.disabled_by_decision[self.active_decision].append("disabled" in attributes)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "fieldset" and self.active_decision is not None:
+            self.active_decision = None
+
+
+def blocker_control_names(html: str) -> dict[str, list[str]]:
+    parser = BlockerAuthorizationControls()
+    parser.feed(html)
+    return parser.names_by_decision
 
 
 def stub_runs(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> None:
@@ -241,6 +278,48 @@ def test_review_detail_shows_package_and_unbiased_form(
         assert f'data-blocker-authorization-for="{kind}"' not in text
 
 
+def test_switching_authorizing_decisions_uses_distinct_blocker_control_names(
+    client: TestClient, settings: Settings
+) -> None:
+    _, review = make_pending_review_case(settings)
+    response = client.get(f"/reviews/{review.review_id}")
+    assert response.status_code == 200
+    names_by_decision = blocker_control_names(response.text)
+    assert set(names_by_decision) == {
+        "APPROVE",
+        "ESTABLISH_MAPPING",
+        "SUPERSEDE_REVISION",
+    }
+    one_name_per_decision = {
+        decision: set(names) for decision, names in names_by_decision.items()
+    }
+    assert all(len(names) == 1 for names in one_name_per_decision.values())
+    assert len({next(iter(names)) for names in one_name_per_decision.values()}) == 3
+
+
+def test_blocker_controls_render_disabled_except_for_selected_decision(
+    client: TestClient, settings: Settings
+) -> None:
+    _, review = make_pending_review_case(settings)
+    initial = client.get(f"/reviews/{review.review_id}")
+    initial_controls = BlockerAuthorizationControls()
+    initial_controls.feed(initial.text)
+    assert all(
+        all(disabled) for disabled in initial_controls.disabled_by_decision.values()
+    )
+
+    rerender = client.post(
+        f"/reviews/{review.review_id}/decision",
+        data={"reviewer": "vp@example.com", "decision": "APPROVE", "reason": "   "},
+    )
+    assert rerender.status_code == 400
+    rerendered_controls = BlockerAuthorizationControls()
+    rerendered_controls.feed(rerender.text)
+    assert not any(rerendered_controls.disabled_by_decision["APPROVE"])
+    assert all(rerendered_controls.disabled_by_decision["ESTABLISH_MAPPING"])
+    assert all(rerendered_controls.disabled_by_decision["SUPERSEDE_REVISION"])
+
+
 def test_review_detail_missing_is_404(client: TestClient) -> None:
     response = client.get("/reviews/rev_missing")
     assert response.status_code == 404
@@ -280,13 +359,15 @@ def test_authorizing_decision_records_selected_blocker_ids(
         entry["blocker_id"] for entry in review.evidence_bundle["blocking_evidence"]
     ]
     assert blocker_ids
+    detail = client.get(f"/reviews/{review.review_id}")
+    selected_field = blocker_control_names(detail.text)["APPROVE"][0]
     response = client.post(
         f"/reviews/{review.review_id}/decision",
         data={
             "reviewer": "vp@example.com",
             "decision": "APPROVE",
             "reason": "explicitly authorizing the cited blockers",
-            "addressed_blocker_ids": blocker_ids,
+            selected_field: blocker_ids,
         },
         follow_redirects=False,
     )
@@ -294,6 +375,43 @@ def test_authorizing_decision_records_selected_blocker_ids(
     stored = WorkflowStore(settings.workflow_db).load_review(review.review_id)
     assert stored.human_decision is not None
     assert stored.human_decision.addressed_blocker_ids == blocker_ids
+
+
+def test_inactive_blocker_selections_cannot_complete_selected_decision_authorization(
+    client: TestClient, settings: Settings
+) -> None:
+    case_id, review = make_pending_review_case(settings)
+    blocker_ids = [
+        entry["blocker_id"] for entry in review.evidence_bundle["blocking_evidence"]
+    ]
+    assert blocker_ids
+    selected_ids = blocker_ids[:-1]
+    detail = client.get(f"/reviews/{review.review_id}")
+    names_by_decision = blocker_control_names(detail.text)
+    selected_field = names_by_decision["APPROVE"][0]
+    inactive_field = names_by_decision["ESTABLISH_MAPPING"][0]
+    data: dict[str, str | list[str]] = {
+        "reviewer": "vp@example.com",
+        "decision": "APPROVE",
+        "reason": "only the visible selected blockers are authorized",
+    }
+    if selected_field == inactive_field:
+        data[selected_field] = [*blocker_ids, *selected_ids]
+    else:
+        data[selected_field] = selected_ids
+        data[inactive_field] = blocker_ids
+
+    response = client.post(
+        f"/reviews/{review.review_id}/decision", data=data, follow_redirects=False
+    )
+
+    assert response.status_code == 303
+    store = WorkflowStore(settings.workflow_db)
+    stored = store.load_review(review.review_id)
+    assert stored.human_decision is not None
+    assert stored.human_decision.addressed_blocker_ids == selected_ids
+    risk = RiskAssessment.model_validate(store.load_comparison(case_id, "risk"))
+    assert unaddressed_blockers(risk, stored.human_decision)
 
 
 def test_mapping_decision_requires_mapping(client: TestClient, settings: Settings) -> None:

@@ -163,8 +163,9 @@
               <p class="small dim">Select every current blocker this decision explicitly authorizes. Missing or extra IDs cannot authorize APPROVE.</p>
               {% for blocker in blocking_evidence %}
               <label class="small">
-                <input type="checkbox" name="addressed_blocker_ids" value="{{ blocker.blocker_id }}"
-                       {% if blocker.blocker_id in form_values.get('addressed_blocker_ids', []) %}checked{% endif %}>
+                <input type="checkbox" name="addressed_blocker_ids_{{ kind.value|lower }}" value="{{ blocker.blocker_id }}"
+                       {% if form_values.get('decision') != kind.value %}disabled{% endif %}
+                       {% if blocker.blocker_id in form_values.get('addressed_blocker_ids_by_decision', {}).get(kind, []) %}checked{% endif %}>
                 <code>{{ blocker.blocker_id }}</code> &mdash; {{ blocker.description }}
               </label><br>
               {% endfor %}

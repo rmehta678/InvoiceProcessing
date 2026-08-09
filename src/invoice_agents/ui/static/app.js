@@ -51,7 +51,11 @@
     var checked = form.querySelector("input[name=decision]:checked");
     form.querySelectorAll(".subform").forEach(function (block) {
       var owner = block.getAttribute("data-for");
-      block.classList.toggle("visible", !!checked && owner === checked.value);
+      var active = !!checked && owner === checked.value;
+      block.classList.toggle("visible", active);
+      block.querySelectorAll("input, select, textarea, button").forEach(function (control) {
+        control.disabled = !active;
+      });
     });
   }
 
