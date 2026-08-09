@@ -22,6 +22,53 @@ SQLITE_HEADER_SIZE = 100
 SQLITE_RESERVED_BYTE = 1_073_741_825
 _COPY_CHUNK_BYTES = 1024 * 1024
 _LOCK_TIMEOUT_SECONDS = 5.0
+_MAINTENANCE_PREFIX = ".invoice-db-maintenance-"
+
+
+def lexical_absolute_path(path: Path) -> Path:
+    """Make a path absolute without resolving any symlink component."""
+
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _missing_error(path: Path) -> DatabaseVerificationError:
+    return DatabaseVerificationError(
+        ErrorCategory.DATABASE,
+        f"required database does not exist: {path}",
+        stop_reason="DATABASE_MISSING",
+    )
+
+
+def _symlink_error(path: Path) -> DatabaseVerificationError:
+    return DatabaseVerificationError(
+        ErrorCategory.DATABASE,
+        f"database paths may not contain symlink components: {path}",
+        stop_reason="DATABASE_SYMLINK_UNSUPPORTED",
+    )
+
+
+def validate_lexical_database_path(
+    path: Path,
+    *,
+    missing_ok: bool = False,
+) -> Path:
+    """Return an absolute lexical path after rejecting every symlink component."""
+
+    lexical = lexical_absolute_path(path)
+    current = Path(lexical.anchor)
+    for part in lexical.parts[1:]:
+        current /= part
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError as exc:
+            if missing_ok:
+                return lexical
+            raise _missing_error(lexical) from exc
+        except OSError as exc:
+            raise _changed_error(lexical) from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise _symlink_error(lexical)
+    return lexical
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +100,7 @@ class SQLiteSourceIdentity:
     size: int
     modified_ns: int
     sha256: str
+    header: bytes
     sidecars: tuple[SQLiteSidecarIdentity, ...]
 
 
@@ -64,29 +112,66 @@ class SQLiteSourceSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class SQLiteMaintenanceLocks:
-    """Open raw descriptors whose SQLite RESERVED locks can be restored after open/ATTACH."""
+class SQLiteMaintenanceBinding:
+    """One caller pathname, locked descriptor, and same-inode SQLite hardlink."""
 
-    descriptors: tuple[tuple[Path, int], ...]
+    caller_path: Path
+    descriptor: int
+    sqlite_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class SQLiteMaintenanceLocks:
+    """Raw locks plus verified same-inode paths used only by migration SQLite opens."""
+
+    bindings: tuple[SQLiteMaintenanceBinding, ...]
+
+    def _binding(self, path: Path) -> SQLiteMaintenanceBinding:
+        lexical = lexical_absolute_path(path)
+        binding = next(
+            (candidate for candidate in self.bindings if candidate.caller_path == lexical),
+            None,
+        )
+        if binding is None:
+            raise RuntimeError(f"database maintenance does not hold {lexical}")
+        return binding
 
     def reacquire(self) -> None:
-        for path, descriptor in self.descriptors:
-            _lock_reserved_byte(descriptor, path)
+        for binding in self.bindings:
+            _lock_reserved_byte(binding.descriptor, binding.caller_path)
+
+    def sqlite_path(self, path: Path) -> Path:
+        """Return the verified private pathname for opening the locked inode through SQLite."""
+
+        binding = self._binding(path)
+        _assert_maintenance_binding(binding)
+        return binding.sqlite_path
+
+    def assert_binding(self, path: Path) -> None:
+        """Require the caller and private pathname to still name the locked inode."""
+
+        _assert_maintenance_binding(self._binding(path))
+
+    def locked_size(self, path: Path) -> int:
+        """Return the held inode size only after both path bindings are verified."""
+
+        binding = self._binding(path)
+        _assert_maintenance_binding(binding)
+        return os.fstat(binding.descriptor).st_size
 
     def validated_identity(
         self,
         path: Path,
         role: SQLiteSourceRole,
     ) -> SQLiteSourceIdentity:
-        resolved = path.resolve()
-        descriptor = next(
-            (candidate for locked_path, candidate in self.descriptors if locked_path == resolved),
-            None,
+        binding = self._binding(path)
+        _assert_maintenance_binding(binding)
+        identity, header = _read_identity_from_descriptor(
+            binding.caller_path,
+            binding.descriptor,
         )
-        if descriptor is None:
-            raise RuntimeError(f"database maintenance does not hold {resolved}")
-        identity, header = _read_identity_from_descriptor(resolved, descriptor)
         _validate_source_contract(identity, header, role)
+        _assert_hardlink_content_identity(binding, identity)
         return identity
 
 
@@ -202,6 +287,11 @@ def validate_complete_sqlite_header(path: Path, header: bytes, file_size: int) -
     """Validate fixed SQLite header invariants before interpreting journal bytes."""
 
     page_size = _page_size(header) if len(header) >= SQLITE_HEADER_SIZE else None
+    schema_format = int.from_bytes(header[44:48], "big") if len(header) >= 48 else -1
+    text_encoding = int.from_bytes(header[56:60], "big") if len(header) >= 60 else -1
+    schema_encoding_pair_is_valid = (schema_format, text_encoding) == (0, 0) or (
+        schema_format in range(1, 5) and text_encoding in range(1, 4)
+    )
     if (
         len(header) < SQLITE_HEADER_SIZE
         or header[: len(SQLITE_SIGNATURE)] != SQLITE_SIGNATURE
@@ -209,8 +299,7 @@ def validate_complete_sqlite_header(path: Path, header: bytes, file_size: int) -
         or header[18] not in (1, 2)
         or header[19] not in (1, 2)
         or header[21:24] != b"\x40\x20\x20"
-        or header[44:48] not in tuple(value.to_bytes(4, "big") for value in range(1, 5))
-        or header[56:60] not in tuple(value.to_bytes(4, "big") for value in range(1, 4))
+        or not schema_encoding_pair_is_valid
         or any(header[72:92])
     ):
         raise _signature_error(path)
@@ -303,6 +392,7 @@ def _read_identity_from_descriptor(
         size=after.st_size,
         modified_ns=after.st_mtime_ns,
         sha256=digest.hexdigest(),
+        header=bytes(header),
         sidecars=_sidecar_identities(path),
     )
     return identity, bytes(header)
@@ -344,6 +434,7 @@ def _read_identity(path: Path) -> tuple[SQLiteSourceIdentity, bytes]:
             size=metadata.st_size,
             modified_ns=metadata.st_mtime_ns,
             sha256=digest,
+            header=header,
             sidecars=sidecars,
         ),
         header,
@@ -360,7 +451,7 @@ def _validate_source_contract(
         raise DatabaseVerificationError(
             ErrorCategory.DATABASE,
             f"{role.label} database uses WAL file-format header bytes; "
-            "rollback-journal mode is required",
+            "DELETE journal mode is required",
             stop_reason=role.wal_stop_reason,
         )
     if identity.sidecars:
@@ -375,15 +466,8 @@ def _validate_source_contract(
 def read_validated_source_identity(path: Path, role: SQLiteSourceRole) -> SQLiteSourceIdentity:
     """Hash and validate one existing source without opening it through SQLite."""
 
-    try:
-        resolved = path.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise DatabaseVerificationError(
-            ErrorCategory.DATABASE,
-            f"required database does not exist: {path}",
-            stop_reason="DATABASE_MISSING",
-        ) from exc
-    identity, header = _read_identity(resolved)
+    lexical = validate_lexical_database_path(path)
+    identity, header = _read_identity(lexical)
     _validate_source_contract(identity, header, role)
     return identity
 
@@ -393,25 +477,18 @@ def _copy_validated_source(
     destination: Path,
     role: SQLiteSourceRole,
 ) -> SQLiteSourceIdentity:
-    try:
-        resolved = path.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise DatabaseVerificationError(
-            ErrorCategory.DATABASE,
-            f"required database does not exist: {path}",
-            stop_reason="DATABASE_MISSING",
-        ) from exc
-    sidecars_before = _sidecar_identities(resolved)
+    lexical = validate_lexical_database_path(path)
+    sidecars_before = _sidecar_identities(lexical)
     source_flags = os.O_RDONLY | os.O_NOFOLLOW
     destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     try:
-        source_descriptor = os.open(resolved, source_flags)
+        source_descriptor = os.open(lexical, source_flags)
     except OSError as exc:
-        raise _changed_error(resolved) from exc
+        raise _changed_error(lexical) from exc
     try:
         before = os.fstat(source_descriptor)
         if not stat.S_ISREG(before.st_mode):
-            raise _changed_error(resolved)
+            raise _changed_error(lexical)
         destination_descriptor = os.open(destination, destination_flags, 0o600)
         try:
             digest = hashlib.sha256()
@@ -435,21 +512,22 @@ def _copy_validated_source(
         finally:
             os.close(destination_descriptor)
         after = os.fstat(source_descriptor)
-        sidecars_after = _sidecar_identities(resolved)
+        sidecars_after = _sidecar_identities(lexical)
         if (
             _identity_stat(before) != _identity_stat(after)
             or copied != after.st_size
             or sidecars_before != sidecars_after
         ):
-            raise _changed_error(resolved)
+            raise _changed_error(lexical)
         identity = SQLiteSourceIdentity(
-            resolved_path=resolved,
+            resolved_path=lexical,
             device=after.st_dev,
             inode=after.st_ino,
             mode=after.st_mode,
             size=after.st_size,
             modified_ns=after.st_mtime_ns,
             sha256=digest.hexdigest(),
+            header=bytes(header),
             sidecars=sidecars_after,
         )
         _validate_source_contract(identity, bytes(header), role)
@@ -462,6 +540,7 @@ def assert_source_identity_unchanged(identity: SQLiteSourceIdentity) -> None:
     """Re-stat and rehash an original source, translating every drift to one code."""
 
     try:
+        validate_lexical_database_path(identity.resolved_path)
         current, _header = _read_identity(identity.resolved_path)
     except DatabaseVerificationError as exc:
         raise _changed_error(identity.resolved_path) from exc
@@ -476,7 +555,9 @@ def authoritative_database_snapshots(
     """Pin a batch of raw rollback files, audit copies, then compare every original."""
 
     with tempfile.TemporaryDirectory(prefix="invoice-db-verify-") as temporary_directory:
-        root = Path(temporary_directory)
+        # This directory is internally created and owned; canonicalize macOS's /var ->
+        # /private/var temporary-root alias so caller-path symlink rejection remains strict.
+        root = Path(temporary_directory).resolve(strict=True)
         snapshots: dict[str, SQLiteSourceSnapshot] = {}
         for index, (path, role) in enumerate(sources):
             copy_path = root / f"snapshot-{index}.db"
@@ -519,6 +600,81 @@ def _lock_reserved_byte(descriptor: int, path: Path) -> None:
             time.sleep(0.01)
 
 
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _assert_maintenance_binding(binding: SQLiteMaintenanceBinding) -> None:
+    """Require both names to remain regular hardlinks to the held descriptor."""
+
+    try:
+        locked = os.fstat(binding.descriptor)
+        caller = os.lstat(binding.caller_path)
+        private = os.lstat(binding.sqlite_path)
+    except OSError as exc:
+        raise _changed_error(binding.caller_path) from exc
+    expected = (locked.st_dev, locked.st_ino)
+    if (
+        not stat.S_ISREG(locked.st_mode)
+        or not stat.S_ISREG(caller.st_mode)
+        or not stat.S_ISREG(private.st_mode)
+        or (caller.st_dev, caller.st_ino) != expected
+        or (private.st_dev, private.st_ino) != expected
+    ):
+        raise _changed_error(binding.caller_path)
+
+
+def _assert_hardlink_content_identity(
+    binding: SQLiteMaintenanceBinding,
+    locked_identity: SQLiteSourceIdentity,
+) -> None:
+    """Compare hardlink metadata without opening a descriptor that would drop POSIX locks."""
+
+    try:
+        metadata = os.lstat(binding.sqlite_path)
+    except OSError as exc:
+        raise _changed_error(binding.caller_path) from exc
+    private_identity = (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+    expected_identity = (
+        locked_identity.device,
+        locked_identity.inode,
+        locked_identity.mode,
+        locked_identity.size,
+        locked_identity.modified_ns,
+    )
+    if private_identity != expected_identity:
+        raise _changed_error(binding.caller_path)
+
+
+def _cleanup_maintenance_directory(directory: Path) -> None:
+    try:
+        with os.scandir(directory) as iterator:
+            entries = list(iterator)
+    except FileNotFoundError:
+        return
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                raise OSError(f"unexpected directory in SQLite maintenance directory: {entry.name}")
+            os.unlink(entry.name, dir_fd=descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_directory(directory)
+    os.rmdir(directory)
+    _fsync_directory(directory.parent)
+
+
 @contextmanager
 def exclusive_database_maintenance(
     paths: Sequence[Path],
@@ -533,12 +689,19 @@ def exclusive_database_maintenance(
     after that commit.
     """
 
-    unique_paths = tuple(sorted({path.resolve() for path in paths}, key=str))
-    allowed_creations = {path.resolve() for path in create_paths}
+    unique_paths = tuple(sorted({lexical_absolute_path(path) for path in paths}, key=str))
+    allowed_creations = {lexical_absolute_path(path) for path in create_paths}
     with _PRODUCTION_CONNECTIONS.maintenance():
         descriptors: list[tuple[Path, int]] = []
+        bindings: list[SQLiteMaintenanceBinding] = []
+        maintenance_directories: list[Path] = []
+        primary_error: BaseException | None = None
         try:
             for path in unique_paths:
+                validate_lexical_database_path(
+                    path,
+                    missing_ok=path in allowed_creations,
+                )
                 try:
                     descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
                 except OSError as exc:
@@ -562,9 +725,48 @@ def exclusive_database_maintenance(
                             stop_reason="DATABASE_LOCK_UNAVAILABLE",
                         ) from exc
                 descriptors.append((path, descriptor))
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise _changed_error(path)
                 _lock_reserved_byte(descriptor, path)
-            yield SQLiteMaintenanceLocks(tuple(descriptors))
+                validate_lexical_database_path(path)
+                maintenance_directory = Path(
+                    tempfile.mkdtemp(prefix=_MAINTENANCE_PREFIX, dir=path.parent)
+                )
+                maintenance_directories.append(maintenance_directory)
+                os.chmod(maintenance_directory, 0o700)
+                if stat.S_IMODE(os.lstat(maintenance_directory).st_mode) != 0o700:
+                    raise DatabaseVerificationError(
+                        ErrorCategory.DATABASE,
+                        f"SQLite maintenance directory is not private: {maintenance_directory}",
+                        stop_reason="DATABASE_MAINTENANCE_BINDING_FAILED",
+                    )
+                sqlite_path = maintenance_directory / f"source-{len(bindings)}.db"
+                try:
+                    os.link(path, sqlite_path, follow_symlinks=False)
+                except OSError as exc:
+                    raise DatabaseVerificationError(
+                        ErrorCategory.DATABASE,
+                        f"could not bind SQLite migration to the locked database inode: {path}",
+                        stop_reason="DATABASE_MAINTENANCE_BINDING_FAILED",
+                    ) from exc
+                binding = SQLiteMaintenanceBinding(path, descriptor, sqlite_path)
+                _assert_maintenance_binding(binding)
+                _fsync_directory(maintenance_directory)
+                _fsync_directory(path.parent)
+                bindings.append(binding)
+            yield SQLiteMaintenanceLocks(tuple(bindings))
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
+            cleanup_error: BaseException | None = None
+            for directory in reversed(maintenance_directories):
+                try:
+                    _cleanup_maintenance_directory(directory)
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
             for _path, descriptor in reversed(descriptors):
                 try:
                     fcntl.lockf(
@@ -576,3 +778,14 @@ def exclusive_database_maintenance(
                     )
                 finally:
                     os.close(descriptor)
+            if cleanup_error is not None:
+                if primary_error is not None:
+                    primary_error.add_note(
+                        f"SQLite maintenance cleanup also failed: {cleanup_error}"
+                    )
+                else:
+                    raise DatabaseVerificationError(
+                        ErrorCategory.DATABASE,
+                        "SQLite maintenance cleanup failed",
+                        stop_reason="DATABASE_MAINTENANCE_CLEANUP_FAILED",
+                    ) from cleanup_error

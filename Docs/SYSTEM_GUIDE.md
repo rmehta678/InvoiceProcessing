@@ -639,6 +639,7 @@ with no fallback permitted. Everything else comes from `.env` (prefix `INVOICE_`
 |---|---|---|
 | `XAI_API_KEY` | — | Required; checked at preflight, value never surfaced |
 | `INVOICE_INVENTORY_DB` / `INVOICE_WORKFLOW_DB` | `inventory.db` / `workflow.db` | Database paths |
+| `INVOICE_SQLITE_JOURNAL_MODE` | `DELETE` | Fixed safety contract; `PERSIST`, `TRUNCATE`, and `WAL` are rejected before database access |
 | `INVOICE_REVIEW_THRESHOLD_AMOUNT` | `10000.00` | Review at/above this declared amount |
 | `INVOICE_REVIEW_THRESHOLD_CURRENCY` | `USD` | Threshold currency; any other currency always reviews |
 | `INVOICE_REVIEW_THRESHOLD_EFFECTIVE_DATE` | `2026-08-06` | Policy effective date |

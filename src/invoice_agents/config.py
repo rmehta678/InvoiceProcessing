@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     xai_api_key: SecretStr | None = Field(default=None, validation_alias="XAI_API_KEY")
     inventory_db: Path = Path("inventory.db")
     workflow_db: Path = Path("workflow.db")
+    sqlite_journal_mode: str = "DELETE"
     source_archive_dir: Path = Path("artifacts/sources")
     source_max_bytes: int = Field(default=10_485_760, gt=0)
     pdf_max_pages: int = Field(default=100, ge=1, le=1_000)
@@ -67,6 +68,25 @@ class Settings(BaseSettings):
         if len(normalized) != 3 or not normalized.isalpha():
             raise ValueError("review threshold currency must be a three-letter code")
         return normalized
+
+    @field_validator("sqlite_journal_mode", mode="before")
+    @classmethod
+    def normalize_delete_journal_mode(cls, value: object) -> str:
+        """Fail before database access when two-file atomicity cannot be guaranteed."""
+
+        if not isinstance(value, str) or value.strip().upper() != "DELETE":
+            raise ValueError("SQLite journal mode must be DELETE")
+        return "DELETE"
+
+    def assert_delete_journal_mode(self) -> None:
+        """Defend production boundaries even if model validation was explicitly bypassed."""
+
+        if self.sqlite_journal_mode != "DELETE":
+            raise InvoiceAgentsError(
+                ErrorCategory.CONFIGURATION,
+                f"SQLite journal mode must be DELETE, not {self.sqlite_journal_mode!r}",
+                stop_reason="SQLITE_JOURNAL_MODE_UNSUPPORTED",
+            )
 
     def provider_key(self) -> str:
         """Return the key only at the client construction boundary."""

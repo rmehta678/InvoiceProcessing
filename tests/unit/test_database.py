@@ -8,8 +8,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
+import invoice_agents.db.core as core_module
+import invoice_agents.db.sqlite_source as sqlite_source_module
 from invoice_agents.config import Settings
 from invoice_agents.db import cli as database_cli
 from invoice_agents.db.core import (
@@ -21,7 +24,68 @@ from invoice_agents.db.core import (
     seed_inventory,
     verify_database,
 )
-from invoice_agents.errors import DatabaseVerificationError
+from invoice_agents.db.store import WorkflowStore
+from invoice_agents.errors import DatabaseVerificationError, InvoiceAgentsError
+
+
+@pytest.mark.parametrize("journal_mode", ["PERSIST", "TRUNCATE", "WAL"])
+def test_settings_rejects_non_delete_journal_mode_before_database_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    journal_mode: str,
+) -> None:
+    sqlite_opens: list[object] = []
+
+    def observe_sqlite_open(*args: object, **kwargs: object) -> sqlite3.Connection:
+        sqlite_opens.append((args, kwargs))
+        raise AssertionError("invalid configuration must fail before SQLite opens")
+
+    monkeypatch.setattr(sqlite3, "connect", observe_sqlite_open)
+
+    with pytest.raises(ValidationError, match="DELETE"):
+        Settings(
+            inventory_db=tmp_path / "inventory.db",
+            workflow_db=tmp_path / "workflow.db",
+            sqlite_journal_mode=journal_mode,
+        )
+
+    assert sqlite_opens == []
+
+
+def test_settings_normalizes_the_only_supported_sqlite_journal_mode() -> None:
+    settings = Settings(sqlite_journal_mode=" delete ")
+
+    assert settings.sqlite_journal_mode == "DELETE"
+
+
+@pytest.mark.parametrize("journal_mode", ["PERSIST", "TRUNCATE", "WAL"])
+def test_core_and_store_reject_bypassed_non_delete_config_before_database_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    journal_mode: str,
+) -> None:
+    settings = Settings(
+        inventory_db=tmp_path / "inventory.db",
+        workflow_db=tmp_path / "workflow.db",
+    ).model_copy(update={"sqlite_journal_mode": journal_mode})
+    sqlite_opens: list[object] = []
+
+    def reject_sqlite_open(*args: object, **kwargs: object) -> Any:
+        sqlite_opens.append((args, kwargs))
+        raise AssertionError("invalid production configuration reached SQLite")
+
+    monkeypatch.setattr(core_module, "connect_database", reject_sqlite_open)
+
+    with pytest.raises(InvoiceAgentsError) as core_error:
+        ensure_databases(settings)
+    with pytest.raises(InvoiceAgentsError) as store_error:
+        WorkflowStore(settings)
+
+    assert core_error.value.stop_reason == "SQLITE_JOURNAL_MODE_UNSUPPORTED"
+    assert store_error.value.stop_reason == "SQLITE_JOURNAL_MODE_UNSUPPORTED"
+    assert sqlite_opens == []
+    assert not settings.inventory_db.exists()
+    assert not settings.workflow_db.exists()
 
 
 def _directory_file_hashes(directory: Path) -> dict[str, str]:
@@ -465,6 +529,156 @@ def test_workflow_verification_does_not_touch_either_source_database(
     assert _directory_file_state(settings.workflow_db.parent) == before
 
 
+@pytest.mark.parametrize("link_kind", ["leaf", "parent"])
+def test_authoritative_verification_rejects_symlink_database_path_without_artifacts(
+    inventory_db: Path,
+    tmp_path: Path,
+    link_kind: str,
+) -> None:
+    before = inventory_db.read_bytes()
+    before_names = {candidate.name for candidate in tmp_path.iterdir()}
+    if link_kind == "leaf":
+        link = tmp_path / "inventory-link.db"
+        link.symlink_to(inventory_db.name)
+        supplied = link
+    else:
+        real_parent = tmp_path / "real-parent"
+        real_parent.mkdir()
+        target = real_parent / "inventory.db"
+        target.write_bytes(before)
+        link = tmp_path / "inventory-parent-link"
+        link.symlink_to(real_parent.name, target_is_directory=True)
+        supplied = link / target.name
+    expected_link = os.readlink(link)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(supplied, DatabaseKind.INVENTORY)
+
+    assert excinfo.value.stop_reason == "DATABASE_SYMLINK_UNSUPPORTED"
+    assert inventory_db.read_bytes() == before
+    assert os.readlink(link) == expected_link
+    assert not Path(f"{supplied}-journal").exists()
+    assert not Path(f"{supplied}-wal").exists()
+    assert not Path(f"{supplied}-shm").exists()
+    assert {candidate.name for candidate in tmp_path.iterdir()} == before_names | {link.name} | (
+        {"real-parent"} if link_kind == "parent" else set()
+    )
+
+
+def test_workflow_verification_rejects_symlink_inventory_context_without_audit(
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory_link = tmp_path / "authorization-inventory-link.db"
+    inventory_link.symlink_to(settings.inventory_db.name)
+    linked_settings = settings.model_copy(update={"inventory_db": inventory_link})
+    workflow_before = settings.workflow_db.read_bytes()
+    inventory_before = settings.inventory_db.read_bytes()
+    audit_started = False
+    real_verify_snapshot = core_module._verify_database_snapshot
+
+    def observe_audit(*args: Any, **kwargs: Any) -> dict[str, object]:
+        nonlocal audit_started
+        audit_started = True
+        return real_verify_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(core_module, "_verify_database_snapshot", observe_audit)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(
+            settings.workflow_db,
+            DatabaseKind.WORKFLOW,
+            settings=linked_settings,
+        )
+
+    assert excinfo.value.stop_reason == "DATABASE_SYMLINK_UNSUPPORTED"
+    assert not audit_started
+    assert settings.workflow_db.read_bytes() == workflow_before
+    assert settings.inventory_db.read_bytes() == inventory_before
+    assert inventory_link.is_symlink()
+
+
+def test_workflow_verification_rejects_symlink_workflow_context_without_audit(
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_link = tmp_path / "workflow-context-link.db"
+    workflow_link.symlink_to(settings.workflow_db.name)
+    linked_settings = settings.model_copy(update={"workflow_db": workflow_link})
+    audit_started = False
+    real_verify_snapshot = core_module._verify_database_snapshot
+
+    def observe_audit(*args: Any, **kwargs: Any) -> dict[str, object]:
+        nonlocal audit_started
+        audit_started = True
+        return real_verify_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(core_module, "_verify_database_snapshot", observe_audit)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(
+            settings.workflow_db,
+            DatabaseKind.WORKFLOW,
+            settings=linked_settings,
+        )
+
+    assert excinfo.value.stop_reason == "DATABASE_SYMLINK_UNSUPPORTED"
+    assert not audit_started
+    assert workflow_link.is_symlink()
+    assert not Path(f"{workflow_link}-journal").exists()
+
+
+def test_workflow_verification_rejects_inventory_retarget_before_temp_audit(
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    moved_inventory = tmp_path / "inventory-before-retarget.db"
+    replacement_inventory = tmp_path / "inventory-retarget.db"
+    replacement_inventory.write_bytes(settings.inventory_db.read_bytes())
+    original_copy = sqlite_source_module._copy_validated_source
+    audit_started = False
+    retargeted = False
+
+    def copy_then_retarget(
+        path: Path,
+        destination: Path,
+        role: sqlite_source_module.SQLiteSourceRole,
+    ) -> sqlite_source_module.SQLiteSourceIdentity:
+        nonlocal retargeted
+        identity = original_copy(path, destination, role)
+        if role.key == "authorization_inventory" and not retargeted:
+            settings.inventory_db.rename(moved_inventory)
+            settings.inventory_db.symlink_to(replacement_inventory.name)
+            retargeted = True
+        return identity
+
+    real_verify_snapshot = core_module._verify_database_snapshot
+
+    def observe_audit(*args: Any, **kwargs: Any) -> dict[str, object]:
+        nonlocal audit_started
+        audit_started = True
+        return real_verify_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite_source_module, "_copy_validated_source", copy_then_retarget)
+    monkeypatch.setattr(core_module, "_verify_database_snapshot", observe_audit)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(
+            settings.workflow_db,
+            DatabaseKind.WORKFLOW,
+            settings=settings,
+        )
+
+    assert retargeted
+    assert not audit_started
+    assert excinfo.value.stop_reason == "DATABASE_CHANGED_DURING_VERIFICATION"
+    assert settings.inventory_db.is_symlink()
+    assert moved_inventory.read_bytes() == replacement_inventory.read_bytes()
+
+
 @pytest.mark.parametrize("suffix", ["-journal", "-wal", "-shm"])
 def test_verification_rejects_rollback_database_with_any_sqlite_sidecar_unchanged(
     inventory_db: Path,
@@ -602,6 +816,8 @@ def test_twenty_byte_sqlite_lookalike_is_signature_invalid(tmp_path: Path) -> No
         "payload-fractions",
         "schema-format",
         "text-encoding",
+        "schema-format-zero-only",
+        "text-encoding-zero-only",
         "page-count",
         "file-size",
         "reserved-header-bytes",
@@ -627,6 +843,10 @@ def test_complete_sqlite_header_contract_rejects_each_invalid_invariant(
         data[44:48] = (5).to_bytes(4, "big")
     elif corruption == "text-encoding":
         data[56:60] = (4).to_bytes(4, "big")
+    elif corruption == "schema-format-zero-only":
+        data[44:48] = (0).to_bytes(4, "big")
+    elif corruption == "text-encoding-zero-only":
+        data[56:60] = (0).to_bytes(4, "big")
     elif corruption == "page-count":
         page_count = int.from_bytes(data[28:32], "big")
         data[28:32] = (page_count + 1).to_bytes(4, "big")
@@ -643,6 +863,46 @@ def test_complete_sqlite_header_contract_rejects_each_invalid_invariant(
     assert excinfo.value.stop_reason == "DATABASE_SIGNATURE_INVALID"
 
 
+def test_user_version_only_pre_schema_database_migrates_from_legal_zero_header_pair(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "user-version-only.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA user_version = 73")
+        connection.commit()
+    header = path.read_bytes()[:100]
+    assert int.from_bytes(header[44:48], "big") == 0
+    assert int.from_bytes(header[56:60], "big") == 0
+
+    assert migrate_database(path, DatabaseKind.INVENTORY) == [1]
+
+    with connect_database(path, read_only=True) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 73
+        assert connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 1
+
+
+def test_zero_header_pair_with_user_schema_is_audited_and_rejected_before_migration(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "false-pre-schema.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE unauthorized (value BLOB)")
+        connection.execute("INSERT INTO unauthorized(value) VALUES (X'CAFE')")
+        connection.commit()
+    data = bytearray(path.read_bytes())
+    data[44:48] = (0).to_bytes(4, "big")
+    data[56:60] = (0).to_bytes(4, "big")
+    path.write_bytes(data)
+    before = path.read_bytes()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.INVENTORY)
+
+    assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
+    assert path.read_bytes() == before
+    assert not Path(f"{path}-journal").exists()
+
+
 def test_migration_accepts_nonexistent_and_zero_length_new_database_paths(
     tmp_path: Path,
 ) -> None:
@@ -654,6 +914,68 @@ def test_migration_accepts_nonexistent_and_zero_length_new_database_paths(
     assert migrate_database(zero_length, DatabaseKind.INVENTORY) == [1]
     assert nonexistent.read_bytes()[18:20] == b"\x01\x01"
     assert zero_length.read_bytes()[18:20] == b"\x01\x01"
+    assert not [
+        candidate
+        for candidate in tmp_path.iterdir()
+        if candidate.is_dir() and candidate.name.startswith(".invoice-db-maintenance-")
+    ]
+
+
+def test_migration_rejects_leaf_symlink_before_lock_or_sqlite_artifacts(
+    inventory_db: Path,
+    tmp_path: Path,
+) -> None:
+    link = tmp_path / "inventory-migration-link.db"
+    link.symlink_to(inventory_db.name)
+    before = inventory_db.read_bytes()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(link, DatabaseKind.INVENTORY)
+
+    assert excinfo.value.stop_reason == "DATABASE_SYMLINK_UNSUPPORTED"
+    assert link.is_symlink()
+    assert os.readlink(link) == inventory_db.name
+    assert inventory_db.read_bytes() == before
+    assert not Path(f"{link}-journal").exists()
+    assert not [
+        candidate
+        for candidate in tmp_path.iterdir()
+        if candidate.is_dir() and candidate.name.startswith(".invoice-db-maintenance-")
+    ]
+
+
+def test_private_hardlink_maintenance_binding_is_0700_and_cleans_up_on_exception(
+    inventory_db: Path,
+) -> None:
+    before = inventory_db.read_bytes()
+    maintenance_prefix = ".invoice-db-maintenance-"
+
+    with (
+        pytest.raises(RuntimeError, match="injected maintenance failure"),
+        sqlite_source_module.exclusive_database_maintenance((inventory_db,)) as locks,
+    ):
+        sqlite_path = locks.sqlite_path(inventory_db)
+        directory = sqlite_path.parent
+        source_metadata = os.lstat(inventory_db)
+        hardlink_metadata = os.lstat(sqlite_path)
+
+        assert directory.parent == inventory_db.parent
+        assert directory.name.startswith(maintenance_prefix)
+        assert os.lstat(directory).st_mode & 0o777 == 0o700
+        assert not sqlite_path.is_symlink()
+        assert (hardlink_metadata.st_dev, hardlink_metadata.st_ino) == (
+            source_metadata.st_dev,
+            source_metadata.st_ino,
+        )
+        raise RuntimeError("injected maintenance failure")
+
+    assert inventory_db.read_bytes() == before
+    assert not [
+        candidate
+        for candidate in inventory_db.parent.iterdir()
+        if candidate.name.startswith(maintenance_prefix)
+    ]
+    assert not Path(f"{inventory_db}-journal").exists()
 
 
 def test_missing_and_corrupt_database_fail_visibly(tmp_path: Path) -> None:

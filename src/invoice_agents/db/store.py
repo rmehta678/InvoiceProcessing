@@ -37,7 +37,7 @@ from invoice_agents.models import (
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
-ROLLBACK_JOURNAL_MODES = frozenset({"delete", "persist", "truncate"})
+REQUIRED_JOURNAL_MODE = "delete"
 
 
 @dataclass(frozen=True, slots=True)
@@ -891,6 +891,8 @@ class WorkflowStore:
     """Own all mutation of the workflow database; inventory remains separate."""
 
     def __init__(self, path: Path | Settings) -> None:
+        if isinstance(path, Settings):
+            path.assert_delete_journal_mode()
         self.settings = path if isinstance(path, Settings) else None
         selected_path = path.workflow_db if isinstance(path, Settings) else path
         self.path = selected_path.resolve()
@@ -1800,12 +1802,12 @@ class WorkflowStore:
             incompatible = {
                 name: mode
                 for name, mode in modes.items()
-                if mode.casefold() not in ROLLBACK_JOURNAL_MODES
+                if mode.casefold() != REQUIRED_JOURNAL_MODE
             }
             if incompatible:
                 raise InvoiceAgentsError(
                     ErrorCategory.DATABASE,
-                    "atomic human decisions require rollback-journal mode for workflow and "
+                    "atomic human decisions require DELETE journal mode for workflow and "
                     f"inventory databases; incompatible modes: {incompatible}",
                     stop_reason="ATOMIC_JOURNAL_MODE_REQUIRED",
                 )

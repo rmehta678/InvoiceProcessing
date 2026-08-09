@@ -25,6 +25,12 @@ Database migrations are runtime package resources, so these commands work from a
 as well as from a source checkout. The source repository's `data/invoices/` directory is only a
 demonstration corpus; installed batch users must pass their own `--invoice-dir PATH`.
 
+Both databases must use SQLite `DELETE` journal mode. This is a fixed safety contract for atomic
+human-decision writes across the workflow and inventory files, exposed as
+`INVOICE_SQLITE_JOURNAL_MODE=DELETE` only for explicit validation. `PERSIST`, `TRUNCATE`, and
+`WAL` are rejected rather than converted, and retained `-journal`, `-wal`, or `-shm` sidecars
+must be recovered or removed by an operator before verification or migration can proceed.
+
 Verification pins the inventory seed verbatim; it contains only facts from the challenge README:
 
 | SKU | Item | Available stock |

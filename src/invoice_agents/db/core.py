@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 from collections.abc import Iterator
@@ -24,8 +25,10 @@ from invoice_agents.db.sqlite_source import (
     authoritative_database_snapshots,
     coordinated_production_connection,
     exclusive_database_maintenance,
+    lexical_absolute_path,
     read_validated_source_identity,
     validate_complete_sqlite_header,
+    validate_lexical_database_path,
 )
 from invoice_agents.errors import DatabaseVerificationError, ErrorCategory
 
@@ -337,7 +340,7 @@ def connect_database(path: Path, *, read_only: bool = False) -> Iterator[sqlite3
 
     with coordinated_production_connection():
         if read_only:
-            uri = f"{path.resolve().as_uri()}?mode=ro"
+            uri = f"{lexical_absolute_path(path).as_uri()}?mode=ro"
             connection = sqlite3.connect(uri, uri=True, timeout=5)
         else:
             connection = sqlite3.connect(path, timeout=5)
@@ -708,13 +711,13 @@ def _retrofit_inventory_path(
             "legacy workflow v3 retrofit requires explicit Settings authorization context",
             stop_reason="DATABASE_AUTHORIZATION_CONTEXT_REQUIRED",
         )
-    if settings.workflow_db.resolve() != workflow_path:
+    if validate_lexical_database_path(settings.workflow_db) != workflow_path:
         raise DatabaseVerificationError(
             ErrorCategory.CONFIGURATION,
             "legacy workflow v3 retrofit Settings do not identify the database being migrated",
             stop_reason="DATABASE_AUTHORIZATION_CONTEXT_MISMATCH",
         )
-    inventory_path = settings.inventory_db.resolve()
+    inventory_path = validate_lexical_database_path(settings.inventory_db)
     _assert_sqlite_file(inventory_path)
     _assert_rollback_journal_header(
         inventory_path,
@@ -1450,7 +1453,7 @@ def reconcile_legacy_authorization(
             "non-authorizing disposition",
             stop_reason="LEGACY_RECONCILIATION_INPUT_INVALID",
         )
-    resolved = path.resolve()
+    resolved = validate_lexical_database_path(path)
     _assert_sqlite_file(resolved)
     resources = _migration_resources(DatabaseKind.WORKFLOW)
     packaged_versions = _migration_versions(resources, DatabaseKind.WORKFLOW)
@@ -1743,8 +1746,9 @@ def reconcile_legacy_authorization(
 
 
 def _is_nonempty_database_path(path: Path) -> bool:
+    lexical = validate_lexical_database_path(path, missing_ok=True)
     try:
-        return path.stat().st_size > 0
+        return os.lstat(lexical).st_size > 0
     except FileNotFoundError:
         return False
 
@@ -1765,15 +1769,15 @@ def _migration_preflight_from_source_snapshots(
     sources: list[tuple[Path, SQLiteSourceRole]] = [(path, role)]
     inventory_original: Path | None = None
     if kind is DatabaseKind.WORKFLOW and settings is not None:
-        inventory_original = settings.inventory_db.resolve()
+        inventory_original = lexical_absolute_path(settings.inventory_db)
         if _is_nonempty_database_path(inventory_original):
             sources.append((inventory_original, AUTHORIZATION_INVENTORY_SOURCE_ROLE))
     with authoritative_database_snapshots(sources) as snapshots:
-        main_copy = snapshots[role.key].copy_path.resolve()
+        main_copy = lexical_absolute_path(snapshots[role.key].copy_path)
         audit_settings = settings
         if settings is not None:
             inventory_copy = (
-                snapshots[AUTHORIZATION_INVENTORY_SOURCE_ROLE.key].copy_path.resolve()
+                lexical_absolute_path(snapshots[AUTHORIZATION_INVENTORY_SOURCE_ROLE.key].copy_path)
                 if AUTHORIZATION_INVENTORY_SOURCE_ROLE.key in snapshots
                 else main_copy.parent / "missing-authorization-inventory.db"
             )
@@ -1794,7 +1798,7 @@ def _migration_preflight_from_source_snapshots(
             preflight is not None
             and preflight.version_neutral_install_required
             and settings is not None
-            and settings.workflow_db.resolve() != path
+            and validate_lexical_database_path(settings.workflow_db) != path
         ):
             raise DatabaseVerificationError(
                 ErrorCategory.CONFIGURATION,
@@ -1817,10 +1821,31 @@ def _assert_locked_source_identity(
     maintenance_locks: SQLiteMaintenanceLocks,
     expected: SQLiteSourceIdentity,
     role: SQLiteSourceRole,
+    *,
+    connection: sqlite3.Connection | None = None,
 ) -> None:
-    current = maintenance_locks.validated_identity(expected.resolved_path, role)
-    if current != expected:
-        _raise_source_changed(expected.resolved_path)
+    try:
+        current = maintenance_locks.validated_identity(expected.resolved_path, role)
+        if current != expected:
+            _raise_source_changed(expected.resolved_path)
+    except DatabaseVerificationError:
+        if connection is not None:
+            connection.rollback()
+        raise
+
+
+def _assert_locked_binding_before_commit(
+    maintenance_locks: SQLiteMaintenanceLocks,
+    path: Path,
+    connection: sqlite3.Connection,
+) -> None:
+    """Revalidate caller/private/descriptor inode binding and roll back any mismatch."""
+
+    try:
+        maintenance_locks.assert_binding(path)
+    except DatabaseVerificationError:
+        connection.rollback()
+        raise
 
 
 def _assert_connection_rollback_mode(
@@ -1830,10 +1855,10 @@ def _assert_connection_rollback_mode(
     role: SQLiteSourceRole,
 ) -> None:
     mode = str(connection.execute(f"PRAGMA {schema}.journal_mode").fetchone()[0]).casefold()
-    if mode not in {"delete", "persist", "truncate"}:
+    if mode != "delete":
         raise DatabaseVerificationError(
             ErrorCategory.DATABASE,
-            f"{role.label} database changed to incompatible journal mode {mode}",
+            f"{role.label} database journal mode is {mode}; DELETE is required",
             stop_reason=role.wal_stop_reason,
         )
 
@@ -1846,12 +1871,16 @@ def migrate_database(
 ) -> list[int]:
     """Apply unapplied migrations; this is never called by normal processing."""
 
+    if settings is not None:
+        settings.assert_delete_journal_mode()
     selected_kind = kind or infer_kind(path)
-    path = path.resolve()
+    path = lexical_absolute_path(path)
+    validate_lexical_database_path(path, missing_ok=True)
     resources = _migration_resources(selected_kind)
     packaged_versions = _migration_versions(resources, selected_kind)
     packaged_hashes = _migration_hashes(resources)
     path.parent.mkdir(parents=True, exist_ok=True)
+    validate_lexical_database_path(path, missing_ok=True)
     applied: list[int] = []
     transaction_controls = {
         _normalized_sql(statement)
@@ -1880,7 +1909,7 @@ def migrate_database(
             and preflight.version_neutral_install_required
         ):
             assert settings is not None
-            inventory_path = settings.inventory_db.resolve()
+            inventory_path = validate_lexical_database_path(settings.inventory_db)
             workflow_identity = identities[WORKFLOW_SOURCE_ROLE.key]
             inventory_identity = identities.get(AUTHORIZATION_INVENTORY_SOURCE_ROLE.key)
             if inventory_identity is None:
@@ -1901,10 +1930,12 @@ def migrate_database(
                         inventory_identity,
                         AUTHORIZATION_INVENTORY_SOURCE_ROLE,
                     )
-                    with connect_database(path) as connection:
+                    workflow_sqlite_path = maintenance_locks.sqlite_path(path)
+                    inventory_sqlite_path = maintenance_locks.sqlite_path(inventory_path)
+                    with connect_database(workflow_sqlite_path) as connection:
                         _attach_retrofit_inventory(
                             connection,
-                            inventory_path,
+                            inventory_sqlite_path,
                             read_only=False,
                         )
                         maintenance_locks.reacquire()
@@ -1935,13 +1966,17 @@ def migrate_database(
                             schema="authorization_inventory",
                             role=AUTHORIZATION_INVENTORY_SOURCE_ROLE,
                         )
-                        maintenance_locks.validated_identity(
-                            path,
+                        _assert_locked_source_identity(
+                            maintenance_locks,
+                            workflow_identity,
                             WORKFLOW_SOURCE_ROLE,
+                            connection=connection,
                         )
-                        maintenance_locks.validated_identity(
-                            inventory_path,
+                        _assert_locked_source_identity(
+                            maintenance_locks,
+                            inventory_identity,
                             AUTHORIZATION_INVENTORY_SOURCE_ROLE,
+                            connection=connection,
                         )
                         connection.execute(
                             "SELECT (SELECT COUNT(*) FROM main.sqlite_schema), "
@@ -2018,6 +2053,16 @@ def migrate_database(
                             schema="authorization_inventory",
                             role=AUTHORIZATION_INVENTORY_SOURCE_ROLE,
                         )
+                        _assert_locked_binding_before_commit(
+                            maintenance_locks,
+                            path,
+                            connection,
+                        )
+                        _assert_locked_binding_before_commit(
+                            maintenance_locks,
+                            inventory_path,
+                            connection,
+                        )
                         connection.commit()
             except DatabaseVerificationError:
                 raise
@@ -2050,14 +2095,14 @@ def migrate_database(
             if selected_kind is DatabaseKind.WORKFLOW
             else INVENTORY_SOURCE_ROLE
         )
-        create_paths = (path,) if preflight is None and not path.exists() else ()
+        create_paths = (path,) if preflight is None and not os.path.lexists(path) else ()
         try:
             with exclusive_database_maintenance(
                 (path,),
                 create_paths=create_paths,
             ) as maintenance_locks:
                 if preflight is None:
-                    if path.stat().st_size != 0:
+                    if maintenance_locks.locked_size(path) != 0:
                         _raise_source_changed(path)
                 else:
                     _assert_locked_source_identity(
@@ -2065,7 +2110,8 @@ def migrate_database(
                         identities[main_role.key],
                         main_role,
                     )
-                with connect_database(path) as connection:
+                sqlite_path = maintenance_locks.sqlite_path(path)
+                with connect_database(sqlite_path) as connection:
                     if disable_foreign_keys:
                         connection.execute("PRAGMA foreign_keys = OFF")
                     if preflight is None:
@@ -2075,12 +2121,12 @@ def migrate_database(
                         if configured_mode != "delete":
                             raise DatabaseVerificationError(
                                 ErrorCategory.DATABASE,
-                                "new database could not be configured for rollback journal mode",
+                                "new database could not be configured for DELETE journal mode",
                                 stop_reason=main_role.wal_stop_reason,
                             )
                     maintenance_locks.reacquire()
                     if preflight is None:
-                        if path.stat().st_size != 0:
+                        if maintenance_locks.locked_size(path) != 0:
                             _raise_source_changed(path)
                     else:
                         if (
@@ -2095,13 +2141,19 @@ def migrate_database(
                         role=main_role,
                     )
                     if preflight is None:
+                        maintenance_locks.assert_binding(path)
                         connection.execute(
                             "CREATE TABLE schema_version ("
                             "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
                         )
                         locked_migration_history: tuple[int, ...] = ()
                     else:
-                        maintenance_locks.validated_identity(path, main_role)
+                        _assert_locked_source_identity(
+                            maintenance_locks,
+                            identities[main_role.key],
+                            main_role,
+                            connection=connection,
+                        )
                         locked_migration_history = _read_migration_history(
                             connection,
                             kind=selected_kind,
@@ -2131,6 +2183,18 @@ def migrate_database(
                                     "workflow version-neutral schema changed during preflight",
                                     stop_reason="DATABASE_SCHEMA_MISMATCH",
                                 )
+                        if (
+                            not locked_migration_history
+                            and connection.execute(
+                                "SELECT 1 FROM sqlite_master "
+                                "WHERE type = 'table' AND name = 'schema_version'"
+                            ).fetchone()
+                            is None
+                        ):
+                            connection.execute(
+                                "CREATE TABLE schema_version ("
+                                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+                            )
                     if version in set(locked_migration_history):
                         raise DatabaseVerificationError(
                             ErrorCategory.DATABASE,
@@ -2174,6 +2238,11 @@ def migrate_database(
                         connection,
                         schema="main",
                         role=main_role,
+                    )
+                    _assert_locked_binding_before_commit(
+                        maintenance_locks,
+                        path,
+                        connection,
                     )
                     connection.commit()
                     if disable_foreign_keys:
@@ -2219,11 +2288,12 @@ def ensure_databases(settings: Settings) -> dict[str, list[int]]:
     entry point shared by the CLI so one command can bring the system up.
     """
 
+    settings.assert_delete_journal_mode()
     inventory_db = settings.inventory_db
     workflow_db = settings.workflow_db
     for existing_path, role in (
-        (inventory_db.resolve(), INVENTORY_SOURCE_ROLE),
-        (workflow_db.resolve(), WORKFLOW_SOURCE_ROLE),
+        (lexical_absolute_path(inventory_db), INVENTORY_SOURCE_ROLE),
+        (lexical_absolute_path(workflow_db), WORKFLOW_SOURCE_ROLE),
     ):
         if _is_nonempty_database_path(existing_path):
             read_validated_source_identity(existing_path, role)
@@ -2260,7 +2330,7 @@ def _assert_rollback_journal_header(
     stop_reason: str,
     database_label: str,
 ) -> None:
-    """Reject WAL from header bytes without opening SQLite or touching its sidecars."""
+    """Require DELETE-compatible header bytes before SQLite can touch sidecars."""
 
     header = _assert_sqlite_file(path)
     write_version = header[18]
@@ -2269,7 +2339,7 @@ def _assert_rollback_journal_header(
         raise DatabaseVerificationError(
             ErrorCategory.DATABASE,
             f"{database_label} database uses WAL file-format header bytes; "
-            "rollback-journal mode is required",
+            "DELETE journal mode is required",
             stop_reason=stop_reason,
         )
 
@@ -2347,8 +2417,10 @@ def verify_database(
 ) -> dict[str, object]:
     """Audit immutable raw copies and certify that every original remained unchanged."""
 
+    if settings is not None:
+        settings.assert_delete_journal_mode()
     selected_kind = kind or infer_kind(path)
-    resolved = path.resolve()
+    resolved = validate_lexical_database_path(path)
     sources: list[tuple[Path, SQLiteSourceRole]]
     if selected_kind is DatabaseKind.WORKFLOW:
         if settings is None:
@@ -2358,7 +2430,7 @@ def verify_database(
                 "workflow schema v3 authorization verification requires explicit Settings",
                 stop_reason="DATABASE_AUTHORIZATION_CONTEXT_REQUIRED",
             )
-        if settings.workflow_db.resolve() != resolved:
+        if validate_lexical_database_path(settings.workflow_db) != resolved:
             read_validated_source_identity(resolved, WORKFLOW_SOURCE_ROLE)
             raise DatabaseVerificationError(
                 ErrorCategory.CONFIGURATION,
@@ -2367,7 +2439,10 @@ def verify_database(
             )
         sources = [
             (resolved, WORKFLOW_SOURCE_ROLE),
-            (settings.inventory_db.resolve(), AUTHORIZATION_INVENTORY_SOURCE_ROLE),
+            (
+                validate_lexical_database_path(settings.inventory_db),
+                AUTHORIZATION_INVENTORY_SOURCE_ROLE,
+            ),
         ]
     else:
         sources = [(resolved, INVENTORY_SOURCE_ROLE)]
@@ -2406,7 +2481,7 @@ def _verify_database_snapshot(
     """Verify one private copy through ordinary SQLite without touching its source."""
 
     selected_kind = kind or infer_kind(path)
-    resolved = path.resolve()
+    resolved = validate_lexical_database_path(path)
     _assert_sqlite_file(resolved)
     _assert_rollback_journal_header(
         resolved,
@@ -2428,13 +2503,13 @@ def _verify_database_snapshot(
                 "workflow schema v3 authorization verification requires explicit Settings",
                 stop_reason="DATABASE_AUTHORIZATION_CONTEXT_REQUIRED",
             )
-        if settings.workflow_db.resolve() != resolved:
+        if validate_lexical_database_path(settings.workflow_db) != resolved:
             raise DatabaseVerificationError(
                 ErrorCategory.CONFIGURATION,
                 "workflow verification Settings do not identify the database being audited",
                 stop_reason="DATABASE_AUTHORIZATION_CONTEXT_MISMATCH",
             )
-        inventory_resolved = settings.inventory_db.resolve()
+        inventory_resolved = validate_lexical_database_path(settings.inventory_db)
         _assert_sqlite_file(inventory_resolved)
         _assert_rollback_journal_header(
             inventory_resolved,

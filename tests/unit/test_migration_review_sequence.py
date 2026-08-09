@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -14,6 +16,7 @@ from typing import Any
 import pytest
 
 import invoice_agents.db.core as core_module
+import invoice_agents.db.store as store_module
 from invoice_agents.agents.decision_rules import blocking_evidence
 from invoice_agents.config import Settings
 from invoice_agents.db.core import (
@@ -618,7 +621,7 @@ def test_legacy_v3_retrofit_holds_cross_process_sqlite_lock_before_begin_immedia
     @contextmanager
     def observed_connect(target: Path, *, read_only: bool = False) -> Iterator[Any]:
         with real_connect(target, read_only=read_only) as connection:
-            if target.resolve() == path.resolve() and not read_only:
+            if not read_only:
                 yield RivalProbeConnection(connection)
             else:
                 yield connection
@@ -647,7 +650,7 @@ def test_legacy_v3_retrofit_aborts_when_same_process_raw_sqlite_switches_to_wal(
     @contextmanager
     def racing_connect(target: Path, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
         nonlocal keeper
-        if target.resolve() == path.resolve() and not read_only and keeper is None:
+        if not read_only and keeper is None:
             keeper = sqlite3.connect(path)
             assert keeper.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
             keeper.execute("UPDATE schema_version SET applied_at = applied_at WHERE version = 1")
@@ -677,6 +680,65 @@ def test_legacy_v3_retrofit_aborts_when_same_process_raw_sqlite_switches_to_wal(
     finally:
         if keeper is not None:
             keeper.close()
+
+
+@pytest.mark.parametrize("mutated_role", ["workflow", "inventory"])
+def test_legacy_v3_retrofit_rejects_application_id_change_after_begin_before_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutated_role: str,
+) -> None:
+    path = tmp_path / f"legacy-v3-post-begin-{mutated_role}.db"
+    migrate_database(path, DatabaseKind.WORKFLOW)
+    _remove_durable_history(path)
+    settings = _retrofit_settings(tmp_path, path)
+    target = path if mutated_role == "workflow" else settings.inventory_db
+    real_connect = core_module.connect_database
+    mutated = False
+
+    class RacingConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self.connection = connection
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.connection, name)
+
+        def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+            nonlocal mutated
+            cursor = self.connection.execute(sql, parameters)
+            if sql == "BEGIN IMMEDIATE" and not mutated:
+                descriptor = os.open(target, os.O_RDWR | os.O_NOFOLLOW)
+                try:
+                    assert os.pwrite(descriptor, b"\x23\x45\x67\x89", 68) == 4
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                mutated = True
+            return cursor
+
+    @contextmanager
+    def racing_connect(database: Path, *, read_only: bool = False) -> Iterator[Any]:
+        with real_connect(database, read_only=read_only) as connection:
+            if read_only:
+                yield connection
+            else:
+                yield RacingConnection(connection)
+
+    monkeypatch.setattr(core_module, "connect_database", racing_connect)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.WORKFLOW, settings=settings)
+
+    assert mutated
+    assert excinfo.value.stop_reason == "DATABASE_CHANGED_DURING_VERIFICATION"
+    with real_connect(path, read_only=True) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'schema_migration_history'"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_legacy_v3_retrofit_rejects_missing_required_trigger_without_mutation(
@@ -837,7 +899,7 @@ def test_legacy_v3_retrofit_rereads_durable_history_after_write_lock_before_writ
     @contextmanager
     def racing_connect(target: Path, *, read_only: bool = False) -> Iterator[Any]:
         with real_connect(target, read_only=read_only) as connection:
-            if target.resolve() == path.resolve() and not read_only:
+            if not read_only:
                 yield RacingConnection(connection)
             else:
                 yield connection
@@ -847,7 +909,7 @@ def test_legacy_v3_retrofit_rereads_durable_history_after_write_lock_before_writ
     with pytest.raises(DatabaseVerificationError) as excinfo:
         migrate_database(path, DatabaseKind.WORKFLOW, settings=settings)
 
-    assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
+    assert excinfo.value.stop_reason == "DATABASE_CHANGED_DURING_VERIFICATION"
     assert race_completed
     assert post_race_mutations == []
     assert path.read_bytes() == raced_bytes[0]
@@ -1007,6 +1069,352 @@ def test_future_synthetic_migration_appends_one_digest_bound_history_row(
     assert path.read_bytes() == before
 
 
+@pytest.mark.parametrize("kind", [DatabaseKind.INVENTORY, DatabaseKind.WORKFLOW])
+def test_normal_migration_rejects_application_id_change_after_begin_before_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: DatabaseKind,
+) -> None:
+    path = tmp_path / f"post-begin-application-id-{kind.value}.db"
+    migrate_database(path, kind)
+    packaged = _migration_resources(kind)
+    next_version = len(packaged) + 1
+    synthetic_sql = "CREATE TABLE post_begin_identity_probe(value INTEGER);\n"
+
+    class SyntheticMigration:
+        name = f"{next_version:03d}_post_begin_identity_probe.sql"
+
+        def read_text(self, encoding: str = "utf-8") -> str:
+            assert encoding == "utf-8"
+            return synthetic_sql
+
+        def read_bytes(self) -> bytes:
+            return synthetic_sql.encode("utf-8")
+
+    original_resources = core_module._migration_resources
+
+    def resources(selected: DatabaseKind) -> list[Any]:
+        if selected is kind:
+            return [*packaged, SyntheticMigration()]
+        return list(original_resources(selected))
+
+    real_connect = core_module.connect_database
+    mutated = False
+
+    class RacingConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self.connection = connection
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.connection, name)
+
+        def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+            nonlocal mutated
+            cursor = self.connection.execute(sql, parameters)
+            if sql == "BEGIN IMMEDIATE" and not mutated:
+                descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+                try:
+                    assert os.pwrite(descriptor, b"\x12\x34\x56\x78", 68) == 4
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                mutated = True
+            return cursor
+
+    @contextmanager
+    def racing_connect(target: Path, *, read_only: bool = False) -> Iterator[Any]:
+        with real_connect(target, read_only=read_only) as connection:
+            if read_only:
+                yield connection
+            else:
+                yield RacingConnection(connection)
+
+    monkeypatch.setattr(core_module, "_migration_resources", resources)
+    monkeypatch.setattr(core_module, "connect_database", racing_connect)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, kind)
+
+    assert mutated
+    assert excinfo.value.stop_reason == "DATABASE_CHANGED_DURING_VERIFICATION"
+    with real_connect(path, read_only=True) as connection:
+        assert connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == (
+            next_version - 1
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'post_begin_identity_probe'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+@pytest.mark.parametrize("journal_mode", ["PERSIST", "TRUNCATE"])
+def test_migration_rejects_non_delete_runtime_journal_mode_before_schema_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    journal_mode: str,
+) -> None:
+    path = tmp_path / f"non-delete-{journal_mode.casefold()}.db"
+    migrate_database(path, DatabaseKind.INVENTORY)
+    packaged = _migration_resources(DatabaseKind.INVENTORY)
+    synthetic_sql = "CREATE TABLE non_delete_journal_probe(value INTEGER);\n"
+
+    class SyntheticMigration:
+        name = "002_non_delete_journal_probe.sql"
+
+        def read_text(self, encoding: str = "utf-8") -> str:
+            assert encoding == "utf-8"
+            return synthetic_sql
+
+        def read_bytes(self) -> bytes:
+            return synthetic_sql.encode("utf-8")
+
+    original_resources = core_module._migration_resources
+
+    def resources(kind: DatabaseKind) -> list[Any]:
+        if kind is DatabaseKind.INVENTORY:
+            return [*packaged, SyntheticMigration()]
+        return list(original_resources(kind))
+
+    real_connect = core_module.connect_database
+    forced = False
+
+    @contextmanager
+    def non_delete_connect(
+        target: Path,
+        *,
+        read_only: bool = False,
+    ) -> Iterator[sqlite3.Connection]:
+        nonlocal forced
+        with real_connect(target, read_only=read_only) as connection:
+            if not read_only:
+                observed = connection.execute(f"PRAGMA journal_mode = {journal_mode}").fetchone()[0]
+                assert str(observed).casefold() == journal_mode.casefold()
+                forced = True
+            yield connection
+
+    monkeypatch.setattr(core_module, "_migration_resources", resources)
+    monkeypatch.setattr(core_module, "connect_database", non_delete_connect)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.INVENTORY)
+
+    assert forced
+    assert excinfo.value.stop_reason == "INVENTORY_WAL_MODE_UNSUPPORTED"
+    assert "DELETE" in str(excinfo.value)
+    with real_connect(path, read_only=True) as connection:
+        assert connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'non_delete_journal_probe'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_failed_migration_rolls_back_and_cleans_private_journal_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "failed-private-journal.db"
+    migrate_database(path, DatabaseKind.INVENTORY)
+    before = path.read_bytes()
+    packaged = _migration_resources(DatabaseKind.INVENTORY)
+    synthetic_sql = (
+        "CREATE TABLE rolled_back_probe(value INTEGER);\n"
+        "INSERT INTO missing_migration_target(value) VALUES (1);\n"
+    )
+
+    class SyntheticMigration:
+        name = "002_failed_private_journal.sql"
+
+        def read_text(self, encoding: str = "utf-8") -> str:
+            assert encoding == "utf-8"
+            return synthetic_sql
+
+        def read_bytes(self) -> bytes:
+            return synthetic_sql.encode("utf-8")
+
+    original_resources = core_module._migration_resources
+
+    def resources(kind: DatabaseKind) -> list[Any]:
+        if kind is DatabaseKind.INVENTORY:
+            return [*packaged, SyntheticMigration()]
+        return list(original_resources(kind))
+
+    monkeypatch.setattr(core_module, "_migration_resources", resources)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.INVENTORY)
+
+    assert excinfo.value.stop_reason == "MIGRATION_FAILED"
+    assert path.read_bytes() == before
+    assert not Path(f"{path}-journal").exists()
+    assert not [
+        candidate
+        for candidate in tmp_path.iterdir()
+        if candidate.is_dir() and candidate.name.startswith(".invoice-db-maintenance-")
+    ]
+    with connect_database(path, read_only=True) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'rolled_back_probe'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_migration_rejects_byte_identical_lexical_replacement_without_writing_either_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "rename-clone-migration.db"
+    moved_original = tmp_path / "rename-clone-locked-original.db"
+    migrate_database(path, DatabaseKind.INVENTORY)
+    before = path.read_bytes()
+    packaged = _migration_resources(DatabaseKind.INVENTORY)
+    synthetic_sql = "CREATE TABLE rename_clone_probe(value INTEGER);\n"
+
+    class SyntheticMigration:
+        name = "002_rename_clone_probe.sql"
+
+        def read_text(self, encoding: str = "utf-8") -> str:
+            assert encoding == "utf-8"
+            return synthetic_sql
+
+        def read_bytes(self) -> bytes:
+            return synthetic_sql.encode("utf-8")
+
+    original_resources = core_module._migration_resources
+
+    def resources(kind: DatabaseKind) -> list[Any]:
+        if kind is DatabaseKind.INVENTORY:
+            return [*packaged, SyntheticMigration()]
+        return list(original_resources(kind))
+
+    real_connect = core_module.connect_database
+    swapped = False
+
+    @contextmanager
+    def racing_connect(target: Path, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
+        nonlocal swapped
+        if not read_only and not swapped:
+            path.rename(moved_original)
+            shutil.copy2(moved_original, path)
+            assert path.read_bytes() == before
+            assert path.stat().st_ino != moved_original.stat().st_ino
+            swapped = True
+        with real_connect(target, read_only=read_only) as connection:
+            yield connection
+
+    monkeypatch.setattr(core_module, "_migration_resources", resources)
+    monkeypatch.setattr(core_module, "connect_database", racing_connect)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.INVENTORY)
+
+    assert swapped
+    assert excinfo.value.stop_reason == "DATABASE_CHANGED_DURING_VERIFICATION"
+    assert path.read_bytes() == before
+    assert moved_original.read_bytes() == before
+    for database in (path, moved_original):
+        with real_connect(database, read_only=True) as connection:
+            assert connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 1
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'rename_clone_probe'"
+                ).fetchone()[0]
+                == 0
+            )
+    assert not [candidate for candidate in tmp_path.iterdir() if candidate.is_dir()]
+
+
+def test_swap_away_and_back_cannot_redirect_migration_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "swap-back-migration.db"
+    moved_original = tmp_path / "swap-back-locked-original.db"
+    moved_replacement = tmp_path / "swap-back-replacement.db"
+    migrate_database(path, DatabaseKind.INVENTORY)
+    before = path.read_bytes()
+    packaged = _migration_resources(DatabaseKind.INVENTORY)
+    synthetic_sql = "CREATE TABLE swap_back_probe(value INTEGER);\n"
+
+    class SyntheticMigration:
+        name = "002_swap_back_probe.sql"
+
+        def read_text(self, encoding: str = "utf-8") -> str:
+            assert encoding == "utf-8"
+            return synthetic_sql
+
+        def read_bytes(self) -> bytes:
+            return synthetic_sql.encode("utf-8")
+
+    original_resources = core_module._migration_resources
+
+    def resources(kind: DatabaseKind) -> list[Any]:
+        if kind is DatabaseKind.INVENTORY:
+            return [*packaged, SyntheticMigration()]
+        return list(original_resources(kind))
+
+    real_connect = core_module.connect_database
+    swapped_away = False
+    swapped_back = False
+
+    @contextmanager
+    def racing_connect(
+        target: Path,
+        *,
+        read_only: bool = False,
+    ) -> Iterator[sqlite3.Connection]:
+        nonlocal swapped_away, swapped_back
+        if not read_only and not swapped_away:
+            path.rename(moved_original)
+            shutil.copy2(moved_original, path)
+            assert path.stat().st_ino != moved_original.stat().st_ino
+            swapped_away = True
+        with real_connect(target, read_only=read_only) as connection:
+            if not read_only and not swapped_back:
+                path.rename(moved_replacement)
+                moved_original.rename(path)
+                swapped_back = True
+            yield connection
+
+    monkeypatch.setattr(core_module, "_migration_resources", resources)
+    monkeypatch.setattr(core_module, "connect_database", racing_connect)
+
+    assert migrate_database(path, DatabaseKind.INVENTORY) == [2]
+
+    assert swapped_away
+    assert swapped_back
+    with real_connect(path, read_only=True) as connection:
+        assert connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 2
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'swap_back_probe'"
+            ).fetchone()[0]
+            == 1
+        )
+    assert moved_replacement.read_bytes() == before
+    with real_connect(moved_replacement, read_only=True) as connection:
+        assert connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'swap_back_probe'"
+            ).fetchone()[0]
+            == 0
+        )
+    assert not [candidate for candidate in tmp_path.iterdir() if candidate.is_dir()]
+
+
 def test_migration_rejects_schema_objects_without_history_using_stable_error(
     tmp_path: Path,
 ) -> None:
@@ -1024,9 +1432,23 @@ def test_migration_rejects_schema_objects_without_history_using_stable_error(
     assert path.read_bytes() == before
 
 
-@pytest.mark.parametrize("wal_database", ["workflow", "inventory"])
-def test_atomic_human_decision_preflight_rejects_wal_without_mutation(
-    wal_database: str, workflow_db: Path, inventory_db: Path
+@pytest.mark.parametrize(
+    ("journal_mode", "journal_database"),
+    [
+        ("WAL", "workflow"),
+        ("WAL", "inventory"),
+        ("PERSIST", "workflow"),
+        ("PERSIST", "inventory"),
+        ("TRUNCATE", "workflow"),
+        ("TRUNCATE", "inventory"),
+    ],
+)
+def test_atomic_human_decision_preflight_rejects_non_delete_mode_without_mutation(
+    journal_mode: str,
+    journal_database: str,
+    workflow_db: Path,
+    inventory_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = Settings(
         workflow_db=workflow_db,
@@ -1045,9 +1467,10 @@ def test_atomic_human_decision_preflight_rejects_wal_without_mutation(
         make_bound_review("rev_journal_mode", LEGACY_AT, invoice, risk, case_critique), claim
     )
     store.release_case_execution(claim)
-    target = workflow_db if wal_database == "workflow" else inventory_db
-    with connect_database(target) as connection:
-        assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+    target = workflow_db if journal_database == "workflow" else inventory_db
+    if journal_mode == "WAL":
+        with connect_database(target) as connection:
+            assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
     with connect_database(workflow_db, read_only=True) as connection:
         review_before = tuple(
             connection.execute(
@@ -1063,12 +1486,46 @@ def test_atomic_human_decision_preflight_rejects_wal_without_mutation(
             "SELECT * FROM item_aliases ORDER BY alias_normalized"
         ).fetchall()
 
+    if journal_mode != "WAL":
+        real_store_connect = store_module.connect_database
+
+        class ForcedJournalConnection:
+            def __init__(self, connection: sqlite3.Connection) -> None:
+                self.connection = connection
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self.connection, name)
+
+            def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+                cursor = self.connection.execute(sql, parameters)
+                if sql.startswith("ATTACH DATABASE"):
+                    schema = "main" if journal_database == "workflow" else "inventory_db"
+                    observed = self.connection.execute(
+                        f"PRAGMA {schema}.journal_mode = {journal_mode}"
+                    ).fetchone()[0]
+                    assert str(observed).casefold() == journal_mode.casefold()
+                return cursor
+
+        @contextmanager
+        def force_non_delete_journal(
+            database: Path,
+            *,
+            read_only: bool = False,
+        ) -> Iterator[Any]:
+            with real_store_connect(database, read_only=read_only) as connection:
+                if not read_only and Path(database).resolve() == workflow_db.resolve():
+                    yield ForcedJournalConnection(connection)
+                else:
+                    yield connection
+
+        monkeypatch.setattr(store_module, "connect_database", force_non_delete_journal)
+
     with pytest.raises(InvoiceAgentsError) as excinfo:
         record_human_decision(
             review.review_id,
             "reviewer@example.com",
             HumanDecisionKind.REJECT,
-            "rollback journal mode is required for two-file atomicity",
+            "DELETE journal mode is required for two-file atomicity",
             store,
             inventory_db,
         )
