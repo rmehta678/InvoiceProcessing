@@ -12,6 +12,21 @@ CREATE TABLE IF NOT EXISTS legacy_authorization_reconciliations (
     state TEXT NOT NULL CHECK(state = 'COMPLETED')
 );
 
+CREATE TABLE IF NOT EXISTS legacy_authorization_database_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    reconciliation_id TEXT NOT NULL UNIQUE REFERENCES legacy_authorization_reconciliations(
+        reconciliation_id
+    ) DEFERRABLE INITIALLY DEFERRED,
+    database_image BLOB NOT NULL,
+    sha256 TEXT NOT NULL CHECK(length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+    size_bytes INTEGER NOT NULL CHECK(size_bytes > 0),
+    captured_at TEXT NOT NULL,
+    source_schema_version INTEGER NOT NULL CHECK(source_schema_version IN (1, 2)),
+    page_size INTEGER NOT NULL CHECK(page_size > 0),
+    page_count INTEGER NOT NULL CHECK(page_count > 0),
+    active_table_counts_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS legacy_authorization_table_manifests (
     manifest_id TEXT PRIMARY KEY,
     reconciliation_id TEXT NOT NULL REFERENCES legacy_authorization_reconciliations(
@@ -62,6 +77,18 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS trg_legacy_authorization_reconciliations_immutable_delete
 BEFORE DELETE ON legacy_authorization_reconciliations
+BEGIN
+    SELECT RAISE(ABORT, 'LEGACY_AUTHORIZATION_ARCHIVE_IMMUTABLE');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_legacy_authorization_database_snapshots_immutable_update
+BEFORE UPDATE ON legacy_authorization_database_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'LEGACY_AUTHORIZATION_ARCHIVE_IMMUTABLE');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_legacy_authorization_database_snapshots_immutable_delete
+BEFORE DELETE ON legacy_authorization_database_snapshots
 BEGIN
     SELECT RAISE(ABORT, 'LEGACY_AUTHORIZATION_ARCHIVE_IMMUTABLE');
 END;

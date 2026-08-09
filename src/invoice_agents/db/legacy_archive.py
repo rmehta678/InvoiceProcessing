@@ -1,4 +1,4 @@
-"""Lossless typed archival for permanently non-authorizing legacy rows."""
+"""Exact whole-database archival plus supplemental typed legacy-row inspection."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ LEGACY_SCHEMA_MANIFEST_HASH_DOMAIN = (
     b"galatiq.invoice-agents/legacy-authorization-schema-manifest/v2\x00"
 )
 LEGACY_MANIFEST_HASH_DOMAIN = b"galatiq.invoice-agents/legacy-authorization-manifest/v2\x00"
-LEGACY_RECONCILIATION_ID_DOMAIN = b"galatiq.invoice-agents/legacy-reconciliation/v2\x00"
+LEGACY_RECONCILIATION_ID_DOMAIN = b"galatiq.invoice-agents/legacy-reconciliation/v3\x00"
 LEGACY_COLUMN_MANIFEST_DOMAIN = b"galatiq.invoice-agents/legacy-columns/v2\x00"
 LEGACY_TYPED_ROW_DOMAIN = b"galatiq.invoice-agents/legacy-row/v2\x00"
 LEGACY_ACTIVE_TABLE_KEYS: dict[str, str] = {
@@ -76,6 +76,16 @@ class LegacyDecodedTable:
     column_manifest: bytes
     schema_hash: str
     rows: tuple[LegacyDecodedRow, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyDatabaseSnapshotFacts:
+    sha256: str
+    size_bytes: int
+    source_schema_version: int
+    page_size: int
+    page_count: int
+    active_table_counts: dict[str, int]
 
 
 def _parse_canonical_utc(value: object) -> datetime | None:
@@ -211,7 +221,6 @@ def _cell_from_sqlite(storage: str, value: object) -> LegacyCell:
     if storage == "real" and isinstance(value, float):
         return LegacyCell("REAL", struct.pack(">d", value))
     if storage == "text" and isinstance(value, bytes):
-        value.decode("utf-8")
         return LegacyCell("TEXT", value)
     if storage == "blob" and isinstance(value, bytes):
         return LegacyCell("BLOB", value)
@@ -270,9 +279,10 @@ def _decode_typed_row(value: bytes, column_count: int) -> LegacyDecodedRow:
             raise ValueError("legacy NULL cell contains bytes")
         if storage == "REAL" and len(data) != 8:
             raise ValueError("legacy REAL cell is not IEEE-754 binary64")
-        decoded = cell.value()
-        if storage == "INTEGER" and (type(decoded) is not int or str(decoded).encode() != data):
-            raise ValueError("legacy INTEGER cell is not canonical")
+        if storage == "INTEGER":
+            decoded = cell.value()
+            if type(decoded) is not int or str(decoded).encode() != data:
+                raise ValueError("legacy INTEGER cell is not canonical")
         cells.append(cell)
     if len(cells) != column_count:
         raise ValueError("legacy typed row column count is invalid")
@@ -395,7 +405,10 @@ def legacy_json_safe_row(
     for column, cell in zip(table.columns, row.cells, strict=True):
         if cell.storage_class == "BLOB":
             return None
-        values[column.name] = cell.value()
+        try:
+            values[column.name] = cell.value()
+        except UnicodeDecodeError:
+            return None
     try:
         return canonical_legacy_json(values)
     except (TypeError, ValueError):
@@ -407,7 +420,10 @@ def legacy_source_record_key(table: LegacyDecodedTable, row: LegacyDecodedRow) -
     key_index = next(index for index, column in enumerate(table.columns) if column.name == key_name)
     cell = row.cells[key_index]
     if cell.storage_class == "TEXT":
-        return cell.encoded.decode("utf-8")
+        try:
+            return cell.encoded.decode("utf-8")
+        except UnicodeDecodeError:
+            return f"text:{_encode_bytes(cell.encoded)}"
     if cell.storage_class == "INTEGER":
         return cell.encoded.decode("ascii")
     return f"{cell.storage_class.lower()}:{_encode_bytes(cell.encoded)}"
@@ -458,10 +474,12 @@ def legacy_reconciliation_id(
     disposition: str,
     source_schema_version: int,
     manifest_hash: str,
+    database_snapshot_hash: str,
 ) -> str:
     material = canonical_legacy_json(
         {
             "disposition": disposition,
+            "database_snapshot": database_snapshot_hash,
             "manifest": manifest_hash,
             "reason": reason,
             "reviewer": reviewer,
@@ -478,6 +496,165 @@ def _strict_json_object(value: object) -> dict[str, Any]:
     if not isinstance(parsed, dict) or canonical_legacy_json(parsed) != value:
         raise ValueError("archive JSON is not a canonical object")
     return parsed
+
+
+def _validate_active_table_counts(value: Mapping[str, object]) -> dict[str, int]:
+    if set(value) != set(LEGACY_ACTIVE_TABLE_KEYS) or any(
+        type(count) is not int or count < 0 for count in value.values()
+    ):
+        raise ValueError("legacy database snapshot active-table counts are invalid")
+    return {table: cast(int, value[table]) for table in LEGACY_ACTIVE_TABLE_KEYS}
+
+
+def verify_serialized_database_snapshot(
+    database_image: bytes,
+    *,
+    expected_active_table_counts: Mapping[str, object],
+    expected_schema_version: int,
+) -> LegacyDatabaseSnapshotFacts:
+    """Deserialize and verify an exact, self-contained pre-reconciliation image."""
+
+    if (
+        not isinstance(database_image, bytes)
+        or not database_image.startswith(b"SQLite format 3\x00")
+        or type(expected_schema_version) is not int
+        or expected_schema_version not in (1, 2)
+    ):
+        raise ValueError("legacy database snapshot identity is invalid")
+    expected_counts = _validate_active_table_counts(expected_active_table_counts)
+    snapshot = sqlite3.connect(":memory:")
+    try:
+        snapshot.deserialize(database_image)
+        if snapshot.serialize() != database_image:
+            raise ValueError("legacy database snapshot is not byte-exact after deserialization")
+        integrity_rows = tuple(str(row[0]) for row in snapshot.execute("PRAGMA integrity_check"))
+        if integrity_rows != ("ok",):
+            raise ValueError("legacy database snapshot failed integrity verification")
+        history = tuple(
+            row[0]
+            for row in snapshot.execute("SELECT version FROM schema_version ORDER BY version")
+        )
+        if history != tuple(range(1, expected_schema_version + 1)):
+            raise ValueError("legacy database snapshot schema version is invalid")
+        actual_counts: dict[str, int] = {}
+        for table in LEGACY_ACTIVE_TABLE_KEYS:
+            table_exists = snapshot.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            if table_exists is None:
+                raise ValueError("legacy database snapshot active table is missing")
+            actual_counts[table] = int(
+                snapshot.execute(f"SELECT COUNT(*) FROM {_quote_identifier(table)}").fetchone()[0]
+            )
+        if actual_counts != expected_counts:
+            raise ValueError("legacy database snapshot active facts do not match")
+        page_size = int(snapshot.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(snapshot.execute("PRAGMA page_count").fetchone()[0])
+        if page_size <= 0 or page_count <= 0 or page_size * page_count != len(database_image):
+            raise ValueError("legacy database snapshot page metadata is invalid")
+    except sqlite3.Error as exc:
+        raise ValueError("legacy database snapshot is not a valid SQLite database") from exc
+    finally:
+        snapshot.close()
+    return LegacyDatabaseSnapshotFacts(
+        sha256=hashlib.sha256(database_image).hexdigest(),
+        size_bytes=len(database_image),
+        source_schema_version=expected_schema_version,
+        page_size=page_size,
+        page_count=page_count,
+        active_table_counts=actual_counts,
+    )
+
+
+def _load_verified_database_snapshot(
+    connection: sqlite3.Connection,
+    reconciliation_id: str,
+) -> tuple[bytes, LegacyDatabaseSnapshotFacts]:
+    row = connection.execute(
+        "SELECT snapshot.snapshot_id, snapshot.reconciliation_id, "
+        "snapshot.database_image, snapshot.sha256, snapshot.size_bytes, "
+        "snapshot.captured_at, snapshot.source_schema_version, snapshot.page_size, "
+        "snapshot.page_count, snapshot.active_table_counts_json, "
+        "metadata.confirmed_at, metadata.source_schema_version AS metadata_schema_version "
+        "FROM legacy_authorization_database_snapshots AS snapshot "
+        "JOIN legacy_authorization_reconciliations AS metadata "
+        "ON metadata.reconciliation_id = snapshot.reconciliation_id "
+        "WHERE snapshot.reconciliation_id = ?",
+        (reconciliation_id,),
+    ).fetchall()
+    if len(row) != 1:
+        raise ValueError("legacy database snapshot does not exist exactly once")
+    record = row[0]
+    image = record["database_image"]
+    counts = _strict_json_object(record["active_table_counts_json"])
+    if not isinstance(image, bytes):
+        raise ValueError("legacy database snapshot image is not a blob")
+    facts = verify_serialized_database_snapshot(
+        image,
+        expected_active_table_counts=counts,
+        expected_schema_version=record["source_schema_version"],
+    )
+    if (
+        record["snapshot_id"] != f"ldbs_{facts.sha256}"
+        or record["reconciliation_id"] != reconciliation_id
+        or record["sha256"] != facts.sha256
+        or record["size_bytes"] != facts.size_bytes
+        or record["source_schema_version"] != facts.source_schema_version
+        or record["page_size"] != facts.page_size
+        or record["page_count"] != facts.page_count
+        or counts != facts.active_table_counts
+        or canonical_legacy_json(counts) != record["active_table_counts_json"]
+        or _parse_canonical_utc(record["captured_at"]) is None
+        or record["captured_at"] != record["confirmed_at"]
+        or record["source_schema_version"] != record["metadata_schema_version"]
+    ):
+        raise ValueError("legacy database snapshot metadata is invalid")
+    return image, facts
+
+
+def export_legacy_database_snapshot(
+    connection: sqlite3.Connection,
+    reconciliation_id: str,
+) -> bytes:
+    """Return one archive image only after byte, hash, and fact verification."""
+
+    image, _facts = _load_verified_database_snapshot(connection, reconciliation_id)
+    return image
+
+
+def restore_legacy_database_snapshot(
+    archive_connection: sqlite3.Connection,
+    destination_connection: sqlite3.Connection,
+    reconciliation_id: str,
+) -> bytes:
+    """Restore the authoritative whole-database image into an empty connection."""
+
+    if destination_connection.in_transaction:
+        raise ValueError("legacy database restore requires an idle destination connection")
+    existing_objects = int(
+        destination_connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+        ).fetchone()[0]
+    )
+    if existing_objects:
+        raise ValueError("legacy database restore requires an empty destination connection")
+    image, facts = _load_verified_database_snapshot(archive_connection, reconciliation_id)
+    try:
+        destination_connection.deserialize(image)
+    except sqlite3.Error as exc:
+        raise ValueError("legacy database snapshot could not be restored") from exc
+    restored_image = destination_connection.serialize()
+    if restored_image != image:
+        raise ValueError("restored legacy database differs from its archived image")
+    restored_facts = verify_serialized_database_snapshot(
+        restored_image,
+        expected_active_table_counts=facts.active_table_counts,
+        expected_schema_version=facts.source_schema_version,
+    )
+    if restored_facts != facts:
+        raise ValueError("restored legacy database facts differ from their archive")
+    return image
 
 
 def _decode_table_manifest(row: sqlite3.Row) -> LegacyDecodedTable:
@@ -516,6 +693,10 @@ def audit_legacy_authorization_archives(connection: sqlite3.Connection) -> int:
         "table_counts_json, state FROM legacy_authorization_reconciliations "
         "ORDER BY reconciliation_id"
     ).fetchall()
+    snapshot_rows = connection.execute(
+        "SELECT snapshot_id, reconciliation_id FROM legacy_authorization_database_snapshots "
+        "ORDER BY reconciliation_id"
+    ).fetchall()
     manifest_rows = connection.execute(
         "SELECT manifest_id, reconciliation_id, source_table_order, source_table, "
         "source_table_sql, column_manifest, schema_hash, original_row_count "
@@ -536,16 +717,22 @@ def audit_legacy_authorization_archives(connection: sqlite3.Connection) -> int:
         "quarantine.source_row_ordinal"
     ).fetchall()
     metadata_by_id = {row["reconciliation_id"]: row for row in metadata_rows}
+    snapshots_by_id: dict[object, list[sqlite3.Row]] = {}
     manifests_by_id: dict[object, list[sqlite3.Row]] = {}
     rows_by_id: dict[object, list[sqlite3.Row]] = {}
     for row in manifest_rows:
         manifests_by_id.setdefault(row["reconciliation_id"], []).append(row)
+    for row in snapshot_rows:
+        snapshots_by_id.setdefault(row["reconciliation_id"], []).append(row)
     for row in archive_rows:
         rows_by_id.setdefault(row["reconciliation_id"], []).append(row)
-    reconciliation_ids = set(metadata_by_id) | set(manifests_by_id) | set(rows_by_id)
+    reconciliation_ids = (
+        set(metadata_by_id) | set(snapshots_by_id) | set(manifests_by_id) | set(rows_by_id)
+    )
     invalid = 0
     for reconciliation_id in reconciliation_ids:
         metadata = metadata_by_id.get(reconciliation_id)
+        raw_snapshots = snapshots_by_id.get(reconciliation_id, [])
         raw_manifests = manifests_by_id.get(reconciliation_id, [])
         raw_rows = rows_by_id.get(reconciliation_id, [])
         try:
@@ -567,6 +754,12 @@ def audit_legacy_authorization_archives(connection: sqlite3.Connection) -> int:
                 or metadata["record_count"] != len(raw_rows)
             ):
                 raise ValueError("legacy reconciliation metadata is invalid")
+            if len(raw_snapshots) != 1:
+                raise ValueError("legacy reconciliation database snapshot is missing")
+            _snapshot_image, snapshot_facts = _load_verified_database_snapshot(
+                connection,
+                reconciliation_id,
+            )
             decoded_manifests = tuple(_decode_table_manifest(row) for row in raw_manifests)
             expected_tables = tuple(LEGACY_ACTIVE_TABLE_KEYS)
             if (
@@ -651,6 +844,7 @@ def audit_legacy_authorization_archives(connection: sqlite3.Connection) -> int:
                 disposition=metadata["disposition"],
                 source_schema_version=metadata["source_schema_version"],
                 manifest_hash=manifest_hash,
+                database_snapshot_hash=snapshot_facts.sha256,
             ):
                 raise ValueError("legacy reconciliation identity is invalid")
         except (KeyError, TypeError, ValueError):
@@ -705,7 +899,7 @@ def restore_legacy_authorization_archive(
     destination_connection: sqlite3.Connection,
     reconciliation_id: str,
 ) -> tuple[LegacyDecodedTable, ...]:
-    """Restore a verified archive into an isolated forensic SQLite connection exactly."""
+    """Restore the supplemental active-table projection for forensic inspection."""
 
     tables = decode_legacy_authorization_archive(archive_connection, reconciliation_id)
     foreign_keys = int(destination_connection.execute("PRAGMA foreign_keys").fetchone()[0])
@@ -726,8 +920,13 @@ def restore_legacy_authorization_archive(
             quoted_table = _quote_identifier(table.source_table)
             quoted_columns = ", ".join(_quote_identifier(column.name) for column in table.columns)
             for row in table.rows:
-                values = tuple(cell.value() for cell in row.cells)
-                placeholders = ", ".join("?" for _ in values)
+                values = tuple(
+                    cell.encoded if cell.storage_class == "TEXT" else cell.value()
+                    for cell in row.cells
+                )
+                placeholders = ", ".join(
+                    "CAST(? AS TEXT)" if cell.storage_class == "TEXT" else "?" for cell in row.cells
+                )
                 if row.source_rowid is None:
                     destination_connection.execute(
                         f"INSERT INTO {quoted_table}({quoted_columns}) VALUES ({placeholders})",

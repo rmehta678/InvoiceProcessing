@@ -125,6 +125,7 @@ def make_review(
         agent_recommendation=DecisionKind.HOLD,
         agent_rationale=["needs human review"],
         critic=make_critique(DecisionKind.HOLD),
+        critic_disagreement_reason=None,
         questions=["Does the evidence support this decision?"],
         created_at=datetime(2026, 1, 1, tzinfo=UTC),
         human_decision=HumanDecision(

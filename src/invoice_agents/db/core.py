@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -341,8 +342,10 @@ def _read_migration_history(
     *,
     kind: DatabaseKind,
     packaged_versions: tuple[int, ...],
+    packaged_hashes: dict[int, str] | None = None,
+    allow_durable_retrofit: bool = False,
 ) -> tuple[int, ...]:
-    """Read an existing history in insertion order and require an exact prefix."""
+    """Require legacy set-prefix semantics and durable ordered history from v3 onward."""
 
     try:
         table = connection.execute(
@@ -357,27 +360,203 @@ def _read_migration_history(
             if user_objects:
                 raise ValueError("database has schema objects but no migration history")
             return ()
-        rows = connection.execute("SELECT version FROM schema_version ORDER BY rowid").fetchall()
-        versions = tuple(row["version"] for row in rows)
+        rows = connection.execute("SELECT version FROM schema_version").fetchall()
+        raw_versions = tuple(row["version"] for row in rows)
+        if any(type(version) is not int for version in raw_versions):
+            raise ValueError("migration versions have invalid storage types")
+        versions = tuple(sorted(raw_versions))
+        if len(set(versions)) != len(versions):
+            raise ValueError("migration versions are not unique")
+        expected = tuple(range(1, len(versions) + 1))
+        if (
+            versions != expected
+            or len(versions) > len(packaged_versions)
+            or versions != packaged_versions[: len(versions)]
+        ):
+            raise ValueError("migration versions are not a packaged contiguous prefix")
+        if not versions:
+            unexpected_objects = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM sqlite_master "
+                    "WHERE name NOT LIKE 'sqlite_%' AND name <> 'schema_version'"
+                ).fetchone()[0]
+            )
+            if unexpected_objects:
+                raise ValueError("empty migration history has unexpected schema objects")
+        durable_table = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'schema_migration_history'"
+        ).fetchone()
+        if kind is not DatabaseKind.WORKFLOW or not versions or versions[-1] < 3:
+            if durable_table is not None:
+                raise ValueError("durable migration history exists before workflow v3")
+            return versions
+        if durable_table is None:
+            durable_artifacts = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'schema_migration_history' "
+                    "OR name LIKE 'trg_schema_migration_history_%'"
+                ).fetchone()[0]
+            )
+            if durable_artifacts:
+                raise ValueError("partial durable migration history schema is invalid")
+            if allow_durable_retrofit and versions == (1, 2, 3):
+                return versions
+            raise ValueError("durable workflow migration history is missing")
+        if packaged_hashes is None:
+            raise ValueError("packaged migration hashes are unavailable")
+        _verify_durable_migration_history(
+            connection,
+            versions=versions,
+            packaged_hashes=packaged_hashes,
+        )
     except (sqlite3.Error, ValueError) as exc:
         raise DatabaseVerificationError(
             ErrorCategory.DATABASE,
             f"{kind.value} migration history cannot be read",
             stop_reason="MIGRATION_HISTORY_INVALID",
         ) from exc
-    expected = tuple(range(1, len(versions) + 1))
-    if (
-        any(type(version) is not int for version in versions)
-        or versions != expected
-        or len(versions) > len(packaged_versions)
-        or versions != packaged_versions[: len(versions)]
-    ):
-        raise DatabaseVerificationError(
-            ErrorCategory.DATABASE,
-            f"{kind.value} migration history is not an exact contiguous prefix from version 1",
-            stop_reason="MIGRATION_HISTORY_INVALID",
-        )
     return versions
+
+
+def _migration_hashes(resources: list[Traversable]) -> dict[int, str]:
+    return {
+        int(resource.name.split("_", 1)[0]): hashlib.sha256(resource.read_bytes()).hexdigest()
+        for resource in resources
+    }
+
+
+def _migration_history_schema_contract() -> tuple[str, dict[str, str]]:
+    migration = next(
+        (
+            resource
+            for resource in _migration_resources(DatabaseKind.WORKFLOW)
+            if int(resource.name.split("_", 1)[0]) == 3
+        ),
+        None,
+    )
+    if migration is None:
+        raise ValueError("packaged workflow migration 003 is unavailable")
+    table_statement: str | None = None
+    trigger_statements: dict[str, str] = {}
+    for statement in _migration_statements(migration.read_text(encoding="utf-8")):
+        table_match = re.match(
+            r"CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+(schema_migration_history)\b",
+            statement,
+            flags=re.IGNORECASE,
+        )
+        if table_match:
+            table_statement = statement
+            continue
+        trigger_match = re.match(
+            r"CREATE\s+TRIGGER(?:\s+IF\s+NOT\s+EXISTS)?\s+"
+            r"(trg_schema_migration_history_[A-Za-z0-9_]+)\b",
+            statement,
+            flags=re.IGNORECASE,
+        )
+        if trigger_match:
+            trigger_statements[trigger_match.group(1)] = statement
+    expected_triggers = {
+        "trg_schema_migration_history_monotonic_insert",
+        "trg_schema_migration_history_immutable_update",
+        "trg_schema_migration_history_immutable_delete",
+    }
+    if table_statement is None or set(trigger_statements) != expected_triggers:
+        raise ValueError("packaged durable migration history schema is incomplete")
+    return table_statement, trigger_statements
+
+
+def _is_canonical_utc(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return (
+        parsed.tzinfo is not None
+        and parsed.utcoffset() == UTC.utcoffset(parsed)
+        and parsed.isoformat() == value
+    )
+
+
+def _verify_durable_migration_history(
+    connection: sqlite3.Connection,
+    *,
+    versions: tuple[int, ...],
+    packaged_hashes: dict[int, str],
+) -> None:
+    table_statement, trigger_statements = _migration_history_schema_contract()
+    actual_table = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'schema_migration_history'"
+    ).fetchone()
+    if (
+        actual_table is None
+        or not isinstance(actual_table["sql"], str)
+        or _normalized_sql(actual_table["sql"]) != _normalized_sql(table_statement)
+    ):
+        raise ValueError("durable migration history table schema is invalid")
+    actual_triggers = {
+        str(row["name"]): str(row["sql"])
+        for row in connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND tbl_name = 'schema_migration_history'"
+        ).fetchall()
+        if row["sql"] is not None
+    }
+    if set(actual_triggers) != set(trigger_statements) or any(
+        _normalized_sql(actual_triggers[name]) != _normalized_sql(statement)
+        for name, statement in trigger_statements.items()
+    ):
+        raise ValueError("durable migration history triggers are invalid")
+    rows = connection.execute(
+        "SELECT ordinal, version, migration_sha256, applied_at "
+        "FROM schema_migration_history ORDER BY ordinal"
+    ).fetchall()
+    if len(rows) != len(versions):
+        raise ValueError("durable migration history row count is invalid")
+    for expected_ordinal, (version, row) in enumerate(zip(versions, rows, strict=True), start=1):
+        if (
+            type(row["ordinal"]) is not int
+            or row["ordinal"] != expected_ordinal
+            or type(row["version"]) is not int
+            or row["version"] != version
+            or not isinstance(row["migration_sha256"], str)
+            or row["migration_sha256"] != packaged_hashes.get(version)
+            or not _is_canonical_utc(row["applied_at"])
+        ):
+            raise ValueError("durable migration history row is invalid")
+
+
+def _install_durable_migration_history_schema(connection: sqlite3.Connection) -> None:
+    table_exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migration_history'"
+    ).fetchone()
+    if table_exists is not None:
+        return
+    table_statement, trigger_statements = _migration_history_schema_contract()
+    connection.execute(table_statement)
+    for statement in trigger_statements.values():
+        connection.execute(statement)
+
+
+def _backfill_durable_migration_history(
+    connection: sqlite3.Connection,
+    *,
+    versions: tuple[int, ...],
+    packaged_hashes: dict[int, str],
+    applied_at: str,
+) -> None:
+    if connection.execute("SELECT COUNT(*) FROM schema_migration_history").fetchone()[0]:
+        raise ValueError("durable migration history is not empty before backfill")
+    connection.executemany(
+        "INSERT INTO schema_migration_history("
+        "ordinal, version, migration_sha256, applied_at) VALUES (?, ?, ?, ?)",
+        (
+            (ordinal, version, packaged_hashes[version], applied_at)
+            for ordinal, version in enumerate(versions, start=1)
+        ),
+    )
 
 
 def _preflight_existing_migration_history(
@@ -385,6 +564,7 @@ def _preflight_existing_migration_history(
     *,
     kind: DatabaseKind,
     packaged_versions: tuple[int, ...],
+    packaged_hashes: dict[int, str],
 ) -> tuple[int, ...] | None:
     """Validate a present SQLite file without opening any write transaction."""
 
@@ -396,6 +576,8 @@ def _preflight_existing_migration_history(
             connection,
             kind=kind,
             packaged_versions=packaged_versions,
+            packaged_hashes=packaged_hashes,
+            allow_durable_retrofit=True,
         )
 
 
@@ -443,6 +625,18 @@ def _install_legacy_archive_schema(connection: sqlite3.Connection) -> None:
             "table_counts_json",
             "state",
         ),
+        "legacy_authorization_database_snapshots": (
+            "snapshot_id",
+            "reconciliation_id",
+            "database_image",
+            "sha256",
+            "size_bytes",
+            "captured_at",
+            "source_schema_version",
+            "page_size",
+            "page_count",
+            "active_table_counts_json",
+        ),
         "legacy_authorization_table_manifests": (
             "manifest_id",
             "reconciliation_id",
@@ -482,7 +676,8 @@ def _install_legacy_archive_schema(connection: sqlite3.Connection) -> None:
         for table, columns in installed_columns.items()
         if columns and columns != expected_columns[table]
     }
-    if incompatible:
+    missing = {table for table, columns in installed_columns.items() if not columns}
+    if incompatible or missing:
         archived_rows = sum(
             int(
                 connection.execute(f"SELECT COUNT(*) FROM {_quote_identifier(table)}").fetchone()[0]
@@ -495,11 +690,15 @@ def _install_legacy_archive_schema(connection: sqlite3.Connection) -> None:
                 ErrorCategory.DATABASE,
                 "an existing legacy authorization archive cannot be upgraded losslessly",
                 stop_reason="LEGACY_RECONCILIATION_ARCHIVE_UPGRADE_REQUIRED",
-                details={"incompatible_archive_tables": sorted(incompatible)},
+                details={
+                    "incompatible_archive_tables": sorted(incompatible),
+                    "missing_archive_tables": sorted(missing),
+                },
             )
         for table in (
             "legacy_authorization_quarantine",
             "legacy_authorization_table_manifests",
+            "legacy_authorization_database_snapshots",
             "legacy_authorization_reconciliations",
         ):
             connection.execute(f"DROP TABLE IF EXISTS {_quote_identifier(table)}")
@@ -508,18 +707,143 @@ def _install_legacy_archive_schema(connection: sqlite3.Connection) -> None:
 
 
 def _normalized_sql(sql: str) -> str:
-    normalized = re.sub(r"\s+", " ", sql.strip().rstrip(";")).casefold()
-    # SQLite does not preserve the optional creation guard consistently in
-    # sqlite_master. It has no bearing on the installed object's definition.
-    return re.sub(
-        r"\b(create (?:index|table|trigger)) if not exists\b",
-        r"\1",
-        normalized,
-    )
+    """Canonicalize SQLite syntax without altering protected token bytes.
+
+    SQLite keywords and unquoted identifiers are case-insensitive, comments and
+    token spacing are insignificant, and ``IF NOT EXISTS`` is only an execution
+    guard.  String/blob literals and every quoted-identifier spelling are data,
+    though, so their exact code points and case remain part of the schema contract.
+    """
+
+    tokens: list[tuple[str, str]] = []
+    index = 0
+    length = len(sql)
+
+    def quoted_token(start: int, delimiter: str) -> int:
+        cursor = start + 1
+        if delimiter == "[":
+            while cursor < length:
+                cursor += 1
+                if sql[cursor - 1] == "]":
+                    break
+            return cursor
+        while cursor < length:
+            if sql[cursor] != delimiter:
+                cursor += 1
+                continue
+            cursor += 1
+            if cursor < length and sql[cursor] == delimiter:
+                cursor += 1
+                continue
+            break
+        return cursor
+
+    while index < length:
+        character = sql[index]
+        if character.isspace():
+            index += 1
+            continue
+        if sql.startswith("--", index):
+            newline = sql.find("\n", index + 2)
+            index = length if newline < 0 else newline + 1
+            continue
+        if sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            index = length if end < 0 else end + 2
+            continue
+        if (
+            character in "xX"
+            and index + 1 < length
+            and sql[index + 1] == "'"
+            and (index == 0 or not (sql[index - 1].isalnum() or sql[index - 1] in "_$"))
+        ):
+            end = quoted_token(index + 1, "'")
+            tokens.append(("protected", sql[index:end]))
+            index = end
+            continue
+        if character in "'\"`[":
+            end = quoted_token(index, character)
+            tokens.append(("protected", sql[index:end]))
+            index = end
+            continue
+        if character.isdigit() or (
+            character == "." and index + 1 < length and sql[index + 1].isdigit()
+        ):
+            end = index
+            if sql.startswith(("0x", "0X"), index):
+                end += 2
+                while end < length and (sql[end].isdigit() or sql[end].lower() in "abcdef_"):
+                    end += 1
+            else:
+                while end < length and (sql[end].isdigit() or sql[end] == "_"):
+                    end += 1
+                if end < length and sql[end] == ".":
+                    end += 1
+                    while end < length and (sql[end].isdigit() or sql[end] == "_"):
+                        end += 1
+                if end < length and sql[end] in "eE":
+                    exponent = end + 1
+                    if exponent < length and sql[exponent] in "+-":
+                        exponent += 1
+                    digits = exponent
+                    while exponent < length and (sql[exponent].isdigit() or sql[exponent] == "_"):
+                        exponent += 1
+                    if exponent > digits:
+                        end = exponent
+            tokens.append(("unquoted", sql[index:end].casefold()))
+            index = end
+            continue
+        if character.isalpha() or character in "_$":
+            end = index + 1
+            while end < length and (sql[end].isalnum() or sql[end] in "_$"):
+                end += 1
+            tokens.append(("unquoted", sql[index:end].casefold()))
+            index = end
+            continue
+        operator = next(
+            (
+                candidate
+                for candidate in ("->>", "||", "->", "<<", ">>", "<=", ">=", "==", "!=", "<>", ":=")
+                if sql.startswith(candidate, index)
+            ),
+            None,
+        )
+        if operator is not None:
+            tokens.append(("punctuation", operator))
+            index += len(operator)
+            continue
+        tokens.append(("punctuation", character))
+        index += 1
+
+    while tokens and tokens[-1] == ("punctuation", ";"):
+        tokens.pop()
+
+    unquoted = [value if kind == "unquoted" else None for kind, value in tokens]
+    try:
+        create_at = unquoted.index("create")
+    except ValueError:
+        create_at = -1
+    if create_at >= 0:
+        object_at = create_at + 1
+        while object_at < len(tokens) and unquoted[object_at] in {
+            "temp",
+            "temporary",
+            "unique",
+        }:
+            object_at += 1
+        if (
+            object_at < len(tokens)
+            and unquoted[object_at] in {"index", "table", "trigger"}
+            and unquoted[object_at + 1 : object_at + 4] == ["if", "not", "exists"]
+        ):
+            del tokens[object_at + 1 : object_at + 4]
+
+    return json.dumps(tokens, ensure_ascii=False, separators=(",", ":"))
 
 
 WORKFLOW_SCHEMA_MANIFEST_TABLES = (
     "schema_version",
+    "schema_migration_history",
     "source_artifacts",
     "cases",
     "extractions",
@@ -532,6 +856,7 @@ WORKFLOW_SCHEMA_MANIFEST_TABLES = (
     "final_decisions",
     "payments",
     "legacy_authorization_reconciliations",
+    "legacy_authorization_database_snapshots",
     "legacy_authorization_table_manifests",
     "legacy_authorization_quarantine",
     "events",
@@ -721,12 +1046,14 @@ def reconcile_legacy_authorization(
         audit_legacy_authorization_archives,
         canonical_legacy_json,
         capture_legacy_authorization_tables,
+        export_legacy_database_snapshot,
         legacy_json_safe_row,
         legacy_manifest_hash,
         legacy_reconciliation_id,
         legacy_record_hash,
         legacy_schema_manifest_hash,
         legacy_source_record_key,
+        verify_serialized_database_snapshot,
     )
 
     selected_reviewer = reviewer.strip()
@@ -752,10 +1079,12 @@ def reconcile_legacy_authorization(
     _assert_sqlite_file(resolved)
     resources = _migration_resources(DatabaseKind.WORKFLOW)
     packaged_versions = _migration_versions(resources, DatabaseKind.WORKFLOW)
+    packaged_hashes = _migration_hashes(resources)
     expected_history = _preflight_existing_migration_history(
         resolved,
         kind=DatabaseKind.WORKFLOW,
         packaged_versions=packaged_versions,
+        packaged_hashes=packaged_hashes,
     )
     assert expected_history is not None
     with connect_database(resolved) as connection:
@@ -764,6 +1093,7 @@ def reconcile_legacy_authorization(
                 connection,
                 kind=DatabaseKind.WORKFLOW,
                 packaged_versions=packaged_versions,
+                packaged_hashes=packaged_hashes,
             )
             if current_history != expected_history:
                 raise DatabaseVerificationError(
@@ -782,6 +1112,7 @@ def reconcile_legacy_authorization(
             captured_tables = capture_legacy_authorization_tables(connection)
             active_count = sum(len(table.rows) for table in captured_tables)
             if archive_schema_exists:
+                _install_legacy_archive_schema(connection)
                 metadata_rows = connection.execute(
                     "SELECT reconciliation_id, reviewer, reason, disposition, confirmed_at, "
                     "record_count, record_manifest_hash, table_counts_json "
@@ -840,9 +1171,29 @@ def reconcile_legacy_authorization(
                     stop_reason="LEGACY_AUTHORIZATION_NOT_FOUND",
                 )
 
-            _install_legacy_archive_schema(connection)
-            table_counts = {table.source_table: len(table.rows) for table in captured_tables}
             archived_at = utc_now()
+            table_counts = {
+                table: int(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM {_quote_identifier(table)}"
+                    ).fetchone()[0]
+                )
+                for table in LEGACY_ACTIVE_TABLE_KEYS
+            }
+            snapshot_image = connection.serialize()
+            snapshot_facts = verify_serialized_database_snapshot(
+                snapshot_image,
+                expected_active_table_counts=table_counts,
+                expected_schema_version=version,
+            )
+            captured_counts = {table.source_table: len(table.rows) for table in captured_tables}
+            if captured_counts != table_counts:
+                raise DatabaseVerificationError(
+                    ErrorCategory.DATABASE,
+                    "legacy active facts changed during exact snapshot capture",
+                    stop_reason="LEGACY_RECONCILIATION_STATE_INVALID",
+                )
+            _install_legacy_archive_schema(connection)
             archived_records: list[
                 tuple[str, int, int | None, str, str | None, bytes, str, str]
             ] = []
@@ -879,6 +1230,7 @@ def reconcile_legacy_authorization(
                 disposition=disposition,
                 source_schema_version=version,
                 manifest_hash=manifest_hash,
+                database_snapshot_hash=snapshot_facts.sha256,
             )
             for manifest_table in captured_tables:
                 connection.execute(
@@ -947,6 +1299,31 @@ def reconcile_legacy_authorization(
                     canonical_legacy_json(table_counts),
                 ),
             )
+            connection.execute(
+                "INSERT INTO legacy_authorization_database_snapshots("
+                "snapshot_id, reconciliation_id, database_image, sha256, size_bytes, "
+                "captured_at, source_schema_version, page_size, page_count, "
+                "active_table_counts_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"ldbs_{snapshot_facts.sha256}",
+                    reconciliation_id,
+                    sqlite3.Binary(snapshot_image),
+                    snapshot_facts.sha256,
+                    snapshot_facts.size_bytes,
+                    archived_at,
+                    snapshot_facts.source_schema_version,
+                    snapshot_facts.page_size,
+                    snapshot_facts.page_count,
+                    canonical_legacy_json(snapshot_facts.active_table_counts),
+                ),
+            )
+            readback_image = export_legacy_database_snapshot(connection, reconciliation_id)
+            if readback_image != snapshot_image:
+                raise DatabaseVerificationError(
+                    ErrorCategory.DATABASE,
+                    "legacy database snapshot readback differs from its source",
+                    stop_reason="LEGACY_RECONCILIATION_ARCHIVE_INVALID",
+                )
             if audit_legacy_authorization_archives(connection):
                 raise DatabaseVerificationError(
                     ErrorCategory.DATABASE,
@@ -997,10 +1374,12 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
     path = path.resolve()
     resources = _migration_resources(selected_kind)
     packaged_versions = _migration_versions(resources, selected_kind)
+    packaged_hashes = _migration_hashes(resources)
     expected_history = _preflight_existing_migration_history(
         path,
         kind=selected_kind,
         packaged_versions=packaged_versions,
+        packaged_hashes=packaged_hashes,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     applied: list[int] = []
@@ -1017,6 +1396,8 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
                 connection,
                 kind=selected_kind,
                 packaged_versions=packaged_versions,
+                packaged_hashes=packaged_hashes,
+                allow_durable_retrofit=True,
             )
             if history != expected_history:
                 raise DatabaseVerificationError(
@@ -1032,8 +1413,26 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 _install_legacy_archive_schema(connection)
+                durable_history_exists = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'schema_migration_history'"
+                ).fetchone()
+                if durable_history_exists is None:
+                    _install_durable_migration_history_schema(connection)
+                    _backfill_durable_migration_history(
+                        connection,
+                        versions=history,
+                        packaged_hashes=packaged_hashes,
+                        applied_at=utc_now(),
+                    )
+                _read_migration_history(
+                    connection,
+                    kind=selected_kind,
+                    packaged_versions=packaged_versions,
+                    packaged_hashes=packaged_hashes,
+                )
                 connection.commit()
-            except sqlite3.Error as exc:
+            except (sqlite3.Error, ValueError) as exc:
                 connection.rollback()
                 raise DatabaseVerificationError(
                     ErrorCategory.DATABASE,
@@ -1047,15 +1446,20 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
             script = resource.read_text(encoding="utf-8")
             statements = _migration_statements(script)
             normalized_statements = {_normalized_sql(statement) for statement in statements}
-            disable_foreign_keys = "pragma foreign_keys=off" in normalized_statements
+            disable_foreign_keys = (
+                _normalized_sql("PRAGMA foreign_keys=OFF") in normalized_statements
+            )
             transaction_controls = {
-                "begin",
-                "begin transaction",
-                "begin immediate",
-                "commit",
-                "end transaction",
-                "pragma foreign_keys=off",
-                "pragma foreign_keys=on",
+                _normalized_sql(statement)
+                for statement in (
+                    "BEGIN",
+                    "BEGIN TRANSACTION",
+                    "BEGIN IMMEDIATE",
+                    "COMMIT",
+                    "END TRANSACTION",
+                    "PRAGMA foreign_keys=OFF",
+                    "PRAGMA foreign_keys=ON",
+                )
             }
             try:
                 if disable_foreign_keys:
@@ -1068,15 +1472,37 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
                     if _normalized_sql(statement) in transaction_controls:
                         continue
                     connection.execute(statement)
+                applied_at = utc_now()
                 connection.execute(
                     "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
-                    (version, utc_now()),
+                    (version, applied_at),
                 )
+                if selected_kind is DatabaseKind.WORKFLOW and version >= 3:
+                    if version == 3:
+                        _backfill_durable_migration_history(
+                            connection,
+                            versions=tuple(range(1, version + 1)),
+                            packaged_hashes=packaged_hashes,
+                            applied_at=applied_at,
+                        )
+                    else:
+                        connection.execute(
+                            "INSERT INTO schema_migration_history("
+                            "ordinal, version, migration_sha256, applied_at) "
+                            "VALUES (?, ?, ?, ?)",
+                            (version, version, packaged_hashes[version], applied_at),
+                        )
+                    _read_migration_history(
+                        connection,
+                        kind=selected_kind,
+                        packaged_versions=packaged_versions,
+                        packaged_hashes=packaged_hashes,
+                    )
                 connection.commit()
             except DatabaseVerificationError:
                 connection.rollback()
                 raise
-            except sqlite3.Error as exc:
+            except (sqlite3.Error, ValueError) as exc:
                 connection.rollback()
                 raise DatabaseVerificationError(
                     ErrorCategory.DATABASE,
@@ -1224,6 +1650,9 @@ def verify_database(
     selected_kind = kind or infer_kind(path)
     resolved = path.resolve()
     _assert_sqlite_file(resolved)
+    migration_resources = _migration_resources(selected_kind)
+    packaged_versions = _migration_versions(migration_resources, selected_kind)
+    packaged_hashes = _migration_hashes(migration_resources)
     inventory_resolved: Path | None = None
     if selected_kind is DatabaseKind.WORKFLOW:
         if settings is None:
@@ -1256,6 +1685,12 @@ def verify_database(
     else:
         required = {
             "schema_version": {"version", "applied_at"},
+            "schema_migration_history": {
+                "ordinal",
+                "version",
+                "migration_sha256",
+                "applied_at",
+            },
             "source_artifacts": {"source_id", "source_hash", "metadata_json"},
             "cases": {
                 "case_id",
@@ -1338,6 +1773,18 @@ def verify_database(
                 "table_counts_json",
                 "state",
             },
+            "legacy_authorization_database_snapshots": {
+                "snapshot_id",
+                "reconciliation_id",
+                "database_image",
+                "sha256",
+                "size_bytes",
+                "captured_at",
+                "source_schema_version",
+                "page_size",
+                "page_count",
+                "active_table_counts_json",
+            },
             "legacy_authorization_table_manifests": {
                 "manifest_id",
                 "reconciliation_id",
@@ -1399,6 +1846,12 @@ def verify_database(
                     f"for {selected_kind.value}",
                     stop_reason="DATABASE_VERSION_MISMATCH",
                 )
+            _read_migration_history(
+                connection,
+                kind=selected_kind,
+                packaged_versions=packaged_versions,
+                packaged_hashes=packaged_hashes,
+            )
             for table, expected_columns in required.items():
                 actual_columns = _columns(connection, table)
                 missing = expected_columns - actual_columns

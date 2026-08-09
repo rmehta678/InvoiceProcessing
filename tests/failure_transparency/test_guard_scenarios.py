@@ -182,6 +182,7 @@ def _pending_review(case_id: str) -> ReviewRequest:
         agent_recommendation=DecisionKind.HOLD,
         agent_rationale=["awaiting human review"],
         critic=_critique(DecisionKind.HOLD),
+        critic_disagreement_reason=None,
         questions=["Does the evidence support this decision?"],
         created_at=datetime.now(UTC),
     )

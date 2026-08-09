@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import invoice_agents.db.core as core_module
 from invoice_agents.agents.decision_rules import blocking_evidence
 from invoice_agents.config import Settings
 from invoice_agents.db.core import (
@@ -78,6 +79,7 @@ def make_review(review_id: str, created_at: datetime, source: SourceArtifact) ->
         agent_recommendation=DecisionKind.HOLD,
         agent_rationale=["legacy review"],
         critic=make_critique(),
+        critic_disagreement_reason=None,
         questions=["Does the legacy evidence support this decision?"],
         created_at=created_at,
     )
@@ -163,6 +165,7 @@ def make_bound_review(
         agent_recommendation=DecisionKind.HOLD,
         agent_rationale=["legacy review"],
         critic=case_critique,
+        critic_disagreement_reason=None,
         questions=["Does the legacy evidence support this decision?"],
         created_at=created_at,
     )
@@ -353,10 +356,9 @@ def test_missing_required_indexes_fail_verification(workflow_db: Path, inventory
         ([3], True),
         ([1, 3], True),
         ([1, 1], False),
-        ([2, 1], False),
         ([1, 2, 3, 4], False),
     ],
-    ids=["missing-prefix", "sparse", "duplicate", "out-of-order", "unknown"],
+    ids=["missing-prefix", "sparse", "duplicate", "unknown"],
 )
 def test_migration_rejects_noncontiguous_history_before_any_database_mutation(
     tmp_path: Path,
@@ -388,6 +390,204 @@ def test_migration_rejects_noncontiguous_history_before_any_database_mutation(
     assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
     assert path.read_bytes() == before_bytes
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before_digest
+
+
+def test_legacy_migration_history_is_a_unique_set_prefix_not_insertion_order() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute(
+            "CREATE TABLE schema_version("
+            "insertion_id INTEGER PRIMARY KEY, version INTEGER UNIQUE, applied_at TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
+            ((2, "legacy-second"), (1, "legacy-first")),
+        )
+
+        assert core_module._read_migration_history(
+            connection,
+            kind=DatabaseKind.WORKFLOW,
+            packaged_versions=(1, 2, 3),
+        ) == (1, 2)
+    finally:
+        connection.close()
+
+
+def _packaged_workflow_hashes() -> dict[int, str]:
+    return {
+        int(resource.name.split("_", 1)[0]): hashlib.sha256(resource.read_bytes()).hexdigest()
+        for resource in _migration_resources(DatabaseKind.WORKFLOW)
+    }
+
+
+def _durable_history_rows(path: Path) -> list[tuple[int, int, str, str]]:
+    with connect_database(path, read_only=True) as connection:
+        return [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT ordinal, version, migration_sha256, applied_at "
+                "FROM schema_migration_history ORDER BY ordinal"
+            )
+        ]
+
+
+def test_migration_003_backfills_digest_bound_immutable_durable_history(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "durable-history.db"
+
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [1, 2, 3]
+
+    rows = _durable_history_rows(path)
+    hashes = _packaged_workflow_hashes()
+    assert [(ordinal, version, digest) for ordinal, version, digest, _at in rows] == [
+        (version, version, hashes[version]) for version in (1, 2, 3)
+    ]
+    for _ordinal, _version, _digest, applied_at in rows:
+        parsed = datetime.fromisoformat(applied_at)
+        assert parsed.tzinfo is not None
+        assert parsed.utcoffset() == UTC.utcoffset(parsed)
+        assert parsed.isoformat() == applied_at
+    with connect_database(path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="MIGRATION_HISTORY_IMMUTABLE"):
+            connection.execute(
+                "UPDATE schema_migration_history SET migration_sha256 = ? WHERE version = 1",
+                ("f" * 64,),
+            )
+        connection.rollback()
+        with pytest.raises(sqlite3.IntegrityError, match="MIGRATION_HISTORY_IMMUTABLE"):
+            connection.execute("DELETE FROM schema_migration_history WHERE version = 1")
+
+
+def test_existing_legitimate_v3_history_is_retrofitted_without_version_004(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "existing-v3-history.db"
+    migrate_database(path, DatabaseKind.WORKFLOW)
+    with connect_database(path) as connection:
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'trg_schema_migration_history_%'"
+        ).fetchall():
+            connection.execute(f'DROP TRIGGER "{row["name"]}"')
+        connection.execute("DROP TABLE schema_migration_history")
+        connection.commit()
+
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == []
+    assert [row[:3] for row in _durable_history_rows(path)] == [
+        (version, version, _packaged_workflow_hashes()[version]) for version in (1, 2, 3)
+    ]
+    assert not any(
+        resource.name.startswith("004_") for resource in _migration_resources(DatabaseKind.WORKFLOW)
+    )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["ordinal-gap", "version-order", "duplicate-version", "digest", "timestamp", "missing"],
+)
+def test_malformed_durable_history_fails_before_any_write(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    path = tmp_path / f"malformed-durable-{corruption}.db"
+    migrate_database(path, DatabaseKind.WORKFLOW)
+    hashes = _packaged_workflow_hashes()
+    valid_at = "2026-08-09T12:00:00+00:00"
+    rows: list[tuple[int, int, str, str]] = [
+        (1, 1, hashes[1], valid_at),
+        (2, 2, hashes[2], valid_at),
+        (3, 3, hashes[3], valid_at),
+    ]
+    if corruption == "ordinal-gap":
+        rows[1] = (4, 2, hashes[2], valid_at)
+    elif corruption == "version-order":
+        rows[1], rows[2] = (2, 3, hashes[3], valid_at), (3, 2, hashes[2], valid_at)
+    elif corruption == "duplicate-version":
+        rows[2] = (3, 2, hashes[2], valid_at)
+    elif corruption == "digest":
+        rows[1] = (2, 2, "f" * 64, valid_at)
+    elif corruption == "timestamp":
+        rows[1] = (2, 2, hashes[2], "2026-08-09 12:00:00Z")
+    else:
+        rows.pop()
+    with connect_database(path) as connection:
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'trg_schema_migration_history_%'"
+        ).fetchall():
+            connection.execute(f'DROP TRIGGER "{row["name"]}"')
+        connection.execute("DROP TABLE schema_migration_history")
+        connection.execute(
+            "CREATE TABLE schema_migration_history("
+            "ordinal INTEGER, version INTEGER, migration_sha256 TEXT, applied_at TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO schema_migration_history VALUES (?, ?, ?, ?)",
+            rows,
+        )
+        connection.commit()
+    before = path.read_bytes()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.WORKFLOW)
+
+    assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
+    assert path.read_bytes() == before
+
+
+def test_future_synthetic_migration_appends_one_digest_bound_history_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "synthetic-future-history.db"
+    migrate_database(path, DatabaseKind.WORKFLOW)
+    packaged = _migration_resources(DatabaseKind.WORKFLOW)
+    synthetic_sql = "CREATE TABLE synthetic_migration_probe(value INTEGER);\n"
+
+    class SyntheticMigration:
+        name = "004_synthetic_history_probe.sql"
+
+        def read_text(self, encoding: str = "utf-8") -> str:
+            assert encoding == "utf-8"
+            return synthetic_sql
+
+        def read_bytes(self) -> bytes:
+            return synthetic_sql.encode("utf-8")
+
+    original_resources = core_module._migration_resources
+
+    def resources(kind: DatabaseKind) -> list[object]:
+        if kind is DatabaseKind.WORKFLOW:
+            return [*packaged, SyntheticMigration()]
+        return list(original_resources(kind))
+
+    monkeypatch.setattr(core_module, "_migration_resources", resources)
+
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [4]
+    rows = _durable_history_rows(path)
+    assert rows[-1][:3] == (
+        4,
+        4,
+        hashlib.sha256(synthetic_sql.encode("utf-8")).hexdigest(),
+    )
+    assert len(rows) == 4
+    with connect_database(path) as connection:
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'trg_schema_migration_history_%'"
+        ).fetchall():
+            connection.execute(f'DROP TRIGGER "{row["name"]}"')
+        connection.execute("DROP TABLE schema_migration_history")
+        connection.commit()
+    before = path.read_bytes()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.WORKFLOW)
+
+    assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
+    assert path.read_bytes() == before
 
 
 def test_migration_rejects_schema_objects_without_history_using_stable_error(

@@ -877,3 +877,49 @@ BEFORE DELETE ON human_decisions
 BEGIN
     SELECT RAISE(ABORT, 'HUMAN_DECISION_IMMUTABLE');
 END;
+
+CREATE TABLE schema_migration_history (
+    ordinal INTEGER PRIMARY KEY CHECK(typeof(ordinal) = 'integer' AND ordinal >= 1),
+    version INTEGER NOT NULL UNIQUE CHECK(typeof(version) = 'integer' AND version >= 1),
+    migration_sha256 TEXT NOT NULL CHECK(
+        typeof(migration_sha256) = 'text'
+        AND length(migration_sha256) = 64
+        AND migration_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    applied_at TEXT NOT NULL CHECK(
+        typeof(applied_at) = 'text'
+        AND substr(applied_at, 1, 4) <> '0000'
+        AND (
+            (length(applied_at) = 25 AND applied_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00')
+            OR (length(applied_at) = 32 AND applied_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'
+                AND substr(applied_at, 21, 6) <> '000000')
+        )
+        AND datetime(applied_at) IS NOT NULL
+        AND strftime('%Y-%m-%dT%H:%M:%S', applied_at) = substr(applied_at, 1, 19)
+        AND CAST(substr(applied_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23
+        AND CAST(substr(applied_at, 15, 2) AS INTEGER) BETWEEN 0 AND 59
+        AND CAST(substr(applied_at, 18, 2) AS INTEGER) BETWEEN 0 AND 59
+    )
+);
+
+CREATE TRIGGER trg_schema_migration_history_monotonic_insert
+BEFORE INSERT ON schema_migration_history
+WHEN NEW.ordinal <> COALESCE((SELECT MAX(ordinal) FROM schema_migration_history), 0) + 1
+    OR NEW.version <> NEW.ordinal
+BEGIN
+    SELECT RAISE(ABORT, 'MIGRATION_HISTORY_SEQUENCE_INVALID');
+END;
+
+CREATE TRIGGER trg_schema_migration_history_immutable_update
+BEFORE UPDATE ON schema_migration_history
+BEGIN
+    SELECT RAISE(ABORT, 'MIGRATION_HISTORY_IMMUTABLE');
+END;
+
+CREATE TRIGGER trg_schema_migration_history_immutable_delete
+BEFORE DELETE ON schema_migration_history
+BEGIN
+    SELECT RAISE(ABORT, 'MIGRATION_HISTORY_IMMUTABLE');
+END;

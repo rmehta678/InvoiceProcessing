@@ -631,6 +631,29 @@ def validate_review_authorization_snapshot(
         raise EvidenceSnapshotError(
             "review authorization does not identify exactly one authoritative snapshot"
         )
+    if human is not None:
+        try:
+            if inventory_connection is None:
+                with connect_database(settings.inventory_db, read_only=True) as inventory:
+                    _validate_human_decision_authority(
+                        connection,
+                        review,
+                        human,
+                        inventory_connection=inventory,
+                        inventory_schema="main",
+                        require_persisted_mapping_provenance=True,
+                    )
+            else:
+                _validate_human_decision_authority(
+                    connection,
+                    review,
+                    human,
+                    inventory_connection=inventory_connection,
+                    inventory_schema=inventory_schema,
+                    require_persisted_mapping_provenance=True,
+                )
+        except InvoiceAgentsError as exc:
+            raise EvidenceSnapshotError(str(exc)) from exc
     return matches[0]
 
 
@@ -714,52 +737,137 @@ def _normalized_invoice_field(invoice: dict[str, Any], name: str) -> str | None:
     return str(normalized) if normalized is not None else None
 
 
-def _validate_supersession(
-    connection: sqlite3.Connection, review: ReviewRequest, superseded_case_id: str
-) -> None:
-    """Require one distinct, earlier persisted POSSIBLE_REVISION candidate."""
+def _valid_superseded_case_ids(
+    connection: sqlite3.Connection,
+    review: ReviewRequest,
+    requested_case_ids: frozenset[str],
+) -> frozenset[str]:
+    """Derive exact supersession facts without deciding their applicability."""
 
-    candidate: dict[str, Any] | None = None
-    for raw_candidate in review.evidence_bundle.get("identity_candidates", []):
-        if isinstance(raw_candidate, dict) and raw_candidate.get("case_id") == superseded_case_id:
-            candidate = raw_candidate
-            break
+    if not requested_case_ids:
+        return frozenset()
+    candidates = {
+        str(raw_candidate["case_id"]): raw_candidate
+        for raw_candidate in review.evidence_bundle.get("identity_candidates", [])
+        if isinstance(raw_candidate, dict)
+        and isinstance(raw_candidate.get("case_id"), str)
+        and raw_candidate["case_id"] in requested_case_ids
+    }
     raw_invoice = review.evidence_bundle.get("invoice")
     invoice = raw_invoice if isinstance(raw_invoice, dict) else {}
     invoice_number = _normalized_invoice_field(invoice, "invoice_number")
     vendor = _normalized_invoice_field(invoice, "vendor")
+    parameters = (review.case_id, *sorted(requested_case_ids))
     rows = connection.execute(
-        "SELECT case_id, invoice_number, vendor, started_at FROM cases WHERE case_id IN (?, ?)",
-        (review.case_id, superseded_case_id),
+        "SELECT case_id, invoice_number, vendor, started_at FROM cases WHERE case_id IN "
+        f"({', '.join('?' for _ in parameters)})",
+        parameters,
     ).fetchall()
     cases = {str(row["case_id"]): row for row in rows}
     current = cases.get(review.case_id)
-    prior = cases.get(superseded_case_id)
-    valid = (
-        superseded_case_id != review.case_id
-        and candidate is not None
-        and candidate.get("relationship") == "POSSIBLE_REVISION"
-        and invoice_number is not None
-        and vendor is not None
-        and candidate.get("invoice_number") == invoice_number
-        and candidate.get("vendor") == vendor
-        and current is not None
-        and prior is not None
-        and current["invoice_number"] == invoice_number
-        and current["vendor"] == vendor
-        and prior["invoice_number"] == invoice_number
-        and prior["vendor"] == vendor
-        and datetime.fromisoformat(str(prior["started_at"]))
-        < datetime.fromisoformat(str(current["started_at"]))
-    )
-    if not valid:
+    if invoice_number is None or vendor is None or current is None:
+        return frozenset()
+    valid: set[str] = set()
+    for case_id, candidate in candidates.items():
+        prior = cases.get(case_id)
+        if (
+            case_id != review.case_id
+            and candidate.get("relationship") == "POSSIBLE_REVISION"
+            and candidate.get("invoice_number") == invoice_number
+            and candidate.get("vendor") == vendor
+            and prior is not None
+            and current["invoice_number"] == invoice_number
+            and current["vendor"] == vendor
+            and prior["invoice_number"] == invoice_number
+            and prior["vendor"] == vendor
+            and datetime.fromisoformat(str(prior["started_at"]))
+            < datetime.fromisoformat(str(current["started_at"]))
+        ):
+            valid.add(case_id)
+    return frozenset(valid)
+
+
+def _validate_human_decision_authority(
+    connection: sqlite3.Connection,
+    review: ReviewRequest,
+    decision: HumanDecision,
+    *,
+    inventory_connection: sqlite3.Connection | None,
+    inventory_schema: str,
+    require_persisted_mapping_provenance: bool,
+) -> tuple[tuple[str, str], ...]:
+    """Load explicit authoritative facts and invoke the one pure decision validator."""
+
+    from invoice_agents.agents.decision_rules import validate_human_decision_applicability
+
+    if not inventory_schema.replace("_", "a").isalnum():
         raise InvoiceAgentsError(
-            ErrorCategory.TOOL,
-            "superseded case must be a distinct, earlier POSSIBLE_REVISION candidate "
-            "for this invoice and vendor",
+            ErrorCategory.DATABASE,
+            "inventory schema name is invalid",
             case_id=review.case_id,
-            stop_reason="SUPERSEDED_CASE_INVALID",
+            stop_reason="HUMAN_MAPPING_PROVENANCE_INVALID",
         )
+    normalized_aliases = {
+        normalized
+        for mapping in decision.mappings
+        if (normalized := _normalize_alias(mapping.raw_item))
+    }
+    requested_skus = {mapping.sku.strip() for mapping in decision.mappings if mapping.sku.strip()}
+    inventory_skus: frozenset[str] = frozenset()
+    persisted_provenance: dict[str, tuple[str, str, str, str]] | None = None
+    if inventory_connection is None and decision.mappings:
+        raise InvoiceAgentsError(
+            ErrorCategory.DATABASE,
+            "mapping validation requires an authoritative inventory connection",
+            case_id=review.case_id,
+            stop_reason="HUMAN_MAPPING_PROVENANCE_INVALID",
+        )
+    if decision.mappings:
+        assert inventory_connection is not None
+        sku_rows = inventory_connection.execute(
+            f'SELECT sku FROM "{inventory_schema}".inventory WHERE sku IN '
+            f"({', '.join('?' for _ in requested_skus)})",
+            tuple(sorted(requested_skus)),
+        ).fetchall()
+        inventory_skus = frozenset(str(row["sku"]) for row in sku_rows)
+    if require_persisted_mapping_provenance and decision.mappings:
+        assert inventory_connection is not None
+        source = f"human_review:{review.review_id}"
+        alias_clause = (
+            f" OR alias_normalized IN ({', '.join('?' for _ in normalized_aliases)})"
+            if normalized_aliases
+            else ""
+        )
+        provenance_rows = inventory_connection.execute(
+            f"SELECT alias_normalized, sku, source, approved_by, approved_at "
+            f'FROM "{inventory_schema}".item_aliases WHERE source = ?{alias_clause}',
+            (source, *sorted(normalized_aliases)),
+        ).fetchall()
+        persisted_provenance = {
+            str(row["alias_normalized"]): (
+                str(row["sku"]),
+                str(row["source"]),
+                str(row["approved_by"]),
+                str(row["approved_at"]),
+            )
+            for row in provenance_rows
+        }
+    elif require_persisted_mapping_provenance:
+        persisted_provenance = {}
+
+    superseded = decision.superseded_case_id
+    valid_superseded_case_ids = _valid_superseded_case_ids(
+        connection,
+        review,
+        frozenset({superseded}) if superseded is not None else frozenset(),
+    )
+    return validate_human_decision_applicability(
+        review,
+        decision,
+        inventory_skus=inventory_skus,
+        valid_superseded_case_ids=valid_superseded_case_ids,
+        persisted_mapping_provenance=persisted_provenance,
+    )
 
 
 def _validate_human_decision(
@@ -767,113 +875,16 @@ def _validate_human_decision(
 ) -> list[tuple[str, str]]:
     """Validate every authorizing input against the transaction-local review evidence."""
 
-    from invoice_agents.agents.decision_rules import AUTHORIZING_HUMAN_DECISIONS
-
-    mappings = decision.mappings
-    if mappings and decision.decision is not HumanDecisionKind.ESTABLISH_MAPPING:
-        raise InvoiceAgentsError(
-            ErrorCategory.TOOL,
-            "mappings are permitted only for ESTABLISH_MAPPING",
-            case_id=review.case_id,
-            stop_reason="HUMAN_MAPPING_INVALID",
+    return list(
+        _validate_human_decision_authority(
+            connection,
+            review,
+            decision,
+            inventory_connection=connection,
+            inventory_schema="inventory_db",
+            require_persisted_mapping_provenance=False,
         )
-    if decision.decision is HumanDecisionKind.ESTABLISH_MAPPING and not mappings:
-        raise InvoiceAgentsError(
-            ErrorCategory.TOOL,
-            "ESTABLISH_MAPPING requires at least one explicit mapping",
-            case_id=review.case_id,
-            stop_reason="HUMAN_MAPPING_MISSING",
-        )
-
-    unresolved_aliases: set[str] = set()
-    for entry in review.evidence_bundle.get("inventory", []):
-        if not isinstance(entry, dict) or entry.get("sku"):
-            continue
-        raw_items = entry.get("raw_items")
-        if isinstance(raw_items, list):
-            unresolved_aliases.update(
-                normalized
-                for raw_item in raw_items
-                if isinstance(raw_item, str) and (normalized := _normalize_alias(raw_item))
-            )
-    validated_mappings: list[tuple[str, str]] = []
-    targets_by_alias: dict[str, str] = {}
-    for mapping in mappings:
-        normalized = _normalize_alias(mapping.raw_item)
-        if not normalized:
-            raise InvoiceAgentsError(
-                ErrorCategory.TOOL,
-                "mapping alias is empty after normalization",
-                case_id=review.case_id,
-                stop_reason="MAPPING_ALIAS_INVALID",
-            )
-        if normalized not in unresolved_aliases:
-            raise InvoiceAgentsError(
-                ErrorCategory.TOOL,
-                f"mapping alias is not unresolved inventory evidence in this review: "
-                f"{mapping.raw_item}",
-                case_id=review.case_id,
-                stop_reason="MAPPING_ALIAS_NOT_IN_REVIEW",
-            )
-        sku = mapping.sku.strip()
-        existing_target = targets_by_alias.get(normalized)
-        if existing_target is not None and existing_target != sku:
-            raise InvoiceAgentsError(
-                ErrorCategory.TOOL,
-                f"mapping alias has conflicting target SKUs: {mapping.raw_item}",
-                case_id=review.case_id,
-                stop_reason="HUMAN_MAPPING_INVALID",
-            )
-        targets_by_alias[normalized] = sku
-        row = connection.execute(
-            "SELECT sku FROM inventory_db.inventory WHERE sku = ?", (sku,)
-        ).fetchone()
-        if row is None:
-            raise InvoiceAgentsError(
-                ErrorCategory.DATABASE,
-                f"mapping target SKU does not exist: {sku}",
-                case_id=review.case_id,
-                stop_reason="MAPPING_SKU_NOT_FOUND",
-            )
-        validated_mappings.append((normalized, sku))
-
-    if (
-        decision.superseded_case_id
-        and decision.decision is not HumanDecisionKind.SUPERSEDE_REVISION
-    ):
-        raise InvoiceAgentsError(
-            ErrorCategory.TOOL,
-            "superseded_case_id is permitted only for SUPERSEDE_REVISION",
-            case_id=review.case_id,
-            stop_reason="SUPERSEDED_CASE_INVALID",
-        )
-    if decision.decision is HumanDecisionKind.SUPERSEDE_REVISION:
-        if not decision.superseded_case_id:
-            raise InvoiceAgentsError(
-                ErrorCategory.TOOL,
-                "SUPERSEDE_REVISION requires a superseded case ID",
-                case_id=review.case_id,
-                stop_reason="SUPERSEDED_CASE_MISSING",
-            )
-        _validate_supersession(connection, review, decision.superseded_case_id)
-
-    package_blocker_ids = {
-        str(entry["blocker_id"])
-        for entry in review.evidence_bundle.get("blocking_evidence", [])
-        if isinstance(entry, dict) and isinstance(entry.get("blocker_id"), str)
-    }
-    unknown_blocker_ids = set(decision.addressed_blocker_ids) - package_blocker_ids
-    if decision.addressed_blocker_ids and (
-        decision.decision not in AUTHORIZING_HUMAN_DECISIONS or unknown_blocker_ids
-    ):
-        raise InvoiceAgentsError(
-            ErrorCategory.TOOL,
-            "blocker authorization is permitted only for authorizing decisions and IDs "
-            f"in this review package; unknown IDs: {sorted(unknown_blocker_ids)}",
-            case_id=review.case_id,
-            stop_reason="BLOCKER_AUTHORIZATION_INVALID",
-        )
-    return validated_mappings
+    )
 
 
 class WorkflowStore:
@@ -1707,9 +1718,12 @@ class WorkflowStore:
         return [ReviewRequest.model_validate_json(row["payload_json"], strict=True) for row in rows]
 
     def classify_human_decision_replay(
-        self, review_id: str, decision: HumanDecision | None
+        self,
+        review_id: str,
+        decision: HumanDecision | None,
+        inventory_db: Path,
     ) -> ReviewRequest | None:
-        """Classify persisted resolved state without opening or touching inventory.
+        """Classify persisted resolved state against exact workflow and mapping facts.
 
         ``None`` means the workflow review was pending at this preliminary read. The
         attached write transaction must reload it before validation or mutation.
@@ -1742,6 +1756,32 @@ class WorkflowStore:
                     str(row["case_id"]),
                     generation,
                     "resolved review digest does not match evidence",
+                )
+            existing = review.human_decision
+            if existing is None:
+                self._raise_snapshot_invalid(
+                    str(row["case_id"]),
+                    generation,
+                    "resolved review has no human decision",
+                )
+            if existing.mappings:
+                with connect_database(inventory_db, read_only=True) as inventory:
+                    _validate_human_decision_authority(
+                        connection,
+                        review,
+                        existing,
+                        inventory_connection=inventory,
+                        inventory_schema="main",
+                        require_persisted_mapping_provenance=True,
+                    )
+            else:
+                _validate_human_decision_authority(
+                    connection,
+                    review,
+                    existing,
+                    inventory_connection=None,
+                    inventory_schema="main",
+                    require_persisted_mapping_provenance=True,
                 )
             return _resolved_human_decision_replay(review, decision)
 

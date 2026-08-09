@@ -15,7 +15,6 @@ from invoice_agents.config import Settings
 from invoice_agents.errors import InvoiceAgentsError
 from invoice_agents.models import (
     Critique,
-    DecisionKind,
     ExtractedInvoice,
     FinalDecision,
     HumanDecision,
@@ -27,6 +26,7 @@ from invoice_agents.models import (
     RiskAssessment,
     SourceArtifact,
     ToolStatus,
+    critic_disagreement_reason,
 )
 
 SNAPSHOT_DIGEST_DOMAIN = b"galatiq.invoice-agents/evidence-snapshot\x00"
@@ -376,10 +376,9 @@ def validate_review_snapshot(review: ReviewRequest, snapshot: EvidenceSnapshot) 
     expected_keys = {*expected_bundle, "rendered_pages"}
     policy_reasons = snapshot.risk.policy_review_reasons
     missing_policy_reasons = [reason for reason in policy_reasons if reason not in review.reasons]
-    critic_disagreement_requires_reason = (
-        review.agent_recommendation is DecisionKind.APPROVE
-        and snapshot.critique.recommended_disposition is not DecisionKind.APPROVE
-        and not any(reason not in policy_reasons for reason in review.reasons)
+    expected_disagreement = critic_disagreement_reason(
+        review.agent_recommendation,
+        snapshot.critique.recommended_disposition,
     )
     raw_pages = bundle.get("rendered_pages")
     expected_page_numbers = (
@@ -429,7 +428,7 @@ def validate_review_snapshot(review: ReviewRequest, snapshot: EvidenceSnapshot) 
         or review.amount != expected_amount
         or review.critic != snapshot.critique
         or missing_policy_reasons
-        or critic_disagreement_requires_reason
+        or review.critic_disagreement_reason != expected_disagreement
         or set(bundle) != expected_keys
         or not rendered_pages_valid
         or any(bundle.get(key) != value for key, value in expected_bundle.items())

@@ -46,6 +46,20 @@ class DecisionKind(StrEnum):
     FAILED = "FAILED"
 
 
+def critic_disagreement_reason(
+    agent_recommendation: DecisionKind,
+    critic_recommendation: DecisionKind,
+) -> str | None:
+    """Return the one canonical fact for a recommendation disagreement."""
+
+    if agent_recommendation is critic_recommendation:
+        return None
+    return (
+        f"agent recommendation {agent_recommendation.value} conflicts with "
+        f"critic recommendation {critic_recommendation.value}"
+    )
+
+
 class HumanDecisionKind(StrEnum):
     APPROVE = "APPROVE"
     REJECT = "REJECT"
@@ -315,6 +329,7 @@ class ReviewRequest(StrictModel):
     agent_recommendation: DecisionKind
     agent_rationale: list[str] = Field(min_length=1)
     critic: Critique
+    critic_disagreement_reason: str | None
     questions: list[str] = Field(min_length=1)
     created_at: datetime
     human_decision: HumanDecision | None = None
@@ -336,6 +351,12 @@ class ReviewRequest(StrictModel):
 
     @model_validator(mode="after")
     def status_and_human_chronology_are_exact(self) -> ReviewRequest:
+        expected_disagreement = critic_disagreement_reason(
+            self.agent_recommendation,
+            self.critic.recommended_disposition,
+        )
+        if self.critic_disagreement_reason != expected_disagreement:
+            raise ValueError("critic disagreement fact is missing, unexpected, or noncanonical")
         if self.status == "PENDING" and self.human_decision is not None:
             raise ValueError("pending review cannot contain a human decision")
         if self.status == "RESOLVED" and self.human_decision is None:

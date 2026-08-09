@@ -659,6 +659,56 @@ def test_preflight_rejects_missing_or_drifted_required_trigger(
     assert drifted.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
 
 
+@pytest.mark.parametrize("schema_object", ["trigger-literal", "check-literal"])
+def test_preflight_rejects_case_only_literal_drift(
+    settings: Settings,
+    schema_object: str,
+) -> None:
+    with connect_database(settings.workflow_db) as connection:
+        if schema_object == "trigger-literal":
+            trigger_name = "trg_final_decisions_no_insert_after_paid"
+            original = str(
+                connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+                    (trigger_name,),
+                ).fetchone()[0]
+            )
+            drifted = original.replace("'PAID'", "'paid'", 1)
+            assert drifted != original
+            connection.execute(f"DROP TRIGGER {trigger_name}")
+            connection.execute(drifted)
+        else:
+            table_name = "legacy_authorization_reconciliations"
+            original = str(
+                connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    (table_name,),
+                ).fetchone()[0]
+            )
+            drifted = original.replace(
+                "'PERMANENTLY_NON_AUTHORIZING'",
+                "'permanently_non_authorizing'",
+                1,
+            )
+            assert drifted != original
+            connection.execute("PRAGMA writable_schema = ON")
+            connection.execute(
+                "UPDATE sqlite_master SET sql = ? WHERE type = 'table' AND name = ?",
+                (drifted, table_name),
+            )
+            connection.execute("PRAGMA writable_schema = OFF")
+        connection.commit()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(
+            settings.workflow_db,
+            DatabaseKind.WORKFLOW,
+            settings=settings,
+        )
+
+    assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+
+
 def test_preflight_rejects_missing_validated_evidence_anchor_table(
     settings: Settings,
 ) -> None:

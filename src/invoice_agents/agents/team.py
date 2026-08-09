@@ -367,15 +367,6 @@ def build_team(
         assert_new_review_cycle_permitted(existing, case_id=context.case_id)
         recommendation = DecisionKind(agent_recommendation)
         critique = context.store.load_current_critique(context.claim)
-        extra_reasons: list[str] = []
-        if (
-            recommendation is DecisionKind.APPROVE
-            and critique.recommended_disposition is not DecisionKind.APPROVE
-        ):
-            extra_reasons.append(
-                f"independent critic recommends {critique.recommended_disposition} while the "
-                "approval agent recommends APPROVE; the disagreement is unresolved"
-            )
         review = create_review_request(
             context.case_id,
             context.invoice(),
@@ -385,7 +376,6 @@ def build_team(
             agent_rationale,
             context.store,
             context.claim,
-            extra_reasons=extra_reasons,
         )
         context.audit.record(
             "workflow.review_requested",

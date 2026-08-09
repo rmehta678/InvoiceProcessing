@@ -12,6 +12,7 @@ from invoice_agents.config import Settings
 from invoice_agents.db.store import (
     ReviewAuthorization,
     _reconcile_review_authorization,
+    _validate_human_decision_authority,
     load_authoritative_review_authorization,
     load_authorization_evidence_snapshot,
     parse_canonical_utc,
@@ -130,7 +131,11 @@ def _audit_review_row(
     return authorization
 
 
-def _audit_human_row(connection: sqlite3.Connection, row: sqlite3.Row) -> HumanDecision:
+def _audit_human_row(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    inventory_schema: str,
+) -> HumanDecision:
     if not isinstance(row["decision_id"], str) or not row["decision_id"]:
         raise ValueError("human decision id is invalid")
     human = HumanDecision.model_validate_json(row["payload_json"], strict=True)
@@ -162,6 +167,14 @@ def _audit_human_row(connection: sqlite3.Connection, row: sqlite3.Row) -> HumanD
     )
     if not exact:
         raise ValueError("human decision relational and embedded values do not match")
+    _validate_human_decision_authority(
+        connection,
+        review,
+        human,
+        inventory_connection=connection,
+        inventory_schema=inventory_schema,
+        require_persisted_mapping_provenance=True,
+    )
     return human
 
 
@@ -362,7 +375,7 @@ def audit_workflow_authorization(
     ).fetchall()
     for row in human_rows:
         try:
-            _audit_human_row(connection, row)
+            _audit_human_row(connection, row, inventory_schema)
         except _AUDIT_ERRORS:
             counts["invalid_human_decision_count"] += 1
 

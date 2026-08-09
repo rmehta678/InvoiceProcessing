@@ -9,6 +9,7 @@ from invoice_agents.config import Settings
 from invoice_agents.db import cli as database_cli
 from invoice_agents.db.core import (
     DatabaseKind,
+    _normalized_sql,
     connect_database,
     ensure_databases,
     migrate_database,
@@ -16,6 +17,51 @@ from invoice_agents.db.core import (
     verify_database,
 )
 from invoice_agents.errors import DatabaseVerificationError
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("status = 'PAID'", "status = 'paid'"),
+        ("payload = X'CAFE'", "payload = X'cafe'"),
+        ('SELECT "PaidColumn"', 'SELECT "paidcolumn"'),
+        ("SELECT `PaidColumn`", "SELECT `paidcolumn`"),
+        ("SELECT [PaidColumn]", "SELECT [paidcolumn]"),
+    ],
+    ids=[
+        "single-quoted-literal",
+        "blob-literal",
+        "double-quoted-identifier",
+        "backtick-quoted-identifier",
+        "bracket-quoted-identifier",
+    ],
+)
+def test_sql_canonicalization_preserves_literal_and_quoted_identifier_bytes(
+    left: str,
+    right: str,
+) -> None:
+    assert _normalized_sql(left) != _normalized_sql(right)
+
+
+def test_sql_canonicalization_ignores_only_comments_spacing_keyword_case_and_creation_guard() -> (
+    None
+):
+    packaged = """
+        CREATE TRIGGER trg_paid BEFORE INSERT ON payments
+        WHEN NEW.status = 'PAID'
+        BEGIN
+            SELECT RAISE(ABORT, 'PAYMENT_INVALID');
+        END;
+    """
+    harmless_variant = """
+        /* deployment guard and formatting are insignificant */
+        create trigger if not exists trg_paid
+        before insert on payments -- object semantics are unchanged
+        when new.status='PAID'
+        begin select raise ( abort , 'PAYMENT_INVALID' ) ; end
+    """
+
+    assert _normalized_sql(packaged) == _normalized_sql(harmless_variant)
 
 
 def test_ensure_databases_creates_seeds_and_is_repeatable(tmp_path: Path) -> None:

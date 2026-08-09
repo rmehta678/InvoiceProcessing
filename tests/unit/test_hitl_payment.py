@@ -1,5 +1,6 @@
 """Persisted review decisions, cross-database atomicity, and payment idempotency."""
 
+import json
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -12,9 +13,14 @@ from typer.testing import CliRunner
 
 from invoice_agents import cli
 from invoice_agents.config import Settings
-from invoice_agents.db.core import connect_database
+from invoice_agents.db.core import (
+    REQUIRED_WORKFLOW_TRIGGERS,
+    DatabaseKind,
+    connect_database,
+    verify_database,
+)
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
-from invoice_agents.errors import InvoiceAgentsError
+from invoice_agents.errors import DatabaseVerificationError, InvoiceAgentsError
 from invoice_agents.hitl.service import create_review_request, record_human_decision
 from invoice_agents.models import (
     CanonicalMapping,
@@ -714,6 +720,153 @@ def test_resolved_retry_never_opens_an_unavailable_inventory_path(
         persisted_decision_state(settings.workflow_db, settings.inventory_db, review.review_id)
         == before
     )
+
+
+def test_replay_and_preflight_share_incompatible_human_field_validation(
+    settings: Settings,
+) -> None:
+    review = pending_review(
+        Path("data/invoices/invoice_1002.txt"),
+        "case_invalid_resolved_replay",
+        settings,
+    )
+    resolved = record_human_decision(
+        review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.REJECT,
+        "the evidence does not support payment",
+        WorkflowStore(settings),
+        settings.inventory_db,
+    )
+    assert resolved.human_decision is not None
+    review_payload = resolved.model_dump(mode="json")
+    human_payload = resolved.human_decision.model_dump(mode="json")
+    review_payload["human_decision"]["superseded_case_id"] = "case_unrelated"
+    human_payload["superseded_case_id"] = "case_unrelated"
+    with connect_database(settings.workflow_db) as connection:
+        for trigger in (
+            "trg_resolved_review_immutable_update",
+            "trg_human_decisions_immutable_update",
+        ):
+            connection.execute(f"DROP TRIGGER {trigger}")
+        connection.execute(
+            "UPDATE review_requests SET payload_json = ? WHERE review_id = ?",
+            (json.dumps(review_payload), review.review_id),
+        )
+        connection.execute(
+            "UPDATE human_decisions SET payload_json = ? WHERE review_id = ?",
+            (json.dumps(human_payload), review.review_id),
+        )
+        for trigger in (
+            "trg_resolved_review_immutable_update",
+            "trg_human_decisions_immutable_update",
+        ):
+            connection.execute(REQUIRED_WORKFLOW_TRIGGERS[trigger])
+        connection.commit()
+
+    with pytest.raises(InvoiceAgentsError) as replay_error:
+        record_human_decision(
+            review.review_id,
+            "reviewer@example.com",
+            HumanDecisionKind.REJECT,
+            "the evidence does not support payment",
+            WorkflowStore(settings),
+            settings.inventory_db,
+            superseded_case_id="case_unrelated",
+        )
+    assert replay_error.value.stop_reason == "SUPERSEDED_CASE_INVALID"
+
+    with pytest.raises(DatabaseVerificationError) as preflight_error:
+        verify_database(settings.workflow_db, DatabaseKind.WORKFLOW, settings=settings)
+    assert preflight_error.value.stop_reason == "DATABASE_AUTHORIZATION_PROVENANCE_INVALID"
+    assert preflight_error.value.details["invalid_review_count"] == 1
+    assert preflight_error.value.details["invalid_human_decision_count"] == 1
+
+
+def test_mapping_replay_and_preflight_require_exact_persisted_alias_provenance(
+    settings: Settings,
+    mapping_review: ReviewRequest,
+) -> None:
+    record_human_decision(
+        mapping_review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.ESTABLISH_MAPPING,
+        "the bulk alias is authorized",
+        WorkflowStore(settings),
+        settings.inventory_db,
+        mappings=[mapping("WidgetA (bulk)")],
+    )
+    with connect_database(settings.inventory_db) as connection:
+        connection.execute(
+            "UPDATE item_aliases SET approved_by = 'forged@example.com' WHERE source = ?",
+            (f"human_review:{mapping_review.review_id}",),
+        )
+        connection.commit()
+
+    with pytest.raises(InvoiceAgentsError) as replay_error:
+        record_human_decision(
+            mapping_review.review_id,
+            "reviewer@example.com",
+            HumanDecisionKind.ESTABLISH_MAPPING,
+            "the bulk alias is authorized",
+            WorkflowStore(settings),
+            settings.inventory_db,
+            mappings=[mapping("WidgetA (bulk)")],
+        )
+    assert replay_error.value.stop_reason == "HUMAN_MAPPING_PROVENANCE_INVALID"
+
+    with pytest.raises(DatabaseVerificationError) as preflight_error:
+        verify_database(settings.workflow_db, DatabaseKind.WORKFLOW, settings=settings)
+    assert preflight_error.value.stop_reason == "DATABASE_AUTHORIZATION_PROVENANCE_INVALID"
+    assert preflight_error.value.details["invalid_review_count"] == 1
+    assert preflight_error.value.details["invalid_human_decision_count"] == 1
+
+
+def test_mapping_replay_and_preflight_reject_extra_aliases_claiming_review_provenance(
+    settings: Settings,
+    mapping_review: ReviewRequest,
+) -> None:
+    resolved = record_human_decision(
+        mapping_review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.ESTABLISH_MAPPING,
+        "the bulk alias is authorized",
+        WorkflowStore(settings),
+        settings.inventory_db,
+        mappings=[mapping("WidgetA (bulk)")],
+    )
+    assert resolved.human_decision is not None
+    with connect_database(settings.inventory_db) as connection:
+        connection.execute(
+            "INSERT INTO item_aliases("
+            "alias_normalized, sku, source, approved_by, approved_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                "forged extra alias",
+                "SKU-WIDGET-A",
+                f"human_review:{mapping_review.review_id}",
+                resolved.human_decision.reviewer,
+                resolved.human_decision.decided_at.isoformat(),
+            ),
+        )
+        connection.commit()
+
+    with pytest.raises(InvoiceAgentsError) as replay_error:
+        record_human_decision(
+            mapping_review.review_id,
+            "reviewer@example.com",
+            HumanDecisionKind.ESTABLISH_MAPPING,
+            "the bulk alias is authorized",
+            WorkflowStore(settings),
+            settings.inventory_db,
+            mappings=[mapping("WidgetA (bulk)")],
+        )
+    assert replay_error.value.stop_reason == "HUMAN_MAPPING_PROVENANCE_INVALID"
+
+    with pytest.raises(DatabaseVerificationError) as preflight_error:
+        verify_database(settings.workflow_db, DatabaseKind.WORKFLOW, settings=settings)
+    assert preflight_error.value.stop_reason == "DATABASE_AUTHORIZATION_PROVENANCE_INVALID"
+    assert preflight_error.value.details["invalid_review_count"] == 1
+    assert preflight_error.value.details["invalid_human_decision_count"] == 1
 
 
 def test_pending_blank_field_still_fails_validation_before_inventory_access(

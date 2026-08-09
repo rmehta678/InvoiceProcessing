@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import struct
@@ -489,7 +490,141 @@ def test_reconciliation_losslessly_archives_and_restores_ordered_typed_sqlite_ro
     assert restored == original
 
 
-@pytest.mark.parametrize("target", ["schema", "typed_row"])
+def test_serialized_snapshot_restores_the_entire_exact_pre_reconciliation_database(
+    tmp_path: Path,
+) -> None:
+    path = _build_opaque_v2_database(tmp_path)
+    invalid_text = b"\x80\xfflegacy-text\x00tail"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE review_requests SET status = CAST(? AS TEXT) WHERE review_id = ?",
+            (sqlite3.Binary(invalid_text), "review_opaque"),
+        )
+        connection.execute(
+            "CREATE INDEX idx_legacy_review_status_exact ON review_requests(status, review_id)"
+        )
+        connection.execute(
+            "CREATE TRIGGER trg_legacy_review_insert_exact BEFORE INSERT ON review_requests "
+            "BEGIN SELECT RAISE(ABORT, 'LEGACY_INSERT_BLOCKED'); END"
+        )
+        connection.execute(
+            "CREATE TABLE forensic_shadowed_rowid(rowid TEXT, _rowid_ TEXT, oid TEXT, payload BLOB)"
+        )
+        connection.execute(
+            "INSERT INTO forensic_shadowed_rowid(rowid, _rowid_, oid, payload) "
+            "VALUES ('visible-rowid', 'visible-alt', 'visible-oid', ?)",
+            (sqlite3.Binary(b"\x00shadowed\xff"),),
+        )
+        connection.execute(
+            "CREATE TABLE forensic_without_rowid("
+            "identity BLOB PRIMARY KEY, payload TEXT) WITHOUT ROWID"
+        )
+        connection.execute(
+            "INSERT INTO forensic_without_rowid(identity, payload) VALUES (?, ?)",
+            (sqlite3.Binary(b"\xffidentity"), "forensic payload"),
+        )
+        connection.commit()
+        expected_image = connection.serialize()
+    expected_hash = hashlib.sha256(expected_image).hexdigest()
+
+    receipt = _reconcile(path)
+
+    assert hasattr(legacy_archive, "export_legacy_database_snapshot")
+    assert hasattr(legacy_archive, "restore_legacy_database_snapshot")
+    with connect_database(path, read_only=True) as archive_connection:
+        snapshot = archive_connection.execute(
+            "SELECT database_image, sha256, size_bytes FROM "
+            "legacy_authorization_database_snapshots WHERE reconciliation_id = ?",
+            (receipt.reconciliation_id,),
+        ).fetchone()
+        assert bytes(snapshot["database_image"]) == expected_image
+        assert snapshot["sha256"] == expected_hash
+        assert snapshot["size_bytes"] == len(expected_image)
+        assert (
+            legacy_archive.export_legacy_database_snapshot(
+                archive_connection,
+                receipt.reconciliation_id,
+            )
+            == expected_image
+        )
+        restored = sqlite3.connect(":memory:")
+        try:
+            legacy_archive.restore_legacy_database_snapshot(
+                archive_connection,
+                restored,
+                receipt.reconciliation_id,
+            )
+            assert restored.serialize() == expected_image
+            assert restored.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            restored.text_factory = bytes
+            restored_status = restored.execute(
+                "SELECT CAST(status AS BLOB) FROM review_requests WHERE review_id = ?",
+                ("review_opaque",),
+            ).fetchone()[0]
+            assert restored_status == invalid_text
+            objects = {
+                (row[0].decode(), row[1].decode())
+                for row in restored.execute(
+                    "SELECT type, name FROM sqlite_master WHERE name LIKE '%exact' "
+                    "OR name LIKE 'forensic_%'"
+                )
+            }
+            assert objects == {
+                ("index", "idx_legacy_review_status_exact"),
+                ("trigger", "trg_legacy_review_insert_exact"),
+                ("table", "forensic_shadowed_rowid"),
+                ("table", "forensic_without_rowid"),
+            }
+            assert restored.execute(
+                "SELECT rowid, _rowid_, oid, payload FROM forensic_shadowed_rowid"
+            ).fetchone() == (
+                b"visible-rowid",
+                b"visible-alt",
+                b"visible-oid",
+                b"\x00shadowed\xff",
+            )
+        finally:
+            restored.close()
+
+
+def test_snapshot_readback_is_deserialized_and_verified_before_active_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _build_full_v2_database(tmp_path)
+    original = _active_rows(path)
+    real_verify = legacy_archive.verify_serialized_database_snapshot
+    calls = 0
+
+    def fail_second_verification(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ValueError("injected readback verification failure")
+        return real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(
+        legacy_archive,
+        "verify_serialized_database_snapshot",
+        fail_second_verification,
+    )
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        _reconcile(path)
+
+    assert excinfo.value.stop_reason == "LEGACY_RECONCILIATION_FAILED"
+    assert calls == 2
+    assert _active_rows(path) == original
+    with connect_database(path, read_only=True) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'legacy_authorization_%'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+@pytest.mark.parametrize("target", ["schema", "typed_row", "database_snapshot"])
 def test_typed_archive_schema_and_rows_are_hash_bound_and_tamper_detected(
     tmp_path: Path,
     target: str,
@@ -505,13 +640,20 @@ def test_typed_archive_schema_and_rows_are_hash_bound_and_tamper_detected(
                 "WHERE source_table = 'review_requests'",
                 (sqlite3.Binary(b"CREATE TABLE forged(value)"),),
             )
-        else:
+        elif target == "typed_row":
             trigger = "trg_legacy_authorization_quarantine_immutable_update"
             connection.execute(f"DROP TRIGGER {trigger}")
             connection.execute(
                 "UPDATE legacy_authorization_quarantine SET typed_row = ? "
                 "WHERE source_table = 'payments'",
                 (sqlite3.Binary(b"forged typed row"),),
+            )
+        else:
+            trigger = "trg_legacy_authorization_database_snapshots_immutable_update"
+            connection.execute(f"DROP TRIGGER {trigger}")
+            connection.execute(
+                "UPDATE legacy_authorization_database_snapshots SET database_image = ?",
+                (sqlite3.Binary(b"forged database image"),),
             )
         connection.commit()
 
@@ -706,3 +848,24 @@ def test_explicit_migrate_retrofits_version_neutral_archive_schema_on_existing_v
 
     assert migrate_database(path, DatabaseKind.WORKFLOW) == []
     assert verify_database(path, DatabaseKind.WORKFLOW, settings=settings)["schema_version"] == 3
+
+
+def test_populated_row_only_archive_cannot_be_retrofitted_without_original_database_image(
+    tmp_path: Path,
+) -> None:
+    path = _build_full_v2_database(tmp_path)
+    _reconcile(path)
+    with connect_database(path) as connection:
+        connection.execute("DROP TABLE legacy_authorization_database_snapshots")
+        connection.commit()
+    before = path.read_bytes()
+
+    with pytest.raises(DatabaseVerificationError) as reconcile_error:
+        _reconcile(path)
+    assert reconcile_error.value.stop_reason == "LEGACY_RECONCILIATION_ARCHIVE_UPGRADE_REQUIRED"
+    assert path.read_bytes() == before
+
+    with pytest.raises(DatabaseVerificationError) as migrate_error:
+        migrate_database(path, DatabaseKind.WORKFLOW)
+    assert migrate_error.value.stop_reason == "LEGACY_RECONCILIATION_ARCHIVE_UPGRADE_REQUIRED"
+    assert path.read_bytes() == before

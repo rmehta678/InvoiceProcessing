@@ -19,6 +19,7 @@ from invoice_agents.models import (
     ReviewRequest,
     RiskAssessment,
     SourceArtifact,
+    critic_disagreement_reason,
 )
 from invoice_agents.source_store import verified_source_path
 from invoice_agents.tools.evidence import render_pdf_page
@@ -55,13 +56,25 @@ def create_review_request(
 ) -> ReviewRequest:
     """Persist a complete evidence package for every policy or ambiguity trigger.
 
-    extra_reasons carries deterministic non-policy triggers (today: the recorded
-    critic/agent disposition disagreement); at least one reason must exist overall.
+    extra_reasons carries deterministic non-policy triggers supplied by the caller;
+    critic disagreement is generated here. At least one reason must exist overall.
     """
 
     from invoice_agents.agents.decision_rules import blocking_evidence
 
-    reasons = list(dict.fromkeys([*risk.policy_review_reasons, *(extra_reasons or [])]))
+    disagreement = critic_disagreement_reason(
+        agent_recommendation,
+        critique.recommended_disposition,
+    )
+    reasons = list(
+        dict.fromkeys(
+            [
+                *risk.policy_review_reasons,
+                *(extra_reasons or []),
+                *([disagreement] if disagreement is not None else []),
+            ]
+        )
+    )
     if not reasons:
         raise InvoiceAgentsError(
             ErrorCategory.TOOL,
@@ -107,6 +120,7 @@ def create_review_request(
         agent_recommendation=agent_recommendation,
         agent_rationale=agent_rationale,
         critic=critique,
+        critic_disagreement_reason=disagreement,
         questions=questions,
         created_at=datetime.now(UTC),
     )
@@ -157,7 +171,7 @@ def record_human_decision(
         if reviewer.strip() and reason.strip()
         else None
     )
-    replay = store.classify_human_decision_replay(review_id, human)
+    replay = store.classify_human_decision_replay(review_id, human, inventory_db)
     if replay is not None:
         return replay
     if human is None:
