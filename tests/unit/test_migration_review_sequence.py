@@ -15,8 +15,15 @@ from invoice_agents.db.core import (
     verify_database,
 )
 from invoice_agents.db.store import WorkflowStore
-from invoice_agents.errors import DatabaseVerificationError
-from invoice_agents.models import Critique, DecisionKind, ReviewRequest, SourceArtifact
+from invoice_agents.errors import DatabaseVerificationError, InvoiceAgentsError
+from invoice_agents.hitl.service import record_human_decision
+from invoice_agents.models import (
+    Critique,
+    DecisionKind,
+    HumanDecisionKind,
+    ReviewRequest,
+    SourceArtifact,
+)
 
 CASE_ID = "case_v1_legacy"
 REVIEW_ID = "rev_v1_legacy"
@@ -180,3 +187,59 @@ def test_missing_required_indexes_fail_verification(workflow_db: Path, inventory
     with pytest.raises(DatabaseVerificationError, match="idx_item_aliases_sku") as inventory_exc:
         verify_database(inventory_db, DatabaseKind.INVENTORY)
     assert inventory_exc.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+
+
+@pytest.mark.parametrize("wal_database", ["workflow", "inventory"])
+def test_atomic_human_decision_preflight_rejects_wal_without_mutation(
+    wal_database: str, workflow_db: Path, inventory_db: Path
+) -> None:
+    store = WorkflowStore(workflow_db)
+    source = make_source()
+    store.register_source(source)
+    store.create_case(CASE_ID, source, LEGACY_AT)
+    review = store.save_review(make_review("rev_journal_mode", LEGACY_AT))
+    target = workflow_db if wal_database == "workflow" else inventory_db
+    with connect_database(target) as connection:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+    with connect_database(workflow_db, read_only=True) as connection:
+        review_before = tuple(
+            connection.execute(
+                "SELECT status, payload_json, resolved_at FROM review_requests WHERE review_id = ?",
+                (review.review_id,),
+            ).fetchone()
+        )
+        decisions_before = connection.execute(
+            "SELECT * FROM human_decisions ORDER BY decision_id"
+        ).fetchall()
+    with connect_database(inventory_db, read_only=True) as connection:
+        aliases_before = connection.execute(
+            "SELECT * FROM item_aliases ORDER BY alias_normalized"
+        ).fetchall()
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        record_human_decision(
+            review.review_id,
+            "reviewer@example.com",
+            HumanDecisionKind.REJECT,
+            "rollback journal mode is required for two-file atomicity",
+            store,
+            inventory_db,
+        )
+
+    assert excinfo.value.stop_reason == "ATOMIC_JOURNAL_MODE_REQUIRED"
+    with connect_database(workflow_db, read_only=True) as connection:
+        assert tuple(
+            connection.execute(
+                "SELECT status, payload_json, resolved_at FROM review_requests WHERE review_id = ?",
+                (review.review_id,),
+            ).fetchone()
+        ) == review_before
+        assert (
+            connection.execute("SELECT * FROM human_decisions ORDER BY decision_id").fetchall()
+            == decisions_before
+        )
+    with connect_database(inventory_db, read_only=True) as connection:
+        assert (
+            connection.execute("SELECT * FROM item_aliases ORDER BY alias_normalized").fetchall()
+            == aliases_before
+        )

@@ -209,6 +209,9 @@ def review_decide(
     reason: Annotated[str, typer.Option(prompt=True)],
     mapping: Annotated[list[str] | None, typer.Option("--mapping")] = None,
     superseded_case_id: Annotated[str | None, typer.Option()] = None,
+    address_blocker: Annotated[
+        list[str] | None, typer.Option("--address-blocker")
+    ] = None,
 ) -> None:
     """Record an attributable decision; mappings use ``raw item=SKU``."""
 
@@ -223,6 +226,7 @@ def review_decide(
             settings.inventory_db,
             mappings=_parse_mapping(mapping or []),
             superseded_case_id=superseded_case_id,
+            addressed_blocker_ids=address_blocker or [],
         )
     except InvoiceAgentsError as exc:
         console.print(str(exc), style="red")

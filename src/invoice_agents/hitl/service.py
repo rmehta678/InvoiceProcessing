@@ -6,7 +6,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import (
@@ -22,7 +21,6 @@ from invoice_agents.models import (
     SourceArtifact,
 )
 from invoice_agents.source_store import verified_source_path
-from invoice_agents.tools.comparison import normalize_alias
 from invoice_agents.tools.evidence import render_pdf_page
 
 
@@ -114,49 +112,6 @@ def create_review_request(
     return store.save_review(review)
 
 
-def _approve_mappings(
-    mappings: list[CanonicalMapping],
-    reviewer: str,
-    review_id: str,
-    inventory_db: Path,
-) -> None:
-    """Write aliases only for an explicit human mapping decision with provenance."""
-
-    with connect_database(inventory_db) as connection:
-        for mapping in mappings:
-            existing = connection.execute(
-                "SELECT sku FROM inventory WHERE sku = ?", (mapping.sku,)
-            ).fetchone()
-            if existing is None:
-                raise InvoiceAgentsError(
-                    ErrorCategory.DATABASE,
-                    f"mapping target SKU does not exist: {mapping.sku}",
-                    stop_reason="MAPPING_SKU_NOT_FOUND",
-                )
-            normalized = normalize_alias(mapping.raw_item)
-            if not normalized:
-                raise InvoiceAgentsError(
-                    ErrorCategory.TOOL,
-                    "mapping alias is empty after normalization",
-                    stop_reason="MAPPING_ALIAS_INVALID",
-                )
-            connection.execute(
-                "INSERT INTO item_aliases("
-                "alias_normalized, sku, source, approved_by, approved_at) VALUES (?, ?, ?, ?, ?) "
-                "ON CONFLICT(alias_normalized) DO UPDATE SET "
-                "sku=excluded.sku, source=excluded.source, approved_by=excluded.approved_by, "
-                "approved_at=excluded.approved_at",
-                (
-                    normalized,
-                    mapping.sku,
-                    f"human_review:{review_id}",
-                    reviewer,
-                    datetime.now(UTC).isoformat(),
-                ),
-            )
-        connection.commit()
-
-
 def record_human_decision(
     review_id: str,
     reviewer: str,
@@ -169,9 +124,7 @@ def record_human_decision(
     superseded_case_id: str | None = None,
     addressed_blocker_ids: list[str] | None = None,
 ) -> ReviewRequest:
-    """Validate and record an attributable decision; no decision defaults are supplied."""
-
-    from invoice_agents.agents.decision_rules import AUTHORIZING_HUMAN_DECISIONS
+    """Record one evidence-bound decision and any aliases in a single SQLite commit."""
 
     if not reviewer.strip() or not reason.strip():
         raise InvoiceAgentsError(
@@ -179,38 +132,24 @@ def record_human_decision(
             "reviewer and reason are required",
             stop_reason="HUMAN_DECISION_INVALID",
         )
-    selected_blocker_ids = list(dict.fromkeys(addressed_blocker_ids or []))
-    review = store.load_review(review_id)
-    package_blocker_ids = {
-        str(entry["blocker_id"])
-        for entry in review.evidence_bundle.get("blocking_evidence", [])
-        if isinstance(entry, dict) and isinstance(entry.get("blocker_id"), str)
-    }
-    unknown_blocker_ids = set(selected_blocker_ids) - package_blocker_ids
-    if selected_blocker_ids and (
-        decision not in AUTHORIZING_HUMAN_DECISIONS or unknown_blocker_ids
-    ):
-        raise InvoiceAgentsError(
-            ErrorCategory.TOOL,
-            "blocker authorization is permitted only for authorizing decisions and IDs "
-            f"in this review package; unknown IDs: {sorted(unknown_blocker_ids)}",
-            stop_reason="BLOCKER_AUTHORIZATION_INVALID",
+    selected_blocker_ids = list(
+        dict.fromkeys(
+            blocker_id.strip()
+            for blocker_id in addressed_blocker_ids or []
+            if blocker_id.strip()
         )
-    selected_mappings = mappings or []
-    if decision is HumanDecisionKind.ESTABLISH_MAPPING and not selected_mappings:
-        raise InvoiceAgentsError(
-            ErrorCategory.TOOL,
-            "ESTABLISH_MAPPING requires at least one explicit mapping",
-            stop_reason="HUMAN_MAPPING_MISSING",
+    )
+    selected_mappings = [
+        mapping.model_copy(
+            update={
+                "raw_item": mapping.raw_item.strip(),
+                "sku": mapping.sku.strip(),
+                "basis": "human_decision",
+            },
+            deep=True,
         )
-    if decision is HumanDecisionKind.SUPERSEDE_REVISION and not superseded_case_id:
-        raise InvoiceAgentsError(
-            ErrorCategory.TOOL,
-            "SUPERSEDE_REVISION requires a superseded case ID",
-            stop_reason="SUPERSEDED_CASE_MISSING",
-        )
-    if selected_mappings:
-        _approve_mappings(selected_mappings, reviewer, review_id, inventory_db)
+        for mapping in mappings or []
+    ]
     human = HumanDecision(
         review_id=review_id,
         reviewer=reviewer.strip(),
@@ -218,7 +157,7 @@ def record_human_decision(
         reason=reason.strip(),
         decided_at=datetime.now(UTC),
         mappings=selected_mappings,
-        superseded_case_id=superseded_case_id,
+        superseded_case_id=(superseded_case_id or "").strip() or None,
         addressed_blocker_ids=selected_blocker_ids,
     )
-    return store.save_human_decision(human)
+    return store.save_human_decision(human, inventory_db)

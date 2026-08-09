@@ -428,6 +428,60 @@ def test_mapping_decision_requires_mapping(client: TestClient, settings: Setting
     assert "requires at least one explicit mapping" in response.text
 
 
+def test_mapping_fields_submitted_with_reject_reach_service_and_are_rejected(
+    client: TestClient, settings: Settings
+) -> None:
+    _, review = make_pending_review_case(
+        settings, source=FIXTURE_DIR / "invoice_2001_bulk_alias.txt"
+    )
+    before = WorkflowStore(settings.workflow_db).load_review(review.review_id)
+
+    response = client.post(
+        f"/reviews/{review.review_id}/decision",
+        data={
+            "reviewer": "vp@example.com",
+            "decision": "REJECT",
+            "reason": "a stale browser retained mapping inputs",
+            "mapping_raw": ["WidgetA (bulk)"],
+            "mapping_sku": ["SKU-WIDGET-A"],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "mappings are permitted only for ESTABLISH_MAPPING" in response.text
+    assert WorkflowStore(settings.workflow_db).load_review(review.review_id) == before
+    with connect_database(settings.inventory_db, read_only=True) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM item_aliases WHERE alias_normalized = ?", ("widgetabulk",)
+        ).fetchone()[0] == 0
+
+
+def test_mapping_dropdown_is_only_a_hint_and_unknown_raw_evidence_is_rejected(
+    client: TestClient, settings: Settings
+) -> None:
+    _, review = make_pending_review_case(
+        settings, source=FIXTURE_DIR / "invoice_2001_bulk_alias.txt"
+    )
+    before = WorkflowStore(settings.workflow_db).load_review(review.review_id)
+
+    response = client.post(
+        f"/reviews/{review.review_id}/decision",
+        data={
+            "reviewer": "vp@example.com",
+            "decision": "ESTABLISH_MAPPING",
+            "reason": "a forged raw item must not be authorized by the dropdown SKU",
+            "mapping_raw": ["Invented browser alias"],
+            "mapping_sku": ["SKU-WIDGET-A"],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "unresolved inventory evidence" in response.text
+    assert WorkflowStore(settings.workflow_db).load_review(review.review_id) == before
+    with connect_database(settings.inventory_db, read_only=True) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM item_aliases").fetchone()[0] == 0
+
+
 def test_reject_decision_recorded_and_resumable(
     client: TestClient, settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:

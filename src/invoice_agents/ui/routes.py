@@ -455,7 +455,7 @@ async def review_decide(
     mappings = [
         CanonicalMapping(raw_item=raw.strip(), sku=sku.strip(), basis="human_decision")
         for raw, sku in zip(mapping_raw or [], mapping_sku or [], strict=False)
-        if selected is HumanDecisionKind.ESTABLISH_MAPPING and raw.strip() and sku.strip()
+        if raw.strip() and sku.strip()
     ]
     try:
         record_human_decision(
