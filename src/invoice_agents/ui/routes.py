@@ -680,7 +680,13 @@ async def system_page(request: Request) -> Response:
         ("Workflow database", settings.workflow_db, DatabaseKind.WORKFLOW),
     ):
         try:
-            checks.append({"name": name, "info": verify_database(path, kind), "error": None})
+            checks.append(
+                {
+                    "name": name,
+                    "info": verify_database(path, kind, settings=settings),
+                    "error": None,
+                }
+            )
         except InvoiceAgentsError as exc:
             checks.append({"name": name, "info": None, "error": exc})
     context = {

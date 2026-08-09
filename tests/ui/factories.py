@@ -110,6 +110,7 @@ def make_succeeded_case(settings: Settings, name: str = "invoice_1001.txt") -> s
     decision = FinalDecision(
         decision=DecisionKind.APPROVE,
         reasons=["all deterministic checks passed"],
+        evidence=[reference for line in invoice.lines for reference in line.evidence[:1]],
         critic_disposition=DecisionKind.APPROVE,
         payment_eligible=True,
     )

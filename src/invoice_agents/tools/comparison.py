@@ -6,7 +6,8 @@ import difflib
 import re
 import sqlite3
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -48,9 +49,26 @@ class InventoryReader:
         path: Path,
         *,
         excluded_alias_sources: frozenset[str] = frozenset(),
+        connection: sqlite3.Connection | None = None,
+        schema: str = "main",
     ) -> None:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema) is None:
+            raise ValueError("inventory schema name is invalid")
         self.path = path.resolve()
         self.excluded_alias_sources = excluded_alias_sources
+        self._shared_connection = connection
+        self._schema = schema
+
+    @contextmanager
+    def _read_connection(self) -> Iterator[sqlite3.Connection]:
+        if self._shared_connection is not None:
+            yield self._shared_connection
+            return
+        with connect_database(self.path, read_only=True) as connection:
+            yield connection
+
+    def _table(self, name: str) -> str:
+        return f'"{self._schema}"."{name}"'
 
     @staticmethod
     def _row(row: sqlite3.Row) -> InventoryRow:
@@ -70,9 +88,10 @@ class InventoryReader:
                 error="item_name is empty",
             )
         try:
-            with connect_database(self.path, read_only=True) as connection:
+            with self._read_connection() as connection:
                 rows = connection.execute(
-                    "SELECT sku, item_name, available_stock FROM inventory WHERE item_name = ?",
+                    "SELECT sku, item_name, available_stock FROM "
+                    f"{self._table('inventory')} WHERE item_name = ?",
                     (item_name.strip(),),
                 ).fetchall()
         except sqlite3.Error as exc:
@@ -102,10 +121,11 @@ class InventoryReader:
                 error="alias is empty after normalization",
             )
         try:
-            with connect_database(self.path, read_only=True) as connection:
+            with self._read_connection() as connection:
                 rows = connection.execute(
                     "SELECT i.sku, i.item_name, i.available_stock, a.source, a.approved_by, "
-                    "a.approved_at FROM item_aliases a JOIN inventory i ON i.sku = a.sku "
+                    f"a.approved_at FROM {self._table('item_aliases')} a "
+                    f"JOIN {self._table('inventory')} i ON i.sku = a.sku "
                     "WHERE a.alias_normalized = ?",
                     (normalized,),
                 ).fetchall()
@@ -115,9 +135,7 @@ class InventoryReader:
                 query=alias,
                 error=f"SQLite alias lookup failed: {exc}",
             )
-        rows = [
-            row for row in rows if str(row["source"]) not in self.excluded_alias_sources
-        ]
+        rows = [row for row in rows if str(row["source"]) not in self.excluded_alias_sources]
         if not rows:
             return InventoryLookupResult(status=ToolStatus.NOT_FOUND, query=alias)
         if len(rows) > 1:
@@ -148,9 +166,10 @@ class InventoryReader:
                 error="raw_item must be non-empty and limit positive",
             )
         try:
-            with connect_database(self.path, read_only=True) as connection:
+            with self._read_connection() as connection:
                 rows = connection.execute(
-                    "SELECT sku, item_name, available_stock FROM inventory ORDER BY item_name"
+                    "SELECT sku, item_name, available_stock FROM "
+                    f"{self._table('inventory')} ORDER BY item_name"
                 ).fetchall()
         except sqlite3.Error as exc:
             return InventoryLookupResult(
@@ -182,9 +201,11 @@ class InventoryReader:
 
     def row_by_sku(self, sku: str) -> InventoryLookupResult:
         try:
-            with connect_database(self.path, read_only=True) as connection:
+            with self._read_connection() as connection:
                 rows = connection.execute(
-                    "SELECT sku, item_name, available_stock FROM inventory WHERE sku = ?", (sku,)
+                    "SELECT sku, item_name, available_stock FROM "
+                    f"{self._table('inventory')} WHERE sku = ?",
+                    (sku,),
                 ).fetchall()
         except sqlite3.Error as exc:
             return InventoryLookupResult(
@@ -538,9 +559,7 @@ def classify_identity_candidate(
     """Classify one authoritative prior extraction against the current invoice."""
 
     same_hash = prior.source.sha256 == invoice.source.sha256
-    same_number = (
-        prior.invoice_number.normalized_value == invoice.invoice_number.normalized_value
-    )
+    same_number = prior.invoice_number.normalized_value == invoice.invoice_number.normalized_value
     same_vendor = prior.vendor.normalized_value == invoice.vendor.normalized_value
     prior_revision = prior.revision.normalized_value if prior.revision else None
     current_revision = invoice.revision.normalized_value if invoice.revision else None

@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 
 class StrictModel(BaseModel):
@@ -325,6 +332,63 @@ class PaymentResult(StrictModel):
     processed_at: datetime | None
     duplicate_of: str | None = None
     error: str | None = None
+
+
+class PersistedPaymentRow(StrictModel):
+    """Strict storage boundary for one immutable payment-ledger row."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    payment_id: str = Field(min_length=1)
+    case_id: str = Field(min_length=1)
+    idempotency_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+    vendor: str = Field(min_length=1)
+    amount: str = Field(min_length=1)
+    currency: CurrencyCode
+    status: Literal["PAID", "FAILED"]
+    error: str | None
+    created_at: str = Field(min_length=1)
+    decision_generation: int = Field(ge=1)
+    evidence_snapshot_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_id: str = Field(min_length=1)
+    invoice_number: str | None
+    review_id: str | None
+
+    @field_validator("amount")
+    @classmethod
+    def canonical_positive_amount(cls, value: str) -> str:
+        try:
+            parsed = Decimal(value)
+        except InvalidOperation as exc:
+            raise ValueError("payment amount is not a canonical decimal") from exc
+        if not parsed.is_finite() or parsed <= 0 or str(parsed) != value:
+            raise ValueError("payment amount is not a canonical positive decimal")
+        return value
+
+    @field_validator("created_at")
+    @classmethod
+    def canonical_utc_timestamp(cls, value: str) -> str:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError("payment timestamp is not canonical UTC") from exc
+        offset = parsed.utcoffset()
+        if (
+            parsed.tzinfo is None
+            or offset is None
+            or offset.total_seconds() != 0
+            or parsed.isoformat() != value
+        ):
+            raise ValueError("payment timestamp is not canonical UTC")
+        return value
+
+    @model_validator(mode="after")
+    def status_error_pair_is_exact(self) -> PersistedPaymentRow:
+        if self.status == "PAID" and self.error is not None:
+            raise ValueError("paid payment cannot contain an error")
+        if self.status == "FAILED" and (self.error is None or not self.error.strip()):
+            raise ValueError("failed payment requires a nonempty error")
+        return self
 
 
 class ErrorRecord(StrictModel):

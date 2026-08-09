@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from importlib.resources import files
 from importlib.resources.abc import Traversable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from invoice_agents.errors import DatabaseVerificationError, ErrorCategory
+
+if TYPE_CHECKING:
+    from invoice_agents.config import Settings
 
 SQLITE_SIGNATURE = b"SQLite format 3\x00"
 SEED_ROWS = (
@@ -26,6 +32,15 @@ SEED_ROWS = (
 class DatabaseKind(StrEnum):
     INVENTORY = "inventory"
     WORKFLOW = "workflow"
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyAuthorizationReconciliationReceipt:
+    reconciliation_id: str
+    record_count: int
+    table_counts: dict[str, int]
+    record_manifest_hash: str
+    confirmed_at: str
 
 
 # Required version per database kind; preflight rejects anything else, in either
@@ -47,6 +62,7 @@ REQUIRED_INDEXES: dict[DatabaseKind, frozenset[str]] = {
             "idx_events_case_created",
             "idx_review_requests_case_sequence",
             "idx_cases_execution_lease",
+            "idx_legacy_authorization_quarantine_reconciliation",
         }
     ),
 }
@@ -160,23 +176,24 @@ REQUIRED_WORKFLOW_TRIGGERS: dict[str, str] = {
 
 
 def _packaged_workflow_trigger_definitions() -> dict[str, str]:
-    """Use migration 003 itself as the exact preflight trigger contract."""
+    """Use packaged schema SQL itself as the exact preflight trigger contract."""
 
-    script = (
-        files("invoice_agents.db")
-        .joinpath("migrations", "workflow", "003_execution_fencing.sql")
-        .read_text(encoding="utf-8")
+    root = files("invoice_agents.db").joinpath("migrations", "workflow")
+    scripts = (
+        root.joinpath("003_execution_fencing.sql").read_text(encoding="utf-8"),
+        root.joinpath("legacy_authorization_archive.sql").read_text(encoding="utf-8"),
     )
     definitions = {
         match.group(1): match.group(0)
+        for script in scripts
         for match in re.finditer(
-            r"CREATE\s+TRIGGER\s+([A-Za-z0-9_]+)\b.*?\bEND\s*;",
+            r"CREATE\s+TRIGGER(?:\s+IF\s+NOT\s+EXISTS)?\s+([A-Za-z0-9_]+)\b.*?\bEND\s*;",
             script,
             flags=re.IGNORECASE | re.DOTALL,
         )
     }
     if not definitions:
-        raise RuntimeError("workflow migration 003 defines no triggers")
+        raise RuntimeError("packaged workflow schema defines no triggers")
     return definitions
 
 
@@ -267,8 +284,29 @@ def _migration_statements(script: str) -> list[str]:
     return statements
 
 
+def _legacy_archive_statements() -> list[str]:
+    script = (
+        files("invoice_agents.db")
+        .joinpath("migrations", "workflow", "legacy_authorization_archive.sql")
+        .read_text(encoding="utf-8")
+    )
+    return _migration_statements(script)
+
+
+def _install_legacy_archive_schema(connection: sqlite3.Connection) -> None:
+    for statement in _legacy_archive_statements():
+        connection.execute(statement)
+
+
 def _normalized_sql(sql: str) -> str:
-    return re.sub(r"\s+", " ", sql.strip().rstrip(";")).casefold()
+    normalized = re.sub(r"\s+", " ", sql.strip().rstrip(";")).casefold()
+    # SQLite does not preserve the optional creation guard consistently in
+    # sqlite_master. It has no bearing on the installed object's definition.
+    return re.sub(
+        r"\b(create (?:index|table|trigger)) if not exists\b",
+        r"\1",
+        normalized,
+    )
 
 
 def _require_reconciled_workflow_authorization(
@@ -276,21 +314,241 @@ def _require_reconciled_workflow_authorization(
 ) -> None:
     """Refuse to invent generation-bound provenance for pre-v3 decisions or payments."""
 
-    final_decision_count = int(
-        connection.execute("SELECT COUNT(*) FROM final_decisions").fetchone()[0]
-    )
-    payment_count = int(connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0])
-    if final_decision_count or payment_count:
+    counts = {
+        "review_request_count": int(
+            connection.execute("SELECT COUNT(*) FROM review_requests").fetchone()[0]
+        ),
+        "human_decision_count": int(
+            connection.execute("SELECT COUNT(*) FROM human_decisions").fetchone()[0]
+        ),
+        "final_decision_count": int(
+            connection.execute("SELECT COUNT(*) FROM final_decisions").fetchone()[0]
+        ),
+        "payment_count": int(connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0]),
+    }
+    if any(counts.values()):
         raise DatabaseVerificationError(
             ErrorCategory.DATABASE,
             "workflow authorization reconciliation is required before migration 003 "
-            f"(final_decisions={final_decision_count}, payments={payment_count})",
+            f"({', '.join(f'{key}={value}' for key, value in counts.items())})",
             stop_reason="AUTHORIZATION_RECONCILIATION_REQUIRED",
-            details={
-                "final_decision_count": final_decision_count,
-                "payment_count": payment_count,
-            },
+            details=counts,
         )
+
+
+def reconcile_legacy_authorization(
+    path: Path,
+    *,
+    reviewer: str,
+    reason: str,
+    disposition: str,
+    confirmed: bool,
+) -> LegacyAuthorizationReconciliationReceipt:
+    """Permanently quarantine exact legacy authority only after explicit confirmation."""
+
+    from invoice_agents.db.legacy_archive import (
+        LEGACY_ACTIVE_TABLE_KEYS,
+        LEGACY_NON_AUTHORIZING_DISPOSITION,
+        audit_legacy_authorization_archives,
+        canonical_legacy_json,
+        legacy_manifest_hash,
+        legacy_reconciliation_id,
+        legacy_record_hash,
+    )
+
+    selected_reviewer = reviewer.strip()
+    selected_reason = reason.strip()
+    if not confirmed:
+        raise DatabaseVerificationError(
+            ErrorCategory.DATABASE,
+            "legacy authorization reconciliation requires explicit operator confirmation",
+            stop_reason="LEGACY_RECONCILIATION_CONFIRMATION_REQUIRED",
+        )
+    if (
+        not selected_reviewer
+        or not selected_reason
+        or disposition != LEGACY_NON_AUTHORIZING_DISPOSITION
+    ):
+        raise DatabaseVerificationError(
+            ErrorCategory.DATABASE,
+            "legacy reconciliation requires reviewer, reason, and the permanent "
+            "non-authorizing disposition",
+            stop_reason="LEGACY_RECONCILIATION_INPUT_INVALID",
+        )
+    resolved = path.resolve()
+    _assert_sqlite_file(resolved)
+    with connect_database(resolved) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            version_row = connection.execute(
+                "SELECT MAX(version) AS version FROM schema_version"
+            ).fetchone()
+            version = int(version_row["version"] or 0)
+            archive_schema_exists = bool(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'legacy_authorization_reconciliations'"
+                ).fetchone()
+            )
+            active_rows = {
+                table: [
+                    dict(row)
+                    for row in connection.execute(
+                        f"SELECT * FROM {table} ORDER BY {key}"
+                    ).fetchall()
+                ]
+                for table, key in LEGACY_ACTIVE_TABLE_KEYS.items()
+            }
+            active_count = sum(len(rows) for rows in active_rows.values())
+            if archive_schema_exists:
+                metadata_rows = connection.execute(
+                    "SELECT reconciliation_id, reviewer, reason, disposition, confirmed_at, "
+                    "record_count, record_manifest_hash, table_counts_json "
+                    "FROM legacy_authorization_reconciliations ORDER BY reconciliation_id"
+                ).fetchall()
+                if metadata_rows:
+                    if active_count or len(metadata_rows) != 1:
+                        raise DatabaseVerificationError(
+                            ErrorCategory.DATABASE,
+                            "legacy reconciliation archive and active authorization state conflict",
+                            stop_reason="LEGACY_RECONCILIATION_STATE_INVALID",
+                        )
+                    if audit_legacy_authorization_archives(connection):
+                        raise DatabaseVerificationError(
+                            ErrorCategory.DATABASE,
+                            "legacy reconciliation archive failed integrity verification",
+                            stop_reason="LEGACY_RECONCILIATION_ARCHIVE_INVALID",
+                        )
+                    metadata = metadata_rows[0]
+                    if (
+                        metadata["reviewer"] != selected_reviewer
+                        or metadata["reason"] != selected_reason
+                        or metadata["disposition"] != disposition
+                    ):
+                        raise DatabaseVerificationError(
+                            ErrorCategory.DATABASE,
+                            "legacy reconciliation retry does not match the completed operation",
+                            stop_reason="LEGACY_RECONCILIATION_REPLAY_MISMATCH",
+                        )
+                    table_counts = json.loads(str(metadata["table_counts_json"]))
+                    if not isinstance(table_counts, dict):
+                        raise DatabaseVerificationError(
+                            ErrorCategory.DATABASE,
+                            "legacy reconciliation archive metadata is invalid",
+                            stop_reason="LEGACY_RECONCILIATION_ARCHIVE_INVALID",
+                        )
+                    receipt = LegacyAuthorizationReconciliationReceipt(
+                        reconciliation_id=str(metadata["reconciliation_id"]),
+                        record_count=int(metadata["record_count"]),
+                        table_counts={str(key): int(value) for key, value in table_counts.items()},
+                        record_manifest_hash=str(metadata["record_manifest_hash"]),
+                        confirmed_at=str(metadata["confirmed_at"]),
+                    )
+                    connection.rollback()
+                    return receipt
+            if version not in (1, 2):
+                raise DatabaseVerificationError(
+                    ErrorCategory.DATABASE,
+                    "legacy authorization reconciliation applies only before workflow v3",
+                    stop_reason="LEGACY_RECONCILIATION_NOT_APPLICABLE",
+                )
+            if not active_count:
+                raise DatabaseVerificationError(
+                    ErrorCategory.DATABASE,
+                    "no active legacy authorization rows require reconciliation",
+                    stop_reason="LEGACY_AUTHORIZATION_NOT_FOUND",
+                )
+
+            _install_legacy_archive_schema(connection)
+            table_counts = {table: len(rows) for table, rows in active_rows.items()}
+            archived_at = utc_now()
+            archived_records: list[tuple[str, str, str, str]] = []
+            for table, key_column in LEGACY_ACTIVE_TABLE_KEYS.items():
+                for row in active_rows[table]:
+                    key = str(row[key_column])
+                    original_json = canonical_legacy_json(row)
+                    record_hash = legacy_record_hash(table, key, original_json)
+                    archived_records.append((table, key, original_json, record_hash))
+            manifest_hash = legacy_manifest_hash(
+                [(table, key, record_hash) for table, key, _json, record_hash in archived_records]
+            )
+            reconciliation_id = legacy_reconciliation_id(
+                reviewer=selected_reviewer,
+                reason=selected_reason,
+                disposition=disposition,
+                source_schema_version=version,
+                manifest_hash=manifest_hash,
+            )
+            connection.execute(
+                "INSERT INTO legacy_authorization_reconciliations("
+                "reconciliation_id, reviewer, reason, disposition, confirmed_at, "
+                "source_schema_version, record_count, record_manifest_hash, table_counts_json, "
+                "state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED')",
+                (
+                    reconciliation_id,
+                    selected_reviewer,
+                    selected_reason,
+                    disposition,
+                    archived_at,
+                    version,
+                    len(archived_records),
+                    manifest_hash,
+                    canonical_legacy_json(table_counts),
+                ),
+            )
+            for table, key, original_json, record_hash in archived_records:
+                connection.execute(
+                    "INSERT INTO legacy_authorization_quarantine("
+                    "archive_id, reconciliation_id, source_table, source_record_key, "
+                    "original_row_json, record_hash, authorization_state, archived_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        f"lqar_{record_hash}",
+                        reconciliation_id,
+                        table,
+                        key,
+                        original_json,
+                        record_hash,
+                        disposition,
+                        archived_at,
+                    ),
+                )
+            if audit_legacy_authorization_archives(connection):
+                raise DatabaseVerificationError(
+                    ErrorCategory.DATABASE,
+                    "legacy rows were not archived with exact canonical hashes",
+                    stop_reason="LEGACY_RECONCILIATION_ARCHIVE_INVALID",
+                )
+            for table in ("payments", "final_decisions", "human_decisions", "review_requests"):
+                connection.execute(f"DELETE FROM {table}")
+            remaining = sum(
+                int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in LEGACY_ACTIVE_TABLE_KEYS
+            )
+            if remaining:
+                raise DatabaseVerificationError(
+                    ErrorCategory.DATABASE,
+                    "legacy active authorization rows remained after verified archival",
+                    stop_reason="LEGACY_RECONCILIATION_DELETE_INCOMPLETE",
+                )
+            connection.commit()
+            return LegacyAuthorizationReconciliationReceipt(
+                reconciliation_id=reconciliation_id,
+                record_count=len(archived_records),
+                table_counts=table_counts,
+                record_manifest_hash=manifest_hash,
+                confirmed_at=archived_at,
+            )
+        except DatabaseVerificationError:
+            connection.rollback()
+            raise
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            connection.rollback()
+            raise DatabaseVerificationError(
+                ErrorCategory.DATABASE,
+                "legacy authorization reconciliation failed atomically",
+                stop_reason="LEGACY_RECONCILIATION_FAILED",
+            ) from exc
 
 
 def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
@@ -310,6 +568,21 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
             for row in connection.execute("SELECT version FROM schema_version").fetchall()
         }
         connection.commit()
+        if (
+            selected_kind is DatabaseKind.WORKFLOW
+            and SCHEMA_VERSIONS[DatabaseKind.WORKFLOW] in existing
+        ):
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                _install_legacy_archive_schema(connection)
+                connection.commit()
+            except sqlite3.Error as exc:
+                connection.rollback()
+                raise DatabaseVerificationError(
+                    ErrorCategory.DATABASE,
+                    "version-neutral workflow schema installation failed",
+                    stop_reason="MIGRATION_FAILED",
+                ) from exc
         for resource in _migration_resources(selected_kind):
             version = int(resource.name.split("_", 1)[0])
             if version in existing:
@@ -333,6 +606,7 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
                 connection.execute("BEGIN IMMEDIATE")
                 if selected_kind is DatabaseKind.WORKFLOW and version == 3:
                     _require_reconciled_workflow_authorization(connection)
+                    _install_legacy_archive_schema(connection)
                 for statement in statements:
                     if _normalized_sql(statement) in transaction_controls:
                         continue
@@ -382,20 +656,22 @@ def seed_inventory(path: Path) -> int:
     return len(SEED_ROWS)
 
 
-def ensure_databases(inventory_db: Path, workflow_db: Path) -> dict[str, list[int]]:
+def ensure_databases(settings: Settings) -> dict[str, list[int]]:
     """Migrate, seed, and verify both databases; idempotent, so safe on every start.
 
     Case processing still never repairs a database - this is an explicit setup
     entry point shared by the CLI so one command can bring the system up.
     """
 
+    inventory_db = settings.inventory_db
+    workflow_db = settings.workflow_db
     applied = {
         DatabaseKind.INVENTORY.value: migrate_database(inventory_db, DatabaseKind.INVENTORY),
         DatabaseKind.WORKFLOW.value: migrate_database(workflow_db, DatabaseKind.WORKFLOW),
     }
     seed_inventory(inventory_db)
     verify_database(inventory_db, DatabaseKind.INVENTORY)
-    verify_database(workflow_db, DatabaseKind.WORKFLOW)
+    verify_database(workflow_db, DatabaseKind.WORKFLOW, settings=settings)
     return applied
 
 
@@ -419,463 +695,64 @@ def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
     return {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})")}
 
 
-def _workflow_authorization_provenance_counts(
-    connection: sqlite3.Connection,
-) -> dict[str, int]:
-    """Count persisted authorization rows that no longer have a complete relational anchor."""
+def _verify_attached_inventory_context(connection: sqlite3.Connection) -> None:
+    """Verify the exact attached inventory snapshot used by workflow authorization."""
 
-    valid_anchors_sql = """
-        SELECT anchor.case_id, anchor.execution_generation, anchor.evidence_snapshot_digest,
-            anchor.review_id, anchor.unresolved_blocker_count, anchor.critique_disposition
-        FROM validated_evidence_snapshots anchor
-        JOIN cases c ON c.case_id = anchor.case_id
-        JOIN extractions e ON e.case_id = anchor.case_id
-            AND e.execution_generation = anchor.execution_generation
-        JOIN identity_results identity_row ON identity_row.case_id = anchor.case_id
-            AND identity_row.execution_generation = anchor.execution_generation
-        JOIN comparison_results inventory ON inventory.case_id = anchor.case_id
-            AND inventory.execution_generation = anchor.execution_generation
-            AND inventory.comparison_type = 'inventory'
-        JOIN comparison_results risk ON risk.case_id = anchor.case_id
-            AND risk.execution_generation = anchor.execution_generation
-            AND risk.comparison_type = 'risk'
-        JOIN critique_results critique ON critique.case_id = anchor.case_id
-            AND critique.execution_generation = anchor.execution_generation
-        WHERE typeof(anchor.execution_generation) = 'integer'
-            AND anchor.execution_generation > 0
-            AND c.execution_generation = anchor.execution_generation
-            AND length(anchor.evidence_snapshot_digest) = 64
-            AND anchor.evidence_snapshot_digest NOT GLOB '*[^0-9a-f]*'
-            AND e.version = (
-                SELECT MAX(latest.version) FROM extractions latest
-                WHERE latest.case_id = anchor.case_id
-                    AND latest.execution_generation = anchor.execution_generation
-            )
-            AND identity_row.rowid = (
-                SELECT MAX(latest.rowid) FROM identity_results latest
-                WHERE latest.case_id = anchor.case_id
-                    AND latest.execution_generation = anchor.execution_generation
-            )
-            AND inventory.rowid = (
-                SELECT MAX(latest.rowid) FROM comparison_results latest
-                WHERE latest.case_id = anchor.case_id
-                    AND latest.execution_generation = anchor.execution_generation
-                    AND latest.comparison_type = 'inventory'
-            )
-            AND risk.rowid = (
-                SELECT MAX(latest.rowid) FROM comparison_results latest
-                WHERE latest.case_id = anchor.case_id
-                    AND latest.execution_generation = anchor.execution_generation
-                    AND latest.comparison_type = 'risk'
-            )
-            AND critique.rowid = (
-                SELECT MAX(latest.rowid) FROM critique_results latest
-                WHERE latest.case_id = anchor.case_id
-                    AND latest.execution_generation = anchor.execution_generation
-            )
-            AND json_valid(e.payload_json) = 1
-            AND json_valid(identity_row.payload_json) = 1
-            AND json_valid(inventory.payload_json) = 1
-            AND json_valid(risk.payload_json) = 1
-            AND json_valid(critique.payload_json) = 1
-            AND anchor.evidence_snapshot_digest = CASE
-                WHEN json_valid(e.payload_json) = 1
-                    AND json_valid(identity_row.payload_json) = 1
-                    AND json_valid(inventory.payload_json) = 1
-                    AND json_valid(risk.payload_json) = 1
-                    AND json_valid(critique.payload_json) = 1
-                THEN stored_evidence_snapshot_digest(
-                    anchor.case_id,
-                    e.payload_json,
-                    identity_row.payload_json,
-                    identity_row.evaluated_at,
-                    inventory.payload_json,
-                    risk.payload_json,
-                    critique.payload_json
-                )
-                ELSE NULL
-            END
-            AND anchor.policy_review_required = CASE
-                WHEN json_array_length(json_extract(
-                    risk.payload_json, '$.policy_review_reasons'
-                )) > 0 THEN 1 ELSE 0 END
-            AND anchor.unresolved_blocker_count = CASE
-                WHEN json_valid(risk.payload_json) = 1
-                    AND (
-                        anchor.review_id IS NULL
-                        OR EXISTS (
-                            SELECT 1 FROM human_decisions h
-                            WHERE h.review_id = anchor.review_id
-                                AND json_valid(h.payload_json) = 1
-                        )
-                    )
-                THEN stored_unresolved_blocker_count(
-                    risk.payload_json,
-                    (SELECT h.payload_json FROM human_decisions h
-                        WHERE h.review_id = anchor.review_id)
-                )
-                ELSE NULL
-            END
-            AND anchor.critique_disposition = json_extract(
-                critique.payload_json, '$.recommended_disposition'
-            )
-            AND (
-                (
-                    anchor.review_id IS NULL
-                    AND anchor.review_snapshot_digest IS NULL
-                    AND anchor.policy_review_required = 0
-                    AND NOT EXISTS (
-                        SELECT 1 FROM review_requests r
-                        WHERE r.case_id = anchor.case_id
-                            AND r.execution_generation = anchor.execution_generation
-                    )
-                )
-                OR EXISTS (
-                    SELECT 1
-                    FROM review_requests r
-                    JOIN human_decisions h ON h.review_id = r.review_id
-                    WHERE r.review_id = anchor.review_id
-                        AND r.case_id = anchor.case_id
-                        AND r.execution_generation = anchor.execution_generation
-                        AND r.sequence = (
-                            SELECT MAX(latest.sequence) FROM review_requests latest
-                            WHERE latest.case_id = anchor.case_id
-                        )
-                        AND r.status = 'RESOLVED'
-                        AND r.resolved_at = h.decided_at
-                        AND r.evidence_snapshot_digest = anchor.review_snapshot_digest
-                        AND (
-                            (
-                                h.decision <> 'ESTABLISH_MAPPING'
-                                AND r.evidence_snapshot_digest =
-                                    anchor.evidence_snapshot_digest
-                            )
-                            OR (
-                                h.decision = 'ESTABLISH_MAPPING'
-                                AND r.execution_generation > 1
-                                AND r.evidence_snapshot_digest = (
-                                    SELECT stored_evidence_snapshot_digest(
-                                        anchor.case_id,
-                                        predecessor_extraction.payload_json,
-                                        predecessor_identity.payload_json,
-                                        predecessor_identity.evaluated_at,
-                                        predecessor_inventory.payload_json,
-                                        predecessor_risk.payload_json,
-                                        predecessor_critique.payload_json
-                                    )
-                                    FROM extractions predecessor_extraction
-                                    JOIN identity_results predecessor_identity
-                                        ON predecessor_identity.case_id =
-                                            predecessor_extraction.case_id
-                                    JOIN comparison_results predecessor_inventory
-                                        ON predecessor_inventory.case_id =
-                                            predecessor_extraction.case_id
-                                        AND predecessor_inventory.comparison_type = 'inventory'
-                                    JOIN comparison_results predecessor_risk
-                                        ON predecessor_risk.case_id =
-                                            predecessor_extraction.case_id
-                                        AND predecessor_risk.comparison_type = 'risk'
-                                    JOIN critique_results predecessor_critique
-                                        ON predecessor_critique.case_id =
-                                            predecessor_extraction.case_id
-                                    WHERE predecessor_extraction.case_id = anchor.case_id
-                                        AND predecessor_extraction.execution_generation =
-                                            anchor.execution_generation - 1
-                                        AND predecessor_identity.execution_generation =
-                                            anchor.execution_generation - 1
-                                        AND predecessor_inventory.execution_generation =
-                                            anchor.execution_generation - 1
-                                        AND predecessor_risk.execution_generation =
-                                            anchor.execution_generation - 1
-                                        AND predecessor_critique.execution_generation =
-                                            anchor.execution_generation - 1
-                                        AND predecessor_extraction.version = (
-                                            SELECT MAX(latest.version) FROM extractions latest
-                                            WHERE latest.case_id = anchor.case_id
-                                                AND latest.execution_generation =
-                                                    anchor.execution_generation - 1
-                                        )
-                                        AND predecessor_identity.rowid = (
-                                            SELECT MAX(latest.rowid) FROM identity_results latest
-                                            WHERE latest.case_id = anchor.case_id
-                                                AND latest.execution_generation =
-                                                    anchor.execution_generation - 1
-                                        )
-                                        AND predecessor_inventory.rowid = (
-                                            SELECT MAX(latest.rowid) FROM comparison_results latest
-                                            WHERE latest.case_id = anchor.case_id
-                                                AND latest.execution_generation =
-                                                    anchor.execution_generation - 1
-                                                AND latest.comparison_type = 'inventory'
-                                        )
-                                        AND predecessor_risk.rowid = (
-                                            SELECT MAX(latest.rowid) FROM comparison_results latest
-                                            WHERE latest.case_id = anchor.case_id
-                                                AND latest.execution_generation =
-                                                    anchor.execution_generation - 1
-                                                AND latest.comparison_type = 'risk'
-                                        )
-                                        AND predecessor_critique.rowid = (
-                                            SELECT MAX(latest.rowid) FROM critique_results latest
-                                            WHERE latest.case_id = anchor.case_id
-                                                AND latest.execution_generation =
-                                                    anchor.execution_generation - 1
-                                        )
-                                )
-                            )
-                        )
-                        AND json_valid(r.payload_json) = 1
-                        AND json_valid(h.payload_json) = 1
-                        AND json_extract(r.payload_json, '$.review_id') = r.review_id
-                        AND json_extract(r.payload_json, '$.case_id') = r.case_id
-                        AND json_extract(r.payload_json, '$.sequence') = r.sequence
-                        AND json_extract(r.payload_json, '$.status') = r.status
-                        AND json_extract(r.payload_json, '$.human_decision.review_id') = h.review_id
-                        AND json_extract(r.payload_json, '$.human_decision.reviewer') = h.reviewer
-                        AND json_extract(r.payload_json, '$.human_decision.decision') = h.decision
-                        AND json_extract(r.payload_json, '$.human_decision.reason') = h.reason
-                        AND julianday(json_extract(
-                            r.payload_json, '$.human_decision.decided_at'
-                        )) = julianday(h.decided_at)
-                        AND json_extract(h.payload_json, '$.review_id') = h.review_id
-                        AND json_extract(h.payload_json, '$.reviewer') = h.reviewer
-                        AND json_extract(h.payload_json, '$.decision') = h.decision
-                        AND json_extract(h.payload_json, '$.reason') = h.reason
-                        AND julianday(json_extract(h.payload_json, '$.decided_at')) =
-                            julianday(h.decided_at)
-                        AND json_extract(h.payload_json, '$.mappings') = json_extract(
-                            r.payload_json, '$.human_decision.mappings'
-                        )
-                        AND json_extract(h.payload_json, '$.superseded_case_id') IS json_extract(
-                            r.payload_json, '$.human_decision.superseded_case_id'
-                        )
-                        AND json_extract(h.payload_json, '$.addressed_blocker_ids') = json_extract(
-                            r.payload_json, '$.human_decision.addressed_blocker_ids'
-                        )
-                        AND (SELECT COUNT(*) FROM human_decisions exact
-                            WHERE exact.review_id = r.review_id) = 1
-                )
-            )
-    """
-    invalid_snapshot_count = int(
-        connection.execute(
-            "SELECT COUNT(*) FROM validated_evidence_snapshots anchor "
-            f"WHERE NOT EXISTS (SELECT 1 FROM ({valid_anchors_sql}) valid "
-            "WHERE valid.case_id = anchor.case_id "
-            "AND valid.execution_generation = anchor.execution_generation "
-            "AND valid.evidence_snapshot_digest = anchor.evidence_snapshot_digest)"
-        ).fetchone()[0]
+    integrity = str(
+        connection.execute("PRAGMA authorization_inventory.integrity_check").fetchone()[0]
     )
-    invalid_final_decision_count = int(
-        connection.execute(
-            """
-            SELECT COUNT(*)
-            FROM final_decisions f
-                WHERE typeof(f.decision_generation) <> 'integer'
-                    OR f.decision_generation < 1
-                    OR json_valid(f.payload_json) <> 1
-                    OR json_extract(
-                        CASE WHEN json_valid(f.payload_json) = 1
-                            THEN f.payload_json ELSE '{}' END,
-                        '$.decision'
-                    )
-                        NOT IN ('APPROVE', 'REJECT', 'HOLD', 'FAILED')
-                    OR NOT (
-                        (json_extract(
-                            CASE WHEN json_valid(f.payload_json) = 1
-                                THEN f.payload_json ELSE '{}' END,
-                            '$.decision'
-                        ) = 'APPROVE'
-                            AND json_extract(
-                                CASE WHEN json_valid(f.payload_json) = 1
-                                    THEN f.payload_json ELSE '{}' END,
-                                '$.payment_eligible'
-                            ) = 1)
-                        OR (json_extract(
-                            CASE WHEN json_valid(f.payload_json) = 1
-                                THEN f.payload_json ELSE '{}' END,
-                            '$.decision'
-                        ) <> 'APPROVE'
-                            AND json_extract(
-                                CASE WHEN json_valid(f.payload_json) = 1
-                                    THEN f.payload_json ELSE '{}' END,
-                                '$.payment_eligible'
-                            ) = 0)
-                )
-                OR NOT EXISTS (
-                    SELECT 1
-                    FROM ("""
-            + valid_anchors_sql
-            + """
-                    ) anchor
-                    JOIN cases c ON c.case_id = f.case_id
-                    JOIN extractions e ON e.case_id = f.case_id
-                        AND e.execution_generation = f.decision_generation
-                    WHERE anchor.case_id = f.case_id
-                        AND anchor.execution_generation = f.decision_generation
-                        AND anchor.evidence_snapshot_digest = f.evidence_snapshot_digest
-                        AND anchor.review_id IS f.review_id
-                        AND e.version = (
-                            SELECT MAX(latest.version) FROM extractions latest
-                            WHERE latest.case_id = f.case_id
-                                AND latest.execution_generation = f.decision_generation
-                        )
-                        AND c.source_id = f.source_id
-                        AND json_extract(e.payload_json, '$.source.source_id') = f.source_id
-                        AND json_extract(e.payload_json, '$.invoice_number.normalized_value')
-                            IS f.invoice_number
-                        AND json_extract(e.payload_json, '$.vendor.normalized_value') IS f.vendor
-                        AND json_extract(e.payload_json, '$.declared_total') IS f.authorized_amount
-                        AND json_extract(e.payload_json, '$.currency.normalized_value')
-                            IS f.authorized_currency
-                        AND f.payment_idempotency_key = payment_identity_key(
-                            f.vendor, f.invoice_number
-                        )
-                        AND (
-                            json_extract(f.payload_json, '$.decision') <> 'APPROVE'
-                            OR anchor.unresolved_blocker_count = 0
-                        )
-                        AND (
-                            json_extract(f.payload_json, '$.decision') <> 'APPROVE'
-                            OR anchor.critique_disposition = 'APPROVE'
-                            OR anchor.review_id IS NOT NULL
-                        )
-                        AND (
-                            (
-                                anchor.review_id IS NULL
-                                AND json_extract(
-                                    f.payload_json, '$.human_outcome'
-                                ) IS NULL
-                            )
-                            OR EXISTS (
-                                SELECT 1
-                                FROM human_decisions h
-                                WHERE h.review_id = anchor.review_id
-                                    AND json_extract(
-                                        f.payload_json, '$.human_outcome.review_id'
-                                    ) = h.review_id
-                                    AND json_extract(
-                                        f.payload_json, '$.human_outcome.reviewer'
-                                    ) = h.reviewer
-                                    AND json_extract(
-                                        f.payload_json, '$.human_outcome.decision'
-                                    ) = h.decision
-                                    AND json_extract(
-                                        f.payload_json, '$.human_outcome.reason'
-                                    ) = h.reason
-                                    AND julianday(json_extract(
-                                        f.payload_json, '$.human_outcome.decided_at'
-                                    )) = julianday(h.decided_at)
-                                    AND json_extract(
-                                        f.payload_json, '$.human_outcome.mappings'
-                                    ) = json_extract(h.payload_json, '$.mappings')
-                                    AND json_extract(
-                                        f.payload_json,
-                                        '$.human_outcome.superseded_case_id'
-                                    ) IS json_extract(
-                                        h.payload_json, '$.superseded_case_id'
-                                    )
-                                    AND json_extract(
-                                        f.payload_json,
-                                        '$.human_outcome.addressed_blocker_ids'
-                                    ) = json_extract(
-                                        h.payload_json, '$.addressed_blocker_ids'
-                                    )
-                                    AND (
-                                        (
-                                            h.decision IN (
-                                                'APPROVE',
-                                                'ESTABLISH_MAPPING',
-                                                'SUPERSEDE_REVISION'
-                                            )
-                                            AND (
-                                                json_extract(
-                                                    f.payload_json, '$.decision'
-                                                ) = 'APPROVE'
-                                                OR (
-                                                    json_extract(
-                                                        f.payload_json, '$.decision'
-                                                    ) = 'HOLD'
-                                                    AND anchor.unresolved_blocker_count > 0
-                                                )
-                                            )
-                                        )
-                                        OR (
-                                            h.decision = 'REJECT'
-                                            AND json_extract(
-                                                f.payload_json, '$.decision'
-                                            ) = 'REJECT'
-                                        )
-                                        OR (
-                                            h.decision = 'REQUEST_CORRECTION'
-                                            AND json_extract(
-                                                f.payload_json, '$.decision'
-                                            ) = 'HOLD'
-                                        )
-                                    )
-                            )
-                        )
-                )
-            """
-        ).fetchone()[0]
-    )
-    invalid_payment_count = int(
-        connection.execute(
-            """
-            SELECT COUNT(*)
-            FROM payments p
-            WHERE typeof(p.decision_generation) <> 'integer'
-                OR p.decision_generation < 1
-                OR p.status NOT IN ('PAID', 'FAILED')
-                OR (p.status = 'PAID' AND p.error IS NOT NULL)
-                OR (p.status = 'FAILED' AND p.error IS NULL)
-                OR NOT EXISTS (
-                    SELECT 1
-                    FROM final_decisions f
-                    JOIN ("""
-            + valid_anchors_sql
-            + """
-                    ) anchor ON anchor.case_id = f.case_id
-                        AND anchor.execution_generation = f.decision_generation
-                        AND anchor.evidence_snapshot_digest = f.evidence_snapshot_digest
-                    JOIN cases c ON c.case_id = f.case_id
-                    WHERE f.case_id = p.case_id
-                        AND f.decision_generation = p.decision_generation
-                        AND f.evidence_snapshot_digest = p.evidence_snapshot_digest
-                        AND json_valid(f.payload_json) = 1
-                            AND json_extract(
-                                CASE WHEN json_valid(f.payload_json) = 1
-                                    THEN f.payload_json ELSE '{}' END,
-                                '$.decision'
-                            ) = 'APPROVE'
-                            AND json_extract(
-                                CASE WHEN json_valid(f.payload_json) = 1
-                                    THEN f.payload_json ELSE '{}' END,
-                                '$.payment_eligible'
-                            ) = 1
-                        AND f.source_id = p.source_id
-                        AND f.invoice_number IS p.invoice_number
-                        AND f.vendor = p.vendor
-                        AND f.authorized_amount = p.amount
-                        AND f.authorized_currency = p.currency
-                        AND f.payment_idempotency_key = p.idempotency_key
-                        AND f.review_id IS p.review_id
-                        AND anchor.review_id IS p.review_id
-                        AND anchor.unresolved_blocker_count = 0
-                        AND (anchor.critique_disposition = 'APPROVE'
-                            OR anchor.review_id IS NOT NULL)
-                        AND c.source_id = p.source_id
-                        AND p.idempotency_key = payment_identity_key(p.vendor, p.invoice_number)
-                        AND CAST(p.amount AS NUMERIC) > 0
-                )
-            """
-        ).fetchone()[0]
-    )
-    return {
-        "invalid_snapshot_count": invalid_snapshot_count,
-        "invalid_final_decision_count": invalid_final_decision_count,
-        "invalid_payment_count": invalid_payment_count,
+    if integrity != "ok":
+        raise DatabaseVerificationError(
+            ErrorCategory.DATABASE,
+            f"attached inventory integrity_check returned {integrity}",
+            stop_reason="DATABASE_INTEGRITY_FAILED",
+        )
+    version_row = connection.execute(
+        "SELECT MAX(version) AS version FROM authorization_inventory.schema_version"
+    ).fetchone()
+    version = int(version_row["version"] or 0)
+    if version != SCHEMA_VERSIONS[DatabaseKind.INVENTORY]:
+        raise DatabaseVerificationError(
+            ErrorCategory.DATABASE,
+            "attached inventory schema version does not match the required authorization context",
+            stop_reason="DATABASE_VERSION_MISMATCH",
+        )
+    required = {
+        "schema_version": {"version", "applied_at"},
+        "inventory": {"sku", "item_name", "available_stock"},
+        "item_aliases": {
+            "alias_normalized",
+            "sku",
+            "source",
+            "approved_by",
+            "approved_at",
+        },
     }
+    for table, expected_columns in required.items():
+        actual_columns = {
+            str(row["name"])
+            for row in connection.execute(f'PRAGMA authorization_inventory.table_info("{table}")')
+        }
+        missing = expected_columns - actual_columns
+        if missing:
+            raise DatabaseVerificationError(
+                ErrorCategory.DATABASE,
+                f"attached inventory table {table} is missing columns: {sorted(missing)}",
+                stop_reason="DATABASE_SCHEMA_MISMATCH",
+            )
+    indexes = {
+        str(row["name"])
+        for row in connection.execute(
+            "SELECT name FROM authorization_inventory.sqlite_master WHERE type = 'index'"
+        )
+    }
+    missing_indexes = REQUIRED_INDEXES[DatabaseKind.INVENTORY] - indexes
+    if missing_indexes:
+        raise DatabaseVerificationError(
+            ErrorCategory.DATABASE,
+            f"attached inventory indexes are missing: {sorted(missing_indexes)}",
+            stop_reason="DATABASE_SCHEMA_MISMATCH",
+        )
 
 
 def verify_database(
@@ -883,12 +760,29 @@ def verify_database(
     kind: DatabaseKind | None = None,
     *,
     require_seed: bool = True,
+    settings: Settings | None = None,
 ) -> dict[str, object]:
     """Verify signature, integrity, version, required schema, indexes, and seed identity."""
 
     selected_kind = kind or infer_kind(path)
     resolved = path.resolve()
     _assert_sqlite_file(resolved)
+    inventory_resolved: Path | None = None
+    if selected_kind is DatabaseKind.WORKFLOW:
+        if settings is None:
+            raise DatabaseVerificationError(
+                ErrorCategory.CONFIGURATION,
+                "workflow schema v3 authorization verification requires explicit Settings",
+                stop_reason="DATABASE_AUTHORIZATION_CONTEXT_REQUIRED",
+            )
+        if settings.workflow_db.resolve() != resolved:
+            raise DatabaseVerificationError(
+                ErrorCategory.CONFIGURATION,
+                "workflow verification Settings do not identify the database being audited",
+                stop_reason="DATABASE_AUTHORIZATION_CONTEXT_MISMATCH",
+            )
+        inventory_resolved = settings.inventory_db.resolve()
+        _assert_sqlite_file(inventory_resolved)
     required: dict[str, set[str]]
     if selected_kind is DatabaseKind.INVENTORY:
         required = {
@@ -974,10 +868,46 @@ def verify_database(
                 "invoice_number",
                 "review_id",
             },
+            "legacy_authorization_reconciliations": {
+                "reconciliation_id",
+                "reviewer",
+                "reason",
+                "disposition",
+                "confirmed_at",
+                "source_schema_version",
+                "record_count",
+                "record_manifest_hash",
+                "table_counts_json",
+                "state",
+            },
+            "legacy_authorization_quarantine": {
+                "archive_id",
+                "reconciliation_id",
+                "source_table",
+                "source_record_key",
+                "original_row_json",
+                "record_hash",
+                "authorization_state",
+                "archived_at",
+            },
             "events": {"case_id", "event_type", "payload_json"},
         }
     try:
         with connect_database(resolved, read_only=True) as connection:
+            if inventory_resolved is not None:
+                inventory_uri = f"{inventory_resolved.as_uri()}?mode=ro"
+                connection.execute(
+                    "ATTACH DATABASE ? AS authorization_inventory",
+                    (inventory_uri,),
+                )
+                connection.execute("BEGIN")
+                # One statement touches both schemas, fixing both read snapshots
+                # before any authorization component is enumerated.
+                connection.execute(
+                    "SELECT (SELECT COUNT(*) FROM main.sqlite_schema), "
+                    "(SELECT COUNT(*) FROM authorization_inventory.sqlite_schema)"
+                ).fetchone()
+                _verify_attached_inventory_context(connection)
             integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
             if integrity != "ok":
                 raise DatabaseVerificationError(
@@ -1053,7 +983,14 @@ def verify_database(
                         f"required triggers are missing or changed: {sorted(invalid_triggers)}",
                         stop_reason="DATABASE_SCHEMA_MISMATCH",
                     )
-                invalid_authorization = _workflow_authorization_provenance_counts(connection)
+                from invoice_agents.db.authorization_audit import audit_workflow_authorization
+
+                assert settings is not None
+                invalid_authorization = audit_workflow_authorization(
+                    connection,
+                    settings,
+                    inventory_schema="authorization_inventory",
+                )
                 if any(invalid_authorization.values()):
                     raise DatabaseVerificationError(
                         ErrorCategory.DATABASE,

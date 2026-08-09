@@ -3,7 +3,10 @@
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
+from invoice_agents.config import Settings
+from invoice_agents.db import cli as database_cli
 from invoice_agents.db.core import (
     DatabaseKind,
     connect_database,
@@ -18,11 +21,12 @@ from invoice_agents.errors import DatabaseVerificationError
 def test_ensure_databases_creates_seeds_and_is_repeatable(tmp_path: Path) -> None:
     inventory = tmp_path / "inventory.db"
     workflow = tmp_path / "workflow.db"
-    first = ensure_databases(inventory, workflow)
+    settings = Settings(inventory_db=inventory, workflow_db=workflow)
+    first = ensure_databases(settings)
     assert first == {"inventory": [1], "workflow": [1, 2, 3]}
     assert verify_database(inventory, DatabaseKind.INVENTORY)["integrity"] == "ok"
-    assert verify_database(workflow, DatabaseKind.WORKFLOW)["integrity"] == "ok"
-    second = ensure_databases(inventory, workflow)
+    assert verify_database(workflow, DatabaseKind.WORKFLOW, settings=settings)["integrity"] == "ok"
+    second = ensure_databases(settings)
     assert second == {"inventory": [], "workflow": []}
 
 
@@ -35,6 +39,54 @@ def test_migrate_seed_verify_is_repeatable(tmp_path: Path) -> None:
     result = verify_database(path, DatabaseKind.INVENTORY)
     assert result["integrity"] == "ok"
     assert result["schema_version"] == 1
+
+
+def test_workflow_verify_cli_requires_explicit_inventory_context(tmp_path: Path) -> None:
+    settings = Settings(
+        inventory_db=tmp_path / "inventory.db",
+        workflow_db=tmp_path / "workflow.db",
+    )
+    ensure_databases(settings)
+    base = [
+        "verify",
+        "--db",
+        str(settings.workflow_db),
+        "--kind",
+        "workflow",
+    ]
+
+    missing_context = CliRunner().invoke(database_cli.app, base)
+    verified = CliRunner().invoke(
+        database_cli.app,
+        [*base, "--inventory-db", str(settings.inventory_db)],
+    )
+
+    assert missing_context.exit_code == 2
+    assert "--inventory-db is required" in missing_context.stderr
+    assert verified.exit_code == 0
+    assert "'schema_version': 3" in verified.stdout
+
+
+def test_workflow_verification_validates_attached_inventory_schema_in_same_snapshot(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        inventory_db=tmp_path / "inventory.db",
+        workflow_db=tmp_path / "workflow.db",
+    )
+    ensure_databases(settings)
+    with connect_database(settings.inventory_db) as connection:
+        connection.execute("DROP INDEX idx_item_aliases_sku")
+        connection.commit()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(
+            settings.workflow_db,
+            DatabaseKind.WORKFLOW,
+            settings=settings,
+        )
+
+    assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
 
 
 def test_missing_and_corrupt_database_fail_visibly(tmp_path: Path) -> None:

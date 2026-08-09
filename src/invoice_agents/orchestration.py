@@ -126,7 +126,7 @@ def preflight(settings: Settings) -> None:
 
     settings.provider_key()
     verify_database(settings.inventory_db, DatabaseKind.INVENTORY)
-    verify_database(settings.workflow_db, DatabaseKind.WORKFLOW)
+    verify_database(settings.workflow_db, DatabaseKind.WORKFLOW, settings=settings)
 
 
 def _error_record(exc: BaseException, case_id: str | None = None) -> ErrorRecord:

@@ -380,8 +380,9 @@ def test_critic_disagreement_blocks_approve() -> None:
     )
 
 
-def test_locked_database_fails_visibly(workflow_db: Path) -> None:
+def test_locked_database_fails_visibly(workflow_db: Path, inventory_db: Path) -> None:
     store = WorkflowStore(workflow_db)
+    settings = Settings(workflow_db=workflow_db, inventory_db=inventory_db)
     # comparison_results.case_id has a foreign key: seed the case so the post-release
     # write can succeed and the locked-phase failure is attributable to the lock alone.
     source = _synthetic_source()
@@ -403,7 +404,7 @@ def test_locked_database_fails_visibly(workflow_db: Path) -> None:
         assert "NOT_FOUND" not in record.stop_reason
 
         with pytest.raises(DatabaseVerificationError) as verify_error:
-            verify_database(workflow_db, DatabaseKind.WORKFLOW)
+            verify_database(workflow_db, DatabaseKind.WORKFLOW, settings=settings)
         assert verify_error.value.category == "DATABASE"
         assert verify_error.value.stop_reason == "DATABASE_VERIFICATION_ERROR"
         assert "NOT_FOUND" not in str(verify_error.value)
@@ -413,7 +414,7 @@ def test_locked_database_fails_visibly(workflow_db: Path) -> None:
 
     # Once the exclusive lock is released both operations succeed.
     assert store.save_comparison("case_x", "inventory", {"a": 1}, claim).startswith("cmp_")
-    verified = verify_database(workflow_db, DatabaseKind.WORKFLOW)
+    verified = verify_database(workflow_db, DatabaseKind.WORKFLOW, settings=settings)
     assert verified["integrity"] == "ok"
 
 
@@ -495,6 +496,7 @@ def test_payment_ledger_write_failure(invoice_dir: Path, settings: Settings) -> 
         FinalDecision(
             decision=DecisionKind.APPROVE,
             reasons=["test"],
+            evidence=[reference for line in invoice.lines for reference in line.evidence[:1]],
             critic_disposition=DecisionKind.APPROVE,
             payment_eligible=True,
         ),

@@ -25,7 +25,10 @@ from invoice_agents.db.store import (
     validated_evidence_facts,
 )
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
-from invoice_agents.evidence_snapshot import EvidenceSnapshotError
+from invoice_agents.evidence_snapshot import (
+    EvidenceSnapshotError,
+    validate_final_decision_snapshot,
+)
 from invoice_agents.models import (
     DecisionKind,
     ExtractedInvoice,
@@ -33,6 +36,7 @@ from invoice_agents.models import (
     Money,
     PaymentResult,
     PaymentStatus,
+    PersistedPaymentRow,
     ReviewRequest,
     RiskAssessment,
 )
@@ -50,6 +54,17 @@ class _AuthorizationSnapshot:
 
 class _AuthorizationSnapshotError(Exception):
     pass
+
+
+def _strict_payment_row(row: sqlite3.Row) -> PersistedPaymentRow:
+    try:
+        return PersistedPaymentRow.model_validate(dict(row), strict=True)
+    except ValueError as exc:
+        raise InvoiceAgentsError(
+            ErrorCategory.PAYMENT,
+            "payment ledger row has an invalid storage shape",
+            stop_reason="PAYMENT_LEDGER_INCONSISTENT",
+        ) from exc
 
 
 def _load_authorization_snapshot(
@@ -118,7 +133,10 @@ def _load_authorization_snapshot(
 
     if decision_row["evidence_snapshot_digest"] != evidence.digest:
         raise _AuthorizationSnapshotError("final decision snapshot digest does not match evidence")
-    decision = FinalDecision.model_validate_json(decision_row["payload_json"])
+    try:
+        decision = FinalDecision.model_validate_json(decision_row["payload_json"], strict=True)
+    except ValueError as exc:
+        raise _AuthorizationSnapshotError("final decision payload is invalid") from exc
     if decision.decision is not DecisionKind.APPROVE or not decision.payment_eligible:
         raise _AuthorizationSnapshotError(
             "case lacks an APPROVE decision with payment_eligible=true"
@@ -134,15 +152,10 @@ def _load_authorization_snapshot(
         )
     except InvoiceAgentsError as exc:
         raise _AuthorizationSnapshotError(exc.message) from exc
-    human = review.human_decision if review is not None else None
-    if decision.human_outcome != human:
-        raise _AuthorizationSnapshotError(
-            "final decision does not match the latest human review decision"
-        )
-    if decision.critic_disposition is not critique.recommended_disposition:
-        raise _AuthorizationSnapshotError(
-            "final decision does not match the latest independent critique"
-        )
+    try:
+        validate_final_decision_snapshot(decision, evidence, review)
+    except EvidenceSnapshotError as exc:
+        raise _AuthorizationSnapshotError(str(exc)) from exc
     expected_review_id = review.review_id if review is not None else None
     exact_authorization_columns = (
         decision_row["source_id"] == invoice.source.source_id
@@ -168,8 +181,9 @@ def _validate_paid_ledger_source(
 ) -> None:
     """Reject a PAID idempotency row whose source authorization has drifted."""
 
-    case_id = str(row["case_id"])
-    generation = int(row["decision_generation"])
+    payment = _strict_payment_row(row)
+    case_id = payment.case_id
+    generation = payment.decision_generation
     try:
         snapshot = _load_authorization_snapshot(connection, case_id, generation, settings)
     except (InvoiceAgentsError, _AuthorizationSnapshotError, ValueError) as exc:
@@ -178,25 +192,19 @@ def _validate_paid_ledger_source(
             f"paid ledger source snapshot is inconsistent for case {case_id}",
             case_id=case_id,
             stop_reason="PAYMENT_LEDGER_INCONSISTENT",
-            details={"reason": str(exc)},
         ) from exc
     invoice = snapshot.invoice
     valid = (
-        snapshot.evidence_snapshot_digest == row["evidence_snapshot_digest"]
-        and isinstance(row["evidence_snapshot_digest"], str)
-        and payment_idempotency_key(invoice) == str(row["idempotency_key"])
-        and invoice.vendor.normalized_value == str(row["vendor"])
-        and invoice.currency.normalized_value == str(row["currency"])
+        snapshot.evidence_snapshot_digest == payment.evidence_snapshot_digest
+        and payment_idempotency_key(invoice) == payment.idempotency_key
+        and invoice.vendor.normalized_value == payment.vendor
+        and invoice.currency.normalized_value == payment.currency
         and invoice.declared_total is not None
-        and invoice.declared_total == Decimal(str(row["amount"]))
-        and row["source_id"] == invoice.source.source_id
-        and row["invoice_number"] == invoice.invoice_number.normalized_value
-        and row["review_id"] == (snapshot.review.review_id if snapshot.review is not None else None)
-        and str(row["status"]) in {PaymentStatus.PAID, PaymentStatus.FAILED}
-        and (
-            (str(row["status"]) == PaymentStatus.PAID and row["error"] is None)
-            or (str(row["status"]) == PaymentStatus.FAILED and row["error"] is not None)
-        )
+        and invoice.declared_total == Decimal(payment.amount)
+        and payment.source_id == invoice.source.source_id
+        and payment.invoice_number == invoice.invoice_number.normalized_value
+        and payment.review_id
+        == (snapshot.review.review_id if snapshot.review is not None else None)
     )
     if not valid:
         raise InvoiceAgentsError(
@@ -222,22 +230,23 @@ def _from_row(
     duplicate: bool = False,
     attempted_case_id: str | None = None,
 ) -> PaymentResult:
-    stored_status = PaymentStatus(str(row["status"]))
+    payment = _strict_payment_row(row)
+    stored_status = PaymentStatus(payment.status)
     status = (
         PaymentStatus.DUPLICATE
         if duplicate and stored_status is PaymentStatus.PAID
         else stored_status
     )
     return PaymentResult(
-        payment_id=str(row["payment_id"]),
-        case_id=attempted_case_id or str(row["case_id"]),
-        idempotency_key=str(row["idempotency_key"]),
+        payment_id=payment.payment_id,
+        case_id=attempted_case_id or payment.case_id,
+        idempotency_key=payment.idempotency_key,
         status=status,
-        vendor=str(row["vendor"]),
-        amount=Money(amount=Decimal(str(row["amount"])), currency=str(row["currency"])),
-        processed_at=datetime.fromisoformat(str(row["created_at"])),
-        duplicate_of=str(row["payment_id"]) if duplicate else None,
-        error=str(row["error"]) if row["error"] is not None else None,
+        vendor=payment.vendor,
+        amount=Money(amount=Decimal(payment.amount), currency=payment.currency),
+        processed_at=datetime.fromisoformat(payment.created_at),
+        duplicate_of=payment.payment_id if duplicate else None,
+        error=payment.error,
     )
 
 
@@ -354,12 +363,13 @@ def mock_payment(
                 "SELECT * FROM payments WHERE idempotency_key = ?", (key,)
             ).fetchone()
             if prior is not None:
-                if PaymentStatus(str(prior["status"])) is PaymentStatus.PAID:
+                prior_payment = _strict_payment_row(prior)
+                if prior_payment.status == "PAID":
                     _validate_paid_ledger_source(connection, prior, snapshot_settings)
                 connection.rollback()
                 return _from_row(
                     prior,
-                    duplicate=PaymentStatus(str(prior["status"])) is PaymentStatus.PAID,
+                    duplicate=prior_payment.status == "PAID",
                     attempted_case_id=case_id,
                 )
             payment_id = f"pay_{uuid4().hex}"

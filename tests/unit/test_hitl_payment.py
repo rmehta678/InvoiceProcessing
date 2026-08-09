@@ -142,11 +142,13 @@ def record_payment_evidence(
 
 def approve_final(store: WorkflowStore, case_id: str, claim: ExecutionClaim) -> ExecutionClaim:
     review = store.load_case_review(case_id)
+    invoice = store.load_current_extraction(claim)
     store.save_final_decision(
         case_id,
         FinalDecision(
             decision=DecisionKind.APPROVE,
             reasons=["approved evidence"],
+            evidence=[reference for line in invoice.lines for reference in line.evidence[:1]],
             critic_disposition=DecisionKind.APPROVE,
             human_outcome=review.human_decision if review is not None else None,
             payment_eligible=True,
@@ -988,6 +990,9 @@ def test_rejected_and_injected_failure_never_report_payment_success(
         FinalDecision(
             decision=DecisionKind.REJECT,
             reasons=["rejected"],
+            evidence=[
+                reference for line in rejected_invoice.lines for reference in line.evidence[:1]
+            ],
             critic_disposition=DecisionKind.REJECT,
             payment_eligible=False,
         ),

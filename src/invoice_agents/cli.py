@@ -209,9 +209,7 @@ def review_decide(
     reason: Annotated[str, typer.Option(prompt=True)],
     mapping: Annotated[list[str] | None, typer.Option("--mapping")] = None,
     superseded_case_id: Annotated[str | None, typer.Option()] = None,
-    address_blocker: Annotated[
-        list[str] | None, typer.Option("--address-blocker")
-    ] = None,
+    address_blocker: Annotated[list[str] | None, typer.Option("--address-blocker")] = None,
 ) -> None:
     """Record an attributable decision; mappings use ``raw item=SKU``."""
 
@@ -292,7 +290,7 @@ def ui_command(
     settings = _settings()
     if init_db:
         try:
-            applied = ensure_databases(settings.inventory_db, settings.workflow_db)
+            applied = ensure_databases(settings)
         except InvoiceAgentsError as exc:
             console.print(f"database setup failed [{exc.stop_reason}]: {exc.message}", style="red")
             raise typer.Exit(1) from exc

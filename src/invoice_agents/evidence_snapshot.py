@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 from invoice_agents.config import Settings
@@ -14,6 +16,7 @@ from invoice_agents.errors import InvoiceAgentsError
 from invoice_agents.models import (
     Critique,
     ExtractedInvoice,
+    FinalDecision,
     HumanDecision,
     IdentityCandidate,
     InventoryComparison,
@@ -126,7 +129,7 @@ def stored_unresolved_blocker_count(risk_json: object, human_json: object) -> in
     if human_json is None:
         human = None
     elif isinstance(human_json, str):
-        human = HumanDecision.model_validate_json(human_json)
+        human = HumanDecision.model_validate_json(human_json, strict=True)
     else:
         raise ValueError("stored human decision must be text or null")
     return len(unaddressed_blockers(risk, human))
@@ -228,6 +231,8 @@ def build_evidence_snapshot(
     authoritative_identity: tuple[IdentityCandidate, ...],
     settings: Settings,
     excluded_alias_sources: frozenset[str] = frozenset(),
+    inventory_connection: sqlite3.Connection | None = None,
+    inventory_schema: str = "main",
 ) -> EvidenceSnapshot:
     """Parse, validate, and digest one exact generation's latest evidence rows."""
 
@@ -274,6 +279,8 @@ def build_evidence_snapshot(
     reader = InventoryReader(
         settings.inventory_db,
         excluded_alias_sources=excluded_alias_sources,
+        connection=inventory_connection,
+        schema=inventory_schema,
     )
     mappings, expected_inventory, unresolved = compare_inventory_evidence(source_invoice, reader)
     inventory_errors = [
@@ -365,13 +372,80 @@ def validate_review_snapshot(review: ReviewRequest, snapshot: EvidenceSnapshot) 
             item.model_dump(mode="json") for item in blocking_evidence(snapshot.risk)
         ],
     }
+    expected_keys = {*expected_bundle, "rendered_pages"}
+    raw_pages = bundle.get("rendered_pages")
+    expected_page_numbers = (
+        list(
+            range(
+                1,
+                (invoice.source.page_count or 1) + 1,
+            )
+        )
+        if invoice.source.source_format == "pdf" and (invoice.source.page_count or 1) <= 3
+        else [1]
+        if invoice.source.source_format == "pdf"
+        else []
+    )
+    if isinstance(raw_pages, list) and len(raw_pages) == len(expected_page_numbers):
+        rendered_pages_valid = True
+        for raw_page, page_number in zip(raw_pages, expected_page_numbers, strict=True):
+            if not isinstance(raw_page, dict):
+                rendered_pages_valid = False
+                break
+            path = raw_page.get("path")
+            rendered_path = Path(path) if isinstance(path, str) else None
+            if (
+                set(raw_page) != {"path", "page", "sha256", "renderer"}
+                or type(raw_page.get("page")) is not int
+                or raw_page.get("page") != page_number
+                or not isinstance(raw_page.get("renderer"), str)
+                or not str(raw_page.get("renderer")).strip()
+                or not isinstance(raw_page.get("sha256"), str)
+                or len(str(raw_page.get("sha256"))) != 64
+                or any(
+                    character not in "0123456789abcdef" for character in str(raw_page.get("sha256"))
+                )
+                or rendered_path is None
+                or not rendered_path.is_absolute()
+                or rendered_path.name != f"{invoice.source.source_id}-page-{page_number}.png"
+                or rendered_path.parent.name != review.review_id
+                or rendered_path.parent.parent.name != "reviews"
+            ):
+                rendered_pages_valid = False
+                break
+    else:
+        rendered_pages_valid = False
     if (
         review.case_id != snapshot.case_id
         or review.source != invoice.source
         or review.amount != expected_amount
         or review.critic != snapshot.critique
+        or set(bundle) != expected_keys
+        or not rendered_pages_valid
         or any(bundle.get(key) != value for key, value in expected_bundle.items())
     ):
         raise EvidenceSnapshotError(
             "review package does not match its bound authorization evidence snapshot"
+        )
+
+
+def validate_final_decision_snapshot(
+    decision: FinalDecision,
+    snapshot: EvidenceSnapshot,
+    review: ReviewRequest | None,
+) -> None:
+    """Require every final payload field that cites evidence/state to match its anchor."""
+
+    expected_evidence = [
+        reference for line in snapshot.invoice.lines for reference in line.evidence[:1]
+    ]
+    human = review.human_decision if review is not None else None
+    if (
+        any(not reason.strip() for reason in decision.reasons)
+        or decision.evidence != expected_evidence
+        or decision.critic_disposition is not snapshot.critique.recommended_disposition
+        or decision.human_outcome != human
+    ):
+        raise EvidenceSnapshotError(
+            "final reasons, evidence, critique, or human outcome do not match the anchor"
         )

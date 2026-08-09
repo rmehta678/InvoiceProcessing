@@ -60,7 +60,7 @@ def run_preflight(settings: Settings) -> PreflightReport:
     )
     for name, path, kind, fix_command in checks:
         try:
-            info = verify_database(path, kind)
+            info = verify_database(path, kind, settings=settings)
             items.append(
                 PreflightItem(
                     name=name,

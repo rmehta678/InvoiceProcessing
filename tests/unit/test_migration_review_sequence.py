@@ -14,9 +14,11 @@ from invoice_agents.db.core import (
     _migration_resources,
     connect_database,
     migrate_database,
+    reconcile_legacy_authorization,
     seed_inventory,
     verify_database,
 )
+from invoice_agents.db.legacy_archive import LEGACY_NON_AUTHORIZING_DISPOSITION
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.errors import DatabaseVerificationError, InvoiceAgentsError
 from invoice_agents.hitl.service import record_human_decision
@@ -63,9 +65,7 @@ def make_source(archive_dir: Path) -> SourceArtifact:
     return snapshot_source(LEGACY_SOURCE, archive_dir, max_bytes=10_485_760)
 
 
-def make_review(
-    review_id: str, created_at: datetime, source: SourceArtifact
-) -> ReviewRequest:
+def make_review(review_id: str, created_at: datetime, source: SourceArtifact) -> ReviewRequest:
     return ReviewRequest(
         review_id=review_id,
         case_id=CASE_ID,
@@ -142,8 +142,7 @@ def make_bound_review(
         reasons=["legacy policy trigger"],
         amount=(
             Money(amount=invoice.declared_total, currency=invoice.currency.normalized_value)
-            if invoice.declared_total is not None
-            and invoice.currency.normalized_value is not None
+            if invoice.declared_total is not None and invoice.currency.normalized_value is not None
             else None
         ),
         source=invoice.source,
@@ -157,9 +156,8 @@ def make_bound_review(
             "dates": [item.model_dump(mode="json") for item in risk.dates],
             "suspicious_signals": risk.suspicious_signals,
             "unavailable_reconciliations": risk.unavailable_reconciliations,
-            "blocking_evidence": [
-                item.model_dump(mode="json") for item in blocking_evidence(risk)
-            ],
+            "blocking_evidence": [item.model_dump(mode="json") for item in blocking_evidence(risk)],
+            "rendered_pages": [],
         },
         agent_recommendation=DecisionKind.HOLD,
         agent_rationale=["legacy review"],
@@ -240,44 +238,64 @@ def build_v1_workflow_db(tmp_path: Path) -> tuple[Path, SourceArtifact]:
     return path, source
 
 
-def test_v1_database_is_rejected_until_migrated_and_rows_gain_sequence(tmp_path: Path) -> None:
+def test_v1_database_requires_explicit_legacy_authorization_reconciliation(
+    tmp_path: Path,
+) -> None:
     path, _source = build_v1_workflow_db(tmp_path)
-    with pytest.raises(DatabaseVerificationError) as excinfo:
-        verify_database(path, DatabaseKind.WORKFLOW)
-    assert excinfo.value.stop_reason == "DATABASE_VERSION_MISMATCH"
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [2, 3]
-    report = verify_database(path, DatabaseKind.WORKFLOW)
-    assert report["schema_version"] == 3
-    with connect_database(path, read_only=True) as connection:
-        row = connection.execute(
-            "SELECT sequence FROM review_requests WHERE review_id = ?", (REVIEW_ID,)
-        ).fetchone()
-        assert int(row["sequence"]) == 1
-        # The human_decisions -> review_requests foreign key survives the table rebuild.
-        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
-    review = WorkflowStore(path).load_case_review(CASE_ID)
-    assert review is not None
-    assert review.review_id == REVIEW_ID
-    assert review.sequence == 1
-
-
-def test_second_review_cycle_is_sequenced_and_duplicates_are_rejected(tmp_path: Path) -> None:
-    path, source = build_v1_workflow_db(tmp_path)
-    migrate_database(path, DatabaseKind.WORKFLOW)
     inventory_db = tmp_path / "inventory.db"
     migrate_database(inventory_db, DatabaseKind.INVENTORY)
     seed_inventory(inventory_db)
-    settings = Settings(
-        workflow_db=path,
-        inventory_db=inventory_db,
-        source_archive_dir=tmp_path / "sources",
+    settings = Settings(workflow_db=path, inventory_db=inventory_db)
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(path, DatabaseKind.WORKFLOW, settings=settings)
+    assert excinfo.value.stop_reason == "DATABASE_VERSION_MISMATCH"
+    with pytest.raises(DatabaseVerificationError) as migration_error:
+        migrate_database(path, DatabaseKind.WORKFLOW)
+    assert migration_error.value.stop_reason == "AUTHORIZATION_RECONCILIATION_REQUIRED"
+    assert migration_error.value.details == {
+        "review_request_count": 1,
+        "human_decision_count": 1,
+        "final_decision_count": 0,
+        "payment_count": 0,
+    }
+    receipt = reconcile_legacy_authorization(
+        path,
+        reviewer="legacy-auditor@example.com",
+        reason="legacy review rows do not carry generation-bound evidence",
+        disposition=LEGACY_NON_AUTHORIZING_DISPOSITION,
+        confirmed=True,
     )
+    assert receipt.record_count == 2
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3]
+    report = verify_database(path, DatabaseKind.WORKFLOW, settings=settings)
+    assert report["schema_version"] == 3
+    with connect_database(path, read_only=True) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM review_requests").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM human_decisions").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM legacy_authorization_quarantine").fetchone()[0]
+            == 2
+        )
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_second_review_cycle_is_sequenced_and_duplicates_are_rejected(
+    settings: Settings,
+) -> None:
+    path = settings.workflow_db
+    source = make_source(settings.source_archive_dir)
     store = WorkflowStore(settings)
+    store.register_source(source)
+    store.create_case(CASE_ID, source, LEGACY_AT)
     claim = store.claim_case_execution(
-        CASE_ID, frozenset({CaseStatus.NEEDS_HUMAN}), lease_seconds=60
+        CASE_ID, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    invoice, risk, case_critique = persist_bound_review_evidence(
-        store, claim, settings, source
+    invoice, risk, case_critique = persist_bound_review_evidence(store, claim, settings, source)
+    first = store.save_review(
+        make_bound_review(
+            "rev_v3_first", datetime(2026, 1, 15, tzinfo=UTC), invoice, risk, case_critique
+        ),
+        claim,
     )
     saved = store.save_review(
         make_bound_review(
@@ -286,13 +304,14 @@ def test_second_review_cycle_is_sequenced_and_duplicates_are_rejected(tmp_path: 
         claim,
     )
     store.release_case_execution(claim)
+    assert first.sequence == 1
     assert saved.sequence == 2
     latest = store.load_case_review(CASE_ID)
     assert latest is not None
     assert latest.review_id == "rev_v2_cycle"
     assert latest.sequence == 2
     ordered = store.list_reviews(pending_only=False)
-    assert [review.review_id for review in ordered] == [REVIEW_ID, "rev_v2_cycle"]
+    assert [review.review_id for review in ordered] == ["rev_v3_first", "rev_v2_cycle"]
     assert [review.sequence for review in ordered] == [1, 2]
     with connect_database(path) as connection, pytest.raises(sqlite3.IntegrityError):
         connection.execute(
@@ -311,11 +330,12 @@ def test_second_review_cycle_is_sequenced_and_duplicates_are_rejected(tmp_path: 
 
 
 def test_missing_required_indexes_fail_verification(workflow_db: Path, inventory_db: Path) -> None:
+    settings = Settings(workflow_db=workflow_db, inventory_db=inventory_db)
     with connect_database(workflow_db) as connection:
         connection.execute("DROP INDEX idx_events_case_created")
         connection.commit()
     with pytest.raises(DatabaseVerificationError, match="idx_events_case_created") as workflow_exc:
-        verify_database(workflow_db, DatabaseKind.WORKFLOW)
+        verify_database(workflow_db, DatabaseKind.WORKFLOW, settings=settings)
     assert workflow_exc.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
 
     with connect_database(inventory_db) as connection:
@@ -342,9 +362,7 @@ def test_atomic_human_decision_preflight_rejects_wal_without_mutation(
     claim = store.claim_case_execution(
         CASE_ID, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    invoice, risk, case_critique = persist_bound_review_evidence(
-        store, claim, settings, source
-    )
+    invoice, risk, case_critique = persist_bound_review_evidence(store, claim, settings, source)
     review = store.save_review(
         make_bound_review("rev_journal_mode", LEGACY_AT, invoice, risk, case_critique), claim
     )
