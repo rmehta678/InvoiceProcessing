@@ -85,7 +85,7 @@ def record_payment_evidence(
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    store.adopt_latest_evidence(claim)
+    store.promote_predecessor_extraction(claim)
     comparisons, _ = compare_inventory(invoice, InventoryReader(settings.inventory_db))
     risk = build_risk_assessment(
         invoice, comparisons, [], compute_invoice_totals(invoice), settings
@@ -157,7 +157,7 @@ def pending_review(
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    store.adopt_latest_evidence(claim)
+    store.promote_predecessor_extraction(claim)
     comparisons, _ = compare_inventory(invoice, InventoryReader(settings.inventory_db))
     risk = build_risk_assessment(
         invoice,
@@ -257,7 +257,7 @@ def test_review_request_and_human_decision_are_persisted(
     claim = store.claim_case_execution(
         "case_review", frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    store.adopt_latest_evidence(claim)
+    store.promote_predecessor_extraction(claim)
     comparisons, _ = compare_inventory(inv, InventoryReader(inventory_db))
     risk = build_risk_assessment(inv, comparisons, [], compute_invoice_totals(inv), settings)
     store.save_identity("case_review", [], claim)
@@ -895,7 +895,7 @@ def test_supersession_requires_distinct_earlier_review_candidate_for_same_invoic
         frozenset({CaseStatus.INCOMPLETE}),
         lease_seconds=60,
     )
-    store.adopt_latest_evidence(claim)
+    store.promote_predecessor_extraction(claim)
     candidates = [candidate("case_prior_revision"), candidate("case_later_revision")]
     store.save_identity("case_current_revision", candidates, claim)
     store.save_comparison(

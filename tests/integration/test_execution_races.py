@@ -28,6 +28,7 @@ from invoice_agents.models import (
     CaseStatus,
     Critique,
     DecisionKind,
+    ExtractedInvoice,
     FinalDecision,
     HumanDecisionKind,
     PaymentStatus,
@@ -101,6 +102,52 @@ def _approve(store: WorkflowStore, case_id: str, claim: ExecutionClaim) -> Final
     )
     store.save_final_decision(case_id, decision, claim)
     return decision
+
+
+def _approve_with_resolved_review(
+    store: WorkflowStore,
+    case_id: str,
+    settings: Settings,
+) -> tuple[ExtractedInvoice, ExecutionClaim]:
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
+    invoice = store.load_current_extraction(claim)
+    risk = RiskAssessment.model_validate(store.load_current_comparison(claim, "risk"))
+    critique = store.load_current_critique(claim)
+    review = create_review_request(
+        case_id,
+        invoice,
+        risk,
+        critique,
+        DecisionKind.HOLD,
+        ["payment authorization requires an attributable human ruling"],
+        store,
+        claim,
+        extra_reasons=["payment authorization requires an attributable human ruling"],
+    )
+    resolved = record_human_decision(
+        review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.APPROVE,
+        "the current evidence is authorized",
+        store,
+        settings.inventory_db,
+    )
+    assert resolved.human_decision is not None
+    store.save_final_decision(
+        case_id,
+        FinalDecision(
+            decision=DecisionKind.APPROVE,
+            reasons=["the resolved review authorizes payment"],
+            critic_disposition=DecisionKind.APPROVE,
+            human_outcome=resolved.human_decision,
+            payment_eligible=True,
+        ),
+        claim,
+    )
+    return invoice, claim
 
 
 def test_two_resume_claims_have_exactly_one_database_owner(settings: Settings) -> None:
@@ -600,6 +647,290 @@ def test_corrupt_future_lease_tuple_is_not_reclaimed(settings: Settings) -> None
             case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
         )
     assert excinfo.value.stop_reason == "EXECUTION_AUTHORITY_CORRUPT"
+
+
+@pytest.mark.parametrize(
+    "lease",
+    [
+        "2000-01-01 00:00:00",
+        "2000-01-01T00:00:00.0+00:00",
+        "2000-02-30T00:00:00+00:00",
+        "2000-01-01T24:00:00+00:00",
+    ],
+)
+def test_schema_rejects_noncanonical_execution_lease(settings: Settings, lease: str) -> None:
+    case_id = "case_noncanonical_lease_trigger"
+    _persist_case(settings, case_id)
+
+    with (
+        connect_database(settings.workflow_db) as connection,
+        pytest.raises(sqlite3.IntegrityError, match="INVALID_EXECUTION_AUTHORITY"),
+    ):
+        connection.execute(
+            "UPDATE cases SET execution_state = 'RUNNING', execution_token = ?, "
+            "execution_generation = execution_generation + 1, lease_expires_at = ? "
+            "WHERE case_id = ?",
+            ("exec_noncanonical", lease, case_id),
+        )
+
+
+def test_claim_rejects_noncanonical_expired_lease_before_cas_adoption(
+    settings: Settings,
+) -> None:
+    case_id = "case_noncanonical_lease_claim"
+    _persist_case(settings, case_id)
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute("DROP TRIGGER trg_cases_execution_authority_update")
+        connection.execute(
+            "UPDATE cases SET execution_state = 'RUNNING', execution_token = ?, "
+            "execution_generation = execution_generation + 1, lease_expires_at = ? "
+            "WHERE case_id = ?",
+            ("exec_noncanonical", "2000-01-01 00:00:00", case_id),
+        )
+        connection.commit()
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        WorkflowStore(settings.workflow_db).claim_case_execution(
+            case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+        )
+    assert excinfo.value.stop_reason == "EXECUTION_AUTHORITY_CORRUPT"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        row = connection.execute(
+            "SELECT execution_token, execution_generation, lease_expires_at FROM cases "
+            "WHERE case_id = ?",
+            (case_id,),
+        ).fetchone()
+    assert row["execution_token"] == "exec_noncanonical"
+    assert row["execution_generation"] == 2
+    assert row["lease_expires_at"] == "2000-01-01 00:00:00"
+
+
+def test_canonical_expired_lease_is_taken_over(settings: Settings) -> None:
+    case_id = "case_canonical_expired_lease"
+    store = _persist_case(settings, case_id)
+    first = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "UPDATE cases SET lease_expires_at = ? WHERE case_id = ?",
+            ("2000-01-01T00:00:00+00:00", case_id),
+        )
+        connection.commit()
+
+    successor = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+
+    assert successor.generation == first.generation + 1
+    assert successor.expires_at.tzinfo is UTC
+    assert successor.expires_at.isoformat().endswith("+00:00")
+
+
+def test_renew_rejects_noncanonical_future_lease_without_overwriting(
+    settings: Settings,
+) -> None:
+    case_id = "case_noncanonical_lease_renew"
+    store = _persist_case(settings, case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    malformed = "2999-01-01 00:00:00"
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute("DROP TRIGGER trg_cases_execution_authority_update")
+        connection.execute(
+            "UPDATE cases SET lease_expires_at = ? WHERE case_id = ?",
+            (malformed, case_id),
+        )
+        connection.commit()
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.renew_case_execution(claim, lease_seconds=60)
+
+    assert excinfo.value.stop_reason == "EXECUTION_AUTHORITY_CORRUPT"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        stored = connection.execute(
+            "SELECT lease_expires_at FROM cases WHERE case_id = ?", (case_id,)
+        ).fetchone()[0]
+    assert stored == malformed
+
+
+def test_adoption_rejects_future_generation_instead_of_copying_global_latest(
+    settings: Settings,
+) -> None:
+    case_id = "case_future_generation_evidence"
+    store = _persist_case(settings, case_id)
+    forged_source = snapshot_source(
+        Path("data/invoices/invoice_1002.txt"),
+        settings.source_archive_dir,
+        max_bytes=settings.source_max_bytes,
+    )
+    forged_invoice = extract_invoice_evidence(forged_source)
+    with connect_database(settings.workflow_db) as connection:
+        next_version = connection.execute(
+            "SELECT MAX(version) + 1 FROM extractions WHERE case_id = ?", (case_id,)
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO extractions(extraction_id, case_id, version, payload_json, "
+            "created_at, execution_generation) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "ext_forged_future",
+                case_id,
+                next_version,
+                forged_invoice.model_dump_json(),
+                datetime.now(UTC).isoformat(),
+                999,
+            ),
+        )
+        connection.commit()
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.adopt_latest_evidence(claim)
+
+    assert excinfo.value.stop_reason == "EVIDENCE_PROVENANCE_INVALID"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        current = connection.execute(
+            "SELECT COUNT(*) FROM extractions WHERE case_id = ? AND execution_generation = ?",
+            (case_id, claim.generation),
+        ).fetchone()[0]
+    assert current == 0
+
+
+def test_adoption_rejects_partial_predecessor_snapshot(settings: Settings) -> None:
+    case_id = "case_partial_predecessor"
+    store = _persist_case(settings, case_id)
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "DELETE FROM critique_results WHERE case_id = ? AND execution_generation = 1",
+            (case_id,),
+        )
+        connection.commit()
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.adopt_latest_evidence(claim)
+
+    assert excinfo.value.stop_reason == "EVIDENCE_PROVENANCE_INVALID"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        adopted = connection.execute(
+            "SELECT COUNT(*) FROM extractions WHERE case_id = ? AND execution_generation = ?",
+            (case_id, claim.generation),
+        ).fetchone()[0]
+    assert adopted == 0
+
+
+def test_fresh_extraction_promotion_rejects_future_generation(
+    settings: Settings,
+) -> None:
+    case_id = "case_future_generation_promotion"
+    store = _persist_case(settings, case_id)
+    invoice = store.load_extraction(case_id)
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "INSERT INTO extractions(extraction_id, case_id, version, payload_json, "
+            "created_at, execution_generation) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "ext_forged_promotion",
+                case_id,
+                2,
+                invoice.model_copy(
+                    update={
+                        "invoice_number": invoice.invoice_number.model_copy(
+                            update={"normalized_value": "INV-1002"}
+                        )
+                    }
+                ).model_dump_json(),
+                datetime.now(UTC).isoformat(),
+                999,
+            ),
+        )
+        connection.commit()
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.promote_predecessor_extraction(claim)
+
+    assert excinfo.value.stop_reason == "EVIDENCE_PROVENANCE_INVALID"
+
+
+@pytest.mark.parametrize("corruption", ["pending", "missing", "mismatched"])
+def test_payment_reconciles_review_with_authoritative_human_decision_rows(
+    settings: Settings, corruption: str
+) -> None:
+    case_id = f"case_review_reconciliation_{corruption}"
+    store = _persist_case(settings, case_id)
+    invoice, claim = _approve_with_resolved_review(store, case_id, settings)
+    review = store.load_current_review(claim)
+    assert review is not None
+    with connect_database(settings.workflow_db) as connection:
+        if corruption == "pending":
+            connection.execute(
+                "UPDATE review_requests SET status = 'PENDING', resolved_at = NULL "
+                "WHERE review_id = ?",
+                (review.review_id,),
+            )
+        elif corruption == "missing":
+            connection.execute(
+                "DELETE FROM human_decisions WHERE review_id = ?", (review.review_id,)
+            )
+        else:
+            connection.execute(
+                "UPDATE human_decisions SET reason = ? WHERE review_id = ?",
+                ("contradictory relational reason", review.review_id),
+            )
+        connection.commit()
+
+    result = mock_payment(case_id, invoice, store, settings.workflow_db, claim)
+
+    assert result.status is PaymentStatus.NOT_ELIGIBLE
+    assert result.error == "review authorization records are inconsistent"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 0
+
+
+def test_duplicate_reconciles_paid_source_human_decision_rows(settings: Settings) -> None:
+    source_case = "case_paid_review_source"
+    store = _persist_case(settings, source_case)
+    source_invoice, source_claim = _approve_with_resolved_review(store, source_case, settings)
+    paid = mock_payment(
+        source_case,
+        source_invoice,
+        store,
+        settings.workflow_db,
+        source_claim,
+    )
+    assert paid.status is PaymentStatus.PAID
+
+    duplicate_case = "case_paid_review_duplicate"
+    _persist_case(settings, duplicate_case)
+    duplicate_invoice = store.load_extraction(duplicate_case)
+    duplicate_claim = store.claim_case_execution(
+        duplicate_case, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    _approve(store, duplicate_case, duplicate_claim)
+    review = store.load_current_review(source_claim)
+    assert review is not None
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute("DELETE FROM human_decisions WHERE review_id = ?", (review.review_id,))
+        connection.commit()
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        mock_payment(
+            duplicate_case,
+            duplicate_invoice,
+            store,
+            settings.workflow_db,
+            duplicate_claim,
+        )
+
+    assert excinfo.value.stop_reason == "PAYMENT_LEDGER_INCONSISTENT"
 
 
 def test_migration_003_rolls_back_and_is_retryable_after_mid_migration_failure(

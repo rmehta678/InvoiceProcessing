@@ -16,13 +16,14 @@ from pathlib import Path
 from uuid import uuid4
 
 from invoice_agents.db.core import connect_database
-from invoice_agents.db.store import ExecutionClaim, WorkflowStore
+from invoice_agents.db.store import ExecutionClaim, WorkflowStore, parse_canonical_utc
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import (
     Critique,
     DecisionKind,
     ExtractedInvoice,
     FinalDecision,
+    HumanDecision,
     Money,
     PaymentResult,
     PaymentStatus,
@@ -41,6 +42,74 @@ class _AuthorizationSnapshot:
 
 class _AuthorizationSnapshotError(Exception):
     pass
+
+
+def _reconcile_review_authorization(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    case_id: str,
+) -> ReviewRequest:
+    """Reconcile embedded review JSON with authoritative relational HITL rows."""
+
+    from invoice_agents.agents.decision_rules import AUTHORIZING_HUMAN_DECISIONS
+
+    inconsistent = _AuthorizationSnapshotError("review authorization records are inconsistent")
+    try:
+        review = ReviewRequest.model_validate_json(row["payload_json"])
+    except ValueError as exc:
+        raise inconsistent from exc
+    human = review.human_decision
+    if (
+        review.case_id != case_id
+        or review.review_id != row["review_id"]
+        or row["case_id"] != case_id
+        or row["status"] != "RESOLVED"
+        or review.status != "RESOLVED"
+        or row["resolved_at"] is None
+        or human is None
+    ):
+        raise inconsistent
+    human_rows = connection.execute(
+        "SELECT review_id, reviewer, decision, reason, payload_json, decided_at "
+        "FROM human_decisions WHERE review_id = ?",
+        (review.review_id,),
+    ).fetchall()
+    if len(human_rows) != 1:
+        raise inconsistent
+    human_row = human_rows[0]
+    try:
+        relational_human = HumanDecision.model_validate_json(human_row["payload_json"])
+    except ValueError as exc:
+        raise inconsistent from exc
+    relational_columns_match = (
+        human_row["review_id"] == review.review_id
+        and human_row["reviewer"] == relational_human.reviewer
+        and human_row["decision"] == relational_human.decision
+        and human_row["reason"] == relational_human.reason
+        and human_row["decided_at"] == relational_human.decided_at.isoformat()
+        and row["resolved_at"] == relational_human.decided_at.isoformat()
+    )
+    raw_blockers = review.evidence_bundle.get("blocking_evidence")
+    if not isinstance(raw_blockers, list):
+        raise inconsistent
+    package_blocker_ids = [
+        entry.get("blocker_id") if isinstance(entry, dict) else None for entry in raw_blockers
+    ]
+    blocker_linkage_valid = (
+        all(isinstance(blocker_id, str) and blocker_id for blocker_id in package_blocker_ids)
+        and len(set(package_blocker_ids)) == len(package_blocker_ids)
+        and len(set(human.addressed_blocker_ids)) == len(human.addressed_blocker_ids)
+        and set(human.addressed_blocker_ids).issubset(set(package_blocker_ids))
+        and (not human.addressed_blocker_ids or human.decision in AUTHORIZING_HUMAN_DECISIONS)
+    )
+    if (
+        relational_human != human
+        or relational_human.review_id != review.review_id
+        or not relational_columns_match
+        or not blocker_linkage_valid
+    ):
+        raise inconsistent
+    return review
 
 
 def _load_authorization_snapshot(
@@ -95,14 +164,15 @@ def _load_authorization_snapshot(
     critique = Critique.model_validate_json(critique_row["payload_json"])
 
     review_row = connection.execute(
-        "SELECT payload_json, execution_generation FROM review_requests WHERE case_id = ? "
+        "SELECT review_id, case_id, status, payload_json, resolved_at, "
+        "execution_generation FROM review_requests WHERE case_id = ? "
         "ORDER BY sequence DESC LIMIT 1",
         (case_id,),
     ).fetchone()
     if review_row is not None and int(review_row["execution_generation"]) != generation:
         raise _AuthorizationSnapshotError("latest review is stale")
     review = (
-        ReviewRequest.model_validate_json(review_row["payload_json"])
+        _reconcile_review_authorization(connection, review_row, case_id)
         if review_row is not None
         else None
     )
@@ -257,13 +327,16 @@ def mock_payment(
                 "c.lease_expires_at FROM cases c WHERE c.case_id = ?",
                 (case_id,),
             ).fetchone()
+            lease = (
+                parse_canonical_utc(case_row["lease_expires_at"]) if case_row is not None else None
+            )
             current_claim = (
                 case_row is not None
                 and str(case_row["execution_token"]) == claim.token
                 and int(case_row["execution_generation"]) == claim.generation
                 and str(case_row["execution_state"]) == "RUNNING"
-                and case_row["lease_expires_at"] is not None
-                and datetime.fromisoformat(str(case_row["lease_expires_at"])) > authorization_time
+                and lease is not None
+                and lease > authorization_time
             )
             if not current_claim:
                 raise InvoiceAgentsError(

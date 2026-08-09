@@ -7,7 +7,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, Never, TypeVar, cast
 from uuid import uuid4
 
 from pydantic import BaseModel
@@ -23,6 +23,7 @@ from invoice_agents.models import (
     HumanDecision,
     HumanDecisionKind,
     ReviewRequest,
+    RiskAssessment,
     SourceArtifact,
 )
 
@@ -43,6 +44,20 @@ class ExecutionClaim:
 
 def now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def parse_canonical_utc(value: object) -> datetime | None:
+    """Parse only Python's canonical, timezone-aware UTC ISO representation."""
+
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        return None
+    return parsed if parsed.isoformat() == value else None
 
 
 def encode(value: BaseModel | dict[str, Any] | list[Any]) -> str:
@@ -341,87 +356,83 @@ class WorkflowStore:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         token = f"exec_{uuid4().hex}"
-        placeholders = ", ".join("?" for _ in expected_statuses)
         statuses = tuple(str(status) for status in sorted(expected_statuses))
         with connect_database(self.path) as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 claimed_at = datetime.now(UTC)
                 expires_at = claimed_at + timedelta(seconds=lease_seconds)
-                updated = connection.execute(
-                    "UPDATE cases SET execution_token = ?, "
-                    "execution_generation = execution_generation + 1, "
-                    "execution_state = 'RUNNING', lease_expires_at = ?, updated_at = ? "
-                    f"WHERE case_id = ? AND status IN ({placeholders}) "
-                    "AND ((execution_state = 'IDLE' AND execution_token IS NULL "
-                    "AND lease_expires_at IS NULL "
-                    "AND typeof(execution_generation) = 'integer' "
-                    "AND execution_generation >= 0) "
-                    "OR (execution_state = 'FINISHED' AND execution_token IS NOT NULL "
-                    "AND execution_token <> '' AND lease_expires_at IS NULL "
-                    "AND typeof(execution_generation) = 'integer' "
-                    "AND execution_generation >= 1) "
-                    "OR (execution_state = 'RUNNING' AND execution_token IS NOT NULL "
-                    "AND execution_token <> '' AND lease_expires_at IS NOT NULL "
-                    "AND datetime(lease_expires_at) IS NOT NULL "
-                    "AND typeof(execution_generation) = 'integer' "
-                    "AND execution_generation >= 1 "
-                    "AND lease_expires_at <= ?))",
-                    (
-                        token,
-                        expires_at.isoformat(),
-                        claimed_at.isoformat(),
-                        case_id,
-                        *statuses,
-                        claimed_at.isoformat(),
-                    ),
+                row = connection.execute(
+                    "SELECT status, execution_token, execution_generation, "
+                    "execution_state, lease_expires_at FROM cases WHERE case_id = ?",
+                    (case_id,),
+                ).fetchone()
+                if row is None:
+                    raise InvoiceAgentsError(
+                        ErrorCategory.DATABASE,
+                        f"case does not exist: {case_id}",
+                        case_id=case_id,
+                        stop_reason="CASE_NOT_FOUND",
+                    )
+                if not self._authority_tuple_is_valid(row):
+                    raise InvoiceAgentsError(
+                        ErrorCategory.DATABASE,
+                        f"case {case_id} has a contradictory execution authority tuple",
+                        case_id=case_id,
+                        stop_reason="EXECUTION_AUTHORITY_CORRUPT",
+                    )
+                if str(row["status"]) not in statuses:
+                    raise InvoiceAgentsError(
+                        ErrorCategory.ORCHESTRATION,
+                        f"case {case_id} has status {row['status']} and is not claimable",
+                        case_id=case_id,
+                        stop_reason="CASE_STATUS_NOT_CLAIMABLE",
+                    )
+                previous_state = str(row["execution_state"])
+                previous_token = row["execution_token"]
+                previous_generation = int(row["execution_generation"])
+                previous_lease = row["lease_expires_at"]
+                parsed_lease = parse_canonical_utc(previous_lease)
+                claimable = previous_state in {"IDLE", "FINISHED"} or (
+                    previous_state == "RUNNING"
+                    and parsed_lease is not None
+                    and parsed_lease <= claimed_at
                 )
-                if updated.rowcount != 1:
-                    row = connection.execute(
-                        "SELECT status, execution_token, execution_generation, "
-                        "execution_state, lease_expires_at FROM cases "
-                        "WHERE case_id = ?",
-                        (case_id,),
-                    ).fetchone()
-                    connection.rollback()
-                    if row is None:
-                        raise InvoiceAgentsError(
-                            ErrorCategory.DATABASE,
-                            f"case does not exist: {case_id}",
-                            case_id=case_id,
-                            stop_reason="CASE_NOT_FOUND",
-                        )
-                    if not self._authority_tuple_is_valid(row):
-                        raise InvoiceAgentsError(
-                            ErrorCategory.DATABASE,
-                            f"case {case_id} has a contradictory execution authority tuple",
-                            case_id=case_id,
-                            stop_reason="EXECUTION_AUTHORITY_CORRUPT",
-                        )
-                    if str(row["status"]) not in statuses:
-                        raise InvoiceAgentsError(
-                            ErrorCategory.ORCHESTRATION,
-                            f"case {case_id} has status {row['status']} and is not claimable",
-                            case_id=case_id,
-                            stop_reason="CASE_STATUS_NOT_CLAIMABLE",
-                        )
+                if not claimable:
                     raise InvoiceAgentsError(
                         ErrorCategory.ORCHESTRATION,
                         f"case {case_id} already has an active execution claim",
                         case_id=case_id,
                         stop_reason="CASE_ALREADY_CLAIMED",
                     )
-                row = connection.execute(
-                    "SELECT execution_generation FROM cases WHERE case_id = ?", (case_id,)
-                ).fetchone()
-                if row is None:
+                generation = previous_generation + 1
+                updated = connection.execute(
+                    "UPDATE cases SET execution_token = ?, "
+                    "execution_generation = ?, "
+                    "execution_state = 'RUNNING', lease_expires_at = ?, updated_at = ? "
+                    "WHERE case_id = ? AND status = ? AND execution_state = ? "
+                    "AND execution_generation = ? AND execution_token IS ? "
+                    "AND lease_expires_at IS ?",
+                    (
+                        token,
+                        generation,
+                        expires_at.isoformat(),
+                        claimed_at.isoformat(),
+                        case_id,
+                        row["status"],
+                        previous_state,
+                        previous_generation,
+                        previous_token,
+                        previous_lease,
+                    ),
+                )
+                if updated.rowcount != 1:
                     raise InvoiceAgentsError(
-                        ErrorCategory.DATABASE,
-                        f"case disappeared while claiming execution: {case_id}",
+                        ErrorCategory.ORCHESTRATION,
+                        f"case {case_id} execution authority changed during claim",
                         case_id=case_id,
-                        stop_reason="CASE_NOT_FOUND",
+                        stop_reason="CASE_ALREADY_CLAIMED",
                     )
-                generation = int(row["execution_generation"])
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -437,6 +448,7 @@ class WorkflowStore:
             connection.execute("BEGIN IMMEDIATE")
             renewed_at = datetime.now(UTC)
             expires_at = renewed_at + timedelta(seconds=lease_seconds)
+            self._require_current_claim(connection, claim, renewed_at)
             updated = connection.execute(
                 "UPDATE cases SET lease_expires_at = ?, updated_at = ? "
                 "WHERE case_id = ? AND execution_token = ? AND execution_generation = ? "
@@ -462,6 +474,7 @@ class WorkflowStore:
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             released_at = datetime.now(UTC)
+            self._require_current_claim(connection, claim, released_at)
             updated = connection.execute(
                 "UPDATE cases SET execution_token = NULL, execution_state = 'IDLE', "
                 "lease_expires_at = NULL, updated_at = ? WHERE case_id = ? "
@@ -490,14 +503,7 @@ class WorkflowStore:
             return False
         generation = raw_generation
         valid_token = isinstance(token, str) and bool(token)
-        valid_lease = False
-        if isinstance(lease, str):
-            try:
-                parsed_lease = datetime.fromisoformat(lease)
-            except ValueError:
-                pass
-            else:
-                valid_lease = parsed_lease.tzinfo is not None
+        valid_lease = parse_canonical_utc(lease) is not None
         return (
             (state == "IDLE" and token is None and lease is None and generation >= 0)
             or (state == "RUNNING" and valid_token and valid_lease and generation >= 1)
@@ -511,17 +517,26 @@ class WorkflowStore:
         checked_at: datetime,
     ) -> None:
         row = connection.execute(
-            "SELECT 1 FROM cases WHERE case_id = ? AND execution_token = ? "
-            "AND execution_generation = ? AND execution_state = 'RUNNING' "
-            "AND lease_expires_at > ?",
-            (
-                claim.case_id,
-                claim.token,
-                claim.generation,
-                checked_at.isoformat(),
-            ),
+            "SELECT execution_token, execution_generation, execution_state, "
+            "lease_expires_at FROM cases WHERE case_id = ?",
+            (claim.case_id,),
         ).fetchone()
-        if row is None:
+        if row is not None and not self._authority_tuple_is_valid(row):
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                f"case {claim.case_id} has a contradictory execution authority tuple",
+                case_id=claim.case_id,
+                stop_reason="EXECUTION_AUTHORITY_CORRUPT",
+            )
+        lease = parse_canonical_utc(row["lease_expires_at"]) if row is not None else None
+        if (
+            row is None
+            or row["execution_token"] != claim.token
+            or int(row["execution_generation"]) != claim.generation
+            or row["execution_state"] != "RUNNING"
+            or lease is None
+            or lease <= checked_at
+        ):
             self._raise_stale_execution_claim(claim)
 
     @staticmethod
@@ -707,47 +722,97 @@ class WorkflowStore:
         return Critique.model_validate(payload)
 
     def adopt_latest_evidence(self, claim: ExecutionClaim) -> None:
-        """Copy the prior stopped generation's evidence into a newly claimed resume."""
+        """Promote one complete, coherent immediate-predecessor snapshot."""
 
         with connect_database(self.path) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            adopted_at = datetime.now(UTC)
-            self._require_current_claim(connection, claim, adopted_at)
-            extraction = connection.execute(
-                "SELECT payload_json, version FROM extractions WHERE case_id = ? "
-                "ORDER BY version DESC LIMIT 1",
-                (claim.case_id,),
-            ).fetchone()
-            if (
-                extraction is not None
-                and connection.execute(
-                    "SELECT 1 FROM extractions WHERE case_id = ? AND execution_generation = ?",
-                    (claim.case_id, claim.generation),
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                adopted_at = datetime.now(UTC)
+                self._require_current_claim(connection, claim, adopted_at)
+                predecessor = claim.generation - 1
+                if predecessor < 1:
+                    self._raise_evidence_provenance(claim, "no predecessor generation exists")
+                self._reject_future_evidence(connection, claim)
+                extraction = connection.execute(
+                    "SELECT payload_json, version FROM extractions WHERE case_id = ? "
+                    "AND execution_generation = ? ORDER BY version DESC LIMIT 1",
+                    (claim.case_id, predecessor),
                 ).fetchone()
-                is None
-            ):
+                identity = connection.execute(
+                    "SELECT payload_json FROM identity_results WHERE case_id = ? "
+                    "AND execution_generation = ? ORDER BY rowid DESC LIMIT 1",
+                    (claim.case_id, predecessor),
+                ).fetchone()
+                inventory = connection.execute(
+                    "SELECT payload_json FROM comparison_results WHERE case_id = ? "
+                    "AND execution_generation = ? AND comparison_type = 'inventory' "
+                    "ORDER BY rowid DESC LIMIT 1",
+                    (claim.case_id, predecessor),
+                ).fetchone()
+                risk = connection.execute(
+                    "SELECT payload_json FROM comparison_results WHERE case_id = ? "
+                    "AND execution_generation = ? AND comparison_type = 'risk' "
+                    "ORDER BY rowid DESC LIMIT 1",
+                    (claim.case_id, predecessor),
+                ).fetchone()
+                critique = connection.execute(
+                    "SELECT payload_json FROM critique_results WHERE case_id = ? "
+                    "AND execution_generation = ? ORDER BY rowid DESC LIMIT 1",
+                    (claim.case_id, predecessor),
+                ).fetchone()
+                required = {
+                    "extraction": extraction,
+                    "identity": identity,
+                    "inventory": inventory,
+                    "risk": risk,
+                    "critique": critique,
+                }
+                missing = sorted(name for name, row in required.items() if row is None)
+                if missing:
+                    self._raise_evidence_provenance(
+                        claim,
+                        f"predecessor generation {predecessor} is incomplete: {missing}",
+                    )
+                assert extraction is not None
+                assert identity is not None
+                assert inventory is not None
+                assert risk is not None
+                assert critique is not None
+                invoice = self._validate_predecessor_snapshot(
+                    connection,
+                    claim,
+                    extraction["payload_json"],
+                    identity["payload_json"],
+                    inventory["payload_json"],
+                    risk["payload_json"],
+                    critique["payload_json"],
+                    predecessor,
+                )
+                next_version = (
+                    int(
+                        connection.execute(
+                            "SELECT COALESCE(MAX(version), 0) FROM extractions WHERE case_id = ?",
+                            (claim.case_id,),
+                        ).fetchone()[0]
+                    )
+                    + 1
+                )
                 connection.execute(
                     "INSERT INTO extractions(extraction_id, case_id, version, payload_json, "
                     "created_at, execution_generation) VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         f"ext_{uuid4().hex}",
                         claim.case_id,
-                        int(extraction["version"]) + 1,
-                        extraction["payload_json"],
+                        next_version,
+                        invoice.model_dump_json(),
                         adopted_at.isoformat(),
                         claim.generation,
                     ),
                 )
-            for table, id_column, prefix in (
-                ("identity_results", "identity_id", "ident"),
-                ("critique_results", "critique_id", "crit"),
-            ):
-                row = connection.execute(
-                    f"SELECT payload_json FROM {table} WHERE case_id = ? "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    (claim.case_id,),
-                ).fetchone()
-                if row is not None:
+                for table, id_column, prefix, row in (
+                    ("identity_results", "identity_id", "ident", identity),
+                    ("critique_results", "critique_id", "crit", critique),
+                ):
                     connection.execute(
                         f"INSERT INTO {table}({id_column}, case_id, payload_json, created_at, "
                         "execution_generation) VALUES (?, ?, ?, ?, ?)",
@@ -759,13 +824,7 @@ class WorkflowStore:
                             claim.generation,
                         ),
                     )
-            for comparison_type in ("inventory", "risk"):
-                row = connection.execute(
-                    "SELECT payload_json FROM comparison_results WHERE case_id = ? "
-                    "AND comparison_type = ? ORDER BY created_at DESC LIMIT 1",
-                    (claim.case_id, comparison_type),
-                ).fetchone()
-                if row is not None:
+                for comparison_type, row in (("inventory", inventory), ("risk", risk)):
                     connection.execute(
                         "INSERT INTO comparison_results(comparison_id, case_id, "
                         "comparison_type, payload_json, created_at, execution_generation) "
@@ -779,13 +838,201 @@ class WorkflowStore:
                             claim.generation,
                         ),
                     )
-            connection.execute(
-                "UPDATE review_requests SET execution_generation = ? WHERE review_id = ("
-                "SELECT review_id FROM review_requests WHERE case_id = ? "
-                "ORDER BY sequence DESC LIMIT 1)",
-                (claim.generation, claim.case_id),
+                review = connection.execute(
+                    "SELECT review_id FROM review_requests WHERE case_id = ? "
+                    "AND execution_generation = ? ORDER BY sequence DESC LIMIT 1",
+                    (claim.case_id, predecessor),
+                ).fetchone()
+                if review is not None:
+                    updated = connection.execute(
+                        "UPDATE review_requests SET execution_generation = ? "
+                        "WHERE review_id = ? AND execution_generation = ?",
+                        (claim.generation, review["review_id"], predecessor),
+                    )
+                    if updated.rowcount != 1:
+                        self._raise_evidence_provenance(
+                            claim, "predecessor review changed during promotion"
+                        )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def promote_predecessor_extraction(self, claim: ExecutionClaim) -> ExtractedInvoice:
+        """Promote only preparation's immediate-predecessor extraction into a fresh run."""
+
+        with connect_database(self.path) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                promoted_at = datetime.now(UTC)
+                self._require_current_claim(connection, claim, promoted_at)
+                predecessor = claim.generation - 1
+                if predecessor < 1:
+                    self._raise_evidence_provenance(claim, "no predecessor generation exists")
+                self._reject_future_evidence(connection, claim)
+                row = connection.execute(
+                    "SELECT payload_json FROM extractions WHERE case_id = ? "
+                    "AND execution_generation = ? ORDER BY version DESC LIMIT 1",
+                    (claim.case_id, predecessor),
+                ).fetchone()
+                if row is None:
+                    self._raise_evidence_provenance(
+                        claim, f"predecessor generation {predecessor} has no extraction"
+                    )
+                invoice = self._validate_case_invoice(connection, claim, row["payload_json"])
+                next_version = (
+                    int(
+                        connection.execute(
+                            "SELECT COALESCE(MAX(version), 0) FROM extractions WHERE case_id = ?",
+                            (claim.case_id,),
+                        ).fetchone()[0]
+                    )
+                    + 1
+                )
+                connection.execute(
+                    "INSERT INTO extractions(extraction_id, case_id, version, payload_json, "
+                    "created_at, execution_generation) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        f"ext_{uuid4().hex}",
+                        claim.case_id,
+                        next_version,
+                        invoice.model_dump_json(),
+                        promoted_at.isoformat(),
+                        claim.generation,
+                    ),
+                )
+                connection.commit()
+                return invoice
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def _reject_future_evidence(
+        self, connection: sqlite3.Connection, claim: ExecutionClaim
+    ) -> None:
+        generation_columns = (
+            ("extractions", "execution_generation"),
+            ("identity_results", "execution_generation"),
+            ("comparison_results", "execution_generation"),
+            ("critique_results", "execution_generation"),
+            ("review_requests", "execution_generation"),
+            ("final_decisions", "decision_generation"),
+            ("payments", "decision_generation"),
+        )
+        invalid = []
+        for table, column in generation_columns:
+            row = connection.execute(
+                f"SELECT MAX({column}) AS generation FROM {table} WHERE case_id = ?",
+                (claim.case_id,),
+            ).fetchone()
+            if row["generation"] is not None and int(row["generation"]) >= claim.generation:
+                invalid.append(f"{table}:{row['generation']}")
+        if invalid:
+            self._raise_evidence_provenance(
+                claim, f"current or future evidence generations exist: {sorted(invalid)}"
             )
-            connection.commit()
+
+    def _validate_case_invoice(
+        self,
+        connection: sqlite3.Connection,
+        claim: ExecutionClaim,
+        payload_json: str,
+    ) -> ExtractedInvoice:
+        try:
+            invoice = ExtractedInvoice.model_validate_json(payload_json)
+        except ValueError as exc:
+            self._raise_evidence_provenance(claim, f"invalid predecessor extraction: {exc}")
+        row = connection.execute(
+            "SELECT source_id, invoice_number, vendor, revision FROM cases WHERE case_id = ?",
+            (claim.case_id,),
+        ).fetchone()
+        revision = invoice.revision.normalized_value if invoice.revision else None
+        if row is None or (
+            invoice.source.source_id != row["source_id"]
+            or invoice.invoice_number.normalized_value != row["invoice_number"]
+            or invoice.vendor.normalized_value != row["vendor"]
+            or revision != row["revision"]
+        ):
+            self._raise_evidence_provenance(
+                claim, "predecessor extraction does not match the case identity"
+            )
+        return invoice
+
+    def _validate_predecessor_snapshot(
+        self,
+        connection: sqlite3.Connection,
+        claim: ExecutionClaim,
+        extraction_json: str,
+        identity_json: str,
+        inventory_json: str,
+        risk_json: str,
+        critique_json: str,
+        predecessor: int,
+    ) -> ExtractedInvoice:
+        invoice = self._validate_case_invoice(connection, claim, extraction_json)
+        try:
+            identity = json.loads(identity_json)
+            inventory = json.loads(inventory_json)
+            risk = RiskAssessment.model_validate_json(risk_json)
+            critique = Critique.model_validate_json(critique_json)
+        except (TypeError, ValueError) as exc:
+            self._raise_evidence_provenance(
+                claim, f"predecessor evidence payload is invalid: {exc}"
+            )
+        if not isinstance(identity, list) or not isinstance(inventory, dict):
+            self._raise_evidence_provenance(
+                claim, "predecessor identity or inventory payload has the wrong shape"
+            )
+        comparisons = inventory.get("comparisons")
+        if comparisons != [item.model_dump(mode="json") for item in risk.inventory] or identity != [
+            item.model_dump(mode="json") for item in risk.identity_candidates
+        ]:
+            self._raise_evidence_provenance(
+                claim, "predecessor risk does not match its identity and inventory evidence"
+            )
+        review_row = connection.execute(
+            "SELECT payload_json, execution_generation FROM review_requests "
+            "WHERE case_id = ? ORDER BY sequence DESC LIMIT 1",
+            (claim.case_id,),
+        ).fetchone()
+        if review_row is not None:
+            if int(review_row["execution_generation"]) != predecessor:
+                self._raise_evidence_provenance(
+                    claim, "latest review does not belong to the predecessor generation"
+                )
+            try:
+                review = ReviewRequest.model_validate_json(review_row["payload_json"])
+            except ValueError as exc:
+                self._raise_evidence_provenance(
+                    claim, f"predecessor review payload is invalid: {exc}"
+                )
+            bundle = review.evidence_bundle
+            coherent_review = (
+                review.case_id == claim.case_id
+                and review.source == invoice.source
+                and bundle.get("invoice") == invoice.model_dump(mode="json")
+                and bundle.get("financial") == risk.financial.model_dump(mode="json")
+                and bundle.get("inventory")
+                == [item.model_dump(mode="json") for item in risk.inventory]
+                and bundle.get("identity_candidates")
+                == [item.model_dump(mode="json") for item in risk.identity_candidates]
+                and review.critic == critique
+            )
+            if not coherent_review:
+                self._raise_evidence_provenance(
+                    claim, "predecessor review does not match the promoted evidence"
+                )
+        return invoice
+
+    @staticmethod
+    def _raise_evidence_provenance(claim: ExecutionClaim, reason: str) -> Never:
+        raise InvoiceAgentsError(
+            ErrorCategory.DATABASE,
+            f"cannot promote evidence for case {claim.case_id}: {reason}",
+            case_id=claim.case_id,
+            stop_reason="EVIDENCE_PROVENANCE_INVALID",
+            details={"execution_generation": claim.generation, "reason": reason},
+        )
 
     def save_review(self, review: ReviewRequest, claim: ExecutionClaim) -> ReviewRequest:
         """Persist the next review cycle for the case and return it with its sequence.
@@ -1060,6 +1307,7 @@ class WorkflowStore:
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             written_at = datetime.now(UTC).isoformat()
+            self._require_current_claim(connection, claim, datetime.fromisoformat(written_at))
             updated = connection.execute(
                 "UPDATE cases SET team_state_json = ?, updated_at = ? WHERE case_id = ? "
                 "AND execution_token = ? AND execution_generation = ? "
@@ -1098,6 +1346,7 @@ class WorkflowStore:
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             written_at = datetime.now(UTC).isoformat()
+            self._require_current_claim(connection, claim, datetime.fromisoformat(written_at))
             updated = connection.execute(
                 "UPDATE cases SET status = ?, stop_reason = ?, result_json = ?, updated_at = ?, "
                 "finished_at = ?, execution_state = 'FINISHED', lease_expires_at = NULL "

@@ -109,7 +109,7 @@ def golden(tmp_path_factory: pytest.TempPathFactory) -> dict[str, CaseEvidence]:
         claim = store.claim_case_execution(
             case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
         )
-        store.adopt_latest_evidence(claim)
+        store.promote_predecessor_extraction(claim)
         store.save_identity(case_id, [c.model_dump(mode="json") for c in identity], claim)
         store.release_case_execution(claim)
         comparisons, _unresolved = compare_inventory(invoice, reader)

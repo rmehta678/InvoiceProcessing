@@ -41,7 +41,7 @@ def build_review(name: str, settings: Settings) -> ReviewRequest:
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    store.adopt_latest_evidence(claim)
+    store.promote_predecessor_extraction(claim)
     comparisons, _unresolved = compare_inventory(invoice, InventoryReader(settings.inventory_db))
     risk = build_risk_assessment(
         invoice, comparisons, [], compute_invoice_totals(invoice), settings

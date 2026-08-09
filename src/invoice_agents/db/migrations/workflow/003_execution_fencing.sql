@@ -53,7 +53,18 @@ WHEN NOT (
         AND NEW.execution_generation >= 0)
     OR (NEW.execution_state = 'RUNNING' AND NEW.execution_token IS NOT NULL
         AND NEW.execution_token <> '' AND NEW.lease_expires_at IS NOT NULL
+        AND (
+            (length(NEW.lease_expires_at) = 25 AND NEW.lease_expires_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00')
+            OR (length(NEW.lease_expires_at) = 32 AND NEW.lease_expires_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00')
+        )
         AND datetime(NEW.lease_expires_at) IS NOT NULL
+        AND strftime('%Y-%m-%dT%H:%M:%S', NEW.lease_expires_at) =
+            substr(NEW.lease_expires_at, 1, 19)
+        AND CAST(substr(NEW.lease_expires_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23
+        AND CAST(substr(NEW.lease_expires_at, 15, 2) AS INTEGER) BETWEEN 0 AND 59
+        AND CAST(substr(NEW.lease_expires_at, 18, 2) AS INTEGER) BETWEEN 0 AND 59
         AND typeof(NEW.execution_generation) = 'integer'
         AND NEW.execution_generation >= 1)
     OR (NEW.execution_state = 'FINISHED' AND NEW.execution_token IS NOT NULL
@@ -75,7 +86,18 @@ WHEN NOT (
         AND NEW.execution_generation >= 0)
     OR (NEW.execution_state = 'RUNNING' AND NEW.execution_token IS NOT NULL
         AND NEW.execution_token <> '' AND NEW.lease_expires_at IS NOT NULL
+        AND (
+            (length(NEW.lease_expires_at) = 25 AND NEW.lease_expires_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00')
+            OR (length(NEW.lease_expires_at) = 32 AND NEW.lease_expires_at GLOB
+                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00')
+        )
         AND datetime(NEW.lease_expires_at) IS NOT NULL
+        AND strftime('%Y-%m-%dT%H:%M:%S', NEW.lease_expires_at) =
+            substr(NEW.lease_expires_at, 1, 19)
+        AND CAST(substr(NEW.lease_expires_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23
+        AND CAST(substr(NEW.lease_expires_at, 15, 2) AS INTEGER) BETWEEN 0 AND 59
+        AND CAST(substr(NEW.lease_expires_at, 18, 2) AS INTEGER) BETWEEN 0 AND 59
         AND typeof(NEW.execution_generation) = 'integer'
         AND NEW.execution_generation >= 1)
     OR (NEW.execution_state = 'FINISHED' AND NEW.execution_token IS NOT NULL

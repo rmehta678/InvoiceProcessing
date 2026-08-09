@@ -68,7 +68,7 @@ def record_case_evidence(
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    store.adopt_latest_evidence(claim)
+    store.promote_predecessor_extraction(claim)
     _mappings, comparisons, unresolved = compare_inventory_evidence(
         invoice, InventoryReader(settings.inventory_db)
     )

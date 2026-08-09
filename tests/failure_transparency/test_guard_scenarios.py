@@ -191,7 +191,7 @@ def _persist_blocking_review(invoice_dir: Path, settings: Settings) -> ReviewReq
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    store.adopt_latest_evidence(claim)
+    store.promote_predecessor_extraction(claim)
     risk = _risk(["blocking evidence requires review"]).model_copy(
         update={"inventory": [_blocking_inventory()]}, deep=True
     )
@@ -429,7 +429,7 @@ def test_payment_ledger_write_failure(invoice_dir: Path, settings: Settings) -> 
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    store.adopt_latest_evidence(claim)
+    store.promote_predecessor_extraction(claim)
     store.save_identity(case_id, [], claim)
     store.save_comparison(case_id, "inventory", {"comparisons": []}, claim)
     store.save_comparison(case_id, "risk", _risk([]).model_dump(mode="json"), claim)

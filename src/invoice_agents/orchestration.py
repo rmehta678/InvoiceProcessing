@@ -403,8 +403,7 @@ async def run_prepared_case(case_id: str, started_at: datetime, settings: Settin
         frozenset({CaseStatus.INCOMPLETE}),
         EXECUTION_LEASE_SECONDS,
     )
-    invoice = store.load_extraction(case_id)
-    store.save_extraction(case_id, invoice, claim)
+    invoice = store.promote_predecessor_extraction(claim)
     audit = AuditRecorder(settings.workflow_db, case_id)
     audit.record(
         "provider.configuration",
