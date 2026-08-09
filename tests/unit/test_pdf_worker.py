@@ -150,6 +150,81 @@ def probe_real_page_extraction(connection: Connection, *worker_args: object) -> 
         allocation_path.write_text(str(peak), encoding="ascii")
 
 
+class TrackedPageText(str):
+    """Expose when the production extraction loop releases one raw page string."""
+
+    release_path: Path
+
+    def __new__(cls, value: str, release_path: Path) -> TrackedPageText:
+        instance = super().__new__(cls, value)
+        instance.release_path = release_path
+        return instance
+
+    def __del__(self) -> None:
+        self.release_path.write_text("released", encoding="ascii")
+
+
+def probe_page_text_release_during_next_extraction(
+    connection: Connection,
+    *worker_args: object,
+) -> None:
+    """Observe page-one liveness from inside page two's real parser call."""
+
+    from pypdf._page import PageObject
+
+    release_path = Path(os.environ["INVOICE_TEST_PAGE_RELEASE_PATH"])
+    liveness_path = Path(os.environ["INVOICE_TEST_PAGE_LIVENESS_PATH"])
+    original_extract_text = PageObject.extract_text
+    extraction_count = 0
+
+    def tracking_extract_text(page: PageObject, *args: Any, **kwargs: Any) -> str:
+        nonlocal extraction_count
+        extraction_count += 1
+        if extraction_count == 2:
+            state = "released" if release_path.exists() else "retained"
+            liveness_path.write_text(state, encoding="ascii")
+        extracted = original_extract_text(page, *args, **kwargs)
+        if extraction_count == 1:
+            return TrackedPageText(extracted, release_path)
+        return extracted
+
+    PageObject.extract_text = tracking_extract_text
+    pdf_worker()._worker_main(connection, *worker_args)
+
+
+def probe_page_text_release_after_append_overflow(
+    connection: Connection,
+    *worker_args: object,
+) -> None:
+    """Observe oversized raw-page liveness before the generic failure is sent."""
+
+    from pypdf._page import PageObject
+
+    release_path = Path(os.environ["INVOICE_TEST_PAGE_RELEASE_PATH"])
+    liveness_path = Path(os.environ["INVOICE_TEST_PAGE_LIVENESS_PATH"])
+    worker_module = pdf_worker()
+    original_extract_text = PageObject.extract_text
+    original_send = worker_module._send
+
+    def tracking_extract_text(page: PageObject, *args: Any, **kwargs: Any) -> str:
+        extracted = original_extract_text(page, *args, **kwargs)
+        return TrackedPageText(extracted, release_path)
+
+    def observing_send(
+        child_connection: Connection,
+        payload: dict[str, object],
+        max_bytes: int,
+    ) -> None:
+        if payload.get("stop_reason") == "PDF_WORKER_FAILED":
+            state = "released" if release_path.exists() else "retained"
+            liveness_path.write_text(state, encoding="ascii")
+        original_send(child_connection, payload, max_bytes)
+
+    PageObject.extract_text = tracking_extract_text
+    worker_module._send = observing_send
+    worker_module._worker_main(connection, *worker_args)
+
+
 def send_page_limit_error_then_stall(connection: Connection, *_args: object) -> None:
     """Send a valid page-limit frame and stay alive for parent cleanup verification."""
 
@@ -374,6 +449,63 @@ def test_oversized_first_page_stops_real_extraction_before_later_pages(
     assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
     assert extraction_path.read_text(encoding="ascii") == "1"
     assert int(allocation_path.read_text(encoding="ascii")) < 4_000_000
+    assert child_pids() == before
+
+
+def test_previous_raw_page_text_is_released_during_next_real_extraction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    submitted = tmp_path / "two-fitting-pages.pdf"
+    write_compressed_pages_pdf(submitted, [128, 128])
+    source = content_addressed_pdf(submitted, tmp_path / "sources", 2)
+    release_path = tmp_path / "page-one-released.txt"
+    liveness_path = tmp_path / "page-two-observation.txt"
+    monkeypatch.setenv("INVOICE_TEST_PAGE_RELEASE_PATH", str(release_path))
+    monkeypatch.setenv("INVOICE_TEST_PAGE_LIVENESS_PATH", str(liveness_path))
+    worker_module = pdf_worker()
+    monkeypatch.setattr(
+        worker_module,
+        "_worker_main",
+        probe_page_text_release_during_next_extraction,
+    )
+    before = child_pids()
+
+    result = worker_module._run_worker("extract", source, timeout_seconds=5.0)
+
+    assert result["page_count"] == 2
+    assert liveness_path.read_text(encoding="ascii") == "released"
+    assert release_path.read_text(encoding="ascii") == "released"
+    assert child_pids() == before
+
+
+def test_raw_page_text_is_released_before_append_overflow_is_reported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    submitted = tmp_path / "oversized-raw-page.pdf"
+    write_compressed_text_pdf(submitted, 40_000)
+    assert submitted.stat().st_size < 65_536
+    source = content_addressed_pdf(submitted, tmp_path / "sources", 1)
+    release_path = tmp_path / "oversized-page-released.txt"
+    liveness_path = tmp_path / "failure-send-observation.txt"
+    monkeypatch.setenv("INVOICE_PDF_WORKER_RESULT_MAX_BYTES", "65536")
+    monkeypatch.setenv("INVOICE_TEST_PAGE_RELEASE_PATH", str(release_path))
+    monkeypatch.setenv("INVOICE_TEST_PAGE_LIVENESS_PATH", str(liveness_path))
+    worker_module = pdf_worker()
+    monkeypatch.setattr(
+        worker_module,
+        "_worker_main",
+        probe_page_text_release_after_append_overflow,
+    )
+    before = child_pids()
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        worker_module._run_worker("extract", source, timeout_seconds=5.0)
+
+    assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
+    assert liveness_path.read_text(encoding="ascii") == "released"
+    assert release_path.read_text(encoding="ascii") == "released"
     assert child_pids() == before
 
 

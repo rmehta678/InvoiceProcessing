@@ -360,13 +360,18 @@ def _worker_main(
                 page_count=page_count,
                 max_bytes=result_max_bytes,
             )
-            try:
-                for index, pdf_page in enumerate(reader.pages, 1):
-                    page_text = pdf_page.extract_text() or ""
+            for index, pdf_page in enumerate(reader.pages, 1):
+                page_text = pdf_page.extract_text() or ""
+                page_too_large = False
+                try:
                     extraction.append_page(index, page_text)
-            except _ResultTooLarge:
-                _send(connection, _generic_failure_payload(), result_max_bytes)
-                return
+                except _ResultTooLarge:
+                    page_too_large = True
+                finally:
+                    del page_text
+                if page_too_large:
+                    _send(connection, _generic_failure_payload(), result_max_bytes)
+                    return
             if not extraction.has_text:
                 _send(
                     connection,
