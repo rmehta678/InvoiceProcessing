@@ -85,6 +85,26 @@ def _review_from_row(row: sqlite3.Row | None, review_id: str) -> ReviewRequest:
     return ReviewRequest.model_validate_json(row["payload_json"])
 
 
+def _resolved_human_decision_replay(
+    review: ReviewRequest, decision: HumanDecision | None
+) -> ReviewRequest:
+    """Return an exact resolved replay or classify every difference consistently."""
+
+    existing = review.human_decision
+    if (
+        decision is not None
+        and existing is not None
+        and _decision_semantics(existing) == _decision_semantics(decision)
+    ):
+        return review
+    raise InvoiceAgentsError(
+        ErrorCategory.DATABASE,
+        f"review {review.review_id} is already resolved",
+        case_id=review.case_id,
+        stop_reason="REVIEW_ALREADY_RESOLVED",
+    )
+
+
 def _normalized_invoice_field(invoice: dict[str, Any], name: str) -> str | None:
     raw = invoice.get(name)
     if not isinstance(raw, dict):
@@ -448,6 +468,20 @@ class WorkflowStore:
             rows = connection.execute(sql, params).fetchall()
         return [ReviewRequest.model_validate_json(row["payload_json"]) for row in rows]
 
+    def classify_human_decision_replay(
+        self, review_id: str, decision: HumanDecision | None
+    ) -> ReviewRequest | None:
+        """Classify persisted resolved state without opening or touching inventory.
+
+        ``None`` means the workflow review was pending at this preliminary read. The
+        attached write transaction must reload it before validation or mutation.
+        """
+
+        review = self.load_review(review_id)
+        if review.status == "PENDING":
+            return None
+        return _resolved_human_decision_replay(review, decision)
+
     def save_human_decision(
         self, decision: HumanDecision, inventory_db: Path
     ) -> ReviewRequest:
@@ -484,18 +518,9 @@ class WorkflowStore:
                 ).fetchone()
                 review = _review_from_row(row, decision.review_id)
                 if review.status == "RESOLVED":
-                    existing = review.human_decision
-                    if existing is not None and _decision_semantics(existing) == _decision_semantics(
-                        decision
-                    ):
-                        connection.rollback()
-                        return review
-                    raise InvoiceAgentsError(
-                        ErrorCategory.DATABASE,
-                        f"review {decision.review_id} is already resolved",
-                        case_id=review.case_id,
-                        stop_reason="REVIEW_ALREADY_RESOLVED",
-                    )
+                    replay = _resolved_human_decision_replay(review, decision)
+                    connection.rollback()
+                    return replay
 
                 mappings = _validate_human_decision(connection, review, decision)
                 resolved = review.model_copy(

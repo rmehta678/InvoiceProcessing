@@ -520,6 +520,179 @@ def test_every_semantically_different_retry_fails_without_mutation(
         )
 
 
+@pytest.mark.parametrize(
+    ("reviewer", "reason"),
+    [
+        ("   ", "approved mapping evidence"),
+        ("reviewer@example.com", " \n\t "),
+    ],
+    ids=["blank-reviewer", "blank-reason"],
+)
+def test_resolved_blank_field_retry_is_classified_as_already_resolved_before_validation(
+    reviewer: str,
+    reason: str,
+    settings: Settings,
+    mapping_review: ReviewRequest,
+) -> None:
+    record_human_decision(
+        mapping_review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.ESTABLISH_MAPPING,
+        "approved mapping evidence",
+        WorkflowStore(settings.workflow_db),
+        settings.inventory_db,
+        mappings=[mapping("WidgetA (bulk)")],
+    )
+    before = persisted_decision_state(
+        settings.workflow_db, settings.inventory_db, mapping_review.review_id
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        record_human_decision(
+            mapping_review.review_id,
+            reviewer,
+            HumanDecisionKind.ESTABLISH_MAPPING,
+            reason,
+            WorkflowStore(settings.workflow_db),
+            settings.inventory_db,
+            mappings=[mapping("WidgetA (bulk)")],
+        )
+
+    assert excinfo.value.stop_reason == "REVIEW_ALREADY_RESOLVED"
+    assert (
+        persisted_decision_state(
+            settings.workflow_db, settings.inventory_db, mapping_review.review_id
+        )
+        == before
+    )
+
+
+@pytest.mark.parametrize("exact_replay", [True, False], ids=["exact", "different"])
+def test_resolved_retry_uses_only_workflow_state_when_inventory_is_wal(
+    exact_replay: bool, settings: Settings
+) -> None:
+    review = pending_review(
+        Path("data/invoices/invoice_1002.txt"), "case_wal_replay", settings
+    )
+    resolved = record_human_decision(
+        review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.REJECT,
+        "the evidence does not support payment",
+        WorkflowStore(settings.workflow_db),
+        settings.inventory_db,
+    )
+    with connect_database(settings.inventory_db) as connection:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+    before = persisted_decision_state(
+        settings.workflow_db, settings.inventory_db, review.review_id
+    )
+
+    if exact_replay:
+        replayed = record_human_decision(
+            review.review_id,
+            "reviewer@example.com",
+            HumanDecisionKind.REJECT,
+            "the evidence does not support payment",
+            WorkflowStore(settings.workflow_db),
+            settings.inventory_db,
+        )
+        assert replayed == resolved
+    else:
+        with pytest.raises(InvoiceAgentsError) as excinfo:
+            record_human_decision(
+                review.review_id,
+                "other@example.com",
+                HumanDecisionKind.REJECT,
+                "the evidence does not support payment",
+                WorkflowStore(settings.workflow_db),
+                settings.inventory_db,
+            )
+        assert excinfo.value.stop_reason == "REVIEW_ALREADY_RESOLVED"
+    assert (
+        persisted_decision_state(settings.workflow_db, settings.inventory_db, review.review_id)
+        == before
+    )
+
+
+@pytest.mark.parametrize("exact_replay", [True, False], ids=["exact", "different"])
+def test_resolved_retry_never_opens_an_unavailable_inventory_path(
+    exact_replay: bool, settings: Settings, tmp_path: Path
+) -> None:
+    review = pending_review(
+        Path("data/invoices/invoice_1002.txt"), "case_missing_inventory_replay", settings
+    )
+    resolved = record_human_decision(
+        review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.REJECT,
+        "the evidence does not support payment",
+        WorkflowStore(settings.workflow_db),
+        settings.inventory_db,
+    )
+    unavailable_inventory = tmp_path / "missing-parent" / "inventory.db"
+    assert not unavailable_inventory.parent.exists()
+    before = persisted_decision_state(
+        settings.workflow_db, settings.inventory_db, review.review_id
+    )
+
+    if exact_replay:
+        replayed = record_human_decision(
+            review.review_id,
+            "reviewer@example.com",
+            HumanDecisionKind.REJECT,
+            "the evidence does not support payment",
+            WorkflowStore(settings.workflow_db),
+            unavailable_inventory,
+        )
+        assert replayed == resolved
+    else:
+        with pytest.raises(InvoiceAgentsError) as excinfo:
+            record_human_decision(
+                review.review_id,
+                "other@example.com",
+                HumanDecisionKind.REJECT,
+                "the evidence does not support payment",
+                WorkflowStore(settings.workflow_db),
+                unavailable_inventory,
+            )
+        assert excinfo.value.stop_reason == "REVIEW_ALREADY_RESOLVED"
+    assert not unavailable_inventory.parent.exists()
+    assert (
+        persisted_decision_state(settings.workflow_db, settings.inventory_db, review.review_id)
+        == before
+    )
+
+
+def test_pending_blank_field_still_fails_validation_before_inventory_access(
+    settings: Settings, mapping_review: ReviewRequest, tmp_path: Path
+) -> None:
+    unavailable_inventory = tmp_path / "missing-parent" / "inventory.db"
+    before = persisted_decision_state(
+        settings.workflow_db, settings.inventory_db, mapping_review.review_id
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        record_human_decision(
+            mapping_review.review_id,
+            "reviewer@example.com",
+            HumanDecisionKind.ESTABLISH_MAPPING,
+            "   ",
+            WorkflowStore(settings.workflow_db),
+            unavailable_inventory,
+            mappings=[mapping("WidgetA (bulk)")],
+        )
+
+    assert excinfo.value.stop_reason == "HUMAN_DECISION_INVALID"
+    assert not unavailable_inventory.parent.exists()
+    assert (
+        persisted_decision_state(
+            settings.workflow_db, settings.inventory_db, mapping_review.review_id
+        )
+        == before
+    )
+
+
 def test_conflicting_targets_for_one_normalized_alias_are_rejected_without_mutation(
     settings: Settings, mapping_review: ReviewRequest
 ) -> None:

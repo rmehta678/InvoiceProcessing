@@ -126,12 +126,6 @@ def record_human_decision(
 ) -> ReviewRequest:
     """Record one evidence-bound decision and any aliases in a single SQLite commit."""
 
-    if not reviewer.strip() or not reason.strip():
-        raise InvoiceAgentsError(
-            ErrorCategory.TOOL,
-            "reviewer and reason are required",
-            stop_reason="HUMAN_DECISION_INVALID",
-        )
     selected_blocker_ids = list(
         dict.fromkeys(
             blocker_id.strip()
@@ -150,14 +144,27 @@ def record_human_decision(
         )
         for mapping in mappings or []
     ]
-    human = HumanDecision(
-        review_id=review_id,
-        reviewer=reviewer.strip(),
-        decision=decision,
-        reason=reason.strip(),
-        decided_at=datetime.now(UTC),
-        mappings=selected_mappings,
-        superseded_case_id=(superseded_case_id or "").strip() or None,
-        addressed_blocker_ids=selected_blocker_ids,
+    human = (
+        HumanDecision(
+            review_id=review_id,
+            reviewer=reviewer.strip(),
+            decision=decision,
+            reason=reason.strip(),
+            decided_at=datetime.now(UTC),
+            mappings=selected_mappings,
+            superseded_case_id=(superseded_case_id or "").strip() or None,
+            addressed_blocker_ids=selected_blocker_ids,
+        )
+        if reviewer.strip() and reason.strip()
+        else None
     )
+    replay = store.classify_human_decision_replay(review_id, human)
+    if replay is not None:
+        return replay
+    if human is None:
+        raise InvoiceAgentsError(
+            ErrorCategory.TOOL,
+            "reviewer and reason are required",
+            stop_reason="HUMAN_DECISION_INVALID",
+        )
     return store.save_human_decision(human, inventory_db)
