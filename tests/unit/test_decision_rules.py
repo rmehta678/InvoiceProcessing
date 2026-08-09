@@ -125,7 +125,7 @@ def make_review(
         agent_recommendation=DecisionKind.HOLD,
         agent_rationale=["needs human review"],
         critic=make_critique(DecisionKind.HOLD),
-        questions=[],
+        questions=["Does the evidence support this decision?"],
         created_at=datetime(2026, 1, 1, tzinfo=UTC),
         human_decision=HumanDecision(
             review_id="rev_test",
@@ -286,9 +286,7 @@ def test_blocking_evidence_flags_each_blocking_inventory_status(status: Inventor
             "blocker_id": f"inventory:SKU-WIDGET-A:{status.value}",
             "kind": "inventory",
             "evidence_id": "SKU-WIDGET-A",
-            "description": (
-                f"inventory {status.value}: WidgetA requested=20 stock=15"
-            ),
+            "description": (f"inventory {status.value}: WidgetA requested=20 stock=15"),
         }
     ]
 
@@ -339,9 +337,7 @@ def test_financial_blocker_id_does_not_change_with_delta_value() -> None:
 def test_approve_rejects_each_unaddressed_inventory_blocker(
     status: InventoryStatus,
 ) -> None:
-    risk = make_risk(
-        inventory=[make_comparison(status)], reasons=["policy trigger"]
-    )
+    risk = make_risk(inventory=[make_comparison(status)], reasons=["policy trigger"])
     with pytest.raises(InvoiceAgentsError) as excinfo:
         validate_final_decision(
             DecisionKind.APPROVE,

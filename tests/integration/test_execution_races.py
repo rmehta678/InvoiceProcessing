@@ -23,6 +23,7 @@ import invoice_agents.payment.service as payment_module
 from invoice_agents import orchestration
 from invoice_agents.agents.decision_rules import blocking_evidence
 from invoice_agents.config import Settings
+from invoice_agents.db.authorization_audit import audit_workflow_authorization
 from invoice_agents.db.core import (
     REQUIRED_WORKFLOW_TRIGGERS,
     DatabaseKind,
@@ -2882,6 +2883,7 @@ def test_workflow_preflight_rejects_unanchored_v3_authorization_rows(
         "invalid_snapshot_count": 0,
         "invalid_final_decision_count": 1,
         "invalid_payment_count": int(include_payment),
+        "invalid_cardinality_count": 0,
         "invalid_quarantine_count": 0,
     }
 
@@ -2968,6 +2970,7 @@ def test_workflow_preflight_audits_existing_authorization_relationships(
         "invalid_snapshot_count": snapshot_count,
         "invalid_final_decision_count": final_count,
         "invalid_payment_count": payment_count,
+        "invalid_cardinality_count": 0,
         "invalid_quarantine_count": 0,
     }
 
@@ -3268,6 +3271,206 @@ def test_workflow_preflight_rejects_every_unanchored_review_boundary_corruption(
     assert excinfo.value.details["invalid_review_count"] == 1
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("reasons", [" "]),
+        ("agent_rationale", []),
+        ("questions", []),
+    ),
+)
+def test_workflow_preflight_rejects_semantically_degraded_valid_review(
+    settings: Settings,
+    field: str,
+    value: list[str],
+) -> None:
+    case_id = f"case_preflight_degraded_review_{field}"
+    store = _persist_case(settings, case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
+    review = create_review_request(
+        case_id,
+        store.load_current_extraction(claim),
+        RiskAssessment.model_validate(store.load_current_comparison(claim, "risk")),
+        store.load_current_critique(claim),
+        DecisionKind.HOLD,
+        ["a deliberate review is required"],
+        store,
+        claim,
+        extra_reasons=["a deliberate review is required"],
+    )
+    with connect_database(settings.workflow_db) as connection:
+        payload = json.loads(review.model_dump_json())
+        payload[field] = value
+        connection.execute(
+            "UPDATE review_requests SET payload_json = ? WHERE review_id = ?",
+            (json.dumps(payload), review.review_id),
+        )
+        connection.commit()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(settings.workflow_db, DatabaseKind.WORKFLOW, settings=settings)
+
+    assert excinfo.value.stop_reason == "DATABASE_AUTHORIZATION_PROVENANCE_INVALID"
+    assert excinfo.value.details["invalid_review_count"] == 1
+
+
+def test_workflow_preflight_requires_every_authoritative_policy_review_reason(
+    settings: Settings,
+) -> None:
+    case_id = "case_preflight_missing_policy_review_reason"
+    store = _persist_case(settings, case_id, Path("data/invoices/invoice_1003.txt"))
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
+    risk = RiskAssessment.model_validate(store.load_current_comparison(claim, "risk"))
+    assert risk.policy_review_reasons
+    review = create_review_request(
+        case_id,
+        store.load_current_extraction(claim),
+        risk,
+        store.load_current_critique(claim),
+        DecisionKind.HOLD,
+        ["the policy evidence requires review"],
+        store,
+        claim,
+    )
+    with connect_database(settings.workflow_db) as connection:
+        payload = review.model_dump(mode="json")
+        payload["reasons"] = ["unrelated nonempty prose cannot replace policy evidence"]
+        connection.execute(
+            "UPDATE review_requests SET payload_json = ? WHERE review_id = ?",
+            (json.dumps(payload), review.review_id),
+        )
+        connection.commit()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(settings.workflow_db, DatabaseKind.WORKFLOW, settings=settings)
+
+    assert excinfo.value.stop_reason == "DATABASE_AUTHORIZATION_PROVENANCE_INVALID"
+    assert excinfo.value.details["invalid_review_count"] == 1
+
+
+def test_human_resolution_rejects_a_degraded_persisted_review_without_mutation(
+    settings: Settings,
+) -> None:
+    case_id = "case_resolution_degraded_review"
+    store = _persist_case(settings, case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
+    review = create_review_request(
+        case_id,
+        store.load_current_extraction(claim),
+        RiskAssessment.model_validate(store.load_current_comparison(claim, "risk")),
+        store.load_current_critique(claim),
+        DecisionKind.HOLD,
+        ["a deliberate review is required"],
+        store,
+        claim,
+        extra_reasons=["a deliberate review is required"],
+    )
+    with connect_database(settings.workflow_db) as connection:
+        payload = review.model_dump(mode="json")
+        payload["questions"] = []
+        connection.execute(
+            "UPDATE review_requests SET payload_json = ? WHERE review_id = ?",
+            (json.dumps(payload), review.review_id),
+        )
+        connection.commit()
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        record_human_decision(
+            review.review_id,
+            "reviewer@example.com",
+            HumanDecisionKind.REJECT,
+            "the evidence is rejected",
+            store,
+            settings.inventory_db,
+        )
+
+    assert excinfo.value.stop_reason == "REVIEW_AUTHORIZATION_INVALID"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        assert (
+            connection.execute(
+                "SELECT status FROM review_requests WHERE review_id = ?", (review.review_id,)
+            ).fetchone()[0]
+            == "PENDING"
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM human_decisions WHERE review_id = ?", (review.review_id,)
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_workflow_preflight_rejects_whitespace_only_human_attribution(
+    settings: Settings,
+) -> None:
+    case_id = "case_preflight_whitespace_human"
+    store = _persist_case(settings, case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
+    review = create_review_request(
+        case_id,
+        store.load_current_extraction(claim),
+        RiskAssessment.model_validate(store.load_current_comparison(claim, "risk")),
+        store.load_current_critique(claim),
+        DecisionKind.HOLD,
+        ["a deliberate review is required"],
+        store,
+        claim,
+        extra_reasons=["a deliberate review is required"],
+    )
+    resolved = record_human_decision(
+        review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.REJECT,
+        "the reviewed evidence is rejected",
+        store,
+        settings.inventory_db,
+    )
+    assert resolved.human_decision is not None
+    review_payload = resolved.model_dump(mode="json")
+    human_payload = resolved.human_decision.model_dump(mode="json")
+    review_payload["human_decision"]["reviewer"] = " "
+    human_payload["reviewer"] = " "
+    with connect_database(settings.workflow_db) as connection:
+        for trigger in (
+            "trg_resolved_review_immutable_update",
+            "trg_human_decisions_immutable_update",
+        ):
+            connection.execute(f"DROP TRIGGER {trigger}")
+        connection.execute(
+            "UPDATE review_requests SET payload_json = ? WHERE review_id = ?",
+            (json.dumps(review_payload), review.review_id),
+        )
+        connection.execute(
+            "UPDATE human_decisions SET reviewer = ?, payload_json = ? WHERE review_id = ?",
+            (" ", json.dumps(human_payload), review.review_id),
+        )
+        for trigger in (
+            "trg_resolved_review_immutable_update",
+            "trg_human_decisions_immutable_update",
+        ):
+            connection.execute(REQUIRED_WORKFLOW_TRIGGERS[trigger])
+        connection.commit()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(settings.workflow_db, DatabaseKind.WORKFLOW, settings=settings)
+
+    assert excinfo.value.stop_reason == "DATABASE_AUTHORIZATION_PROVENANCE_INVALID"
+    assert excinfo.value.details["invalid_review_count"] == 1
+    assert excinfo.value.details["invalid_human_decision_count"] == 1
+
+
 def test_workflow_preflight_rejects_relational_human_mismatch_even_when_unreferenced(
     settings: Settings,
 ) -> None:
@@ -3382,9 +3585,8 @@ def test_workflow_preflight_rejects_multiple_humans_for_one_review(
             settings=settings,
         )
 
-    assert excinfo.value.stop_reason == "DATABASE_AUTHORIZATION_PROVENANCE_INVALID"
-    assert excinfo.value.details["invalid_review_count"] == 1
-    assert excinfo.value.details["invalid_human_decision_count"] == 2
+    assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+    assert excinfo.value.details == {"invalid_schema_definitions": ["human_decisions"]}
 
 
 @pytest.mark.parametrize("corruption", ("empty_reason", "foreign_evidence"))
@@ -3532,6 +3734,57 @@ def test_workflow_preflight_strictly_parses_every_payment_row(
 
     assert excinfo.value.stop_reason == "DATABASE_AUTHORIZATION_PROVENANCE_INVALID"
     assert excinfo.value.details["invalid_payment_count"] == 1
+
+
+def test_schema_and_authorization_audit_reject_duplicate_coherent_final_identity(
+    settings: Settings,
+) -> None:
+    case_id = "case_duplicate_coherent_final"
+    store = _persist_case(settings, case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    _approve(store, case_id, claim)
+    with connect_database(settings.workflow_db) as connection:
+        trigger_rows = [
+            (str(row[0]), str(row[1]))
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+                "AND instr(lower(sql), 'final_decisions') > 0 ORDER BY name"
+            ).fetchall()
+        ]
+        for name, _definition in trigger_rows:
+            connection.execute(f"DROP TRIGGER {name}")
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute(
+            "CREATE TABLE final_decisions_rebuilt ("
+            "decision_id TEXT NOT NULL, case_id TEXT NOT NULL REFERENCES cases(case_id), "
+            "payload_json TEXT NOT NULL, created_at TEXT NOT NULL, "
+            "decision_generation INTEGER NOT NULL DEFAULT 0, evidence_snapshot_digest TEXT, "
+            "source_id TEXT, invoice_number TEXT, vendor TEXT, authorized_amount TEXT, "
+            "authorized_currency TEXT, payment_idempotency_key TEXT, review_id TEXT)"
+        )
+        connection.execute("INSERT INTO final_decisions_rebuilt SELECT * FROM final_decisions")
+        connection.execute("INSERT INTO final_decisions_rebuilt SELECT * FROM final_decisions")
+        connection.execute("DROP TABLE final_decisions")
+        connection.execute("ALTER TABLE final_decisions_rebuilt RENAME TO final_decisions")
+        for _name, definition in trigger_rows:
+            connection.execute(definition)
+        connection.commit()
+
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        inventory_uri = f"{settings.inventory_db.resolve().as_uri()}?mode=ro"
+        connection.execute("ATTACH DATABASE ? AS authorization_inventory", (inventory_uri,))
+        counts = audit_workflow_authorization(
+            connection,
+            settings,
+            inventory_schema="authorization_inventory",
+        )
+    assert counts["invalid_cardinality_count"] >= 1
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(settings.workflow_db, DatabaseKind.WORKFLOW, settings=settings)
+    assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
 
 
 @pytest.mark.asyncio

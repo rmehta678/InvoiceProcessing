@@ -317,7 +317,14 @@ def _review_from_row(row: sqlite3.Row | None, review_id: str) -> ReviewRequest:
             f"review request does not exist: {review_id}",
             stop_reason="REVIEW_NOT_FOUND",
         )
-    return ReviewRequest.model_validate_json(row["payload_json"], strict=True)
+    try:
+        return ReviewRequest.model_validate_json(row["payload_json"], strict=True)
+    except ValueError as exc:
+        raise InvoiceAgentsError(
+            ErrorCategory.DATABASE,
+            f"review authorization payload is invalid: {review_id}",
+            stop_reason="REVIEW_AUTHORIZATION_INVALID",
+        ) from exc
 
 
 def _resolved_human_decision_replay(

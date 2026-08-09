@@ -1,5 +1,6 @@
 """Workflow migration 002: review sequencing, v2 verification, and required indexes."""
 
+import hashlib
 import json
 import sqlite3
 from datetime import UTC, datetime
@@ -77,7 +78,7 @@ def make_review(review_id: str, created_at: datetime, source: SourceArtifact) ->
         agent_recommendation=DecisionKind.HOLD,
         agent_rationale=["legacy review"],
         critic=make_critique(),
-        questions=[],
+        questions=["Does the legacy evidence support this decision?"],
         created_at=created_at,
     )
 
@@ -162,7 +163,7 @@ def make_bound_review(
         agent_recommendation=DecisionKind.HOLD,
         agent_rationale=["legacy review"],
         critic=case_critique,
-        questions=[],
+        questions=["Does the legacy evidence support this decision?"],
         created_at=created_at,
     )
 
@@ -344,6 +345,66 @@ def test_missing_required_indexes_fail_verification(workflow_db: Path, inventory
     with pytest.raises(DatabaseVerificationError, match="idx_item_aliases_sku") as inventory_exc:
         verify_database(inventory_db, DatabaseKind.INVENTORY)
     assert inventory_exc.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    ("versions", "primary_key"),
+    [
+        ([3], True),
+        ([1, 3], True),
+        ([1, 1], False),
+        ([2, 1], False),
+        ([1, 2, 3, 4], False),
+    ],
+    ids=["missing-prefix", "sparse", "duplicate", "out-of-order", "unknown"],
+)
+def test_migration_rejects_noncontiguous_history_before_any_database_mutation(
+    tmp_path: Path,
+    versions: list[int],
+    primary_key: bool,
+) -> None:
+    path = tmp_path / "invalid-history.db"
+    with sqlite3.connect(path) as connection:
+        key_sql = " PRIMARY KEY" if primary_key else ""
+        connection.execute(
+            f"CREATE TABLE schema_version (version INTEGER{key_sql}, applied_at TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
+            [
+                (version, f"2026-08-08T00:00:0{index}+00:00")
+                for index, version in enumerate(versions)
+            ],
+        )
+        connection.execute("CREATE TABLE untouched (value BLOB)")
+        connection.execute("INSERT INTO untouched(value) VALUES (?)", (b"opaque-before-migration",))
+        connection.commit()
+    before_bytes = path.read_bytes()
+    before_digest = hashlib.sha256(before_bytes).hexdigest()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.WORKFLOW)
+
+    assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
+    assert path.read_bytes() == before_bytes
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before_digest
+
+
+def test_migration_rejects_schema_objects_without_history_using_stable_error(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "missing-history.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE untouched (value BLOB)")
+        connection.execute("INSERT INTO untouched(value) VALUES (?)", (b"opaque",))
+        connection.commit()
+    before = path.read_bytes()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.WORKFLOW)
+
+    assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
+    assert path.read_bytes() == before
 
 
 @pytest.mark.parametrize("wal_database", ["workflow", "inventory"])

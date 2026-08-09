@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
+import struct
+import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -15,6 +16,7 @@ import pytest
 from typer.testing import CliRunner
 
 import invoice_agents.db.core as core_module
+import invoice_agents.db.legacy_archive as legacy_archive
 from invoice_agents.config import Settings
 from invoice_agents.db import cli as database_cli
 from invoice_agents.db.core import (
@@ -37,16 +39,10 @@ ACTIVE_TABLE_KEYS = {
     "final_decisions": "decision_id",
     "payments": "payment_id",
 }
-RECORD_HASH_DOMAIN = b"galatiq.invoice-agents/legacy-authorization-record/v1\x00"
 
 
 def _canonical_row(row: dict[str, Any]) -> str:
     return json.dumps(row, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-
-
-def _record_hash(table: str, key: str, row_json: str) -> str:
-    material = RECORD_HASH_DOMAIN + table.encode() + b"\x00" + key.encode() + b"\x00"
-    return hashlib.sha256(material + row_json.encode()).hexdigest()
 
 
 def _build_full_v2_database(tmp_path: Path) -> Path:
@@ -128,6 +124,138 @@ def _build_full_v2_database(tmp_path: Path) -> Path:
     return path
 
 
+def _build_opaque_v2_database(tmp_path: Path) -> Path:
+    path = _build_full_v2_database(tmp_path)
+    schemas = {
+        "review_requests": (
+            "CREATE TABLE review_requests ("
+            "payload_json BLOB, review_id TEXT, case_id TEXT, sequence INTEGER, "
+            "status TEXT, created_at REAL, resolved_at TEXT)"
+        ),
+        "human_decisions": (
+            "CREATE TABLE human_decisions ("
+            "decision_id TEXT, review_id TEXT, reviewer TEXT, decision TEXT, reason BLOB, "
+            "payload_json TEXT, decided_at REAL)"
+        ),
+        "final_decisions": (
+            "CREATE TABLE final_decisions ("
+            "created_at INTEGER, payload_json BLOB, case_id TEXT, decision_id TEXT)"
+        ),
+        "payments": (
+            "CREATE TABLE payments ("
+            "payment_id TEXT, case_id TEXT, idempotency_key BLOB, vendor TEXT, amount REAL, "
+            "currency TEXT, status TEXT, error BLOB, created_at INTEGER)"
+        ),
+    }
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        for table in ("payments", "final_decisions", "human_decisions", "review_requests"):
+            connection.execute(f"DROP TABLE {table}")
+            connection.execute(schemas[table])
+        connection.execute(
+            "INSERT INTO review_requests(rowid, payload_json, review_id, case_id, sequence, "
+            "status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                7,
+                sqlite3.Binary(b"\x00\xffopaque-review"),
+                "review_opaque",
+                "case_opaque",
+                1,
+                "RESOLVED",
+                0.1,
+                None,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO review_requests(rowid, payload_json, review_id, case_id, sequence, "
+            "status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                3,
+                sqlite3.Binary(b"earlier-rowid"),
+                "review_earlier",
+                "case_opaque",
+                2,
+                "PENDING",
+                -0.0,
+                "snowman \u2603\x00tail",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO human_decisions(rowid, decision_id, review_id, reviewer, decision, "
+            "reason, payload_json, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                11,
+                "human_opaque",
+                "review_opaque",
+                "R\u00e9viewer \u2603",
+                "APPROVE",
+                sqlite3.Binary(b"\x00\xfeopaque-reason"),
+                "text\x00with-nul",
+                -0.0,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO final_decisions(rowid, created_at, payload_json, case_id, decision_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                13,
+                9223372036854775807,
+                sqlite3.Binary(b"\x80\x00final"),
+                "case_opaque",
+                "final_opaque",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO payments(rowid, payment_id, case_id, idempotency_key, vendor, amount, "
+            "currency, status, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                17,
+                "payment_opaque",
+                "case_opaque",
+                sqlite3.Binary(b"\x00idem\xff"),
+                "Vendor \u2603",
+                1.0 / 10.0,
+                "USD",
+                "FAILED",
+                sqlite3.Binary(b"\x00\xfffailure"),
+                -7,
+            ),
+        )
+        connection.commit()
+    return path
+
+
+def _storage_value(value: object) -> tuple[str, object]:
+    if value is None:
+        return ("null", None)
+    if isinstance(value, bytes):
+        return ("blob", value)
+    if isinstance(value, str):
+        return ("text", value.encode("utf-8"))
+    if isinstance(value, int):
+        return ("integer", str(value))
+    if isinstance(value, float):
+        return ("real", struct.pack(">d", value))
+    raise AssertionError(f"unexpected SQLite value: {value!r}")
+
+
+def _exact_table_snapshot(
+    connection: sqlite3.Connection,
+    table: str,
+) -> tuple[str, tuple[tuple[object, ...], ...], tuple[tuple[object, ...], ...]]:
+    sql = str(
+        connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()[0]
+    )
+    columns = tuple(tuple(row) for row in connection.execute(f'PRAGMA table_info("{table}")'))
+    rows = tuple(
+        (int(row[0]), *(_storage_value(value) for value in row[1:]))
+        for row in connection.execute(f'SELECT rowid, * FROM "{table}" ORDER BY rowid')
+    )
+    return sql, columns, rows
+
+
 def _active_rows(path: Path) -> dict[str, list[dict[str, Any]]]:
     with connect_database(path, read_only=True) as connection:
         return {
@@ -174,6 +302,26 @@ def test_reconciliation_requires_explicit_confirmation_without_any_mutation(
         ] == schema_before
 
 
+def test_reconciliation_rejects_sparse_migration_history_before_archive_install(
+    tmp_path: Path,
+) -> None:
+    path = _build_full_v2_database(tmp_path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("DELETE FROM schema_version WHERE version = 2")
+        connection.execute(
+            "INSERT INTO schema_version(version, applied_at) VALUES (3, ?)",
+            (datetime(2026, 8, 8, 12, 35, tzinfo=UTC).isoformat(),),
+        )
+        connection.commit()
+    before = path.read_bytes()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        _reconcile(path)
+
+    assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
+    assert path.read_bytes() == before
+
+
 def test_reconciliation_cli_requires_every_explicit_disposition_input(
     tmp_path: Path,
 ) -> None:
@@ -194,8 +342,8 @@ def test_reconciliation_cli_requires_every_explicit_disposition_input(
     unconfirmed = CliRunner().invoke(database_cli.app, arguments)
 
     assert unconfirmed.exit_code == 1
-    assert isinstance(unconfirmed.exception, DatabaseVerificationError)
-    assert unconfirmed.exception.stop_reason == "LEGACY_RECONCILIATION_CONFIRMATION_REQUIRED"
+    assert "error_code=LEGACY_RECONCILIATION_CONFIRMATION_REQUIRED" in unconfirmed.stderr
+    assert "Traceback" not in unconfirmed.stderr
     assert _active_rows(path) == before
 
     confirmed = CliRunner().invoke(database_cli.app, [*arguments, "--confirm"])
@@ -204,6 +352,46 @@ def test_reconciliation_cli_requires_every_explicit_disposition_input(
     assert "reconciliation_id=lrec_" in confirmed.stdout
     assert "record_count=4" in confirmed.stdout
     assert all(not rows for rows in _active_rows(path).values())
+
+
+def test_database_cli_subprocess_reports_only_stable_code_for_secret_bearing_driver_error(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "workflow-secret-bearing-driver-error.db"
+    secret = "sk-proj-task8-must-never-reach-operator-output"
+    with sqlite3.connect(path) as connection:
+        connection.create_function(secret, 0, lambda: 1, deterministic=True)
+        connection.execute(
+            "CREATE TABLE schema_version ("
+            "marker INTEGER, "
+            f'version INTEGER GENERATED ALWAYS AS ("{secret}"()) VIRTUAL, '
+            "applied_at TEXT)"
+        )
+        connection.execute("INSERT INTO schema_version(marker, applied_at) VALUES (1, 'legacy')")
+        connection.commit()
+
+    completed = subprocess.run(
+        [
+            str(Path(__file__).parents[2] / ".venv" / "bin" / "invoice-agents"),
+            "db",
+            "migrate",
+            "--db",
+            str(path),
+            "--kind",
+            "workflow",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    output = completed.stdout + completed.stderr
+
+    assert completed.returncode == 1
+    assert "error_code=MIGRATION_HISTORY_INVALID" in output
+    assert secret not in output
+    assert "Traceback" not in output
+    assert "sqlite3" not in output
+    assert "DatabaseVerificationError" not in output
 
 
 def test_reconciliation_archives_exact_rows_and_hashes_before_removing_active_authority(
@@ -223,7 +411,8 @@ def test_reconciliation_archives_exact_rows_and_hashes_before_removing_active_au
         } == {table: 0 for table in ACTIVE_TABLE_KEYS}
         archive_rows = connection.execute(
             "SELECT reconciliation_id, source_table, source_record_key, original_row_json, "
-            "record_hash, authorization_state FROM legacy_authorization_quarantine "
+            "typed_row, schema_hash, record_hash, authorization_state "
+            "FROM legacy_authorization_quarantine "
             "ORDER BY source_table"
         ).fetchall()
         metadata = connection.execute(
@@ -239,7 +428,11 @@ def test_reconciliation_archives_exact_rows_and_hashes_before_removing_active_au
         assert archive["reconciliation_id"] == receipt.reconciliation_id
         assert archive["source_record_key"] == key
         assert archive["original_row_json"] == expected_json
-        assert archive["record_hash"] == _record_hash(table, key, expected_json)
+        assert archive["record_hash"] == legacy_archive.legacy_record_hash(
+            table,
+            str(archive["schema_hash"]),
+            bytes(archive["typed_row"]),
+        )
         assert archive["authorization_state"] == DISPOSITION
     assert tuple(metadata) == (
         REVIEWER,
@@ -250,6 +443,80 @@ def test_reconciliation_archives_exact_rows_and_hashes_before_removing_active_au
         _canonical_row({table: 1 for table in ACTIVE_TABLE_KEYS}),
         "COMPLETED",
     )
+
+
+def test_reconciliation_losslessly_archives_and_restores_ordered_typed_sqlite_rows(
+    tmp_path: Path,
+) -> None:
+    path = _build_opaque_v2_database(tmp_path)
+    with sqlite3.connect(path) as connection:
+        original = {table: _exact_table_snapshot(connection, table) for table in ACTIVE_TABLE_KEYS}
+
+    receipt = _reconcile(path)
+
+    assert receipt.record_count == 5
+    assert receipt.table_counts == {
+        "review_requests": 2,
+        "human_decisions": 1,
+        "final_decisions": 1,
+        "payments": 1,
+    }
+    assert hasattr(legacy_archive, "decode_legacy_authorization_archive")
+    assert hasattr(legacy_archive, "restore_legacy_authorization_archive")
+    restored_path = tmp_path / "restored-opaque.db"
+    with (
+        connect_database(path, read_only=True) as archive_connection,
+        sqlite3.connect(restored_path) as restored_connection,
+    ):
+        decoded = legacy_archive.decode_legacy_authorization_archive(
+            archive_connection, receipt.reconciliation_id
+        )
+        storage_classes = {
+            cell.storage_class for table in decoded for row in table.rows for cell in row.cells
+        }
+        assert storage_classes == {"NULL", "INTEGER", "REAL", "TEXT", "BLOB"}
+        review = next(table for table in decoded if table.source_table == "review_requests")
+        assert [row.source_rowid for row in review.rows] == [3, 7]
+        legacy_archive.restore_legacy_authorization_archive(
+            archive_connection,
+            restored_connection,
+            receipt.reconciliation_id,
+        )
+        restored_connection.commit()
+        restored = {
+            table: _exact_table_snapshot(restored_connection, table) for table in ACTIVE_TABLE_KEYS
+        }
+    assert restored == original
+
+
+@pytest.mark.parametrize("target", ["schema", "typed_row"])
+def test_typed_archive_schema_and_rows_are_hash_bound_and_tamper_detected(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    path = _build_opaque_v2_database(tmp_path)
+    _reconcile(path)
+    with connect_database(path) as connection:
+        if target == "schema":
+            trigger = "trg_legacy_authorization_table_manifests_immutable_update"
+            connection.execute(f"DROP TRIGGER {trigger}")
+            connection.execute(
+                "UPDATE legacy_authorization_table_manifests SET source_table_sql = ? "
+                "WHERE source_table = 'review_requests'",
+                (sqlite3.Binary(b"CREATE TABLE forged(value)"),),
+            )
+        else:
+            trigger = "trg_legacy_authorization_quarantine_immutable_update"
+            connection.execute(f"DROP TRIGGER {trigger}")
+            connection.execute(
+                "UPDATE legacy_authorization_quarantine SET typed_row = ? "
+                "WHERE source_table = 'payments'",
+                (sqlite3.Binary(b"forged typed row"),),
+            )
+        connection.commit()
+
+    with connect_database(path, read_only=True) as connection:
+        assert legacy_archive.audit_legacy_authorization_archives(connection) == 1
 
 
 def test_exact_reconciliation_retry_is_idempotent_and_changed_retry_is_rejected(

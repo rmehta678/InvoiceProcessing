@@ -1,5 +1,6 @@
 """CLI for explicit inventory and workflow database lifecycle operations."""
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated
 
@@ -14,8 +15,28 @@ from invoice_agents.db.core import (
     seed_inventory,
     verify_database,
 )
+from invoice_agents.errors import InvoiceAgentsError
 
 app = typer.Typer(no_args_is_help=True, help="Explicit SQLite setup and verification.")
+
+
+def _run_database_operation[OperationResult](
+    operation_name: str,
+    operation: Callable[[], OperationResult],
+) -> OperationResult:
+    """Expose only stable, audit-safe error codes at the operator boundary."""
+
+    try:
+        return operation()
+    except InvoiceAgentsError as exc:
+        error_code = exc.stop_reason or "DATABASE_OPERATION_FAILED"
+    except Exception:
+        error_code = "DATABASE_OPERATION_FAILED"
+    typer.echo(
+        f"database_operation={operation_name} status=FAILED error_code={error_code}",
+        err=True,
+    )
+    raise typer.Exit(1) from None
 
 
 @app.command("migrate")
@@ -26,7 +47,10 @@ def migrate_command(
     """Apply versioned migrations without seeding inferred data."""
 
     selected = kind or infer_kind(db)
-    applied = migrate_database(db, selected)
+    applied = _run_database_operation(
+        "migrate",
+        lambda: migrate_database(db, selected),
+    )
     typer.echo(f"database={db.resolve()} kind={selected.value} applied={applied}")
 
 
@@ -36,7 +60,7 @@ def seed_command(
 ) -> None:
     """Seed the four inventory facts supplied by the challenge README."""
 
-    count = seed_inventory(db)
+    count = _run_database_operation("seed", lambda: seed_inventory(db))
     typer.echo(f"database={db.resolve()} seeded_rows={count}")
 
 
@@ -55,14 +79,20 @@ def verify_command(
     """Fail loudly if signature, schema, integrity, or seed identity is wrong."""
 
     selected = kind or infer_kind(db)
-    settings = None
-    if selected is DatabaseKind.WORKFLOW:
-        if inventory_db is None:
-            raise typer.BadParameter(
-                "--inventory-db is required for authoritative workflow verification"
-            )
-        settings = Settings(workflow_db=db, inventory_db=inventory_db)
-    result = verify_database(db, selected, settings=settings)
+    if selected is DatabaseKind.WORKFLOW and inventory_db is None:
+        raise typer.BadParameter(
+            "--inventory-db is required for authoritative workflow verification"
+        )
+
+    def verify() -> dict[str, object]:
+        settings = (
+            Settings(workflow_db=db, inventory_db=inventory_db)
+            if selected is DatabaseKind.WORKFLOW
+            else None
+        )
+        return verify_database(db, selected, settings=settings)
+
+    result = _run_database_operation("verify", verify)
     typer.echo(str(result))
 
 
@@ -94,12 +124,15 @@ def reconcile_legacy_authorization_command(
 ) -> None:
     """Archive legacy authority exactly, then remove only its active copies."""
 
-    receipt = reconcile_legacy_authorization(
-        db,
-        reviewer=reviewer,
-        reason=reason,
-        disposition=disposition,
-        confirmed=confirmed,
+    receipt = _run_database_operation(
+        "reconcile-legacy-authorization",
+        lambda: reconcile_legacy_authorization(
+            db,
+            reviewer=reviewer,
+            reason=reason,
+            disposition=disposition,
+            confirmed=confirmed,
+        ),
     )
     typer.echo(
         f"database={db.resolve()} reconciliation_id={receipt.reconciliation_id} "

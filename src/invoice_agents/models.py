@@ -286,6 +286,21 @@ class HumanDecision(StrictModel):
     superseded_case_id: str | None = None
     addressed_blocker_ids: list[str] = Field(default_factory=list)
 
+    @field_validator("reviewer", "reason")
+    @classmethod
+    def attributable_nonblank_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("human decision attribution cannot be blank")
+        return value
+
+    @field_validator("decided_at")
+    @classmethod
+    def decided_at_is_utc(cls, value: datetime) -> datetime:
+        offset = value.utcoffset()
+        if value.tzinfo is None or offset is None or offset.total_seconds() != 0:
+            raise ValueError("human decision timestamp must be UTC")
+        return value
+
 
 class ReviewRequest(StrictModel):
     review_id: str
@@ -293,16 +308,44 @@ class ReviewRequest(StrictModel):
     # Review cycles are ordered per case; pre-schema-v2 payloads default to 1.
     sequence: int = Field(default=1, ge=1)
     status: Literal["PENDING", "RESOLVED"]
-    reasons: list[str]
+    reasons: list[str] = Field(min_length=1)
     amount: Money | None
     source: SourceArtifact
     evidence_bundle: dict[str, Any]
     agent_recommendation: DecisionKind
-    agent_rationale: list[str]
+    agent_rationale: list[str] = Field(min_length=1)
     critic: Critique
-    questions: list[str]
+    questions: list[str] = Field(min_length=1)
     created_at: datetime
     human_decision: HumanDecision | None = None
+
+    @field_validator("reasons", "agent_rationale", "questions")
+    @classmethod
+    def required_text_entries_are_nonblank(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() for value in values):
+            raise ValueError("review text entries cannot be blank")
+        return values
+
+    @field_validator("created_at")
+    @classmethod
+    def created_at_is_utc(cls, value: datetime) -> datetime:
+        offset = value.utcoffset()
+        if value.tzinfo is None or offset is None or offset.total_seconds() != 0:
+            raise ValueError("review timestamp must be UTC")
+        return value
+
+    @model_validator(mode="after")
+    def status_and_human_chronology_are_exact(self) -> ReviewRequest:
+        if self.status == "PENDING" and self.human_decision is not None:
+            raise ValueError("pending review cannot contain a human decision")
+        if self.status == "RESOLVED" and self.human_decision is None:
+            raise ValueError("resolved review requires a human decision")
+        if self.human_decision is not None and (
+            self.human_decision.review_id != self.review_id
+            or self.human_decision.decided_at < self.created_at
+        ):
+            raise ValueError("review and human decision identity or chronology is invalid")
+        return self
 
 
 class FinalDecision(StrictModel):

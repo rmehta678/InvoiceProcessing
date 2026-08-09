@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from functools import lru_cache
 from importlib.resources import files
 from importlib.resources.abc import Traversable
 from pathlib import Path
@@ -41,6 +42,65 @@ class LegacyAuthorizationReconciliationReceipt:
     table_counts: dict[str, int]
     record_manifest_hash: str
     confirmed_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaColumnManifest:
+    cid: int
+    name: str
+    declared_type: str
+    not_null: int
+    default_sql: str | None
+    primary_key_position: int
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaForeignKeyManifest:
+    identifier: int
+    sequence: int
+    referenced_table: str
+    from_column: str
+    to_column: str | None
+    on_update: str
+    on_delete: str
+    match: str
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaIndexColumnManifest:
+    sequence: int
+    cid: int
+    name: str | None
+    descending: int
+    collation: str
+    key_column: int
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaIndexManifest:
+    sequence: int
+    name: str
+    unique: int
+    origin: str
+    partial: int
+    columns: tuple[SchemaIndexColumnManifest, ...]
+    normalized_sql: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaTriggerManifest:
+    name: str
+    normalized_sql: str
+
+
+@dataclass(frozen=True, slots=True)
+class TableSchemaManifest:
+    name: str
+    normalized_sql: str
+    columns: tuple[SchemaColumnManifest, ...]
+    foreign_keys: tuple[SchemaForeignKeyManifest, ...]
+    indexes: tuple[SchemaIndexManifest, ...]
+    triggers: tuple[SchemaTriggerManifest, ...]
 
 
 # Required version per database kind; preflight rejects anything else, in either
@@ -264,6 +324,81 @@ def _migration_resources(kind: DatabaseKind) -> list[Traversable]:
     return resources
 
 
+def _migration_versions(resources: list[Traversable], kind: DatabaseKind) -> tuple[int, ...]:
+    versions = tuple(int(resource.name.split("_", 1)[0]) for resource in resources)
+    expected = tuple(range(1, len(versions) + 1))
+    if versions != expected:
+        raise DatabaseVerificationError(
+            ErrorCategory.DATABASE,
+            f"packaged {kind.value} migration history is not contiguous",
+            stop_reason="MIGRATION_HISTORY_INVALID",
+        )
+    return versions
+
+
+def _read_migration_history(
+    connection: sqlite3.Connection,
+    *,
+    kind: DatabaseKind,
+    packaged_versions: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Read an existing history in insertion order and require an exact prefix."""
+
+    try:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'"
+        ).fetchone()
+        if table is None:
+            user_objects = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+                ).fetchone()[0]
+            )
+            if user_objects:
+                raise ValueError("database has schema objects but no migration history")
+            return ()
+        rows = connection.execute("SELECT version FROM schema_version ORDER BY rowid").fetchall()
+        versions = tuple(row["version"] for row in rows)
+    except (sqlite3.Error, ValueError) as exc:
+        raise DatabaseVerificationError(
+            ErrorCategory.DATABASE,
+            f"{kind.value} migration history cannot be read",
+            stop_reason="MIGRATION_HISTORY_INVALID",
+        ) from exc
+    expected = tuple(range(1, len(versions) + 1))
+    if (
+        any(type(version) is not int for version in versions)
+        or versions != expected
+        or len(versions) > len(packaged_versions)
+        or versions != packaged_versions[: len(versions)]
+    ):
+        raise DatabaseVerificationError(
+            ErrorCategory.DATABASE,
+            f"{kind.value} migration history is not an exact contiguous prefix from version 1",
+            stop_reason="MIGRATION_HISTORY_INVALID",
+        )
+    return versions
+
+
+def _preflight_existing_migration_history(
+    path: Path,
+    *,
+    kind: DatabaseKind,
+    packaged_versions: tuple[int, ...],
+) -> tuple[int, ...] | None:
+    """Validate a present SQLite file without opening any write transaction."""
+
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+    _assert_sqlite_file(path)
+    with connect_database(path, read_only=True) as connection:
+        return _read_migration_history(
+            connection,
+            kind=kind,
+            packaged_versions=packaged_versions,
+        )
+
+
 def _migration_statements(script: str) -> list[str]:
     """Split SQLite scripts without executing implicit transaction boundaries."""
 
@@ -294,6 +429,80 @@ def _legacy_archive_statements() -> list[str]:
 
 
 def _install_legacy_archive_schema(connection: sqlite3.Connection) -> None:
+    expected_columns = {
+        "legacy_authorization_reconciliations": (
+            "reconciliation_id",
+            "reviewer",
+            "reason",
+            "disposition",
+            "confirmed_at",
+            "source_schema_version",
+            "record_count",
+            "schema_manifest_hash",
+            "record_manifest_hash",
+            "table_counts_json",
+            "state",
+        ),
+        "legacy_authorization_table_manifests": (
+            "manifest_id",
+            "reconciliation_id",
+            "source_table_order",
+            "source_table",
+            "source_table_sql",
+            "column_manifest",
+            "schema_hash",
+            "original_row_count",
+        ),
+        "legacy_authorization_quarantine": (
+            "archive_id",
+            "reconciliation_id",
+            "source_table",
+            "source_record_key",
+            "source_row_ordinal",
+            "source_rowid",
+            "original_row_json",
+            "typed_row",
+            "schema_hash",
+            "record_hash",
+            "authorization_state",
+            "archived_at",
+        ),
+    }
+    installed_columns = {
+        table: tuple(
+            str(row["name"])
+            for row in connection.execute(
+                f"PRAGMA table_info({_quote_identifier(table)})"
+            ).fetchall()
+        )
+        for table in expected_columns
+    }
+    incompatible = {
+        table
+        for table, columns in installed_columns.items()
+        if columns and columns != expected_columns[table]
+    }
+    if incompatible:
+        archived_rows = sum(
+            int(
+                connection.execute(f"SELECT COUNT(*) FROM {_quote_identifier(table)}").fetchone()[0]
+            )
+            for table, columns in installed_columns.items()
+            if columns
+        )
+        if archived_rows:
+            raise DatabaseVerificationError(
+                ErrorCategory.DATABASE,
+                "an existing legacy authorization archive cannot be upgraded losslessly",
+                stop_reason="LEGACY_RECONCILIATION_ARCHIVE_UPGRADE_REQUIRED",
+                details={"incompatible_archive_tables": sorted(incompatible)},
+            )
+        for table in (
+            "legacy_authorization_quarantine",
+            "legacy_authorization_table_manifests",
+            "legacy_authorization_reconciliations",
+        ):
+            connection.execute(f"DROP TABLE IF EXISTS {_quote_identifier(table)}")
     for statement in _legacy_archive_statements():
         connection.execute(statement)
 
@@ -307,6 +516,166 @@ def _normalized_sql(sql: str) -> str:
         r"\1",
         normalized,
     )
+
+
+WORKFLOW_SCHEMA_MANIFEST_TABLES = (
+    "schema_version",
+    "source_artifacts",
+    "cases",
+    "extractions",
+    "identity_results",
+    "comparison_results",
+    "critique_results",
+    "review_requests",
+    "human_decisions",
+    "validated_evidence_snapshots",
+    "final_decisions",
+    "payments",
+    "legacy_authorization_reconciliations",
+    "legacy_authorization_table_manifests",
+    "legacy_authorization_quarantine",
+    "events",
+)
+
+
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _table_schema_manifest(
+    connection: sqlite3.Connection,
+    table: str,
+) -> TableSchemaManifest:
+    table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    if table_row is None or table_row["sql"] is None:
+        raise ValueError(f"required schema manifest table is missing: {table}")
+    quoted_table = _quote_identifier(table)
+    columns = tuple(
+        SchemaColumnManifest(
+            cid=int(row["cid"]),
+            name=str(row["name"]),
+            declared_type=str(row["type"]),
+            not_null=int(row["notnull"]),
+            default_sql=str(row["dflt_value"]) if row["dflt_value"] is not None else None,
+            primary_key_position=int(row["pk"]),
+        )
+        for row in connection.execute(f"PRAGMA table_info({quoted_table})").fetchall()
+    )
+    foreign_keys = tuple(
+        SchemaForeignKeyManifest(
+            identifier=int(row["id"]),
+            sequence=int(row["seq"]),
+            referenced_table=str(row["table"]),
+            from_column=str(row["from"]),
+            to_column=str(row["to"]) if row["to"] is not None else None,
+            on_update=str(row["on_update"]),
+            on_delete=str(row["on_delete"]),
+            match=str(row["match"]),
+        )
+        for row in connection.execute(f"PRAGMA foreign_key_list({quoted_table})").fetchall()
+    )
+    indexes: list[SchemaIndexManifest] = []
+    for row in connection.execute(f"PRAGMA index_list({quoted_table})").fetchall():
+        index_name = str(row["name"])
+        quoted_index = _quote_identifier(index_name)
+        index_sql_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index_name,),
+        ).fetchone()
+        index_sql = (
+            _normalized_sql(str(index_sql_row["sql"]))
+            if index_sql_row is not None and index_sql_row["sql"] is not None
+            else None
+        )
+        index_columns = tuple(
+            SchemaIndexColumnManifest(
+                sequence=int(column["seqno"]),
+                cid=int(column["cid"]),
+                name=str(column["name"]) if column["name"] is not None else None,
+                descending=int(column["desc"]),
+                collation=str(column["coll"]),
+                key_column=int(column["key"]),
+            )
+            for column in connection.execute(f"PRAGMA index_xinfo({quoted_index})").fetchall()
+        )
+        indexes.append(
+            SchemaIndexManifest(
+                sequence=int(row["seq"]),
+                name=index_name,
+                unique=int(row["unique"]),
+                origin=str(row["origin"]),
+                partial=int(row["partial"]),
+                columns=index_columns,
+                normalized_sql=index_sql,
+            )
+        )
+    triggers = tuple(
+        SchemaTriggerManifest(
+            name=str(row["name"]),
+            normalized_sql=_normalized_sql(str(row["sql"])),
+        )
+        for row in connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ? "
+            "ORDER BY name",
+            (table,),
+        ).fetchall()
+        if row["sql"] is not None
+    )
+    return TableSchemaManifest(
+        name=table,
+        normalized_sql=_normalized_sql(str(table_row["sql"])),
+        columns=columns,
+        foreign_keys=foreign_keys,
+        indexes=tuple(indexes),
+        triggers=triggers,
+    )
+
+
+@lru_cache(maxsize=1)
+def _expected_workflow_schema_manifest() -> tuple[TableSchemaManifest, ...]:
+    """Build the exact ordered contract from the packaged migration resources."""
+
+    reference = sqlite3.connect(":memory:")
+    reference.row_factory = sqlite3.Row
+    try:
+        reference.execute(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        for resource in _migration_resources(DatabaseKind.WORKFLOW):
+            reference.executescript(resource.read_text(encoding="utf-8"))
+        reference.executescript(
+            files("invoice_agents.db")
+            .joinpath("migrations", "workflow", "legacy_authorization_archive.sql")
+            .read_text(encoding="utf-8")
+        )
+        return tuple(
+            _table_schema_manifest(reference, table) for table in WORKFLOW_SCHEMA_MANIFEST_TABLES
+        )
+    finally:
+        reference.close()
+
+
+def _verify_workflow_schema_manifest(connection: sqlite3.Connection) -> None:
+    expected = _expected_workflow_schema_manifest()
+    invalid: list[str] = []
+    for table_manifest in expected:
+        try:
+            actual = _table_schema_manifest(connection, table_manifest.name)
+        except ValueError:
+            invalid.append(table_manifest.name)
+            continue
+        if actual != table_manifest:
+            invalid.append(table_manifest.name)
+    if invalid:
+        raise DatabaseVerificationError(
+            ErrorCategory.DATABASE,
+            f"workflow schema definitions differ from the ordered manifest: {invalid}",
+            stop_reason="DATABASE_SCHEMA_MISMATCH",
+            details={"invalid_schema_definitions": invalid},
+        )
 
 
 def _require_reconciled_workflow_authorization(
@@ -351,9 +720,13 @@ def reconcile_legacy_authorization(
         LEGACY_NON_AUTHORIZING_DISPOSITION,
         audit_legacy_authorization_archives,
         canonical_legacy_json,
+        capture_legacy_authorization_tables,
+        legacy_json_safe_row,
         legacy_manifest_hash,
         legacy_reconciliation_id,
         legacy_record_hash,
+        legacy_schema_manifest_hash,
+        legacy_source_record_key,
     )
 
     selected_reviewer = reviewer.strip()
@@ -377,29 +750,37 @@ def reconcile_legacy_authorization(
         )
     resolved = path.resolve()
     _assert_sqlite_file(resolved)
+    resources = _migration_resources(DatabaseKind.WORKFLOW)
+    packaged_versions = _migration_versions(resources, DatabaseKind.WORKFLOW)
+    expected_history = _preflight_existing_migration_history(
+        resolved,
+        kind=DatabaseKind.WORKFLOW,
+        packaged_versions=packaged_versions,
+    )
+    assert expected_history is not None
     with connect_database(resolved) as connection:
         try:
+            current_history = _read_migration_history(
+                connection,
+                kind=DatabaseKind.WORKFLOW,
+                packaged_versions=packaged_versions,
+            )
+            if current_history != expected_history:
+                raise DatabaseVerificationError(
+                    ErrorCategory.DATABASE,
+                    "workflow migration history changed during reconciliation preflight",
+                    stop_reason="MIGRATION_HISTORY_INVALID",
+                )
             connection.execute("BEGIN IMMEDIATE")
-            version_row = connection.execute(
-                "SELECT MAX(version) AS version FROM schema_version"
-            ).fetchone()
-            version = int(version_row["version"] or 0)
+            version = current_history[-1] if current_history else 0
             archive_schema_exists = bool(
                 connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' "
                     "AND name = 'legacy_authorization_reconciliations'"
                 ).fetchone()
             )
-            active_rows = {
-                table: [
-                    dict(row)
-                    for row in connection.execute(
-                        f"SELECT * FROM {table} ORDER BY {key}"
-                    ).fetchall()
-                ]
-                for table, key in LEGACY_ACTIVE_TABLE_KEYS.items()
-            }
-            active_count = sum(len(rows) for rows in active_rows.values())
+            captured_tables = capture_legacy_authorization_tables(connection)
+            active_count = sum(len(table.rows) for table in captured_tables)
             if archive_schema_exists:
                 metadata_rows = connection.execute(
                     "SELECT reconciliation_id, reviewer, reason, disposition, confirmed_at, "
@@ -460,17 +841,37 @@ def reconcile_legacy_authorization(
                 )
 
             _install_legacy_archive_schema(connection)
-            table_counts = {table: len(rows) for table, rows in active_rows.items()}
+            table_counts = {table.source_table: len(table.rows) for table in captured_tables}
             archived_at = utc_now()
-            archived_records: list[tuple[str, str, str, str]] = []
-            for table, key_column in LEGACY_ACTIVE_TABLE_KEYS.items():
-                for row in active_rows[table]:
-                    key = str(row[key_column])
-                    original_json = canonical_legacy_json(row)
-                    record_hash = legacy_record_hash(table, key, original_json)
-                    archived_records.append((table, key, original_json, record_hash))
+            archived_records: list[
+                tuple[str, int, int | None, str, str | None, bytes, str, str]
+            ] = []
+            for table in captured_tables:
+                for row in table.rows:
+                    record_hash = legacy_record_hash(
+                        table.source_table,
+                        table.schema_hash,
+                        row.typed_row,
+                    )
+                    archived_records.append(
+                        (
+                            table.source_table,
+                            row.source_row_ordinal,
+                            row.source_rowid,
+                            legacy_source_record_key(table, row),
+                            legacy_json_safe_row(table, row),
+                            row.typed_row,
+                            table.schema_hash,
+                            record_hash,
+                        )
+                    )
+            schema_manifest_hash = legacy_schema_manifest_hash(captured_tables)
             manifest_hash = legacy_manifest_hash(
-                [(table, key, record_hash) for table, key, _json, record_hash in archived_records]
+                schema_manifest_hash,
+                [
+                    (table, ordinal, record_hash)
+                    for table, ordinal, _rowid, _key, _json, _typed, _schema, record_hash in archived_records
+                ],
             )
             reconciliation_id = legacy_reconciliation_id(
                 reviewer=selected_reviewer,
@@ -479,11 +880,60 @@ def reconcile_legacy_authorization(
                 source_schema_version=version,
                 manifest_hash=manifest_hash,
             )
+            for manifest_table in captured_tables:
+                connection.execute(
+                    "INSERT INTO legacy_authorization_table_manifests("
+                    "manifest_id, reconciliation_id, source_table_order, source_table, "
+                    "source_table_sql, column_manifest, schema_hash, original_row_count) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        f"ltm_{manifest_table.schema_hash}",
+                        reconciliation_id,
+                        manifest_table.source_table_order,
+                        manifest_table.source_table,
+                        sqlite3.Binary(manifest_table.source_table_sql.encode("utf-8")),
+                        sqlite3.Binary(manifest_table.column_manifest),
+                        manifest_table.schema_hash,
+                        len(manifest_table.rows),
+                    ),
+                )
+            for (
+                source_table,
+                ordinal,
+                source_rowid,
+                key,
+                original_json,
+                typed_row,
+                schema_hash,
+                record_hash,
+            ) in archived_records:
+                connection.execute(
+                    "INSERT INTO legacy_authorization_quarantine("
+                    "archive_id, reconciliation_id, source_table, source_record_key, "
+                    "source_row_ordinal, source_rowid, original_row_json, typed_row, "
+                    "schema_hash, record_hash, authorization_state, archived_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        f"lqar_{record_hash}",
+                        reconciliation_id,
+                        source_table,
+                        key,
+                        ordinal,
+                        source_rowid,
+                        original_json,
+                        sqlite3.Binary(typed_row),
+                        schema_hash,
+                        record_hash,
+                        disposition,
+                        archived_at,
+                    ),
+                )
             connection.execute(
                 "INSERT INTO legacy_authorization_reconciliations("
                 "reconciliation_id, reviewer, reason, disposition, confirmed_at, "
-                "source_schema_version, record_count, record_manifest_hash, table_counts_json, "
-                "state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED')",
+                "source_schema_version, record_count, schema_manifest_hash, "
+                "record_manifest_hash, table_counts_json, state) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED')",
                 (
                     reconciliation_id,
                     selected_reviewer,
@@ -492,38 +942,27 @@ def reconcile_legacy_authorization(
                     archived_at,
                     version,
                     len(archived_records),
+                    schema_manifest_hash,
                     manifest_hash,
                     canonical_legacy_json(table_counts),
                 ),
             )
-            for table, key, original_json, record_hash in archived_records:
-                connection.execute(
-                    "INSERT INTO legacy_authorization_quarantine("
-                    "archive_id, reconciliation_id, source_table, source_record_key, "
-                    "original_row_json, record_hash, authorization_state, archived_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        f"lqar_{record_hash}",
-                        reconciliation_id,
-                        table,
-                        key,
-                        original_json,
-                        record_hash,
-                        disposition,
-                        archived_at,
-                    ),
-                )
             if audit_legacy_authorization_archives(connection):
                 raise DatabaseVerificationError(
                     ErrorCategory.DATABASE,
                     "legacy rows were not archived with exact canonical hashes",
                     stop_reason="LEGACY_RECONCILIATION_ARCHIVE_INVALID",
                 )
-            for table in ("payments", "final_decisions", "human_decisions", "review_requests"):
-                connection.execute(f"DELETE FROM {table}")
+            for active_table in (
+                "payments",
+                "final_decisions",
+                "human_decisions",
+                "review_requests",
+            ):
+                connection.execute(f"DELETE FROM {active_table}")
             remaining = sum(
-                int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-                for table in LEGACY_ACTIVE_TABLE_KEYS
+                int(connection.execute(f"SELECT COUNT(*) FROM {active_table}").fetchone()[0])
+                for active_table in LEGACY_ACTIVE_TABLE_KEYS
             )
             if remaining:
                 raise DatabaseVerificationError(
@@ -556,18 +995,36 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
 
     selected_kind = kind or infer_kind(path)
     path = path.resolve()
+    resources = _migration_resources(selected_kind)
+    packaged_versions = _migration_versions(resources, selected_kind)
+    expected_history = _preflight_existing_migration_history(
+        path,
+        kind=selected_kind,
+        packaged_versions=packaged_versions,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     applied: list[int] = []
     with connect_database(path) as connection:
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS schema_version ("
-            "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
-        )
-        existing = {
-            int(row["version"])
-            for row in connection.execute("SELECT version FROM schema_version").fetchall()
-        }
-        connection.commit()
+        if expected_history is None:
+            connection.execute(
+                "CREATE TABLE schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+            )
+            connection.commit()
+            history: tuple[int, ...] = ()
+        else:
+            history = _read_migration_history(
+                connection,
+                kind=selected_kind,
+                packaged_versions=packaged_versions,
+            )
+            if history != expected_history:
+                raise DatabaseVerificationError(
+                    ErrorCategory.DATABASE,
+                    f"{selected_kind.value} migration history changed during preflight",
+                    stop_reason="MIGRATION_HISTORY_INVALID",
+                )
+        existing = set(history)
         if (
             selected_kind is DatabaseKind.WORKFLOW
             and SCHEMA_VERSIONS[DatabaseKind.WORKFLOW] in existing
@@ -583,7 +1040,7 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
                     "version-neutral workflow schema installation failed",
                     stop_reason="MIGRATION_FAILED",
                 ) from exc
-        for resource in _migration_resources(selected_kind):
+        for resource in resources:
             version = int(resource.name.split("_", 1)[0])
             if version in existing:
                 continue
@@ -876,16 +1333,31 @@ def verify_database(
                 "confirmed_at",
                 "source_schema_version",
                 "record_count",
+                "schema_manifest_hash",
                 "record_manifest_hash",
                 "table_counts_json",
                 "state",
+            },
+            "legacy_authorization_table_manifests": {
+                "manifest_id",
+                "reconciliation_id",
+                "source_table_order",
+                "source_table",
+                "source_table_sql",
+                "column_manifest",
+                "schema_hash",
+                "original_row_count",
             },
             "legacy_authorization_quarantine": {
                 "archive_id",
                 "reconciliation_id",
                 "source_table",
                 "source_record_key",
+                "source_row_ordinal",
+                "source_rowid",
                 "original_row_json",
+                "typed_row",
+                "schema_hash",
                 "record_hash",
                 "authorization_state",
                 "archived_at",
@@ -964,6 +1436,7 @@ def verify_database(
                     stop_reason="DATABASE_SCHEMA_MISMATCH",
                 )
             if selected_kind is DatabaseKind.WORKFLOW:
+                _verify_workflow_schema_manifest(connection)
                 trigger_rows = connection.execute(
                     "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
                 ).fetchall()

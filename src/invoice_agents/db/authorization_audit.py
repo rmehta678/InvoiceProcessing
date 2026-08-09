@@ -28,6 +28,7 @@ from invoice_agents.models import FinalDecision, HumanDecision, PersistedPayment
 from invoice_agents.payment.identity import payment_identity_key
 
 AUDIT_COUNT_KEYS = (
+    "invalid_cardinality_count",
     "invalid_review_count",
     "invalid_human_decision_count",
     "invalid_snapshot_count",
@@ -50,6 +51,37 @@ _AUDIT_ERRORS = (
 class _AuditedAnchor:
     snapshot: EvidenceSnapshot
     review_authorization: ReviewAuthorization | None
+
+
+_AUTHORIZATION_IDENTITIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("review_requests", ("review_id",)),
+    ("review_requests", ("case_id", "sequence")),
+    ("human_decisions", ("decision_id",)),
+    ("human_decisions", ("review_id",)),
+    ("validated_evidence_snapshots", ("case_id", "execution_generation")),
+    (
+        "validated_evidence_snapshots",
+        ("case_id", "execution_generation", "evidence_snapshot_digest"),
+    ),
+    ("final_decisions", ("decision_id",)),
+    ("final_decisions", ("case_id",)),
+    ("final_decisions", ("case_id", "decision_generation")),
+    ("payments", ("payment_id",)),
+    ("payments", ("idempotency_key",)),
+)
+
+
+def _invalid_authorization_cardinality(connection: sqlite3.Connection) -> int:
+    """Count every row beyond one for each independently authoritative identity."""
+
+    invalid = 0
+    for table, columns in _AUTHORIZATION_IDENTITIES:
+        grouped = ", ".join(columns)
+        rows = connection.execute(
+            f"SELECT COUNT(*) AS cardinality FROM {table} GROUP BY {grouped} HAVING COUNT(*) <> 1"
+        ).fetchall()
+        invalid += sum(int(row["cardinality"]) - 1 for row in rows)
+    return invalid
 
 
 def _lower_hex_digest(value: object) -> bool:
@@ -312,6 +344,7 @@ def audit_workflow_authorization(
     """Enumerate and revalidate every active authorization row without mutation."""
 
     counts = {key: 0 for key in AUDIT_COUNT_KEYS}
+    counts["invalid_cardinality_count"] = _invalid_authorization_cardinality(connection)
     review_rows = connection.execute(
         "SELECT review_id, case_id, sequence, status, payload_json, created_at, resolved_at, "
         "execution_generation, evidence_snapshot_digest FROM review_requests "
