@@ -271,6 +271,28 @@ def _normalized_sql(sql: str) -> str:
     return re.sub(r"\s+", " ", sql.strip().rstrip(";")).casefold()
 
 
+def _require_reconciled_workflow_authorization(
+    connection: sqlite3.Connection,
+) -> None:
+    """Refuse to invent generation-bound provenance for pre-v3 decisions or payments."""
+
+    final_decision_count = int(
+        connection.execute("SELECT COUNT(*) FROM final_decisions").fetchone()[0]
+    )
+    payment_count = int(connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0])
+    if final_decision_count or payment_count:
+        raise DatabaseVerificationError(
+            ErrorCategory.DATABASE,
+            "workflow authorization reconciliation is required before migration 003 "
+            f"(final_decisions={final_decision_count}, payments={payment_count})",
+            stop_reason="AUTHORIZATION_RECONCILIATION_REQUIRED",
+            details={
+                "final_decision_count": final_decision_count,
+                "payment_count": payment_count,
+            },
+        )
+
+
 def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
     """Apply unapplied migrations; this is never called by normal processing."""
 
@@ -309,6 +331,8 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
                 if disable_foreign_keys:
                     connection.execute("PRAGMA foreign_keys = OFF")
                 connection.execute("BEGIN IMMEDIATE")
+                if selected_kind is DatabaseKind.WORKFLOW and version == 3:
+                    _require_reconciled_workflow_authorization(connection)
                 for statement in statements:
                     if _normalized_sql(statement) in transaction_controls:
                         continue
@@ -318,6 +342,9 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
                     (version, utc_now()),
                 )
                 connection.commit()
+            except DatabaseVerificationError:
+                connection.rollback()
+                raise
             except sqlite3.Error as exc:
                 connection.rollback()
                 raise DatabaseVerificationError(
@@ -390,6 +417,465 @@ def _assert_sqlite_file(path: Path) -> None:
 
 def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
     return {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def _workflow_authorization_provenance_counts(
+    connection: sqlite3.Connection,
+) -> dict[str, int]:
+    """Count persisted authorization rows that no longer have a complete relational anchor."""
+
+    valid_anchors_sql = """
+        SELECT anchor.case_id, anchor.execution_generation, anchor.evidence_snapshot_digest,
+            anchor.review_id, anchor.unresolved_blocker_count, anchor.critique_disposition
+        FROM validated_evidence_snapshots anchor
+        JOIN cases c ON c.case_id = anchor.case_id
+        JOIN extractions e ON e.case_id = anchor.case_id
+            AND e.execution_generation = anchor.execution_generation
+        JOIN identity_results identity_row ON identity_row.case_id = anchor.case_id
+            AND identity_row.execution_generation = anchor.execution_generation
+        JOIN comparison_results inventory ON inventory.case_id = anchor.case_id
+            AND inventory.execution_generation = anchor.execution_generation
+            AND inventory.comparison_type = 'inventory'
+        JOIN comparison_results risk ON risk.case_id = anchor.case_id
+            AND risk.execution_generation = anchor.execution_generation
+            AND risk.comparison_type = 'risk'
+        JOIN critique_results critique ON critique.case_id = anchor.case_id
+            AND critique.execution_generation = anchor.execution_generation
+        WHERE typeof(anchor.execution_generation) = 'integer'
+            AND anchor.execution_generation > 0
+            AND c.execution_generation = anchor.execution_generation
+            AND length(anchor.evidence_snapshot_digest) = 64
+            AND anchor.evidence_snapshot_digest NOT GLOB '*[^0-9a-f]*'
+            AND e.version = (
+                SELECT MAX(latest.version) FROM extractions latest
+                WHERE latest.case_id = anchor.case_id
+                    AND latest.execution_generation = anchor.execution_generation
+            )
+            AND identity_row.rowid = (
+                SELECT MAX(latest.rowid) FROM identity_results latest
+                WHERE latest.case_id = anchor.case_id
+                    AND latest.execution_generation = anchor.execution_generation
+            )
+            AND inventory.rowid = (
+                SELECT MAX(latest.rowid) FROM comparison_results latest
+                WHERE latest.case_id = anchor.case_id
+                    AND latest.execution_generation = anchor.execution_generation
+                    AND latest.comparison_type = 'inventory'
+            )
+            AND risk.rowid = (
+                SELECT MAX(latest.rowid) FROM comparison_results latest
+                WHERE latest.case_id = anchor.case_id
+                    AND latest.execution_generation = anchor.execution_generation
+                    AND latest.comparison_type = 'risk'
+            )
+            AND critique.rowid = (
+                SELECT MAX(latest.rowid) FROM critique_results latest
+                WHERE latest.case_id = anchor.case_id
+                    AND latest.execution_generation = anchor.execution_generation
+            )
+            AND json_valid(e.payload_json) = 1
+            AND json_valid(identity_row.payload_json) = 1
+            AND json_valid(inventory.payload_json) = 1
+            AND json_valid(risk.payload_json) = 1
+            AND json_valid(critique.payload_json) = 1
+            AND anchor.evidence_snapshot_digest = CASE
+                WHEN json_valid(e.payload_json) = 1
+                    AND json_valid(identity_row.payload_json) = 1
+                    AND json_valid(inventory.payload_json) = 1
+                    AND json_valid(risk.payload_json) = 1
+                    AND json_valid(critique.payload_json) = 1
+                THEN stored_evidence_snapshot_digest(
+                    anchor.case_id,
+                    e.payload_json,
+                    identity_row.payload_json,
+                    identity_row.evaluated_at,
+                    inventory.payload_json,
+                    risk.payload_json,
+                    critique.payload_json
+                )
+                ELSE NULL
+            END
+            AND anchor.policy_review_required = CASE
+                WHEN json_array_length(json_extract(
+                    risk.payload_json, '$.policy_review_reasons'
+                )) > 0 THEN 1 ELSE 0 END
+            AND anchor.unresolved_blocker_count = CASE
+                WHEN json_valid(risk.payload_json) = 1
+                    AND (
+                        anchor.review_id IS NULL
+                        OR EXISTS (
+                            SELECT 1 FROM human_decisions h
+                            WHERE h.review_id = anchor.review_id
+                                AND json_valid(h.payload_json) = 1
+                        )
+                    )
+                THEN stored_unresolved_blocker_count(
+                    risk.payload_json,
+                    (SELECT h.payload_json FROM human_decisions h
+                        WHERE h.review_id = anchor.review_id)
+                )
+                ELSE NULL
+            END
+            AND anchor.critique_disposition = json_extract(
+                critique.payload_json, '$.recommended_disposition'
+            )
+            AND (
+                (
+                    anchor.review_id IS NULL
+                    AND anchor.review_snapshot_digest IS NULL
+                    AND anchor.policy_review_required = 0
+                    AND NOT EXISTS (
+                        SELECT 1 FROM review_requests r
+                        WHERE r.case_id = anchor.case_id
+                            AND r.execution_generation = anchor.execution_generation
+                    )
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM review_requests r
+                    JOIN human_decisions h ON h.review_id = r.review_id
+                    WHERE r.review_id = anchor.review_id
+                        AND r.case_id = anchor.case_id
+                        AND r.execution_generation = anchor.execution_generation
+                        AND r.sequence = (
+                            SELECT MAX(latest.sequence) FROM review_requests latest
+                            WHERE latest.case_id = anchor.case_id
+                        )
+                        AND r.status = 'RESOLVED'
+                        AND r.resolved_at = h.decided_at
+                        AND r.evidence_snapshot_digest = anchor.review_snapshot_digest
+                        AND (
+                            (
+                                h.decision <> 'ESTABLISH_MAPPING'
+                                AND r.evidence_snapshot_digest =
+                                    anchor.evidence_snapshot_digest
+                            )
+                            OR (
+                                h.decision = 'ESTABLISH_MAPPING'
+                                AND r.execution_generation > 1
+                                AND r.evidence_snapshot_digest = (
+                                    SELECT stored_evidence_snapshot_digest(
+                                        anchor.case_id,
+                                        predecessor_extraction.payload_json,
+                                        predecessor_identity.payload_json,
+                                        predecessor_identity.evaluated_at,
+                                        predecessor_inventory.payload_json,
+                                        predecessor_risk.payload_json,
+                                        predecessor_critique.payload_json
+                                    )
+                                    FROM extractions predecessor_extraction
+                                    JOIN identity_results predecessor_identity
+                                        ON predecessor_identity.case_id =
+                                            predecessor_extraction.case_id
+                                    JOIN comparison_results predecessor_inventory
+                                        ON predecessor_inventory.case_id =
+                                            predecessor_extraction.case_id
+                                        AND predecessor_inventory.comparison_type = 'inventory'
+                                    JOIN comparison_results predecessor_risk
+                                        ON predecessor_risk.case_id =
+                                            predecessor_extraction.case_id
+                                        AND predecessor_risk.comparison_type = 'risk'
+                                    JOIN critique_results predecessor_critique
+                                        ON predecessor_critique.case_id =
+                                            predecessor_extraction.case_id
+                                    WHERE predecessor_extraction.case_id = anchor.case_id
+                                        AND predecessor_extraction.execution_generation =
+                                            anchor.execution_generation - 1
+                                        AND predecessor_identity.execution_generation =
+                                            anchor.execution_generation - 1
+                                        AND predecessor_inventory.execution_generation =
+                                            anchor.execution_generation - 1
+                                        AND predecessor_risk.execution_generation =
+                                            anchor.execution_generation - 1
+                                        AND predecessor_critique.execution_generation =
+                                            anchor.execution_generation - 1
+                                        AND predecessor_extraction.version = (
+                                            SELECT MAX(latest.version) FROM extractions latest
+                                            WHERE latest.case_id = anchor.case_id
+                                                AND latest.execution_generation =
+                                                    anchor.execution_generation - 1
+                                        )
+                                        AND predecessor_identity.rowid = (
+                                            SELECT MAX(latest.rowid) FROM identity_results latest
+                                            WHERE latest.case_id = anchor.case_id
+                                                AND latest.execution_generation =
+                                                    anchor.execution_generation - 1
+                                        )
+                                        AND predecessor_inventory.rowid = (
+                                            SELECT MAX(latest.rowid) FROM comparison_results latest
+                                            WHERE latest.case_id = anchor.case_id
+                                                AND latest.execution_generation =
+                                                    anchor.execution_generation - 1
+                                                AND latest.comparison_type = 'inventory'
+                                        )
+                                        AND predecessor_risk.rowid = (
+                                            SELECT MAX(latest.rowid) FROM comparison_results latest
+                                            WHERE latest.case_id = anchor.case_id
+                                                AND latest.execution_generation =
+                                                    anchor.execution_generation - 1
+                                                AND latest.comparison_type = 'risk'
+                                        )
+                                        AND predecessor_critique.rowid = (
+                                            SELECT MAX(latest.rowid) FROM critique_results latest
+                                            WHERE latest.case_id = anchor.case_id
+                                                AND latest.execution_generation =
+                                                    anchor.execution_generation - 1
+                                        )
+                                )
+                            )
+                        )
+                        AND json_valid(r.payload_json) = 1
+                        AND json_valid(h.payload_json) = 1
+                        AND json_extract(r.payload_json, '$.review_id') = r.review_id
+                        AND json_extract(r.payload_json, '$.case_id') = r.case_id
+                        AND json_extract(r.payload_json, '$.sequence') = r.sequence
+                        AND json_extract(r.payload_json, '$.status') = r.status
+                        AND json_extract(r.payload_json, '$.human_decision.review_id') = h.review_id
+                        AND json_extract(r.payload_json, '$.human_decision.reviewer') = h.reviewer
+                        AND json_extract(r.payload_json, '$.human_decision.decision') = h.decision
+                        AND json_extract(r.payload_json, '$.human_decision.reason') = h.reason
+                        AND julianday(json_extract(
+                            r.payload_json, '$.human_decision.decided_at'
+                        )) = julianday(h.decided_at)
+                        AND json_extract(h.payload_json, '$.review_id') = h.review_id
+                        AND json_extract(h.payload_json, '$.reviewer') = h.reviewer
+                        AND json_extract(h.payload_json, '$.decision') = h.decision
+                        AND json_extract(h.payload_json, '$.reason') = h.reason
+                        AND julianday(json_extract(h.payload_json, '$.decided_at')) =
+                            julianday(h.decided_at)
+                        AND json_extract(h.payload_json, '$.mappings') = json_extract(
+                            r.payload_json, '$.human_decision.mappings'
+                        )
+                        AND json_extract(h.payload_json, '$.superseded_case_id') IS json_extract(
+                            r.payload_json, '$.human_decision.superseded_case_id'
+                        )
+                        AND json_extract(h.payload_json, '$.addressed_blocker_ids') = json_extract(
+                            r.payload_json, '$.human_decision.addressed_blocker_ids'
+                        )
+                        AND (SELECT COUNT(*) FROM human_decisions exact
+                            WHERE exact.review_id = r.review_id) = 1
+                )
+            )
+    """
+    invalid_snapshot_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM validated_evidence_snapshots anchor "
+            f"WHERE NOT EXISTS (SELECT 1 FROM ({valid_anchors_sql}) valid "
+            "WHERE valid.case_id = anchor.case_id "
+            "AND valid.execution_generation = anchor.execution_generation "
+            "AND valid.evidence_snapshot_digest = anchor.evidence_snapshot_digest)"
+        ).fetchone()[0]
+    )
+    invalid_final_decision_count = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM final_decisions f
+                WHERE typeof(f.decision_generation) <> 'integer'
+                    OR f.decision_generation < 1
+                    OR json_valid(f.payload_json) <> 1
+                    OR json_extract(
+                        CASE WHEN json_valid(f.payload_json) = 1
+                            THEN f.payload_json ELSE '{}' END,
+                        '$.decision'
+                    )
+                        NOT IN ('APPROVE', 'REJECT', 'HOLD', 'FAILED')
+                    OR NOT (
+                        (json_extract(
+                            CASE WHEN json_valid(f.payload_json) = 1
+                                THEN f.payload_json ELSE '{}' END,
+                            '$.decision'
+                        ) = 'APPROVE'
+                            AND json_extract(
+                                CASE WHEN json_valid(f.payload_json) = 1
+                                    THEN f.payload_json ELSE '{}' END,
+                                '$.payment_eligible'
+                            ) = 1)
+                        OR (json_extract(
+                            CASE WHEN json_valid(f.payload_json) = 1
+                                THEN f.payload_json ELSE '{}' END,
+                            '$.decision'
+                        ) <> 'APPROVE'
+                            AND json_extract(
+                                CASE WHEN json_valid(f.payload_json) = 1
+                                    THEN f.payload_json ELSE '{}' END,
+                                '$.payment_eligible'
+                            ) = 0)
+                )
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM ("""
+            + valid_anchors_sql
+            + """
+                    ) anchor
+                    JOIN cases c ON c.case_id = f.case_id
+                    JOIN extractions e ON e.case_id = f.case_id
+                        AND e.execution_generation = f.decision_generation
+                    WHERE anchor.case_id = f.case_id
+                        AND anchor.execution_generation = f.decision_generation
+                        AND anchor.evidence_snapshot_digest = f.evidence_snapshot_digest
+                        AND anchor.review_id IS f.review_id
+                        AND e.version = (
+                            SELECT MAX(latest.version) FROM extractions latest
+                            WHERE latest.case_id = f.case_id
+                                AND latest.execution_generation = f.decision_generation
+                        )
+                        AND c.source_id = f.source_id
+                        AND json_extract(e.payload_json, '$.source.source_id') = f.source_id
+                        AND json_extract(e.payload_json, '$.invoice_number.normalized_value')
+                            IS f.invoice_number
+                        AND json_extract(e.payload_json, '$.vendor.normalized_value') IS f.vendor
+                        AND json_extract(e.payload_json, '$.declared_total') IS f.authorized_amount
+                        AND json_extract(e.payload_json, '$.currency.normalized_value')
+                            IS f.authorized_currency
+                        AND f.payment_idempotency_key = payment_identity_key(
+                            f.vendor, f.invoice_number
+                        )
+                        AND (
+                            json_extract(f.payload_json, '$.decision') <> 'APPROVE'
+                            OR anchor.unresolved_blocker_count = 0
+                        )
+                        AND (
+                            json_extract(f.payload_json, '$.decision') <> 'APPROVE'
+                            OR anchor.critique_disposition = 'APPROVE'
+                            OR anchor.review_id IS NOT NULL
+                        )
+                        AND (
+                            (
+                                anchor.review_id IS NULL
+                                AND json_extract(
+                                    f.payload_json, '$.human_outcome'
+                                ) IS NULL
+                            )
+                            OR EXISTS (
+                                SELECT 1
+                                FROM human_decisions h
+                                WHERE h.review_id = anchor.review_id
+                                    AND json_extract(
+                                        f.payload_json, '$.human_outcome.review_id'
+                                    ) = h.review_id
+                                    AND json_extract(
+                                        f.payload_json, '$.human_outcome.reviewer'
+                                    ) = h.reviewer
+                                    AND json_extract(
+                                        f.payload_json, '$.human_outcome.decision'
+                                    ) = h.decision
+                                    AND json_extract(
+                                        f.payload_json, '$.human_outcome.reason'
+                                    ) = h.reason
+                                    AND julianday(json_extract(
+                                        f.payload_json, '$.human_outcome.decided_at'
+                                    )) = julianday(h.decided_at)
+                                    AND json_extract(
+                                        f.payload_json, '$.human_outcome.mappings'
+                                    ) = json_extract(h.payload_json, '$.mappings')
+                                    AND json_extract(
+                                        f.payload_json,
+                                        '$.human_outcome.superseded_case_id'
+                                    ) IS json_extract(
+                                        h.payload_json, '$.superseded_case_id'
+                                    )
+                                    AND json_extract(
+                                        f.payload_json,
+                                        '$.human_outcome.addressed_blocker_ids'
+                                    ) = json_extract(
+                                        h.payload_json, '$.addressed_blocker_ids'
+                                    )
+                                    AND (
+                                        (
+                                            h.decision IN (
+                                                'APPROVE',
+                                                'ESTABLISH_MAPPING',
+                                                'SUPERSEDE_REVISION'
+                                            )
+                                            AND (
+                                                json_extract(
+                                                    f.payload_json, '$.decision'
+                                                ) = 'APPROVE'
+                                                OR (
+                                                    json_extract(
+                                                        f.payload_json, '$.decision'
+                                                    ) = 'HOLD'
+                                                    AND anchor.unresolved_blocker_count > 0
+                                                )
+                                            )
+                                        )
+                                        OR (
+                                            h.decision = 'REJECT'
+                                            AND json_extract(
+                                                f.payload_json, '$.decision'
+                                            ) = 'REJECT'
+                                        )
+                                        OR (
+                                            h.decision = 'REQUEST_CORRECTION'
+                                            AND json_extract(
+                                                f.payload_json, '$.decision'
+                                            ) = 'HOLD'
+                                        )
+                                    )
+                            )
+                        )
+                )
+            """
+        ).fetchone()[0]
+    )
+    invalid_payment_count = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM payments p
+            WHERE typeof(p.decision_generation) <> 'integer'
+                OR p.decision_generation < 1
+                OR p.status NOT IN ('PAID', 'FAILED')
+                OR (p.status = 'PAID' AND p.error IS NOT NULL)
+                OR (p.status = 'FAILED' AND p.error IS NULL)
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM final_decisions f
+                    JOIN ("""
+            + valid_anchors_sql
+            + """
+                    ) anchor ON anchor.case_id = f.case_id
+                        AND anchor.execution_generation = f.decision_generation
+                        AND anchor.evidence_snapshot_digest = f.evidence_snapshot_digest
+                    JOIN cases c ON c.case_id = f.case_id
+                    WHERE f.case_id = p.case_id
+                        AND f.decision_generation = p.decision_generation
+                        AND f.evidence_snapshot_digest = p.evidence_snapshot_digest
+                        AND json_valid(f.payload_json) = 1
+                            AND json_extract(
+                                CASE WHEN json_valid(f.payload_json) = 1
+                                    THEN f.payload_json ELSE '{}' END,
+                                '$.decision'
+                            ) = 'APPROVE'
+                            AND json_extract(
+                                CASE WHEN json_valid(f.payload_json) = 1
+                                    THEN f.payload_json ELSE '{}' END,
+                                '$.payment_eligible'
+                            ) = 1
+                        AND f.source_id = p.source_id
+                        AND f.invoice_number IS p.invoice_number
+                        AND f.vendor = p.vendor
+                        AND f.authorized_amount = p.amount
+                        AND f.authorized_currency = p.currency
+                        AND f.payment_idempotency_key = p.idempotency_key
+                        AND f.review_id IS p.review_id
+                        AND anchor.review_id IS p.review_id
+                        AND anchor.unresolved_blocker_count = 0
+                        AND (anchor.critique_disposition = 'APPROVE'
+                            OR anchor.review_id IS NOT NULL)
+                        AND c.source_id = p.source_id
+                        AND p.idempotency_key = payment_identity_key(p.vendor, p.invoice_number)
+                        AND CAST(p.amount AS NUMERIC) > 0
+                )
+            """
+        ).fetchone()[0]
+    )
+    return {
+        "invalid_snapshot_count": invalid_snapshot_count,
+        "invalid_final_decision_count": invalid_final_decision_count,
+        "invalid_payment_count": invalid_payment_count,
+    }
 
 
 def verify_database(
@@ -566,6 +1052,15 @@ def verify_database(
                         ErrorCategory.DATABASE,
                         f"required triggers are missing or changed: {sorted(invalid_triggers)}",
                         stop_reason="DATABASE_SCHEMA_MISMATCH",
+                    )
+                invalid_authorization = _workflow_authorization_provenance_counts(connection)
+                if any(invalid_authorization.values()):
+                    raise DatabaseVerificationError(
+                        ErrorCategory.DATABASE,
+                        "workflow authorization provenance is incomplete or inconsistent "
+                        f"({', '.join(f'{key}={value}' for key, value in invalid_authorization.items())})",
+                        stop_reason="DATABASE_AUTHORIZATION_PROVENANCE_INVALID",
+                        details=invalid_authorization,
                     )
     except DatabaseVerificationError:
         raise

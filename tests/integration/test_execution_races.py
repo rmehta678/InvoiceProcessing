@@ -23,7 +23,14 @@ import invoice_agents.payment.service as payment_module
 from invoice_agents import orchestration
 from invoice_agents.agents.decision_rules import blocking_evidence
 from invoice_agents.config import Settings
-from invoice_agents.db.core import DatabaseKind, connect_database, migrate_database, verify_database
+from invoice_agents.db.core import (
+    REQUIRED_WORKFLOW_TRIGGERS,
+    DatabaseKind,
+    _migration_resources,
+    connect_database,
+    migrate_database,
+    verify_database,
+)
 from invoice_agents.db.store import (
     ExecutionClaim,
     WorkflowStore,
@@ -2602,6 +2609,268 @@ def test_migration_003_rolls_back_and_is_retryable_after_mid_migration_failure(
         "trg_payments_immutable_delete",
     } <= trigger_names
     assert backfilled_at == legacy_evaluated_at
+
+
+def _build_v2_authorization_database(
+    tmp_path: Path,
+    *,
+    final_decision: str,
+    include_payment: bool,
+) -> Path:
+    path = tmp_path / f"workflow-v2-{final_decision}-{include_payment}.db"
+    at = datetime(2026, 8, 8, tzinfo=UTC).isoformat()
+    resources = _migration_resources(DatabaseKind.WORKFLOW)
+    with connect_database(path) as connection:
+        connection.executescript(resources[0].read_text(encoding="utf-8"))
+        connection.executescript(resources[1].read_text(encoding="utf-8"))
+        connection.execute(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
+            ((1, at), (2, at)),
+        )
+        connection.execute(
+            "INSERT INTO source_artifacts(source_id, canonical_path, source_hash, source_format, "
+            "size_bytes, modified_at, metadata_json, created_at) "
+            "VALUES ('legacy_source', '/legacy/invoice.txt', ?, 'txt', 1, ?, '{}', ?)",
+            ("a" * 64, at, at),
+        )
+        connection.execute(
+            "INSERT INTO cases(case_id, source_id, invoice_number, vendor, status, "
+            "started_at, updated_at) VALUES "
+            "('legacy_case', 'legacy_source', 'INV-LEGACY', 'Legacy Vendor', 'COMPLETE', ?, ?)",
+            (at, at),
+        )
+        connection.execute(
+            "INSERT INTO final_decisions(decision_id, case_id, payload_json, created_at) "
+            "VALUES ('legacy_final', 'legacy_case', ?, ?)",
+            (
+                json.dumps(
+                    {
+                        "decision": final_decision,
+                        "reasons": ["legacy authorization has no generation-bound provenance"],
+                        "critic_disposition": final_decision,
+                        "human_outcome": None,
+                        "payment_eligible": final_decision == "APPROVE",
+                    }
+                ),
+                at,
+            ),
+        )
+        if include_payment:
+            connection.execute(
+                "INSERT INTO payments(payment_id, case_id, idempotency_key, vendor, amount, "
+                "currency, status, error, created_at) VALUES "
+                "('legacy_payment', 'legacy_case', 'legacy-key', 'Legacy Vendor', '10.00', "
+                "'USD', 'PAID', NULL, ?)",
+                (at,),
+            )
+        connection.commit()
+    return path
+
+
+@pytest.mark.parametrize(
+    ("final_decision", "include_payment"),
+    (("APPROVE", True), ("REJECT", True), ("HOLD", False)),
+)
+def test_migration_003_rejects_unanchored_legacy_authorization_atomically_and_retryably(
+    tmp_path: Path,
+    final_decision: str,
+    include_payment: bool,
+) -> None:
+    path = _build_v2_authorization_database(
+        tmp_path,
+        final_decision=final_decision,
+        include_payment=include_payment,
+    )
+    with connect_database(path, read_only=True) as connection:
+        schema_before = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+            ).fetchall()
+        ]
+        data_before = connection.execute(
+            "SELECT payload_json FROM final_decisions WHERE case_id = 'legacy_case'"
+        ).fetchone()[0]
+
+    for _attempt in range(2):
+        with pytest.raises(DatabaseVerificationError) as excinfo:
+            migrate_database(path, DatabaseKind.WORKFLOW)
+        assert excinfo.value.stop_reason == "AUTHORIZATION_RECONCILIATION_REQUIRED"
+        assert excinfo.value.details == {
+            "final_decision_count": 1,
+            "payment_count": int(include_payment),
+        }
+        assert "final_decisions=1" in excinfo.value.message
+        assert f"payments={int(include_payment)}" in excinfo.value.message
+        with connect_database(path, read_only=True) as connection:
+            assert [
+                int(row[0])
+                for row in connection.execute("SELECT version FROM schema_version ORDER BY version")
+            ] == [1, 2]
+            assert "execution_token" not in {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(cases)")
+            }
+            assert [
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+                ).fetchall()
+            ] == schema_before
+            assert (
+                connection.execute(
+                    "SELECT payload_json FROM final_decisions WHERE case_id = 'legacy_case'"
+                ).fetchone()[0]
+                == data_before
+            )
+            assert connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == int(
+                include_payment
+            )
+
+    with connect_database(path) as connection:
+        connection.execute("DELETE FROM payments")
+        connection.execute("DELETE FROM final_decisions")
+        connection.commit()
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3]
+    assert verify_database(path, DatabaseKind.WORKFLOW)["schema_version"] == 3
+
+
+@pytest.mark.parametrize("include_payment", (False, True))
+def test_workflow_preflight_rejects_unanchored_v3_authorization_rows(
+    settings: Settings,
+    include_payment: bool,
+) -> None:
+    case_id = f"case_preflight_unanchored_{include_payment}"
+    store = _persist_case(settings, case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    _approve(store, case_id, claim)
+    invoice = store.load_current_extraction(claim)
+    if include_payment:
+        payment = mock_payment(case_id, invoice, store, settings.workflow_db, claim)
+        assert payment.status is PaymentStatus.PAID
+    assert verify_database(settings.workflow_db, DatabaseKind.WORKFLOW)["schema_version"] == 3
+
+    trigger_name = "trg_validated_evidence_snapshots_delete"
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(f"DROP TRIGGER {trigger_name}")
+        connection.execute("DELETE FROM validated_evidence_snapshots WHERE case_id = ?", (case_id,))
+        connection.execute(REQUIRED_WORKFLOW_TRIGGERS[trigger_name])
+        connection.commit()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(settings.workflow_db, DatabaseKind.WORKFLOW)
+    assert excinfo.value.stop_reason == "DATABASE_AUTHORIZATION_PROVENANCE_INVALID"
+    assert excinfo.value.details == {
+        "invalid_snapshot_count": 0,
+        "invalid_final_decision_count": 1,
+        "invalid_payment_count": int(include_payment),
+    }
+
+
+@pytest.mark.parametrize(
+    ("corruption", "include_payment", "triggers", "statement", "expected_counts"),
+    (
+        (
+            "zero final generation",
+            False,
+            (
+                "trg_final_decisions_immutable_update",
+                "trg_final_decisions_snapshot_digest_update",
+            ),
+            "UPDATE final_decisions SET decision_generation = 0 WHERE case_id = ?",
+            (0, 1, 0),
+        ),
+        (
+            "mismatched final source",
+            False,
+            ("trg_final_decisions_immutable_update",),
+            "UPDATE final_decisions SET source_id = 'not-the-case-source' WHERE case_id = ?",
+            (0, 1, 0),
+        ),
+        (
+            "invalid validated blocker facts",
+            False,
+            ("trg_validated_evidence_snapshots_update",),
+            "UPDATE validated_evidence_snapshots SET unresolved_blocker_count = 1 "
+            "WHERE case_id = ?",
+            (1, 1, 0),
+        ),
+        (
+            "mismatched payment source",
+            True,
+            (
+                "trg_payments_immutable_update",
+                "trg_paid_payments_immutable_update",
+            ),
+            "UPDATE payments SET source_id = 'not-the-final-source' WHERE case_id = ?",
+            (0, 0, 1),
+        ),
+    ),
+)
+def test_workflow_preflight_audits_existing_authorization_relationships(
+    settings: Settings,
+    corruption: str,
+    include_payment: bool,
+    triggers: tuple[str, ...],
+    statement: str,
+    expected_counts: tuple[int, int, int],
+) -> None:
+    case_id = f"case_preflight_relational_{corruption.replace(' ', '_')}"
+    store = _persist_case(settings, case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    _approve(store, case_id, claim)
+    if include_payment:
+        paid = mock_payment(
+            case_id,
+            store.load_current_extraction(claim),
+            store,
+            settings.workflow_db,
+            claim,
+        )
+        assert paid.status is PaymentStatus.PAID
+
+    with connect_database(settings.workflow_db) as connection:
+        for trigger in triggers:
+            connection.execute(f"DROP TRIGGER {trigger}")
+        connection.execute(statement, (case_id,))
+        for trigger in triggers:
+            connection.execute(REQUIRED_WORKFLOW_TRIGGERS[trigger])
+        connection.commit()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(settings.workflow_db, DatabaseKind.WORKFLOW)
+    assert excinfo.value.stop_reason == "DATABASE_AUTHORIZATION_PROVENANCE_INVALID"
+    assert excinfo.value.details == dict(
+        zip(
+            (
+                "invalid_snapshot_count",
+                "invalid_final_decision_count",
+                "invalid_payment_count",
+            ),
+            expected_counts,
+            strict=True,
+        )
+    )
+
+
+def test_workflow_preflight_accepts_complete_review_bound_payment_authorization(
+    settings: Settings,
+) -> None:
+    case_id = "case_preflight_complete_review_authorization"
+    store = _persist_case(settings, case_id)
+    invoice, claim = _approve_with_resolved_review(store, case_id, settings)
+    paid = mock_payment(case_id, invoice, store, settings.workflow_db, claim)
+    assert paid.status is PaymentStatus.PAID
+
+    report = verify_database(settings.workflow_db, DatabaseKind.WORKFLOW)
+
+    assert report["schema_version"] == 3
 
 
 @pytest.mark.asyncio
