@@ -3,6 +3,8 @@
 import hashlib
 import json
 import sqlite3
+import subprocess
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -461,6 +463,39 @@ def _directory_file_hashes(directory: Path) -> dict[str, str]:
     }
 
 
+def _run_rival_database_operation(path: Path, operation: str) -> str:
+    script = """
+import sqlite3
+import sys
+
+path, operation = sys.argv[1:]
+connection = sqlite3.connect(path, timeout=0.1)
+try:
+    if operation == "wal":
+        mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+        print(f"CHANGED:{mode}")
+    else:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "UPDATE schema_version SET applied_at = applied_at WHERE version = 1"
+        )
+        connection.commit()
+        print("CHANGED:write")
+except sqlite3.OperationalError as exc:
+    print(f"LOCKED:{exc}")
+finally:
+    connection.close()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(path), operation],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    return completed.stdout.strip()
+
+
 def test_migration_003_backfills_digest_bound_immutable_durable_history(
     tmp_path: Path,
 ) -> None:
@@ -553,6 +588,95 @@ def test_legacy_v3_retrofit_rejects_wal_without_touching_existing_sidecars(
         assert _directory_file_hashes(tmp_path) == before
     finally:
         keeper.close()
+
+
+@pytest.mark.parametrize("operation", ["wal", "write"])
+def test_legacy_v3_retrofit_holds_cross_process_sqlite_lock_before_begin_immediate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    path = tmp_path / f"legacy-v3-cross-process-{operation}.db"
+    migrate_database(path, DatabaseKind.WORKFLOW)
+    _remove_durable_history(path)
+    settings = _retrofit_settings(tmp_path, path)
+    real_connect = core_module.connect_database
+    rival_results: list[str] = []
+
+    class RivalProbeConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self.connection = connection
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.connection, name)
+
+        def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+            if sql == "BEGIN IMMEDIATE" and not rival_results:
+                rival_results.append(_run_rival_database_operation(path, operation))
+            return self.connection.execute(sql, parameters)
+
+    @contextmanager
+    def observed_connect(target: Path, *, read_only: bool = False) -> Iterator[Any]:
+        with real_connect(target, read_only=read_only) as connection:
+            if target.resolve() == path.resolve() and not read_only:
+                yield RivalProbeConnection(connection)
+            else:
+                yield connection
+
+    monkeypatch.setattr(core_module, "connect_database", observed_connect)
+
+    assert migrate_database(path, DatabaseKind.WORKFLOW, settings=settings) == []
+    assert len(rival_results) == 1
+    assert rival_results[0].startswith("LOCKED:database is locked")
+    assert [row[:3] for row in _durable_history_rows(path)] == [
+        (version, version, _packaged_workflow_hashes()[version]) for version in (1, 2, 3)
+    ]
+
+
+def test_legacy_v3_retrofit_aborts_when_same_process_raw_sqlite_switches_to_wal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "legacy-v3-same-process-wal-race.db"
+    migrate_database(path, DatabaseKind.WORKFLOW)
+    _remove_durable_history(path)
+    settings = _retrofit_settings(tmp_path, path)
+    real_connect = core_module.connect_database
+    keeper: sqlite3.Connection | None = None
+
+    @contextmanager
+    def racing_connect(target: Path, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
+        nonlocal keeper
+        if target.resolve() == path.resolve() and not read_only and keeper is None:
+            keeper = sqlite3.connect(path)
+            assert keeper.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+            keeper.execute("UPDATE schema_version SET applied_at = applied_at WHERE version = 1")
+            keeper.commit()
+            assert Path(f"{path}-wal").is_file()
+            assert Path(f"{path}-shm").is_file()
+        with real_connect(target, read_only=read_only) as connection:
+            yield connection
+
+    monkeypatch.setattr(core_module, "connect_database", racing_connect)
+
+    try:
+        with pytest.raises(DatabaseVerificationError) as excinfo:
+            migrate_database(path, DatabaseKind.WORKFLOW, settings=settings)
+
+        assert excinfo.value.stop_reason == "WORKFLOW_WAL_MODE_UNSUPPORTED"
+        assert keeper is not None
+        assert Path(f"{path}-wal").is_file()
+        assert Path(f"{path}-shm").is_file()
+        assert (
+            keeper.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'schema_migration_history'"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        if keeper is not None:
+            keeper.close()
 
 
 def test_legacy_v3_retrofit_rejects_missing_required_trigger_without_mutation(
@@ -655,7 +779,7 @@ def test_legacy_v3_retrofit_revalidates_contract_after_write_lock(
     with pytest.raises(DatabaseVerificationError) as excinfo:
         migrate_database(path, DatabaseKind.WORKFLOW, settings=settings)
 
-    assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+    assert excinfo.value.stop_reason == "DATABASE_CHANGED_DURING_VERIFICATION"
     assert len(raced_bytes) == 1
     assert path.read_bytes() == raced_bytes[0]
 

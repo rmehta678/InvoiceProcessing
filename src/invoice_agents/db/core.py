@@ -17,12 +17,36 @@ from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from invoice_agents.db.sqlite_source import (
+    SQLiteMaintenanceLocks,
+    SQLiteSourceIdentity,
+    SQLiteSourceRole,
+    authoritative_database_snapshots,
+    coordinated_production_connection,
+    exclusive_database_maintenance,
+    read_validated_source_identity,
+    validate_complete_sqlite_header,
+)
 from invoice_agents.errors import DatabaseVerificationError, ErrorCategory
 
 if TYPE_CHECKING:
     from invoice_agents.config import Settings
 
-SQLITE_SIGNATURE = b"SQLite format 3\x00"
+INVENTORY_SOURCE_ROLE = SQLiteSourceRole(
+    key="inventory",
+    label="inventory",
+    wal_stop_reason="INVENTORY_WAL_MODE_UNSUPPORTED",
+)
+WORKFLOW_SOURCE_ROLE = SQLiteSourceRole(
+    key="workflow",
+    label="workflow",
+    wal_stop_reason="WORKFLOW_WAL_MODE_UNSUPPORTED",
+)
+AUTHORIZATION_INVENTORY_SOURCE_ROLE = SQLiteSourceRole(
+    key="authorization_inventory",
+    label="authorization inventory",
+    wal_stop_reason="AUTHORIZATION_INVENTORY_WAL_MODE_UNSUPPORTED",
+)
 SEED_ROWS = (
     ("SKU-WIDGET-A", "WidgetA", 15),
     ("SKU-WIDGET-B", "WidgetB", 10),
@@ -311,41 +335,42 @@ def infer_kind(path: Path) -> DatabaseKind:
 def connect_database(path: Path, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
     """Open SQLite with foreign keys enabled and row dictionaries."""
 
-    if read_only:
-        uri = f"{path.resolve().as_uri()}?mode=ro"
-        connection = sqlite3.connect(uri, uri=True, timeout=5)
-    else:
-        connection = sqlite3.connect(path, timeout=5)
-    connection.row_factory = sqlite3.Row
-    from invoice_agents.evidence_snapshot import (
-        stored_evidence_snapshot_digest,
-        stored_unresolved_blocker_count,
-    )
-    from invoice_agents.payment.identity import payment_identity_key
+    with coordinated_production_connection():
+        if read_only:
+            uri = f"{path.resolve().as_uri()}?mode=ro"
+            connection = sqlite3.connect(uri, uri=True, timeout=5)
+        else:
+            connection = sqlite3.connect(path, timeout=5)
+        try:
+            connection.row_factory = sqlite3.Row
+            from invoice_agents.evidence_snapshot import (
+                stored_evidence_snapshot_digest,
+                stored_unresolved_blocker_count,
+            )
+            from invoice_agents.payment.identity import payment_identity_key
 
-    connection.create_function(
-        "payment_identity_key",
-        2,
-        payment_identity_key,
-        deterministic=True,
-    )
-    connection.create_function(
-        "stored_evidence_snapshot_digest",
-        7,
-        stored_evidence_snapshot_digest,
-        deterministic=True,
-    )
-    connection.create_function(
-        "stored_unresolved_blocker_count",
-        2,
-        stored_unresolved_blocker_count,
-        deterministic=True,
-    )
-    connection.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield connection
-    finally:
-        connection.close()
+            connection.create_function(
+                "payment_identity_key",
+                2,
+                payment_identity_key,
+                deterministic=True,
+            )
+            connection.create_function(
+                "stored_evidence_snapshot_digest",
+                7,
+                stored_evidence_snapshot_digest,
+                deterministic=True,
+            )
+            connection.create_function(
+                "stored_unresolved_blocker_count",
+                2,
+                stored_unresolved_blocker_count,
+                deterministic=True,
+            )
+            connection.execute("PRAGMA foreign_keys = ON")
+            yield connection
+        finally:
+            connection.close()
 
 
 def _migration_resources(kind: DatabaseKind) -> list[Traversable]:
@@ -748,13 +773,15 @@ def _preflight_existing_migration_history(
 
     if not path.exists() or path.stat().st_size == 0:
         return None
-    _assert_sqlite_file(path)
-    if kind is DatabaseKind.WORKFLOW:
-        _assert_rollback_journal_header(
-            path,
-            stop_reason="WORKFLOW_WAL_MODE_UNSUPPORTED",
-            database_label="workflow",
-        )
+    _assert_rollback_journal_header(
+        path,
+        stop_reason=(
+            "WORKFLOW_WAL_MODE_UNSUPPORTED"
+            if kind is DatabaseKind.WORKFLOW
+            else "INVENTORY_WAL_MODE_UNSUPPORTED"
+        ),
+        database_label=kind.value,
+    )
     with connect_database(path, read_only=True) as connection:
         history = _read_migration_history(
             connection,
@@ -1715,6 +1742,102 @@ def reconcile_legacy_authorization(
             ) from exc
 
 
+def _is_nonempty_database_path(path: Path) -> bool:
+    try:
+        return path.stat().st_size > 0
+    except FileNotFoundError:
+        return False
+
+
+def _migration_preflight_from_source_snapshots(
+    path: Path,
+    *,
+    kind: DatabaseKind,
+    packaged_versions: tuple[int, ...],
+    packaged_hashes: dict[int, str],
+    settings: Settings | None,
+) -> tuple[MigrationPreflight | None, dict[str, SQLiteSourceIdentity]]:
+    """Audit existing migration inputs through raw copies, never through source SQLite opens."""
+
+    if not _is_nonempty_database_path(path):
+        return None, {}
+    role = WORKFLOW_SOURCE_ROLE if kind is DatabaseKind.WORKFLOW else INVENTORY_SOURCE_ROLE
+    sources: list[tuple[Path, SQLiteSourceRole]] = [(path, role)]
+    inventory_original: Path | None = None
+    if kind is DatabaseKind.WORKFLOW and settings is not None:
+        inventory_original = settings.inventory_db.resolve()
+        if _is_nonempty_database_path(inventory_original):
+            sources.append((inventory_original, AUTHORIZATION_INVENTORY_SOURCE_ROLE))
+    with authoritative_database_snapshots(sources) as snapshots:
+        main_copy = snapshots[role.key].copy_path.resolve()
+        audit_settings = settings
+        if settings is not None:
+            inventory_copy = (
+                snapshots[AUTHORIZATION_INVENTORY_SOURCE_ROLE.key].copy_path.resolve()
+                if AUTHORIZATION_INVENTORY_SOURCE_ROLE.key in snapshots
+                else main_copy.parent / "missing-authorization-inventory.db"
+            )
+            audit_settings = settings.model_copy(
+                update={
+                    "workflow_db": main_copy,
+                    "inventory_db": inventory_copy,
+                }
+            )
+        preflight = _preflight_existing_migration_history(
+            main_copy,
+            kind=kind,
+            packaged_versions=packaged_versions,
+            packaged_hashes=packaged_hashes,
+            settings=audit_settings,
+        )
+        if (
+            preflight is not None
+            and preflight.version_neutral_install_required
+            and settings is not None
+            and settings.workflow_db.resolve() != path
+        ):
+            raise DatabaseVerificationError(
+                ErrorCategory.CONFIGURATION,
+                "legacy workflow v3 retrofit Settings do not identify the database being migrated",
+                stop_reason="DATABASE_AUTHORIZATION_CONTEXT_MISMATCH",
+            )
+        identities = {key: snapshot.identity for key, snapshot in snapshots.items()}
+    return preflight, identities
+
+
+def _raise_source_changed(path: Path) -> None:
+    raise DatabaseVerificationError(
+        ErrorCategory.DATABASE,
+        f"database source changed between migration preflight and write lock: {path}",
+        stop_reason="DATABASE_CHANGED_DURING_VERIFICATION",
+    )
+
+
+def _assert_locked_source_identity(
+    maintenance_locks: SQLiteMaintenanceLocks,
+    expected: SQLiteSourceIdentity,
+    role: SQLiteSourceRole,
+) -> None:
+    current = maintenance_locks.validated_identity(expected.resolved_path, role)
+    if current != expected:
+        _raise_source_changed(expected.resolved_path)
+
+
+def _assert_connection_rollback_mode(
+    connection: sqlite3.Connection,
+    *,
+    schema: str,
+    role: SQLiteSourceRole,
+) -> None:
+    mode = str(connection.execute(f"PRAGMA {schema}.journal_mode").fetchone()[0]).casefold()
+    if mode not in {"delete", "persist", "truncate"}:
+        raise DatabaseVerificationError(
+            ErrorCategory.DATABASE,
+            f"{role.label} database changed to incompatible journal mode {mode}",
+            stop_reason=role.wal_stop_reason,
+        )
+
+
 def migrate_database(
     path: Path,
     kind: DatabaseKind | None = None,
@@ -1728,199 +1851,342 @@ def migrate_database(
     resources = _migration_resources(selected_kind)
     packaged_versions = _migration_versions(resources, selected_kind)
     packaged_hashes = _migration_hashes(resources)
-    preflight = _preflight_existing_migration_history(
-        path,
-        kind=selected_kind,
-        packaged_versions=packaged_versions,
-        packaged_hashes=packaged_hashes,
-        settings=settings,
-    )
     path.parent.mkdir(parents=True, exist_ok=True)
     applied: list[int] = []
-    with connect_database(path) as connection:
-        if preflight is None:
-            connection.execute(
-                "CREATE TABLE schema_version ("
-                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
-            )
-            connection.commit()
-            history: tuple[int, ...] = ()
-        else:
-            history = _read_migration_history(
-                connection,
-                kind=selected_kind,
-                packaged_versions=packaged_versions,
-                packaged_hashes=packaged_hashes,
-                allow_durable_retrofit=True,
-            )
-            history_snapshot = _migration_history_snapshot(connection)
-            if history != preflight.history or history_snapshot != preflight.history_snapshot:
-                raise DatabaseVerificationError(
-                    ErrorCategory.DATABASE,
-                    f"{selected_kind.value} migration history changed during preflight",
-                    stop_reason="MIGRATION_HISTORY_INVALID",
-                )
+    transaction_controls = {
+        _normalized_sql(statement)
+        for statement in (
+            "BEGIN",
+            "BEGIN TRANSACTION",
+            "BEGIN IMMEDIATE",
+            "COMMIT",
+            "END TRANSACTION",
+            "PRAGMA foreign_keys=OFF",
+            "PRAGMA foreign_keys=ON",
+        )
+    }
+    while True:
+        preflight, identities = _migration_preflight_from_source_snapshots(
+            path,
+            kind=selected_kind,
+            packaged_versions=packaged_versions,
+            packaged_hashes=packaged_hashes,
+            settings=settings,
+        )
+        history = preflight.history if preflight is not None else ()
         if (
             selected_kind is DatabaseKind.WORKFLOW
             and preflight is not None
             and preflight.version_neutral_install_required
         ):
+            assert settings is not None
+            inventory_path = settings.inventory_db.resolve()
+            workflow_identity = identities[WORKFLOW_SOURCE_ROLE.key]
+            inventory_identity = identities.get(AUTHORIZATION_INVENTORY_SOURCE_ROLE.key)
+            if inventory_identity is None:
+                raise DatabaseVerificationError(
+                    ErrorCategory.DATABASE,
+                    f"required database does not exist: {inventory_path}",
+                    stop_reason="DATABASE_MISSING",
+                )
             try:
-                inventory_path = _retrofit_inventory_path(path, settings)
-                _attach_retrofit_inventory(connection, inventory_path, read_only=False)
-                connection.execute("BEGIN IMMEDIATE")
-                connection.execute(
-                    "SELECT (SELECT COUNT(*) FROM main.sqlite_schema), "
-                    "(SELECT COUNT(*) FROM authorization_inventory.sqlite_schema)"
-                ).fetchone()
-                locked_history = _read_migration_history(
-                    connection,
-                    kind=selected_kind,
-                    packaged_versions=packaged_versions,
-                    packaged_hashes=packaged_hashes,
-                    allow_durable_retrofit=True,
-                )
-                locked_history_snapshot = _migration_history_snapshot(connection)
-                if (
-                    locked_history != preflight.history
-                    or locked_history_snapshot != preflight.history_snapshot
-                ):
-                    raise DatabaseVerificationError(
-                        ErrorCategory.DATABASE,
-                        "workflow migration history changed after the retrofit write lock",
-                        stop_reason="MIGRATION_HISTORY_INVALID",
+                with exclusive_database_maintenance((path, inventory_path)) as maintenance_locks:
+                    _assert_locked_source_identity(
+                        maintenance_locks,
+                        workflow_identity,
+                        WORKFLOW_SOURCE_ROLE,
                     )
-                version_neutral_state = _inspect_workflow_version_neutral_contract(
-                    connection,
-                    history=locked_history,
-                )
-                if not version_neutral_state.install_required:
-                    raise DatabaseVerificationError(
-                        ErrorCategory.DATABASE,
-                        "workflow version-neutral schema changed during preflight",
-                        stop_reason="DATABASE_SCHEMA_MISMATCH",
+                    _assert_locked_source_identity(
+                        maintenance_locks,
+                        inventory_identity,
+                        AUTHORIZATION_INVENTORY_SOURCE_ROLE,
                     )
-                assert settings is not None
-                _audit_workflow_retrofit_authorization(
-                    connection,
-                    settings,
-                    archive_install_required=version_neutral_state.archive_install_required,
-                )
-                _install_legacy_archive_schema(connection)
-                durable_history_exists = connection.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                    "AND name = 'schema_migration_history'"
-                ).fetchone()
-                if durable_history_exists is None:
-                    _install_durable_migration_history_schema(connection)
-                    _backfill_durable_migration_history(
-                        connection,
-                        versions=locked_history,
-                        packaged_hashes=packaged_hashes,
-                        applied_at=utc_now(),
-                    )
-                _verify_schema_manifest(
-                    connection,
-                    _expected_workflow_schema_manifest(
-                        locked_history,
-                        include_durable_history=True,
-                    ),
-                    allow_partial_empty_archive=False,
-                )
-                _read_migration_history(
-                    connection,
-                    kind=selected_kind,
-                    packaged_versions=packaged_versions,
-                    packaged_hashes=packaged_hashes,
-                )
-                connection.commit()
-                history = locked_history
+                    with connect_database(path) as connection:
+                        _attach_retrofit_inventory(
+                            connection,
+                            inventory_path,
+                            read_only=False,
+                        )
+                        maintenance_locks.reacquire()
+                        if (
+                            maintenance_locks.validated_identity(
+                                path,
+                                WORKFLOW_SOURCE_ROLE,
+                            )
+                            != workflow_identity
+                        ):
+                            _raise_source_changed(path)
+                        if (
+                            maintenance_locks.validated_identity(
+                                inventory_path,
+                                AUTHORIZATION_INVENTORY_SOURCE_ROLE,
+                            )
+                            != inventory_identity
+                        ):
+                            _raise_source_changed(inventory_path)
+                        connection.execute("BEGIN IMMEDIATE")
+                        _assert_connection_rollback_mode(
+                            connection,
+                            schema="main",
+                            role=WORKFLOW_SOURCE_ROLE,
+                        )
+                        _assert_connection_rollback_mode(
+                            connection,
+                            schema="authorization_inventory",
+                            role=AUTHORIZATION_INVENTORY_SOURCE_ROLE,
+                        )
+                        maintenance_locks.validated_identity(
+                            path,
+                            WORKFLOW_SOURCE_ROLE,
+                        )
+                        maintenance_locks.validated_identity(
+                            inventory_path,
+                            AUTHORIZATION_INVENTORY_SOURCE_ROLE,
+                        )
+                        connection.execute(
+                            "SELECT (SELECT COUNT(*) FROM main.sqlite_schema), "
+                            "(SELECT COUNT(*) FROM authorization_inventory.sqlite_schema)"
+                        ).fetchone()
+                        locked_history = _read_migration_history(
+                            connection,
+                            kind=selected_kind,
+                            packaged_versions=packaged_versions,
+                            packaged_hashes=packaged_hashes,
+                            allow_durable_retrofit=True,
+                        )
+                        locked_history_snapshot = _migration_history_snapshot(connection)
+                        if (
+                            locked_history != preflight.history
+                            or locked_history_snapshot != preflight.history_snapshot
+                        ):
+                            raise DatabaseVerificationError(
+                                ErrorCategory.DATABASE,
+                                "workflow migration history changed after the retrofit write lock",
+                                stop_reason="MIGRATION_HISTORY_INVALID",
+                            )
+                        version_neutral_state = _inspect_workflow_version_neutral_contract(
+                            connection,
+                            history=locked_history,
+                        )
+                        if not version_neutral_state.install_required:
+                            raise DatabaseVerificationError(
+                                ErrorCategory.DATABASE,
+                                "workflow version-neutral schema changed during preflight",
+                                stop_reason="DATABASE_SCHEMA_MISMATCH",
+                            )
+                        _audit_workflow_retrofit_authorization(
+                            connection,
+                            settings,
+                            archive_install_required=(
+                                version_neutral_state.archive_install_required
+                            ),
+                        )
+                        _install_legacy_archive_schema(connection)
+                        durable_history_exists = connection.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                            "AND name = 'schema_migration_history'"
+                        ).fetchone()
+                        if durable_history_exists is None:
+                            _install_durable_migration_history_schema(connection)
+                            _backfill_durable_migration_history(
+                                connection,
+                                versions=locked_history,
+                                packaged_hashes=packaged_hashes,
+                                applied_at=utc_now(),
+                            )
+                        _verify_schema_manifest(
+                            connection,
+                            _expected_workflow_schema_manifest(
+                                locked_history,
+                                include_durable_history=True,
+                            ),
+                            allow_partial_empty_archive=False,
+                        )
+                        _read_migration_history(
+                            connection,
+                            kind=selected_kind,
+                            packaged_versions=packaged_versions,
+                            packaged_hashes=packaged_hashes,
+                        )
+                        _assert_connection_rollback_mode(
+                            connection,
+                            schema="main",
+                            role=WORKFLOW_SOURCE_ROLE,
+                        )
+                        _assert_connection_rollback_mode(
+                            connection,
+                            schema="authorization_inventory",
+                            role=AUTHORIZATION_INVENTORY_SOURCE_ROLE,
+                        )
+                        connection.commit()
             except DatabaseVerificationError:
-                connection.rollback()
                 raise
             except (sqlite3.Error, ValueError) as exc:
-                connection.rollback()
                 raise DatabaseVerificationError(
                     ErrorCategory.DATABASE,
                     "version-neutral workflow schema installation failed",
                     stop_reason="MIGRATION_FAILED",
                 ) from exc
+            continue
+
         existing = set(history)
-        for resource in resources:
-            version = int(resource.name.split("_", 1)[0])
-            if version in existing:
-                continue
-            script = resource.read_text(encoding="utf-8")
-            statements = _migration_statements(script)
-            normalized_statements = {_normalized_sql(statement) for statement in statements}
-            disable_foreign_keys = (
-                _normalized_sql("PRAGMA foreign_keys=OFF") in normalized_statements
-            )
-            transaction_controls = {
-                _normalized_sql(statement)
-                for statement in (
-                    "BEGIN",
-                    "BEGIN TRANSACTION",
-                    "BEGIN IMMEDIATE",
-                    "COMMIT",
-                    "END TRANSACTION",
-                    "PRAGMA foreign_keys=OFF",
-                    "PRAGMA foreign_keys=ON",
-                )
-            }
-            try:
-                if disable_foreign_keys:
-                    connection.execute("PRAGMA foreign_keys = OFF")
-                connection.execute("BEGIN IMMEDIATE")
-                if selected_kind is DatabaseKind.WORKFLOW and version == 3:
-                    _require_reconciled_workflow_authorization(connection)
-                    _install_legacy_archive_schema(connection)
-                for statement in statements:
-                    if _normalized_sql(statement) in transaction_controls:
-                        continue
-                    connection.execute(statement)
-                applied_at = utc_now()
-                connection.execute(
-                    "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
-                    (version, applied_at),
-                )
-                if selected_kind is DatabaseKind.WORKFLOW and version >= 3:
-                    if version == 3:
-                        _backfill_durable_migration_history(
-                            connection,
-                            versions=tuple(range(1, version + 1)),
-                            packaged_hashes=packaged_hashes,
-                            applied_at=applied_at,
-                        )
-                    else:
-                        connection.execute(
-                            "INSERT INTO schema_migration_history("
-                            "ordinal, version, migration_sha256, applied_at) "
-                            "VALUES (?, ?, ?, ?)",
-                            (version, version, packaged_hashes[version], applied_at),
-                        )
-                    _read_migration_history(
-                        connection,
-                        kind=selected_kind,
-                        packaged_versions=packaged_versions,
-                        packaged_hashes=packaged_hashes,
+        resource = next(
+            (
+                candidate
+                for candidate in resources
+                if int(candidate.name.split("_", 1)[0]) not in existing
+            ),
+            None,
+        )
+        if resource is None:
+            return applied
+        version = int(resource.name.split("_", 1)[0])
+        script = resource.read_text(encoding="utf-8")
+        statements = _migration_statements(script)
+        normalized_statements = {_normalized_sql(statement) for statement in statements}
+        disable_foreign_keys = _normalized_sql("PRAGMA foreign_keys=OFF") in normalized_statements
+        main_role = (
+            WORKFLOW_SOURCE_ROLE
+            if selected_kind is DatabaseKind.WORKFLOW
+            else INVENTORY_SOURCE_ROLE
+        )
+        create_paths = (path,) if preflight is None and not path.exists() else ()
+        try:
+            with exclusive_database_maintenance(
+                (path,),
+                create_paths=create_paths,
+            ) as maintenance_locks:
+                if preflight is None:
+                    if path.stat().st_size != 0:
+                        _raise_source_changed(path)
+                else:
+                    _assert_locked_source_identity(
+                        maintenance_locks,
+                        identities[main_role.key],
+                        main_role,
                     )
-                connection.commit()
-            except DatabaseVerificationError:
-                connection.rollback()
-                raise
-            except (sqlite3.Error, ValueError) as exc:
-                connection.rollback()
-                raise DatabaseVerificationError(
-                    ErrorCategory.DATABASE,
-                    f"migration {resource.name} failed: {exc}",
-                    stop_reason="MIGRATION_FAILED",
-                ) from exc
-            finally:
-                if disable_foreign_keys:
-                    connection.execute("PRAGMA foreign_keys = ON")
-            applied.append(version)
-    return applied
+                with connect_database(path) as connection:
+                    if disable_foreign_keys:
+                        connection.execute("PRAGMA foreign_keys = OFF")
+                    if preflight is None:
+                        configured_mode = str(
+                            connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0]
+                        ).casefold()
+                        if configured_mode != "delete":
+                            raise DatabaseVerificationError(
+                                ErrorCategory.DATABASE,
+                                "new database could not be configured for rollback journal mode",
+                                stop_reason=main_role.wal_stop_reason,
+                            )
+                    maintenance_locks.reacquire()
+                    if preflight is None:
+                        if path.stat().st_size != 0:
+                            _raise_source_changed(path)
+                    else:
+                        if (
+                            maintenance_locks.validated_identity(path, main_role)
+                            != identities[main_role.key]
+                        ):
+                            _raise_source_changed(path)
+                    connection.execute("BEGIN IMMEDIATE")
+                    _assert_connection_rollback_mode(
+                        connection,
+                        schema="main",
+                        role=main_role,
+                    )
+                    if preflight is None:
+                        connection.execute(
+                            "CREATE TABLE schema_version ("
+                            "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+                        )
+                        locked_migration_history: tuple[int, ...] = ()
+                    else:
+                        maintenance_locks.validated_identity(path, main_role)
+                        locked_migration_history = _read_migration_history(
+                            connection,
+                            kind=selected_kind,
+                            packaged_versions=packaged_versions,
+                            packaged_hashes=packaged_hashes,
+                            allow_durable_retrofit=True,
+                        )
+                        locked_migration_history_snapshot = _migration_history_snapshot(connection)
+                        if (
+                            locked_migration_history != preflight.history
+                            or locked_migration_history_snapshot != preflight.history_snapshot
+                        ):
+                            raise DatabaseVerificationError(
+                                ErrorCategory.DATABASE,
+                                f"{selected_kind.value} migration history changed after "
+                                "the migration write lock",
+                                stop_reason="MIGRATION_HISTORY_INVALID",
+                            )
+                        if selected_kind is DatabaseKind.WORKFLOW:
+                            locked_state = _inspect_workflow_version_neutral_contract(
+                                connection,
+                                history=locked_migration_history,
+                            )
+                            if locked_state.install_required:
+                                raise DatabaseVerificationError(
+                                    ErrorCategory.DATABASE,
+                                    "workflow version-neutral schema changed during preflight",
+                                    stop_reason="DATABASE_SCHEMA_MISMATCH",
+                                )
+                    if version in set(locked_migration_history):
+                        raise DatabaseVerificationError(
+                            ErrorCategory.DATABASE,
+                            "migration target changed after locked history verification",
+                            stop_reason="MIGRATION_HISTORY_INVALID",
+                        )
+                    if selected_kind is DatabaseKind.WORKFLOW and version == 3:
+                        _require_reconciled_workflow_authorization(connection)
+                        _install_legacy_archive_schema(connection)
+                    for statement in statements:
+                        if _normalized_sql(statement) in transaction_controls:
+                            continue
+                        connection.execute(statement)
+                    applied_at = utc_now()
+                    connection.execute(
+                        "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
+                        (version, applied_at),
+                    )
+                    if selected_kind is DatabaseKind.WORKFLOW and version >= 3:
+                        if version == 3:
+                            _backfill_durable_migration_history(
+                                connection,
+                                versions=tuple(range(1, version + 1)),
+                                packaged_hashes=packaged_hashes,
+                                applied_at=applied_at,
+                            )
+                        else:
+                            connection.execute(
+                                "INSERT INTO schema_migration_history("
+                                "ordinal, version, migration_sha256, applied_at) "
+                                "VALUES (?, ?, ?, ?)",
+                                (version, version, packaged_hashes[version], applied_at),
+                            )
+                        _read_migration_history(
+                            connection,
+                            kind=selected_kind,
+                            packaged_versions=packaged_versions,
+                            packaged_hashes=packaged_hashes,
+                        )
+                    _assert_connection_rollback_mode(
+                        connection,
+                        schema="main",
+                        role=main_role,
+                    )
+                    connection.commit()
+                    if disable_foreign_keys:
+                        connection.execute("PRAGMA foreign_keys = ON")
+        except DatabaseVerificationError:
+            raise
+        except (sqlite3.Error, ValueError) as exc:
+            raise DatabaseVerificationError(
+                ErrorCategory.DATABASE,
+                f"migration {resource.name} failed: {exc}",
+                stop_reason="MIGRATION_FAILED",
+            ) from exc
+        applied.append(version)
 
 
 def seed_inventory(path: Path) -> int:
@@ -1955,6 +2221,12 @@ def ensure_databases(settings: Settings) -> dict[str, list[int]]:
 
     inventory_db = settings.inventory_db
     workflow_db = settings.workflow_db
+    for existing_path, role in (
+        (inventory_db.resolve(), INVENTORY_SOURCE_ROLE),
+        (workflow_db.resolve(), WORKFLOW_SOURCE_ROLE),
+    ):
+        if _is_nonempty_database_path(existing_path):
+            read_validated_source_identity(existing_path, role)
     applied = {
         DatabaseKind.INVENTORY.value: migrate_database(inventory_db, DatabaseKind.INVENTORY),
         DatabaseKind.WORKFLOW.value: migrate_database(
@@ -1977,13 +2249,8 @@ def _assert_sqlite_file(path: Path) -> bytes:
             stop_reason="DATABASE_MISSING",
         )
     with path.open("rb") as handle:
-        header = handle.read(20)
-    if len(header) < 20 or header[: len(SQLITE_SIGNATURE)] != SQLITE_SIGNATURE:
-        raise DatabaseVerificationError(
-            ErrorCategory.DATABASE,
-            f"file is not a SQLite database: {path}",
-            stop_reason="DATABASE_SIGNATURE_INVALID",
-        )
+        header = handle.read(100)
+    validate_complete_sqlite_header(path, header, path.stat().st_size)
     return header
 
 
@@ -2078,7 +2345,65 @@ def verify_database(
     require_seed: bool = True,
     settings: Settings | None = None,
 ) -> dict[str, object]:
-    """Verify signature, integrity, version, required schema, indexes, and seed identity."""
+    """Audit immutable raw copies and certify that every original remained unchanged."""
+
+    selected_kind = kind or infer_kind(path)
+    resolved = path.resolve()
+    sources: list[tuple[Path, SQLiteSourceRole]]
+    if selected_kind is DatabaseKind.WORKFLOW:
+        if settings is None:
+            read_validated_source_identity(resolved, WORKFLOW_SOURCE_ROLE)
+            raise DatabaseVerificationError(
+                ErrorCategory.CONFIGURATION,
+                "workflow schema v3 authorization verification requires explicit Settings",
+                stop_reason="DATABASE_AUTHORIZATION_CONTEXT_REQUIRED",
+            )
+        if settings.workflow_db.resolve() != resolved:
+            read_validated_source_identity(resolved, WORKFLOW_SOURCE_ROLE)
+            raise DatabaseVerificationError(
+                ErrorCategory.CONFIGURATION,
+                "workflow verification Settings do not identify the database being audited",
+                stop_reason="DATABASE_AUTHORIZATION_CONTEXT_MISMATCH",
+            )
+        sources = [
+            (resolved, WORKFLOW_SOURCE_ROLE),
+            (settings.inventory_db.resolve(), AUTHORIZATION_INVENTORY_SOURCE_ROLE),
+        ]
+    else:
+        sources = [(resolved, INVENTORY_SOURCE_ROLE)]
+    with authoritative_database_snapshots(sources) as snapshots:
+        main_role = (
+            WORKFLOW_SOURCE_ROLE
+            if selected_kind is DatabaseKind.WORKFLOW
+            else INVENTORY_SOURCE_ROLE
+        )
+        copy_path = snapshots[main_role.key].copy_path
+        audit_settings = settings
+        if settings is not None and selected_kind is DatabaseKind.WORKFLOW:
+            audit_settings = settings.model_copy(
+                update={
+                    "workflow_db": copy_path,
+                    "inventory_db": snapshots[AUTHORIZATION_INVENTORY_SOURCE_ROLE.key].copy_path,
+                }
+            )
+        result = _verify_database_snapshot(
+            copy_path,
+            selected_kind,
+            require_seed=require_seed,
+            settings=audit_settings,
+        )
+    result["path"] = str(resolved)
+    return result
+
+
+def _verify_database_snapshot(
+    path: Path,
+    kind: DatabaseKind | None = None,
+    *,
+    require_seed: bool = True,
+    settings: Settings | None = None,
+) -> dict[str, object]:
+    """Verify one private copy through ordinary SQLite without touching its source."""
 
     selected_kind = kind or infer_kind(path)
     resolved = path.resolve()

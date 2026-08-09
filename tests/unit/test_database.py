@@ -2,7 +2,10 @@
 
 import hashlib
 import json
+import os
+import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -27,6 +30,23 @@ def _directory_file_hashes(directory: Path) -> dict[str, str]:
         for path in directory.iterdir()
         if path.is_file()
     }
+
+
+def _directory_file_state(directory: Path) -> dict[str, tuple[int, int, int, int, int, str]]:
+    state: dict[str, tuple[int, int, int, int, int, str]] = {}
+    for path in directory.iterdir():
+        if not path.is_file():
+            continue
+        metadata = path.stat()
+        state[path.name] = (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+    return state
 
 
 @pytest.mark.parametrize(
@@ -417,6 +437,223 @@ def test_standalone_inventory_verification_rejects_wal_without_persistent_artifa
 
     assert excinfo.value.stop_reason == "INVENTORY_WAL_MODE_UNSUPPORTED"
     assert _directory_file_hashes(inventory_db.parent) == before
+
+
+def test_standalone_inventory_verification_does_not_touch_source_directory(
+    inventory_db: Path,
+) -> None:
+    before = _directory_file_state(inventory_db.parent)
+
+    result = verify_database(inventory_db, DatabaseKind.INVENTORY)
+
+    assert result["path"] == str(inventory_db.resolve())
+    assert _directory_file_state(inventory_db.parent) == before
+
+
+def test_workflow_verification_does_not_touch_either_source_database(
+    settings: Settings,
+) -> None:
+    before = _directory_file_state(settings.workflow_db.parent)
+
+    result = verify_database(
+        settings.workflow_db,
+        DatabaseKind.WORKFLOW,
+        settings=settings,
+    )
+
+    assert result["path"] == str(settings.workflow_db.resolve())
+    assert _directory_file_state(settings.workflow_db.parent) == before
+
+
+@pytest.mark.parametrize("suffix", ["-journal", "-wal", "-shm"])
+def test_verification_rejects_rollback_database_with_any_sqlite_sidecar_unchanged(
+    inventory_db: Path,
+    suffix: str,
+) -> None:
+    sidecar = Path(f"{inventory_db}{suffix}")
+    sidecar.write_bytes(f"preexisting{suffix}".encode())
+    before = _directory_file_state(inventory_db.parent)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(inventory_db, DatabaseKind.INVENTORY)
+
+    assert excinfo.value.stop_reason == "DATABASE_SIDECAR_UNSUPPORTED"
+    assert _directory_file_state(inventory_db.parent) == before
+
+
+def test_authoritative_verification_detects_wal_switch_between_copy_and_temp_audit(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_connect = connect_database
+    switched = False
+
+    def switch_source_then_connect(
+        target: Path,
+        *,
+        read_only: bool = False,
+    ) -> Any:
+        nonlocal switched
+        if not switched:
+            with sqlite3.connect(settings.workflow_db) as rival:
+                assert rival.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+            switched = True
+        return real_connect(target, read_only=read_only)
+
+    monkeypatch.setattr("invoice_agents.db.core.connect_database", switch_source_then_connect)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(
+            settings.workflow_db,
+            DatabaseKind.WORKFLOW,
+            settings=settings,
+        )
+
+    assert switched
+    assert excinfo.value.stop_reason == "DATABASE_CHANGED_DURING_VERIFICATION"
+
+
+def test_authoritative_verification_detects_original_change_during_temp_audit(
+    inventory_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_connect = connect_database
+    original = inventory_db.resolve()
+    changed = False
+
+    def change_source_then_connect(
+        target: Path,
+        *,
+        read_only: bool = False,
+    ) -> Any:
+        nonlocal changed
+        if Path(target).resolve() != original and not changed:
+            metadata = original.stat()
+            os.utime(
+                original,
+                ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1),
+            )
+            changed = True
+        return real_connect(target, read_only=read_only)
+
+    monkeypatch.setattr("invoice_agents.db.core.connect_database", change_source_then_connect)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(inventory_db, DatabaseKind.INVENTORY)
+
+    assert changed
+    assert excinfo.value.stop_reason == "DATABASE_CHANGED_DURING_VERIFICATION"
+
+
+@pytest.mark.parametrize("wal_target", ["inventory", "workflow"])
+def test_ensure_databases_guards_every_existing_header_before_any_sqlite_open(
+    settings: Settings,
+    wal_target: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = settings.inventory_db if wal_target == "inventory" else settings.workflow_db
+    with sqlite3.connect(target) as connection:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+    before = _directory_file_state(target.parent)
+    real_connect = connect_database
+    source_opens: list[Path] = []
+
+    def observe_connect(
+        database: Path,
+        *,
+        read_only: bool = False,
+    ) -> Any:
+        resolved = Path(database).resolve()
+        if resolved in {settings.inventory_db.resolve(), settings.workflow_db.resolve()}:
+            source_opens.append(resolved)
+        return real_connect(database, read_only=read_only)
+
+    monkeypatch.setattr("invoice_agents.db.core.connect_database", observe_connect)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        ensure_databases(settings)
+
+    assert excinfo.value.stop_reason == (
+        "INVENTORY_WAL_MODE_UNSUPPORTED"
+        if wal_target == "inventory"
+        else "WORKFLOW_WAL_MODE_UNSUPPORTED"
+    )
+    assert source_opens == []
+    assert _directory_file_state(target.parent) == before
+
+
+def test_twenty_byte_sqlite_lookalike_is_signature_invalid(tmp_path: Path) -> None:
+    path = tmp_path / "twenty-byte-lookalike.db"
+    path.write_bytes(b"SQLite format 3\x00\x00\x00\x02\x02")
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(path, DatabaseKind.INVENTORY)
+
+    assert excinfo.value.stop_reason == "DATABASE_SIGNATURE_INVALID"
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "truncated-header",
+        "page-size",
+        "write-version",
+        "read-version",
+        "payload-fractions",
+        "schema-format",
+        "text-encoding",
+        "page-count",
+        "file-size",
+        "reserved-header-bytes",
+    ],
+)
+def test_complete_sqlite_header_contract_rejects_each_invalid_invariant(
+    inventory_db: Path,
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    data = bytearray(inventory_db.read_bytes())
+    if corruption == "truncated-header":
+        data = data[:99]
+    elif corruption == "page-size":
+        data[16:18] = b"\x00\x00"
+    elif corruption == "write-version":
+        data[18] = 3
+    elif corruption == "read-version":
+        data[19] = 3
+    elif corruption == "payload-fractions":
+        data[21:24] = b"\x40\x20\x21"
+    elif corruption == "schema-format":
+        data[44:48] = (5).to_bytes(4, "big")
+    elif corruption == "text-encoding":
+        data[56:60] = (4).to_bytes(4, "big")
+    elif corruption == "page-count":
+        page_count = int.from_bytes(data[28:32], "big")
+        data[28:32] = (page_count + 1).to_bytes(4, "big")
+    elif corruption == "file-size":
+        data.extend(b"x")
+    else:
+        data[72] = 1
+    path = tmp_path / f"invalid-header-{corruption}.db"
+    path.write_bytes(data)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        verify_database(path, DatabaseKind.INVENTORY)
+
+    assert excinfo.value.stop_reason == "DATABASE_SIGNATURE_INVALID"
+
+
+def test_migration_accepts_nonexistent_and_zero_length_new_database_paths(
+    tmp_path: Path,
+) -> None:
+    nonexistent = tmp_path / "new-inventory.db"
+    zero_length = tmp_path / "zero-length-inventory.db"
+    zero_length.touch()
+
+    assert migrate_database(nonexistent, DatabaseKind.INVENTORY) == [1]
+    assert migrate_database(zero_length, DatabaseKind.INVENTORY) == [1]
+    assert nonexistent.read_bytes()[18:20] == b"\x01\x01"
+    assert zero_length.read_bytes()[18:20] == b"\x01\x01"
 
 
 def test_missing_and_corrupt_database_fail_visibly(tmp_path: Path) -> None:

@@ -395,6 +395,9 @@ def test_locked_database_fails_visibly(workflow_db: Path, inventory_db: Path) ->
     blocker = sqlite3.connect(workflow_db)
     try:
         blocker.execute("BEGIN EXCLUSIVE")
+        blocker.execute(
+            "UPDATE cases SET updated_at = 'locked-uncommitted' WHERE case_id = 'case_x'"
+        )
 
         # Each blocked call below waits out the 5s busy timeout; that is expected.
         with pytest.raises(sqlite3.OperationalError, match="locked") as save_error:
@@ -407,7 +410,7 @@ def test_locked_database_fails_visibly(workflow_db: Path, inventory_db: Path) ->
         with pytest.raises(DatabaseVerificationError) as verify_error:
             verify_database(workflow_db, DatabaseKind.WORKFLOW, settings=settings)
         assert verify_error.value.category == "DATABASE"
-        assert verify_error.value.stop_reason == "DATABASE_VERIFICATION_ERROR"
+        assert verify_error.value.stop_reason == "DATABASE_SIDECAR_UNSUPPORTED"
         assert "NOT_FOUND" not in str(verify_error.value)
     finally:
         blocker.rollback()
