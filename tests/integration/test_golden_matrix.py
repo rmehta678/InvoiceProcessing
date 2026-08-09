@@ -19,6 +19,7 @@ from invoice_agents.db.core import DatabaseKind, migrate_database, seed_inventor
 from invoice_agents.db.store import WorkflowStore
 from invoice_agents.models import (
     CaseResult,
+    CaseStatus,
     ExtractedInvoice,
     FinancialComparison,
     IdentityCandidate,
@@ -105,7 +106,12 @@ def golden(tmp_path_factory: pytest.TempPathFactory) -> dict[str, CaseEvidence]:
         case_id, _started_at = prepared
         invoice = store.load_extraction(case_id)
         identity = find_prior_invoice_candidates(case_id, invoice, store)
-        store.save_identity(case_id, [c.model_dump(mode="json") for c in identity])
+        claim = store.claim_case_execution(
+            case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+        )
+        store.adopt_latest_evidence(claim)
+        store.save_identity(case_id, [c.model_dump(mode="json") for c in identity], claim)
+        store.release_case_execution(claim)
         comparisons, _unresolved = compare_inventory(invoice, reader)
         financial = compute_invoice_totals(invoice)
         risk = build_risk_assessment(invoice, comparisons, identity, financial, settings)

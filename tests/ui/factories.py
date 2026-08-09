@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from invoice_agents.config import Settings
-from invoice_agents.db.store import WorkflowStore
+from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.hitl.service import create_review_request
 from invoice_agents.models import (
     CaseResult,
@@ -60,11 +60,15 @@ def prepare_fixture_case(settings: Settings, source: Path) -> tuple[str, datetim
 
 def record_case_evidence(
     settings: Settings, case_id: str, critic_disposition: DecisionKind
-) -> RiskAssessment:
+) -> tuple[RiskAssessment, ExecutionClaim]:
     """Persist inventory/risk/critique evidence exactly as the agent tools do."""
 
     store = WorkflowStore(settings.workflow_db)
     invoice = store.load_extraction(case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
     _mappings, comparisons, unresolved = compare_inventory_evidence(
         invoice, InventoryReader(settings.inventory_db)
     )
@@ -77,13 +81,15 @@ def record_case_evidence(
                 item: result.model_dump(mode="json") for item, result in unresolved.items()
             },
         },
+        claim,
     )
     risk = build_risk_assessment(
         invoice, comparisons, [], compute_invoice_totals(invoice), settings
     )
-    store.save_comparison(case_id, "risk", risk.model_dump(mode="json"))
-    store.save_critique(case_id, make_critique(critic_disposition))
-    return risk
+    store.save_identity(case_id, [], claim)
+    store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim)
+    store.save_critique(case_id, make_critique(critic_disposition), claim)
+    return risk, claim
 
 
 def make_succeeded_case(settings: Settings, name: str = "invoice_1001.txt") -> str:
@@ -92,10 +98,7 @@ def make_succeeded_case(settings: Settings, name: str = "invoice_1001.txt") -> s
     case_id, started_at = prepare_fixture_case(settings, DATA_DIR / name)
     store = WorkflowStore(settings.workflow_db)
     invoice = store.load_extraction(case_id)
-    record_case_evidence(settings, case_id, DecisionKind.APPROVE)
-    claim = store.claim_case_execution(
-        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
-    )
+    _risk, claim = record_case_evidence(settings, case_id, DecisionKind.APPROVE)
     decision = FinalDecision(
         decision=DecisionKind.APPROVE,
         reasons=["all deterministic checks passed"],
@@ -127,7 +130,7 @@ def make_pending_review_case(
     case_id, started_at = prepare_fixture_case(settings, source or (DATA_DIR / "invoice_1002.txt"))
     store = WorkflowStore(settings.workflow_db)
     invoice = store.load_extraction(case_id)
-    risk = record_case_evidence(settings, case_id, DecisionKind.HOLD)
+    risk, claim = record_case_evidence(settings, case_id, DecisionKind.HOLD)
     assert risk.policy_review_reasons, "fixture invoice must trigger review policy"
     review = create_review_request(
         case_id,
@@ -137,9 +140,7 @@ def make_pending_review_case(
         DecisionKind.HOLD,
         ["policy triggers require human review"],
         store,
-    )
-    claim = store.claim_case_execution(
-        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+        claim,
     )
     store.save_team_state(case_id, {"fixture": "stopped-team-state"}, claim)
     result = CaseResult(

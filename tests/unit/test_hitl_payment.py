@@ -55,7 +55,11 @@ def persist_case(
 ) -> None:
     store.register_source(invoice.source)
     store.create_case(case_id, invoice.source, started_at or datetime.now(UTC))
-    store.save_extraction(case_id, invoice)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.save_extraction(case_id, invoice, claim)
+    store.release_case_execution(claim)
 
 
 def critique(disposition: DecisionKind = DecisionKind.HOLD) -> Critique:
@@ -75,25 +79,61 @@ def record_payment_evidence(
     invoice: Any,
     settings: Settings,
     disposition: DecisionKind = DecisionKind.APPROVE,
-) -> None:
+    *,
+    authorize_review: bool = False,
+) -> ExecutionClaim:
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
     comparisons, _ = compare_inventory(invoice, InventoryReader(settings.inventory_db))
     risk = build_risk_assessment(
         invoice, comparisons, [], compute_invoice_totals(invoice), settings
     )
-    store.save_comparison(case_id, "risk", risk.model_dump(mode="json"))
-    store.save_critique(case_id, critique(disposition))
-
-
-def approve_final(store: WorkflowStore, case_id: str) -> ExecutionClaim:
-    claim = store.claim_case_execution(
-        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    store.save_identity(case_id, [], claim)
+    store.save_comparison(
+        case_id,
+        "inventory",
+        {"comparisons": [item.model_dump(mode="json") for item in comparisons]},
+        claim,
     )
+    store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim)
+    case_critique = critique(disposition)
+    store.save_critique(case_id, case_critique, claim)
+    if authorize_review:
+        review = create_review_request(
+            case_id,
+            invoice,
+            risk,
+            case_critique,
+            DecisionKind.HOLD,
+            ["explicit fixture authorization for representation-specific evidence"],
+            store,
+            claim,
+        )
+        record_human_decision(
+            review.review_id,
+            "payment-fixture-reviewer@example.com",
+            HumanDecisionKind.APPROVE,
+            "the representation-specific evidence is explicitly authorized",
+            store,
+            settings.inventory_db,
+            addressed_blocker_ids=[
+                str(item["blocker_id"]) for item in review.evidence_bundle["blocking_evidence"]
+            ],
+        )
+    return claim
+
+
+def approve_final(store: WorkflowStore, case_id: str, claim: ExecutionClaim) -> ExecutionClaim:
+    review = store.load_case_review(case_id)
     store.save_final_decision(
         case_id,
         FinalDecision(
             decision=DecisionKind.APPROVE,
             reasons=["approved evidence"],
             critic_disposition=DecisionKind.APPROVE,
+            human_outcome=review.human_decision if review is not None else None,
             payment_eligible=True,
         ),
         claim,
@@ -114,6 +154,10 @@ def pending_review(
     store = WorkflowStore(settings.workflow_db)
     invoice = load(source.parent, source.name, settings.source_archive_dir)
     persist_case(store, case_id, invoice, started_at=started_at)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
     comparisons, _ = compare_inventory(invoice, InventoryReader(settings.inventory_db))
     risk = build_risk_assessment(
         invoice,
@@ -122,16 +166,29 @@ def pending_review(
         compute_invoice_totals(invoice),
         settings,
     )
-    return create_review_request(
+    store.save_identity(case_id, identity_candidates or [], claim)
+    store.save_comparison(
+        case_id,
+        "inventory",
+        {"comparisons": [item.model_dump(mode="json") for item in comparisons]},
+        claim,
+    )
+    store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim)
+    case_critique = critique()
+    store.save_critique(case_id, case_critique, claim)
+    review = create_review_request(
         case_id,
         invoice,
         risk,
-        critique(),
+        case_critique,
         DecisionKind.HOLD,
         ["evidence requires a human decision"],
         store,
+        claim,
         extra_reasons=["atomic-decision regression"],
     )
+    store.release_case_execution(claim)
+    return review
 
 
 def persisted_decision_state(
@@ -197,11 +254,33 @@ def test_review_request_and_human_decision_are_persisted(
     store = WorkflowStore(workflow_db)
     inv = load(invoice_dir, "invoice_1002.txt", workflow_db.parent / "sources")
     persist_case(store, "case_review", inv)
+    claim = store.claim_case_execution(
+        "case_review", frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
     comparisons, _ = compare_inventory(inv, InventoryReader(inventory_db))
     risk = build_risk_assessment(inv, comparisons, [], compute_invoice_totals(inv), settings)
-    review = create_review_request(
-        "case_review", inv, risk, critique(), DecisionKind.HOLD, ["stock exceeds"], store
+    store.save_identity("case_review", [], claim)
+    store.save_comparison(
+        "case_review",
+        "inventory",
+        {"comparisons": [item.model_dump(mode="json") for item in comparisons]},
+        claim,
     )
+    store.save_comparison("case_review", "risk", risk.model_dump(mode="json"), claim)
+    case_critique = critique()
+    store.save_critique("case_review", case_critique, claim)
+    review = create_review_request(
+        "case_review",
+        inv,
+        risk,
+        case_critique,
+        DecisionKind.HOLD,
+        ["stock exceeds"],
+        store,
+        claim,
+    )
+    store.release_case_execution(claim)
     assert review.status == "PENDING"
     resolved = record_human_decision(
         review.review_id,
@@ -236,9 +315,7 @@ def test_nonexistent_review_decision_leaves_both_databases_unchanged(
 
     assert excinfo.value.stop_reason == "REVIEW_NOT_FOUND"
     assert (
-        persisted_decision_state(
-            settings.workflow_db, settings.inventory_db, "rev_does_not_exist"
-        )
+        persisted_decision_state(settings.workflow_db, settings.inventory_db, "rev_does_not_exist")
         == before
     )
 
@@ -592,9 +669,7 @@ def test_resolved_blank_field_retry_is_classified_as_already_resolved_before_val
 def test_resolved_retry_uses_only_workflow_state_when_inventory_is_wal(
     exact_replay: bool, settings: Settings
 ) -> None:
-    review = pending_review(
-        Path("data/invoices/invoice_1002.txt"), "case_wal_replay", settings
-    )
+    review = pending_review(Path("data/invoices/invoice_1002.txt"), "case_wal_replay", settings)
     resolved = record_human_decision(
         review.review_id,
         "reviewer@example.com",
@@ -605,9 +680,7 @@ def test_resolved_retry_uses_only_workflow_state_when_inventory_is_wal(
     )
     with connect_database(settings.inventory_db) as connection:
         assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
-    before = persisted_decision_state(
-        settings.workflow_db, settings.inventory_db, review.review_id
-    )
+    before = persisted_decision_state(settings.workflow_db, settings.inventory_db, review.review_id)
 
     if exact_replay:
         replayed = record_human_decision(
@@ -653,9 +726,7 @@ def test_resolved_retry_never_opens_an_unavailable_inventory_path(
     )
     unavailable_inventory = tmp_path / "missing-parent" / "inventory.db"
     assert not unavailable_inventory.parent.exists()
-    before = persisted_decision_state(
-        settings.workflow_db, settings.inventory_db, review.review_id
-    )
+    before = persisted_decision_state(settings.workflow_db, settings.inventory_db, review.review_id)
 
     if exact_replay:
         replayed = record_human_decision(
@@ -790,15 +861,9 @@ def test_supersession_requires_distinct_earlier_review_candidate_for_same_invoic
     prior_at = datetime(2026, 1, 1, tzinfo=UTC)
     current_at = datetime(2026, 2, 1, tzinfo=UTC)
     later_at = datetime(2026, 3, 1, tzinfo=UTC)
-    original = load(
-        Path("data/invoices"), "invoice_1004.json", settings.source_archive_dir
-    )
-    revised = load(
-        Path("data/invoices"), "invoice_1004_revised.json", settings.source_archive_dir
-    )
-    unrelated = load(
-        Path("data/invoices"), "invoice_1001.txt", settings.source_archive_dir
-    )
+    original = load(Path("data/invoices"), "invoice_1004.json", settings.source_archive_dir)
+    revised = load(Path("data/invoices"), "invoice_1004_revised.json", settings.source_archive_dir)
+    unrelated = load(Path("data/invoices"), "invoice_1001.txt", settings.source_archive_dir)
     persist_case(store, "case_prior_revision", original, started_at=prior_at)
     persist_case(store, "case_current_revision", revised, started_at=current_at)
     persist_case(store, "case_later_revision", original, started_at=later_at)
@@ -825,18 +890,35 @@ def test_supersession_requires_distinct_earlier_review_candidate_for_same_invoic
         compute_invoice_totals(revised),
         settings,
     )
+    claim = store.claim_case_execution(
+        "case_current_revision",
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+    store.adopt_latest_evidence(claim)
+    candidates = [candidate("case_prior_revision"), candidate("case_later_revision")]
+    store.save_identity("case_current_revision", candidates, claim)
+    store.save_comparison(
+        "case_current_revision",
+        "inventory",
+        {"comparisons": [item.model_dump(mode="json") for item in comparisons]},
+        claim,
+    )
+    store.save_comparison("case_current_revision", "risk", risk.model_dump(mode="json"), claim)
+    case_critique = critique()
+    store.save_critique("case_current_revision", case_critique, claim)
     review = create_review_request(
         "case_current_revision",
         revised,
         risk,
-        critique(),
+        case_critique,
         DecisionKind.HOLD,
         ["possible revision requires a human ruling"],
         store,
+        claim,
     )
-    before = persisted_decision_state(
-        settings.workflow_db, settings.inventory_db, review.review_id
-    )
+    store.release_case_execution(claim)
+    before = persisted_decision_state(settings.workflow_db, settings.inventory_db, review.review_id)
     for invalid_case_id in (
         "case_current_revision",
         "case_unrelated",
@@ -855,9 +937,7 @@ def test_supersession_requires_distinct_earlier_review_candidate_for_same_invoic
             )
         assert excinfo.value.stop_reason == "SUPERSEDED_CASE_INVALID"
         assert (
-            persisted_decision_state(
-                settings.workflow_db, settings.inventory_db, review.review_id
-            )
+            persisted_decision_state(settings.workflow_db, settings.inventory_db, review.review_id)
             == before
         )
 
@@ -877,12 +957,9 @@ def test_supersession_requires_distinct_earlier_review_candidate_for_same_invoic
 def test_cli_accepts_repeatable_address_blocker_options(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    review = pending_review(
-        Path("data/invoices/invoice_1002.txt"), "case_cli_blockers", settings
-    )
+    review = pending_review(Path("data/invoices/invoice_1002.txt"), "case_cli_blockers", settings)
     blocker_ids = [
-        str(entry["blocker_id"])
-        for entry in review.evidence_bundle["blocking_evidence"]
+        str(entry["blocker_id"]) for entry in review.evidence_bundle["blocking_evidence"]
     ]
     assert blocker_ids
     monkeypatch.setattr(cli, "_settings", lambda: settings)
@@ -916,13 +993,13 @@ def test_mock_payment_pays_once_across_duplicate_representations(
     text = load(invoice_dir, "invoice_1011.txt", workflow_db.parent / "sources")
     pdf = load(invoice_dir, "invoice_1011.pdf", workflow_db.parent / "sources")
     persist_case(store, "case_text", text)
-    record_payment_evidence(store, "case_text", text, settings)
-    text_claim = approve_final(store, "case_text")
+    text_claim = record_payment_evidence(store, "case_text", text, settings)
+    approve_final(store, "case_text", text_claim)
     first = mock_payment("case_text", text, store, workflow_db, text_claim)
     assert first.status is PaymentStatus.PAID
     persist_case(store, "case_pdf", pdf)
-    record_payment_evidence(store, "case_pdf", pdf, settings)
-    pdf_claim = approve_final(store, "case_pdf")
+    pdf_claim = record_payment_evidence(store, "case_pdf", pdf, settings, authorize_review=True)
+    approve_final(store, "case_pdf", pdf_claim)
     duplicate = mock_payment("case_pdf", pdf, store, workflow_db, pdf_claim)
     assert duplicate.status is PaymentStatus.DUPLICATE
     assert duplicate.case_id == "case_pdf"
@@ -938,9 +1015,8 @@ def test_rejected_and_injected_failure_never_report_payment_success(
     store = WorkflowStore(workflow_db)
     rejected_invoice = load(invoice_dir, "invoice_1001.txt", workflow_db.parent / "sources")
     persist_case(store, "case_rejected", rejected_invoice)
-    record_payment_evidence(store, "case_rejected", rejected_invoice, settings)
-    rejected_claim = store.claim_case_execution(
-        "case_rejected", frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    rejected_claim = record_payment_evidence(
+        store, "case_rejected", rejected_invoice, settings, DecisionKind.REJECT
     )
     store.save_final_decision(
         "case_rejected",
@@ -952,15 +1028,13 @@ def test_rejected_and_injected_failure_never_report_payment_success(
         ),
         rejected_claim,
     )
-    rejected = mock_payment(
-        "case_rejected", rejected_invoice, store, workflow_db, rejected_claim
-    )
+    rejected = mock_payment("case_rejected", rejected_invoice, store, workflow_db, rejected_claim)
     assert rejected.status is PaymentStatus.NOT_ELIGIBLE
 
     failed_invoice = load(invoice_dir, "invoice_1004.json", workflow_db.parent / "sources")
     persist_case(store, "case_failed_payment", failed_invoice)
-    record_payment_evidence(store, "case_failed_payment", failed_invoice, settings)
-    failed_claim = approve_final(store, "case_failed_payment")
+    failed_claim = record_payment_evidence(store, "case_failed_payment", failed_invoice, settings)
+    approve_final(store, "case_failed_payment", failed_claim)
     failed = mock_payment(
         "case_failed_payment",
         failed_invoice,
@@ -973,13 +1047,18 @@ def test_rejected_and_injected_failure_never_report_payment_success(
     assert failed.error == "injected mock-payment failure"
 
 
-def test_payment_rejects_missing_risk_snapshot(
-    invoice_dir: Path, settings: Settings
-) -> None:
+def test_payment_rejects_missing_risk_snapshot(invoice_dir: Path, settings: Settings) -> None:
     store = WorkflowStore(settings.workflow_db)
     invoice = load(invoice_dir, "invoice_1001.txt", settings.source_archive_dir)
     persist_case(store, "case_missing_payment_risk", invoice)
-    claim = approve_final(store, "case_missing_payment_risk")
+    claim = record_payment_evidence(store, "case_missing_payment_risk", invoice, settings)
+    approve_final(store, "case_missing_payment_risk", claim)
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "DELETE FROM comparison_results WHERE case_id = ? AND comparison_type = 'risk'",
+            ("case_missing_payment_risk",),
+        )
+        connection.commit()
 
     result = mock_payment(
         "case_missing_payment_risk",
@@ -990,7 +1069,7 @@ def test_payment_rejects_missing_risk_snapshot(
     )
 
     assert result.status is PaymentStatus.NOT_ELIGIBLE
-    assert result.error == "latest risk assessment is missing"
+    assert result.error == "latest risk assessment is missing or stale"
     with connect_database(settings.workflow_db, read_only=True) as connection:
         assert connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 0
 
@@ -1001,8 +1080,8 @@ def test_payment_rejects_final_decision_from_prior_execution_generation(
     store = WorkflowStore(settings.workflow_db)
     invoice = load(invoice_dir, "invoice_1001.txt", settings.source_archive_dir)
     persist_case(store, "case_stale_payment_decision", invoice)
-    record_payment_evidence(store, "case_stale_payment_decision", invoice, settings)
-    stale = approve_final(store, "case_stale_payment_decision")
+    stale = record_payment_evidence(store, "case_stale_payment_decision", invoice, settings)
+    approve_final(store, "case_stale_payment_decision", stale)
     with connect_database(settings.workflow_db) as connection:
         connection.execute(
             "UPDATE cases SET lease_expires_at = ? WHERE case_id = ?",
@@ -1015,6 +1094,7 @@ def test_payment_rejects_final_decision_from_prior_execution_generation(
         lease_seconds=60,
     )
     assert current.generation == stale.generation + 1
+    store.adopt_latest_evidence(current)
 
     result = mock_payment(
         "case_stale_payment_decision",
@@ -1025,6 +1105,6 @@ def test_payment_rejects_final_decision_from_prior_execution_generation(
     )
 
     assert result.status is PaymentStatus.NOT_ELIGIBLE
-    assert result.error == "final decision is missing or stale for the current execution generation"
+    assert result.error == "final decision is missing or stale"
     with connect_database(settings.workflow_db, read_only=True) as connection:
         assert connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 0

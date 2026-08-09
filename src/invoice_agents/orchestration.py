@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
@@ -24,7 +25,7 @@ from pydantic import ValidationError
 from invoice_agents.agents.team import AgentCaseContext, build_team, create_model_client
 from invoice_agents.config import XAI_BASE_URL, XAI_MODEL, Settings
 from invoice_agents.db.core import DatabaseKind, verify_database
-from invoice_agents.db.store import WorkflowStore
+from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import (
     CaseResult,
@@ -53,6 +54,7 @@ from invoice_agents.tools.evidence import extract_invoice_evidence
 # it fails the pinned contract test instead of silently misclassifying stops.
 MAX_MESSAGES_STOP_PHRASE = "maximum number of messages"
 EXECUTION_LEASE_SECONDS = 21_600
+EXECUTION_RENEWAL_INTERVAL_SECONDS = 30.0
 
 
 def is_max_messages_stop(stop_reason: str) -> bool:
@@ -63,6 +65,60 @@ def is_max_messages_stop(stop_reason: str) -> bool:
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+async def _run_with_lease_heartbeat[ResultT](
+    operation: Awaitable[ResultT],
+    *,
+    renew: Callable[[ExecutionClaim, int], ExecutionClaim],
+    claim: ExecutionClaim,
+    lease_seconds: int,
+    renewal_interval_seconds: float,
+) -> ResultT:
+    """Run one lifecycle while renewal failures cancel and replace its result."""
+
+    if renewal_interval_seconds <= 0:
+        raise ValueError("renewal_interval_seconds must be positive")
+    stopped = asyncio.Event()
+
+    async def heartbeat() -> None:
+        while True:
+            try:
+                await asyncio.wait_for(stopped.wait(), timeout=renewal_interval_seconds)
+                return
+            except TimeoutError:
+                await asyncio.to_thread(renew, claim, lease_seconds)
+
+    operation_task: asyncio.Future[ResultT] = asyncio.ensure_future(operation)
+    heartbeat_task: asyncio.Task[None] = asyncio.create_task(heartbeat())
+    waiters: set[asyncio.Future[Any]] = set()
+    waiters.add(operation_task)
+    waiters.add(heartbeat_task)
+    try:
+        done, _pending = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        if heartbeat_task in done and (failure := heartbeat_task.exception()) is not None:
+            operation_task.cancel()
+            await asyncio.gather(operation_task, return_exceptions=True)
+            raise failure
+        if heartbeat_task in done and operation_task not in done:
+            operation_task.cancel()
+            await asyncio.gather(operation_task, return_exceptions=True)
+            raise InvoiceAgentsError(
+                ErrorCategory.ORCHESTRATION,
+                "execution lease heartbeat stopped before the lifecycle completed",
+                case_id=claim.case_id,
+                stop_reason="EXECUTION_HEARTBEAT_STOPPED",
+            )
+        stopped.set()
+        await heartbeat_task
+        return operation_task.result()
+    finally:
+        stopped.set()
+        if not operation_task.done():
+            operation_task.cancel()
+        if not heartbeat_task.done():
+            heartbeat_task.cancel()
+        await asyncio.gather(operation_task, heartbeat_task, return_exceptions=True)
 
 
 def preflight(settings: Settings) -> None:
@@ -151,6 +207,7 @@ def prepare_case(path: Path, settings: Settings) -> tuple[str, datetime] | CaseR
     case_id = f"case_{uuid4().hex}"
     source_id: str | None = None
     case_created = False
+    claim: ExecutionClaim | None = None
     try:
         source = snapshot_source(path, settings.source_archive_dir, settings.source_max_bytes)
         source_id = source.source_id
@@ -158,8 +215,13 @@ def prepare_case(path: Path, settings: Settings) -> tuple[str, datetime] | CaseR
         store.register_source(source)
         store.create_case(case_id, source, started_at)
         case_created = True
+        claim = store.claim_case_execution(
+            case_id,
+            frozenset({CaseStatus.INCOMPLETE}),
+            EXECUTION_LEASE_SECONDS,
+        )
         invoice = extract_invoice_evidence(source)
-        store.save_extraction(case_id, invoice)
+        store.save_extraction(case_id, invoice, claim)
         AuditRecorder(settings.workflow_db, case_id).record(
             "case.prepared",
             {
@@ -169,17 +231,19 @@ def prepare_case(path: Path, settings: Settings) -> tuple[str, datetime] | CaseR
             },
             source_id=source.source_id,
         )
+        store.release_case_execution(claim)
         return case_id, started_at
     except BaseException as exc:
         result = _failed_result(case_id, source_id, started_at, exc)
         if source_id is not None and case_created:
             try:
                 failed_store = WorkflowStore(settings.workflow_db)
-                claim = failed_store.claim_case_execution(
-                    case_id,
-                    frozenset({CaseStatus.INCOMPLETE}),
-                    EXECUTION_LEASE_SECONDS,
-                )
+                if claim is None:
+                    claim = failed_store.claim_case_execution(
+                        case_id,
+                        frozenset({CaseStatus.INCOMPLETE}),
+                        EXECUTION_LEASE_SECONDS,
+                    )
                 failed_store.finish_case(result, claim)
             except BaseException as persistence_exc:
                 # Preserve both the original case failure and the secondary audit-write
@@ -243,8 +307,8 @@ def _result_from_stop(
     usage: UsageSummary,
 ) -> CaseResult:
     stop_reason = task_result.stop_reason or "AUTOGEN_STOP_REASON_MISSING"
-    review = context.store.load_case_review(context.case_id)
-    final = context.store.load_final_decision(context.case_id)
+    review = context.store.load_current_review(context.claim)
+    final = context.store.load_current_final_decision(context.claim)
     errors = [
         ErrorRecord(
             category=ErrorCategory.TOOL,
@@ -340,6 +404,7 @@ async def run_prepared_case(case_id: str, started_at: datetime, settings: Settin
         EXECUTION_LEASE_SECONDS,
     )
     invoice = store.load_extraction(case_id)
+    store.save_extraction(case_id, invoice, claim)
     audit = AuditRecorder(settings.workflow_db, case_id)
     audit.record(
         "provider.configuration",
@@ -368,7 +433,8 @@ async def run_prepared_case(case_id: str, started_at: datetime, settings: Settin
     clock = monotonic()
     client = create_model_client(settings)
     team = build_team(context, client)
-    try:
+
+    async def execute_lifecycle() -> CaseResult:
         with bind_audit_recorder(audit):
             task_result = await _stream_team(
                 team,
@@ -383,7 +449,16 @@ async def run_prepared_case(case_id: str, started_at: datetime, settings: Settin
         state = await team.save_state()
         store.save_team_state(case_id, dict(state), claim)
         usage.latency_ms = int((monotonic() - clock) * 1000)
-        result = _result_from_stop(context, task_result, started_at, usage)
+        return _result_from_stop(context, task_result, started_at, usage)
+
+    try:
+        result = await _run_with_lease_heartbeat(
+            execute_lifecycle(),
+            renew=store.renew_case_execution,
+            claim=claim,
+            lease_seconds=EXECUTION_LEASE_SECONDS,
+            renewal_interval_seconds=EXECUTION_RENEWAL_INTERVAL_SECONDS,
+        )
     except BaseException as exc:
         usage.latency_ms = int((monotonic() - clock) * 1000)
         result = _failed_result(case_id, invoice.source.source_id, started_at, exc)
@@ -478,6 +553,7 @@ def _recompute_after_mapping(
     settings: Settings,
     store: WorkflowStore,
     audit: AuditRecorder,
+    claim: ExecutionClaim,
 ) -> None:
     """Re-derive inventory, mapping, financial, and risk evidence deterministically.
 
@@ -487,7 +563,7 @@ def _recompute_after_mapping(
     between the human decision and any final decision (remediation G6).
     """
 
-    invoice = store.load_extraction(case_id)
+    invoice = store.load_current_extraction(claim)
     reader = InventoryReader(settings.inventory_db)
     mappings, comparisons, unresolved = compare_inventory_evidence(invoice, reader)
     errors = [
@@ -508,13 +584,15 @@ def _recompute_after_mapping(
             item: result.model_dump(mode="json") for item, result in unresolved.items()
         },
     }
-    comparison_id = store.save_comparison(case_id, "inventory", inventory_payload)
+    comparison_id = store.save_comparison(case_id, "inventory", inventory_payload, claim)
     enriched = apply_mapping_evidence(invoice, mappings, unresolved)
-    extraction_id = store.save_extraction(case_id, enriched)
+    extraction_id = store.save_extraction(case_id, enriched, claim)
     financial = compute_invoice_totals(enriched)
-    identity = [IdentityCandidate.model_validate(item) for item in store.load_identity(case_id)]
+    identity = [
+        IdentityCandidate.model_validate(item) for item in store.load_current_identity(claim)
+    ]
     risk = build_risk_assessment(enriched, comparisons, identity, financial, settings)
-    risk_id = store.save_comparison(case_id, "risk", risk.model_dump(mode="json"))
+    risk_id = store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim)
     audit.record(
         "recompute.after_human_mapping",
         {
@@ -585,18 +663,20 @@ async def resume_case(case_id: str, settings: Settings) -> CaseResult:
             case_id=case_id,
             stop_reason="TEAM_STATE_MISSING",
         )
-    invoice = store.load_extraction(case_id)
+    store.adopt_latest_evidence(claim)
+    invoice = store.load_current_extraction(claim)
     audit = AuditRecorder(settings.workflow_db, case_id)
     human = review.human_decision
     if human.decision is HumanDecisionKind.ESTABLISH_MAPPING:
-        _recompute_after_mapping(case_id, human, settings, store, audit)
-        invoice = store.load_extraction(case_id)
+        _recompute_after_mapping(case_id, human, settings, store, audit, claim)
+        invoice = store.load_current_extraction(claim)
     context = AgentCaseContext(case_id, settings, store, audit, claim)
     client = create_model_client(settings)
     team = build_team(context, client)
     usage = previous.usage.model_copy(deep=True)
     clock = monotonic()
-    try:
+
+    async def execute_resume_lifecycle() -> CaseResult:
         await team.load_state(state)
         message = HandoffMessage(
             source="human_reviewer",
@@ -618,7 +698,16 @@ async def resume_case(case_id: str, settings: Settings) -> CaseResult:
         new_state = await team.save_state()
         store.save_team_state(case_id, dict(new_state), claim)
         usage.latency_ms += int((monotonic() - clock) * 1000)
-        result = _result_from_stop(context, task_result, previous.started_at, usage)
+        return _result_from_stop(context, task_result, previous.started_at, usage)
+
+    try:
+        result = await _run_with_lease_heartbeat(
+            execute_resume_lifecycle(),
+            renew=store.renew_case_execution,
+            claim=claim,
+            lease_seconds=EXECUTION_LEASE_SECONDS,
+            renewal_interval_seconds=EXECUTION_RENEWAL_INTERVAL_SECONDS,
+        )
     except BaseException as exc:
         usage.latency_ms += int((monotonic() - clock) * 1000)
         result = _failed_result(case_id, invoice.source.source_id, previous.started_at, exc)

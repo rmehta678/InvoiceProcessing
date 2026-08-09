@@ -188,10 +188,14 @@ def _blocking_inventory() -> InventoryComparison:
 def _persist_blocking_review(invoice_dir: Path, settings: Settings) -> ReviewRequest:
     case_id, _started_at = _prepare(invoice_dir, settings)
     store = WorkflowStore(settings.workflow_db)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
     risk = _risk(["blocking evidence requires review"]).model_copy(
         update={"inventory": [_blocking_inventory()]}, deep=True
     )
-    return create_review_request(
+    review = create_review_request(
         case_id,
         store.load_extraction(case_id),
         risk,
@@ -199,7 +203,10 @@ def _persist_blocking_review(invoice_dir: Path, settings: Settings) -> ReviewReq
         DecisionKind.HOLD,
         ["blocking evidence requires review"],
         store,
+        claim,
     )
+    store.release_case_execution(claim)
+    return review
 
 
 def test_review_package_persists_typed_blocking_evidence(
@@ -223,9 +230,7 @@ def test_review_decision_persists_explicit_blocker_authorization(
     invoice_dir: Path, settings: Settings
 ) -> None:
     review = _persist_blocking_review(invoice_dir, settings)
-    blocker_ids = [
-        entry["blocker_id"] for entry in review.evidence_bundle["blocking_evidence"]
-    ]
+    blocker_ids = [entry["blocker_id"] for entry in review.evidence_bundle["blocking_evidence"]]
     resolved = record_human_decision(
         review.review_id,
         "reviewer@example.com",
@@ -236,9 +241,7 @@ def test_review_decision_persists_explicit_blocker_authorization(
         addressed_blocker_ids=blocker_ids,
     )
     assert resolved.human_decision is not None
-    assert resolved.human_decision.addressed_blocker_ids == [
-        "inventory:SKU-WIDGET-A:EXCEEDS_STOCK"
-    ]
+    assert resolved.human_decision.addressed_blocker_ids == ["inventory:SKU-WIDGET-A:EXCEEDS_STOCK"]
 
 
 @pytest.mark.parametrize(
@@ -351,13 +354,16 @@ def test_locked_database_fails_visibly(workflow_db: Path) -> None:
     source = _synthetic_source()
     store.register_source(source)
     store.create_case("case_x", source, datetime.now(UTC))
+    claim = store.claim_case_execution(
+        "case_x", frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
     blocker = sqlite3.connect(workflow_db)
     try:
         blocker.execute("BEGIN EXCLUSIVE")
 
         # Each blocked call below waits out the 5s busy timeout; that is expected.
         with pytest.raises(sqlite3.OperationalError, match="locked") as save_error:
-            store.save_comparison("case_x", "inventory", {"a": 1})
+            store.save_comparison("case_x", "inventory", {"a": 1}, claim)
         record = _error_record(save_error.value)
         assert record.category == "DATABASE"
         assert record.stop_reason == "DATABASE_ERROR"
@@ -373,7 +379,7 @@ def test_locked_database_fails_visibly(workflow_db: Path) -> None:
         blocker.close()
 
     # Once the exclusive lock is released both operations succeed.
-    assert store.save_comparison("case_x", "inventory", {"a": 1}).startswith("cmp_")
+    assert store.save_comparison("case_x", "inventory", {"a": 1}, claim).startswith("cmp_")
     verified = verify_database(workflow_db, DatabaseKind.WORKFLOW)
     assert verified["integrity"] == "ok"
 
@@ -420,10 +426,14 @@ def test_payment_ledger_write_failure(invoice_dir: Path, settings: Settings) -> 
     store = WorkflowStore(settings.workflow_db)
     case_id, _ = _prepare(invoice_dir, settings)
     invoice = store.load_extraction(case_id)
-    store.save_comparison(case_id, "risk", _risk([]).model_dump(mode="json"))
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
+    store.adopt_latest_evidence(claim)
+    store.save_identity(case_id, [], claim)
+    store.save_comparison(case_id, "inventory", {"comparisons": []}, claim)
+    store.save_comparison(case_id, "risk", _risk([]).model_dump(mode="json"), claim)
+    store.save_critique(case_id, _critique(DecisionKind.APPROVE), claim)
     store.save_final_decision(
         case_id,
         FinalDecision(

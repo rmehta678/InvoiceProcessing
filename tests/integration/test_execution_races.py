@@ -8,7 +8,7 @@ import threading
 from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,9 +19,9 @@ import invoice_agents.db.store as store_module
 import invoice_agents.payment.service as payment_module
 from invoice_agents import orchestration
 from invoice_agents.config import Settings
-from invoice_agents.db.core import connect_database
+from invoice_agents.db.core import DatabaseKind, connect_database, migrate_database, verify_database
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
-from invoice_agents.errors import InvoiceAgentsError
+from invoice_agents.errors import DatabaseVerificationError, InvoiceAgentsError
 from invoice_agents.hitl.service import create_review_request, record_human_decision
 from invoice_agents.models import (
     CaseResult,
@@ -55,8 +55,18 @@ def _persist_case(settings: Settings, case_id: str) -> WorkflowStore:
     store = WorkflowStore(settings.workflow_db)
     store.register_source(source)
     store.create_case(case_id, source, datetime.now(UTC))
-    store.save_extraction(case_id, invoice)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.save_extraction(case_id, invoice, claim)
     comparisons, _unresolved = compare_inventory(invoice, InventoryReader(settings.inventory_db))
+    store.save_identity(case_id, [], claim)
+    store.save_comparison(
+        case_id,
+        "inventory",
+        {"comparisons": [item.model_dump(mode="json") for item in comparisons]},
+        claim,
+    )
     risk = build_risk_assessment(
         invoice,
         comparisons,
@@ -64,7 +74,7 @@ def _persist_case(settings: Settings, case_id: str) -> WorkflowStore:
         compute_invoice_totals(invoice),
         settings,
     )
-    store.save_comparison(case_id, "risk", risk.model_dump(mode="json"))
+    store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim)
     store.save_critique(
         case_id,
         Critique(
@@ -75,11 +85,14 @@ def _persist_case(settings: Settings, case_id: str) -> WorkflowStore:
             recommended_disposition=DecisionKind.APPROVE,
             rationale=["race-test fixture has no unresolved evidence"],
         ),
+        claim,
     )
+    store.release_case_execution(claim)
     return store
 
 
 def _approve(store: WorkflowStore, case_id: str, claim: ExecutionClaim) -> FinalDecision:
+    store.adopt_latest_evidence(claim)
     decision = FinalDecision(
         decision=DecisionKind.APPROVE,
         reasons=["all evidence supports payment"],
@@ -161,6 +174,10 @@ async def test_two_orchestration_resume_attempts_have_one_database_owner(
     store = _persist_case(settings, case_id)
     invoice = store.load_extraction(case_id)
     risk = store.load_comparison(case_id, "risk")
+    setup_claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(setup_claim)
     review = create_review_request(
         case_id,
         invoice,
@@ -169,10 +186,8 @@ async def test_two_orchestration_resume_attempts_have_one_database_owner(
         DecisionKind.HOLD,
         ["race fixture requires a persisted ruling"],
         store,
+        setup_claim,
         extra_reasons=["race fixture requires a persisted ruling"],
-    )
-    setup_claim = store.claim_case_execution(
-        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
     store.save_team_state(case_id, {"fixture": "stopped"}, setup_claim)
     store.finish_case(
@@ -319,10 +334,9 @@ def test_payment_and_competing_final_decision_cannot_commit_impossible_state(
     store_connect = store_module.connect_database
 
     @contextmanager
-    def pause_payment(
-        path: Path, *, read_only: bool = False
-    ) -> Iterator[sqlite3.Connection]:
+    def pause_payment(path: Path, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
         with payment_connect(path, read_only=read_only) as connection:
+
             def after_execute(sql: str) -> None:
                 if "SELECT c.execution_token" in sql:
                     authorization_read.set()
@@ -339,6 +353,7 @@ def test_payment_and_competing_final_decision_cannot_commit_impossible_state(
         path: Path, *, read_only: bool = False
     ) -> Iterator[sqlite3.Connection]:
         with store_connect(path, read_only=read_only) as connection:
+
             def before_execute(sql: str) -> None:
                 if sql.strip().upper() == "BEGIN IMMEDIATE":
                     writer_begin_attempted.set()
@@ -394,8 +409,9 @@ def test_payment_and_competing_final_decision_cannot_commit_impossible_state(
     assert not isinstance(payment_outcome[0], BaseException)
     assert payment_outcome[0].status is PaymentStatus.PAID
     assert len(writer_outcome) == 1
-    assert isinstance(writer_outcome[0], sqlite3.IntegrityError)
-    assert "PAID_FINAL_DECISION_IMMUTABLE" in str(writer_outcome[0])
+    assert isinstance(writer_outcome[0], InvoiceAgentsError)
+    assert writer_outcome[0].stop_reason == "PAID_FINAL_DECISION_IMMUTABLE"
+    assert "immutable final decision" in str(writer_outcome[0])
     assert store.load_final_decision(case_id) == approved
     with connect_database(settings.workflow_db, read_only=True) as connection:
         paid = connection.execute(
@@ -407,3 +423,355 @@ def test_payment_and_competing_final_decision_cannot_commit_impossible_state(
         pytest.raises(sqlite3.IntegrityError, match="PAID_FINAL_DECISION_IMMUTABLE"),
     ):
         connection.execute("DELETE FROM final_decisions WHERE case_id = ?", (case_id,))
+
+
+@pytest.mark.parametrize(
+    "trigger_name",
+    [
+        "trg_final_decisions_no_insert_after_paid",
+        "trg_final_decisions_no_update_after_paid",
+        "trg_final_decisions_no_delete_after_paid",
+    ],
+)
+def test_preflight_rejects_missing_or_drifted_paid_decision_trigger(
+    settings: Settings, trigger_name: str
+) -> None:
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(f"DROP TRIGGER {trigger_name}")
+        connection.commit()
+    with pytest.raises(DatabaseVerificationError) as missing:
+        verify_database(settings.workflow_db, DatabaseKind.WORKFLOW)
+    assert missing.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            f"CREATE TRIGGER {trigger_name} BEFORE UPDATE ON final_decisions "
+            "BEGIN SELECT RAISE(ABORT, 'DRIFTED_TRIGGER'); END"
+        )
+        connection.commit()
+    with pytest.raises(DatabaseVerificationError) as drifted:
+        verify_database(settings.workflow_db, DatabaseKind.WORKFLOW)
+    assert drifted.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+
+
+def test_store_rejects_post_paid_decision_mutation_even_if_triggers_were_dropped(
+    settings: Settings,
+) -> None:
+    case_id = "case_paid_without_triggers"
+    store = _persist_case(settings, case_id)
+    invoice = store.load_extraction(case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    approved = _approve(store, case_id, claim)
+    payment = mock_payment(case_id, invoice, store, settings.workflow_db, claim)
+    assert payment.status is PaymentStatus.PAID
+    with connect_database(settings.workflow_db) as connection:
+        for name in (
+            "trg_final_decisions_no_insert_after_paid",
+            "trg_final_decisions_no_update_after_paid",
+            "trg_final_decisions_no_delete_after_paid",
+        ):
+            connection.execute(f"DROP TRIGGER {name}")
+        connection.commit()
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.save_final_decision(
+            case_id,
+            FinalDecision(
+                decision=DecisionKind.REJECT,
+                reasons=["must not replace paid approval"],
+                critic_disposition=DecisionKind.REJECT,
+                payment_eligible=False,
+            ),
+            claim,
+        )
+
+    assert excinfo.value.stop_reason == "PAID_FINAL_DECISION_IMMUTABLE"
+    assert store.load_final_decision(case_id) == approved
+
+
+def test_duplicate_payment_revalidates_source_case_snapshot(settings: Settings) -> None:
+    store = _persist_case(settings, "case_paid_source")
+    first_invoice = store.load_extraction("case_paid_source")
+    first_claim = store.claim_case_execution(
+        "case_paid_source", frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    _approve(store, "case_paid_source", first_claim)
+    first = mock_payment(
+        "case_paid_source", first_invoice, store, settings.workflow_db, first_claim
+    )
+    assert first.status is PaymentStatus.PAID
+
+    second_store = _persist_case(settings, "case_duplicate_attempt")
+    second_invoice = second_store.load_extraction("case_duplicate_attempt")
+    second_claim = second_store.claim_case_execution(
+        "case_duplicate_attempt", frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    _approve(second_store, "case_duplicate_attempt", second_claim)
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "DELETE FROM comparison_results WHERE case_id = ? AND comparison_type = 'risk'",
+            ("case_paid_source",),
+        )
+        connection.commit()
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        mock_payment(
+            "case_duplicate_attempt",
+            second_invoice,
+            second_store,
+            settings.workflow_db,
+            second_claim,
+        )
+    assert excinfo.value.stop_reason == "PAYMENT_LEDGER_INCONSISTENT"
+
+
+def test_every_execution_evidence_write_rejects_stale_generation(settings: Settings) -> None:
+    case_id = "case_stale_evidence"
+    store = _persist_case(settings, case_id)
+    invoice = store.load_extraction(case_id)
+    risk = RiskAssessment.model_validate(store.load_comparison(case_id, "risk"))
+    stale = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(stale)
+    review = create_review_request(
+        case_id,
+        invoice,
+        risk,
+        store.load_current_critique(stale),
+        DecisionKind.HOLD,
+        ["stale writer must not persist"],
+        store,
+        stale,
+        extra_reasons=["stale writer must not persist"],
+    )
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "UPDATE cases SET lease_expires_at = ? WHERE case_id = ?",
+            ("2000-01-01T00:00:00+00:00", case_id),
+        )
+        connection.commit()
+    store.claim_case_execution(case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60)
+    retry_review = review.model_copy(
+        update={"review_id": "rev_stale_retry", "status": "PENDING"}, deep=True
+    )
+    writes = (
+        lambda: store.save_extraction(case_id, invoice, stale),
+        lambda: store.save_identity(case_id, [], stale),
+        lambda: store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), stale),
+        lambda: store.save_critique(case_id, store.load_critique(case_id), stale),
+        lambda: store.save_review(retry_review, stale),
+    )
+    for write in writes:
+        with pytest.raises(InvoiceAgentsError) as excinfo:
+            write()
+        assert excinfo.value.stop_reason == "STALE_EXECUTION_CLAIM"
+
+    reads = (
+        lambda: store.load_current_extraction(stale),
+        lambda: store.load_current_identity(stale),
+        lambda: store.load_current_comparison(stale, "risk"),
+        lambda: store.load_current_critique(stale),
+        lambda: store.load_current_review(stale),
+        lambda: store.load_current_final_decision(stale),
+    )
+    for read in reads:
+        with pytest.raises(InvoiceAgentsError) as excinfo:
+            read()
+        assert excinfo.value.stop_reason == "STALE_EXECUTION_CLAIM"
+
+
+def test_corrupt_future_lease_tuple_is_not_reclaimed(settings: Settings) -> None:
+    case_id = "case_corrupt_authority"
+    _persist_case(settings, case_id)
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute("DROP TRIGGER trg_cases_execution_authority_update")
+        connection.execute(
+            "UPDATE cases SET execution_state = 'IDLE', execution_token = NULL, "
+            "lease_expires_at = '2999-01-01T00:00:00+00:00' WHERE case_id = ?",
+            (case_id,),
+        )
+        connection.commit()
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        WorkflowStore(settings.workflow_db).claim_case_execution(
+            case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+        )
+    assert excinfo.value.stop_reason == "EXECUTION_AUTHORITY_CORRUPT"
+
+
+def test_migration_003_rolls_back_and_is_retryable_after_mid_migration_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import invoice_agents.db.core as core_module
+
+    path = tmp_path / "workflow-atomic.db"
+    real_connect = core_module.connect_database
+    armed = True
+
+    class FailingConnection(_ConnectionProxy):
+        def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+            nonlocal armed
+            if armed and "CREATE INDEX idx_cases_execution_lease" in sql:
+                armed = False
+                raise sqlite3.OperationalError("injected migration interruption")
+            return self._connection.execute(sql, parameters)
+
+    @contextmanager
+    def failing_connect(target: Path, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
+        with real_connect(target, read_only=read_only) as connection:
+            yield FailingConnection(
+                connection,
+                before_execute=lambda _sql: None,
+                after_execute=lambda _sql: None,
+            )  # type: ignore[misc]
+
+    monkeypatch.setattr(core_module, "connect_database", failing_connect)
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.WORKFLOW)
+    assert excinfo.value.stop_reason == "MIGRATION_FAILED"
+    with real_connect(path, read_only=True) as connection:
+        columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(cases)")}
+        versions = [
+            int(row["version"])
+            for row in connection.execute("SELECT version FROM schema_version ORDER BY version")
+        ]
+    assert "execution_token" not in columns
+    assert versions == [1, 2]
+
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3]
+    assert verify_database(path, DatabaseKind.WORKFLOW)["schema_version"] == 3
+
+
+@pytest.mark.asyncio
+async def test_lease_heartbeat_propagates_renewal_failure_without_masking() -> None:
+    from invoice_agents.orchestration import _run_with_lease_heartbeat
+
+    operation_started = asyncio.Event()
+    operation_cancelled = asyncio.Event()
+    renew_attempted = asyncio.Event()
+    claim = ExecutionClaim(
+        case_id="case_heartbeat",
+        token="exec_heartbeat",
+        generation=1,
+        expires_at=datetime.now(UTC),
+    )
+
+    async def operation() -> str:
+        operation_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            operation_cancelled.set()
+        return "unreachable"
+
+    def fail_renewal(_claim: ExecutionClaim, _lease_seconds: int) -> ExecutionClaim:
+        renew_attempted.set()
+        raise InvoiceAgentsError(
+            category=orchestration.ErrorCategory.ORCHESTRATION,
+            message="lease was taken over",
+            case_id=claim.case_id,
+            stop_reason="STALE_EXECUTION_CLAIM",
+        )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        await _run_with_lease_heartbeat(
+            operation(),
+            renew=fail_renewal,
+            claim=claim,
+            lease_seconds=60,
+            renewal_interval_seconds=0.001,
+        )
+    assert operation_started.is_set()
+    assert renew_attempted.is_set()
+    assert operation_cancelled.is_set()
+    assert excinfo.value.stop_reason == "STALE_EXECUTION_CLAIM"
+
+
+def test_claim_and_renew_compute_authoritative_time_after_write_lock(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case_id = "case_lock_time"
+    _persist_case(settings, case_id)
+    real_connect = store_module.connect_database
+    begin_attempted = threading.Event()
+    initial = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    after_claim_lock = initial + timedelta(minutes=5)
+    after_renew_lock = after_claim_lock + timedelta(minutes=5)
+
+    class ControlledDatetime(datetime):
+        current = initial
+
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            return cls.current
+
+    @contextmanager
+    def observed_connect(path: Path, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
+        with real_connect(path, read_only=read_only) as connection:
+
+            def before_execute(sql: str) -> None:
+                if sql.strip().upper() == "BEGIN IMMEDIATE":
+                    begin_attempted.set()
+
+            yield _ConnectionProxy(
+                connection,
+                before_execute=before_execute,
+                after_execute=lambda _sql: None,
+            )  # type: ignore[misc]
+
+    monkeypatch.setattr(store_module, "datetime", ControlledDatetime)
+    monkeypatch.setattr(store_module, "connect_database", observed_connect)
+    claim_outcome: list[ExecutionClaim | BaseException] = []
+    with real_connect(settings.workflow_db) as blocker:
+        blocker.execute("BEGIN IMMEDIATE")
+
+        def claim_case() -> None:
+            try:
+                claim_outcome.append(
+                    WorkflowStore(settings.workflow_db).claim_case_execution(
+                        case_id,
+                        frozenset({CaseStatus.INCOMPLETE}),
+                        lease_seconds=60,
+                    )
+                )
+            except BaseException as exc:
+                claim_outcome.append(exc)
+
+        worker = threading.Thread(target=claim_case)
+        worker.start()
+        assert begin_attempted.wait(timeout=5)
+        ControlledDatetime.current = after_claim_lock
+        blocker.commit()
+        worker.join(timeout=10)
+    assert len(claim_outcome) == 1
+    assert isinstance(claim_outcome[0], ExecutionClaim)
+    claim = claim_outcome[0]
+    assert claim.expires_at == after_claim_lock + timedelta(seconds=60)
+
+    begin_attempted.clear()
+    renew_outcome: list[ExecutionClaim | BaseException] = []
+    with real_connect(settings.workflow_db) as blocker:
+        blocker.execute("BEGIN IMMEDIATE")
+
+        def renew_case() -> None:
+            try:
+                renew_outcome.append(
+                    WorkflowStore(settings.workflow_db).renew_case_execution(
+                        claim, lease_seconds=120
+                    )
+                )
+            except BaseException as exc:
+                renew_outcome.append(exc)
+
+        worker = threading.Thread(target=renew_case)
+        worker.start()
+        assert begin_attempted.wait(timeout=5)
+        ControlledDatetime.current = after_renew_lock
+        blocker.commit()
+        worker.join(timeout=10)
+    assert len(renew_outcome) == 1
+    assert isinstance(renew_outcome[0], InvoiceAgentsError)
+    assert renew_outcome[0].stop_reason == "STALE_EXECUTION_CLAIM"

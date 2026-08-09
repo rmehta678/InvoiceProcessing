@@ -4,6 +4,12 @@ ALTER TABLE cases ADD COLUMN execution_state TEXT NOT NULL DEFAULT 'IDLE';
 ALTER TABLE cases ADD COLUMN lease_expires_at TEXT;
 
 ALTER TABLE final_decisions ADD COLUMN decision_generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE payments ADD COLUMN decision_generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE extractions ADD COLUMN execution_generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE identity_results ADD COLUMN execution_generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE comparison_results ADD COLUMN execution_generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE critique_results ADD COLUMN execution_generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE review_requests ADD COLUMN execution_generation INTEGER NOT NULL DEFAULT 0;
 
 CREATE INDEX idx_cases_execution_lease
 ON cases(execution_state, lease_expires_at);
@@ -36,4 +42,47 @@ WHEN EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'PAID_FINAL_DECISION_IMMUTABLE');
+END;
+
+CREATE TRIGGER trg_cases_execution_authority_insert
+BEFORE INSERT ON cases
+WHEN NOT (
+    (NEW.execution_state = 'IDLE' AND NEW.execution_token IS NULL
+        AND NEW.lease_expires_at IS NULL
+        AND typeof(NEW.execution_generation) = 'integer'
+        AND NEW.execution_generation >= 0)
+    OR (NEW.execution_state = 'RUNNING' AND NEW.execution_token IS NOT NULL
+        AND NEW.execution_token <> '' AND NEW.lease_expires_at IS NOT NULL
+        AND datetime(NEW.lease_expires_at) IS NOT NULL
+        AND typeof(NEW.execution_generation) = 'integer'
+        AND NEW.execution_generation >= 1)
+    OR (NEW.execution_state = 'FINISHED' AND NEW.execution_token IS NOT NULL
+        AND NEW.execution_token <> '' AND NEW.lease_expires_at IS NULL
+        AND typeof(NEW.execution_generation) = 'integer'
+        AND NEW.execution_generation >= 1)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'INVALID_EXECUTION_AUTHORITY');
+END;
+
+CREATE TRIGGER trg_cases_execution_authority_update
+BEFORE UPDATE OF execution_token, execution_generation, execution_state, lease_expires_at
+ON cases
+WHEN NOT (
+    (NEW.execution_state = 'IDLE' AND NEW.execution_token IS NULL
+        AND NEW.lease_expires_at IS NULL
+        AND typeof(NEW.execution_generation) = 'integer'
+        AND NEW.execution_generation >= 0)
+    OR (NEW.execution_state = 'RUNNING' AND NEW.execution_token IS NOT NULL
+        AND NEW.execution_token <> '' AND NEW.lease_expires_at IS NOT NULL
+        AND datetime(NEW.lease_expires_at) IS NOT NULL
+        AND typeof(NEW.execution_generation) = 'integer'
+        AND NEW.execution_generation >= 1)
+    OR (NEW.execution_state = 'FINISHED' AND NEW.execution_token IS NOT NULL
+        AND NEW.execution_token <> '' AND NEW.lease_expires_at IS NULL
+        AND typeof(NEW.execution_generation) = 'integer'
+        AND NEW.execution_generation >= 1)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'INVALID_EXECUTION_AUTHORITY');
 END;

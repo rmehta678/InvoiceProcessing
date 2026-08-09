@@ -8,11 +8,12 @@ import pytest
 from invoice_agents import orchestration
 from invoice_agents.agents.decision_rules import blocking_evidence, validate_final_decision
 from invoice_agents.config import Settings
-from invoice_agents.db.store import WorkflowStore
+from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.errors import InvoiceAgentsError
 from invoice_agents.hitl.service import create_review_request, record_human_decision
 from invoice_agents.models import (
     CanonicalMapping,
+    CaseStatus,
     Critique,
     DecisionKind,
     HumanDecisionKind,
@@ -50,10 +51,14 @@ def prepare(path: Path, settings: Settings) -> str:
 
 def first_pass_review(
     case_id: str, settings: Settings, store: WorkflowStore
-) -> tuple[RiskAssessment, ReviewRequest]:
+) -> tuple[RiskAssessment, ReviewRequest, ExecutionClaim]:
     """Run the deterministic pass-1 evidence chain and persist it like the team does."""
 
     invoice = store.load_extraction(case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
     comparisons, unresolved = compare_inventory(invoice, InventoryReader(settings.inventory_db))
     risk = build_risk_assessment(
         invoice, comparisons, [], compute_invoice_totals(invoice), settings
@@ -67,12 +72,23 @@ def first_pass_review(
                 item: result.model_dump(mode="json") for item, result in unresolved.items()
             },
         },
+        claim,
     )
-    store.save_comparison(case_id, "risk", risk.model_dump(mode="json"))
+    store.save_identity(case_id, [], claim)
+    store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim)
+    case_critique = make_critique()
+    store.save_critique(case_id, case_critique, claim)
     review = create_review_request(
-        case_id, invoice, risk, make_critique(), DecisionKind.HOLD, ["ambiguous mapping"], store
+        case_id,
+        invoice,
+        risk,
+        case_critique,
+        DecisionKind.HOLD,
+        ["ambiguous mapping"],
+        store,
+        claim,
     )
-    return risk, review
+    return risk, review, claim
 
 
 def establish_mapping_and_recompute(
@@ -82,6 +98,7 @@ def establish_mapping_and_recompute(
     reason: str,
     settings: Settings,
     store: WorkflowStore,
+    claim: ExecutionClaim,
 ) -> ReviewRequest:
     resolved = record_human_decision(
         review.review_id,
@@ -99,6 +116,7 @@ def establish_mapping_and_recompute(
         settings,
         store,
         AuditRecorder(settings.workflow_db, case_id),
+        claim,
     )
     return resolved
 
@@ -112,10 +130,16 @@ def test_mapping_recompute_resolves_blocker_and_authorizes_approve(
 ) -> None:
     case_id = prepare(invoice_dir / "invoice_1010.txt", settings)
     store = WorkflowStore(settings.workflow_db)
-    first_risk, review = first_pass_review(case_id, settings, store)
+    first_risk, review, claim = first_pass_review(case_id, settings, store)
     assert any(item.status is InventoryStatus.AMBIGUOUS for item in first_risk.inventory)
     resolved = establish_mapping_and_recompute(
-        case_id, review, "WidgetA (rush order)", "maps rush order", settings, store
+        case_id,
+        review,
+        "WidgetA (rush order)",
+        "maps rush order",
+        settings,
+        store,
+        claim,
     )
     risk = latest_risk(store, case_id)
     assert all(item.status is not InventoryStatus.AMBIGUOUS for item in risk.inventory)
@@ -136,6 +160,7 @@ def test_mapping_recompute_resolves_blocker_and_authorizes_approve(
         is None
     )
     assert store.count_events(case_id, "recompute.after_human_mapping") == 1
+    store.release_case_execution(claim)
 
 
 def test_mapping_recompute_with_exceeding_stock_stays_blocked_and_needs_second_review(
@@ -143,11 +168,17 @@ def test_mapping_recompute_with_exceeding_stock_stays_blocked_and_needs_second_r
 ) -> None:
     case_id = prepare(FIXTURE_DIR / "invoice_2001_bulk_alias.txt", settings)
     store = WorkflowStore(settings.workflow_db)
-    first_risk, review = first_pass_review(case_id, settings, store)
+    first_risk, review, claim = first_pass_review(case_id, settings, store)
     bulk = next(item for item in first_risk.inventory if item.raw_items == ["WidgetA (bulk)"])
     assert bulk.status is InventoryStatus.AMBIGUOUS
     resolved = establish_mapping_and_recompute(
-        case_id, review, "WidgetA (bulk)", "maps bulk alias", settings, store
+        case_id,
+        review,
+        "WidgetA (bulk)",
+        "maps bulk alias",
+        settings,
+        store,
+        claim,
     )
     risk = latest_risk(store, case_id)
     widget_a = next(item for item in risk.inventory if item.sku == "SKU-WIDGET-A")
@@ -178,6 +209,7 @@ def test_mapping_recompute_with_exceeding_stock_stays_blocked_and_needs_second_r
         DecisionKind.HOLD,
         ["blocking evidence remains after mapping"],
         store,
+        claim,
     )
     assert second.sequence == 2
     latest = store.load_case_review(case_id)
@@ -185,3 +217,4 @@ def test_mapping_recompute_with_exceeding_stock_stays_blocked_and_needs_second_r
     assert latest.review_id == second.review_id
     assert latest.sequence == 2
     assert latest.status == "PENDING"
+    store.release_case_execution(claim)

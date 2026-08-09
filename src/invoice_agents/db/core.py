@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -50,6 +51,87 @@ REQUIRED_INDEXES: dict[DatabaseKind, frozenset[str]] = {
     ),
 }
 
+REQUIRED_WORKFLOW_TRIGGERS: dict[str, str] = {
+    "trg_final_decisions_no_insert_after_paid": """
+        CREATE TRIGGER trg_final_decisions_no_insert_after_paid
+        BEFORE INSERT ON final_decisions
+        WHEN EXISTS (
+            SELECT 1 FROM payments
+            WHERE payments.case_id = NEW.case_id AND payments.status = 'PAID'
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'PAID_FINAL_DECISION_IMMUTABLE');
+        END
+    """,
+    "trg_final_decisions_no_update_after_paid": """
+        CREATE TRIGGER trg_final_decisions_no_update_after_paid
+        BEFORE UPDATE ON final_decisions
+        WHEN EXISTS (
+            SELECT 1 FROM payments
+            WHERE payments.case_id = OLD.case_id AND payments.status = 'PAID'
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'PAID_FINAL_DECISION_IMMUTABLE');
+        END
+    """,
+    "trg_final_decisions_no_delete_after_paid": """
+        CREATE TRIGGER trg_final_decisions_no_delete_after_paid
+        BEFORE DELETE ON final_decisions
+        WHEN EXISTS (
+            SELECT 1 FROM payments
+            WHERE payments.case_id = OLD.case_id AND payments.status = 'PAID'
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'PAID_FINAL_DECISION_IMMUTABLE');
+        END
+    """,
+    "trg_cases_execution_authority_insert": """
+        CREATE TRIGGER trg_cases_execution_authority_insert
+        BEFORE INSERT ON cases
+        WHEN NOT (
+            (NEW.execution_state = 'IDLE' AND NEW.execution_token IS NULL
+                AND NEW.lease_expires_at IS NULL
+                AND typeof(NEW.execution_generation) = 'integer'
+                AND NEW.execution_generation >= 0)
+            OR (NEW.execution_state = 'RUNNING' AND NEW.execution_token IS NOT NULL
+                AND NEW.execution_token <> '' AND NEW.lease_expires_at IS NOT NULL
+                AND datetime(NEW.lease_expires_at) IS NOT NULL
+                AND typeof(NEW.execution_generation) = 'integer'
+                AND NEW.execution_generation >= 1)
+            OR (NEW.execution_state = 'FINISHED' AND NEW.execution_token IS NOT NULL
+                AND NEW.execution_token <> '' AND NEW.lease_expires_at IS NULL
+                AND typeof(NEW.execution_generation) = 'integer'
+                AND NEW.execution_generation >= 1)
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'INVALID_EXECUTION_AUTHORITY');
+        END
+    """,
+    "trg_cases_execution_authority_update": """
+        CREATE TRIGGER trg_cases_execution_authority_update
+        BEFORE UPDATE OF execution_token, execution_generation, execution_state, lease_expires_at
+        ON cases
+        WHEN NOT (
+            (NEW.execution_state = 'IDLE' AND NEW.execution_token IS NULL
+                AND NEW.lease_expires_at IS NULL
+                AND typeof(NEW.execution_generation) = 'integer'
+                AND NEW.execution_generation >= 0)
+            OR (NEW.execution_state = 'RUNNING' AND NEW.execution_token IS NOT NULL
+                AND NEW.execution_token <> '' AND NEW.lease_expires_at IS NOT NULL
+                AND datetime(NEW.lease_expires_at) IS NOT NULL
+                AND typeof(NEW.execution_generation) = 'integer'
+                AND NEW.execution_generation >= 1)
+            OR (NEW.execution_state = 'FINISHED' AND NEW.execution_token IS NOT NULL
+                AND NEW.execution_token <> '' AND NEW.lease_expires_at IS NULL
+                AND typeof(NEW.execution_generation) = 'integer'
+                AND NEW.execution_generation >= 1)
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'INVALID_EXECUTION_AUTHORITY');
+        END
+    """,
+}
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
@@ -91,6 +173,30 @@ def _migration_resources(kind: DatabaseKind) -> list[Traversable]:
     return resources
 
 
+def _migration_statements(script: str) -> list[str]:
+    """Split SQLite scripts without executing implicit transaction boundaries."""
+
+    uncommented = "\n".join(
+        line for line in script.splitlines() if not line.lstrip().startswith("--")
+    )
+    statements: list[str] = []
+    buffer = ""
+    for line in uncommented.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            statement = buffer.strip()
+            if statement:
+                statements.append(statement)
+            buffer = ""
+    if buffer.strip():
+        raise sqlite3.OperationalError("migration contains an incomplete SQL statement")
+    return statements
+
+
+def _normalized_sql(sql: str) -> str:
+    return re.sub(r"\s+", " ", sql.strip().rstrip(";")).casefold()
+
+
 def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
     """Apply unapplied migrations; this is never called by normal processing."""
 
@@ -107,13 +213,32 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
             int(row["version"])
             for row in connection.execute("SELECT version FROM schema_version").fetchall()
         }
+        connection.commit()
         for resource in _migration_resources(selected_kind):
             version = int(resource.name.split("_", 1)[0])
             if version in existing:
                 continue
             script = resource.read_text(encoding="utf-8")
+            statements = _migration_statements(script)
+            normalized_statements = {_normalized_sql(statement) for statement in statements}
+            disable_foreign_keys = "pragma foreign_keys=off" in normalized_statements
+            transaction_controls = {
+                "begin",
+                "begin transaction",
+                "begin immediate",
+                "commit",
+                "end transaction",
+                "pragma foreign_keys=off",
+                "pragma foreign_keys=on",
+            }
             try:
-                connection.executescript(script)
+                if disable_foreign_keys:
+                    connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("BEGIN IMMEDIATE")
+                for statement in statements:
+                    if _normalized_sql(statement) in transaction_controls:
+                        continue
+                    connection.execute(statement)
                 connection.execute(
                     "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
                     (version, utc_now()),
@@ -126,6 +251,9 @@ def migrate_database(path: Path, kind: DatabaseKind | None = None) -> list[int]:
                     f"migration {resource.name} failed: {exc}",
                     stop_reason="MIGRATION_FAILED",
                 ) from exc
+            finally:
+                if disable_foreign_keys:
+                    connection.execute("PRAGMA foreign_keys = ON")
             applied.append(version)
     return applied
 
@@ -228,14 +356,26 @@ def verify_database(
                 "execution_state",
                 "lease_expires_at",
             },
-            "extractions": {"case_id", "payload_json"},
-            "identity_results": {"case_id", "payload_json"},
-            "comparison_results": {"case_id", "comparison_type", "payload_json"},
-            "critique_results": {"case_id", "payload_json"},
-            "review_requests": {"review_id", "case_id", "sequence", "status", "payload_json"},
+            "extractions": {"case_id", "payload_json", "execution_generation"},
+            "identity_results": {"case_id", "payload_json", "execution_generation"},
+            "comparison_results": {
+                "case_id",
+                "comparison_type",
+                "payload_json",
+                "execution_generation",
+            },
+            "critique_results": {"case_id", "payload_json", "execution_generation"},
+            "review_requests": {
+                "review_id",
+                "case_id",
+                "sequence",
+                "status",
+                "payload_json",
+                "execution_generation",
+            },
             "human_decisions": {"review_id", "reviewer", "decision"},
             "final_decisions": {"case_id", "payload_json", "decision_generation"},
-            "payments": {"case_id", "idempotency_key", "status"},
+            "payments": {"case_id", "idempotency_key", "status", "decision_generation"},
             "events": {"case_id", "event_type", "payload_json"},
         }
     try:
@@ -295,6 +435,26 @@ def verify_database(
                     f"required indexes are missing: {sorted(missing_indexes)}",
                     stop_reason="DATABASE_SCHEMA_MISMATCH",
                 )
+            if selected_kind is DatabaseKind.WORKFLOW:
+                trigger_rows = connection.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
+                ).fetchall()
+                actual_triggers = {
+                    str(row["name"]): _normalized_sql(str(row["sql"]))
+                    for row in trigger_rows
+                    if row["sql"] is not None
+                }
+                invalid_triggers = {
+                    name
+                    for name, definition in REQUIRED_WORKFLOW_TRIGGERS.items()
+                    if actual_triggers.get(name) != _normalized_sql(definition)
+                }
+                if invalid_triggers:
+                    raise DatabaseVerificationError(
+                        ErrorCategory.DATABASE,
+                        f"required triggers are missing or changed: {sorted(invalid_triggers)}",
+                        stop_reason="DATABASE_SCHEMA_MISMATCH",
+                    )
     except DatabaseVerificationError:
         raise
     except sqlite3.Error as exc:

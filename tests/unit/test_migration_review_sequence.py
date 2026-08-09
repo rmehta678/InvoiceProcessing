@@ -18,6 +18,7 @@ from invoice_agents.db.store import WorkflowStore
 from invoice_agents.errors import DatabaseVerificationError, InvoiceAgentsError
 from invoice_agents.hitl.service import record_human_decision
 from invoice_agents.models import (
+    CaseStatus,
     Critique,
     DecisionKind,
     HumanDecisionKind,
@@ -148,7 +149,11 @@ def test_second_review_cycle_is_sequenced_and_duplicates_are_rejected(tmp_path: 
     path = build_v1_workflow_db(tmp_path)
     migrate_database(path, DatabaseKind.WORKFLOW)
     store = WorkflowStore(path)
-    saved = store.save_review(make_review("rev_v2_cycle", datetime(2026, 2, 1, tzinfo=UTC)))
+    claim = store.claim_case_execution(
+        CASE_ID, frozenset({CaseStatus.NEEDS_HUMAN}), lease_seconds=60
+    )
+    saved = store.save_review(make_review("rev_v2_cycle", datetime(2026, 2, 1, tzinfo=UTC)), claim)
+    store.release_case_execution(claim)
     assert saved.sequence == 2
     latest = store.load_case_review(CASE_ID)
     assert latest is not None
@@ -197,7 +202,11 @@ def test_atomic_human_decision_preflight_rejects_wal_without_mutation(
     source = make_source()
     store.register_source(source)
     store.create_case(CASE_ID, source, LEGACY_AT)
-    review = store.save_review(make_review("rev_journal_mode", LEGACY_AT))
+    claim = store.claim_case_execution(
+        CASE_ID, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    review = store.save_review(make_review("rev_journal_mode", LEGACY_AT), claim)
+    store.release_case_execution(claim)
     target = workflow_db if wal_database == "workflow" else inventory_db
     with connect_database(target) as connection:
         assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
@@ -228,12 +237,15 @@ def test_atomic_human_decision_preflight_rejects_wal_without_mutation(
 
     assert excinfo.value.stop_reason == "ATOMIC_JOURNAL_MODE_REQUIRED"
     with connect_database(workflow_db, read_only=True) as connection:
-        assert tuple(
-            connection.execute(
-                "SELECT status, payload_json, resolved_at FROM review_requests WHERE review_id = ?",
-                (review.review_id,),
-            ).fetchone()
-        ) == review_before
+        assert (
+            tuple(
+                connection.execute(
+                    "SELECT status, payload_json, resolved_at FROM review_requests WHERE review_id = ?",
+                    (review.review_id,),
+                ).fetchone()
+            )
+            == review_before
+        )
         assert (
             connection.execute("SELECT * FROM human_decisions ORDER BY decision_id").fetchall()
             == decisions_before

@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from invoice_agents.db.store import WorkflowStore
+from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import (
     CanonicalMapping,
@@ -49,6 +49,7 @@ def create_review_request(
     agent_recommendation: DecisionKind,
     agent_rationale: list[str],
     store: WorkflowStore,
+    claim: ExecutionClaim,
     *,
     extra_reasons: list[str] | None = None,
 ) -> ReviewRequest:
@@ -109,7 +110,7 @@ def create_review_request(
         questions=questions,
         created_at=datetime.now(UTC),
     )
-    return store.save_review(review)
+    return store.save_review(review, claim)
 
 
 def record_human_decision(
@@ -128,9 +129,7 @@ def record_human_decision(
 
     selected_blocker_ids = list(
         dict.fromkeys(
-            blocker_id.strip()
-            for blocker_id in addressed_blocker_ids or []
-            if blocker_id.strip()
+            blocker_id.strip() for blocker_id in addressed_blocker_ids or [] if blocker_id.strip()
         )
     )
     selected_mappings = [

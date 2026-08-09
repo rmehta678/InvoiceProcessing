@@ -5,6 +5,7 @@ from pathlib import Path
 from invoice_agents.config import Settings
 from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import WorkflowStore
+from invoice_agents.models import CaseStatus
 from invoice_agents.orchestration import prepare_case
 from invoice_agents.source_store import snapshot_source
 from invoice_agents.tools.comparison import (
@@ -26,7 +27,11 @@ def enrich_and_persist(case_id: str, settings: Settings, store: WorkflowStore) -
     reader = InventoryReader(settings.inventory_db)
     mappings, _comparisons, unresolved = compare_inventory_evidence(invoice, reader)
     enriched = apply_mapping_evidence(invoice, mappings, unresolved)
-    store.save_extraction(case_id, enriched)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.save_extraction(case_id, enriched, claim)
+    store.release_case_execution(claim)
 
 
 def extraction_count(settings: Settings, case_id: str) -> int:

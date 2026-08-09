@@ -61,10 +61,10 @@ class AgentCaseContext:
     tool_failures: list[str] = field(default_factory=list)
 
     def invoice(self) -> ExtractedInvoice:
-        return self.store.load_extraction(self.case_id)
+        return self.store.load_current_extraction(self.claim)
 
     def risk(self) -> RiskAssessment:
-        payload = self.store.load_comparison(self.case_id, "risk")
+        payload = self.store.load_current_comparison(self.claim, "risk")
         if payload is None:
             raise InvoiceAgentsError(
                 ErrorCategory.DATABASE,
@@ -134,7 +134,7 @@ def build_team(
         source = context.invoice().source
         verified_source_path(source)
         invoice = extract_invoice_evidence(source)
-        context.store.save_extraction(context.case_id, invoice)
+        context.store.save_extraction(context.case_id, invoice, context.claim)
         payload = invoice.model_dump(mode="json")
         context.audit.record(
             "tool.invoice_extracted",
@@ -150,7 +150,7 @@ def build_team(
         invoice = context.invoice()
         candidates = find_prior_invoice_candidates(context.case_id, invoice, context.store)
         payload = [candidate.model_dump(mode="json") for candidate in candidates]
-        record_id = context.store.save_identity(context.case_id, payload)
+        record_id = context.store.save_identity(context.case_id, payload, context.claim)
         context.audit.record(
             "tool.identity_candidates",
             payload,
@@ -185,11 +185,13 @@ def build_team(
                 item: result.model_dump(mode="json") for item, result in unresolved.items()
             },
         }
-        record_id = context.store.save_comparison(context.case_id, "inventory", payload)
+        record_id = context.store.save_comparison(
+            context.case_id, "inventory", payload, context.claim
+        )
         # Mapping outcomes become a new extraction version (§7): canonical_sku only from
         # explicit bases, candidates only from unresolved lookups. v1 stays immutable.
         enriched = apply_mapping_evidence(invoice, mappings, unresolved)
-        extraction_id = context.store.save_extraction(context.case_id, enriched)
+        extraction_id = context.store.save_extraction(context.case_id, enriched, context.claim)
         context.audit.record(
             "tool.inventory_comparison",
             payload,
@@ -220,7 +222,7 @@ def build_team(
         """Recompute amounts/dates/signals and apply explicit human-review policy."""
 
         invoice = context.invoice()
-        stored_inventory = context.store.load_comparison(context.case_id, "inventory")
+        stored_inventory = context.store.load_current_comparison(context.claim, "inventory")
         if stored_inventory is None:
             raise InvoiceAgentsError(
                 ErrorCategory.DATABASE,
@@ -235,12 +237,12 @@ def build_team(
         ]
         identity = [
             IdentityCandidate.model_validate(item)
-            for item in context.store.load_identity(context.case_id)
+            for item in context.store.load_current_identity(context.claim)
         ]
         financial = compute_invoice_totals(invoice)
         risk = build_risk_assessment(invoice, inventory, identity, financial, context.settings)
         payload = risk.model_dump(mode="json")
-        record_id = context.store.save_comparison(context.case_id, "risk", payload)
+        record_id = context.store.save_comparison(context.case_id, "risk", payload, context.claim)
         context.audit.record(
             "tool.financial_risk_assessment",
             payload,
@@ -305,7 +307,7 @@ def build_team(
             recommended_disposition=DecisionKind(recommended_disposition),
             rationale=rationale,
         )
-        record_id = context.store.save_critique(context.case_id, critique)
+        record_id = context.store.save_critique(context.case_id, critique, context.claim)
         payload = critique.model_dump(mode="json")
         context.audit.record(
             "tool.critique_recorded",
@@ -321,9 +323,11 @@ def build_team(
 
         invoice = context.invoice()
         risk = context.risk()
-        critique = context.store.load_critique(context.case_id)
-        review = context.store.load_case_review(context.case_id)
-        human = review.human_decision if review is not None and review.status == "RESOLVED" else None
+        critique = context.store.load_current_critique(context.claim)
+        review = context.store.load_current_review(context.claim)
+        human = (
+            review.human_decision if review is not None and review.status == "RESOLVED" else None
+        )
         return {
             "invoice_identity": {
                 "invoice_number": invoice.invoice_number.model_dump(mode="json"),
@@ -340,8 +344,7 @@ def build_team(
                 blocker.model_dump(mode="json") for blocker in blocking_evidence(risk)
             ],
             "unaddressed_blocking_evidence": [
-                blocker.model_dump(mode="json")
-                for blocker in unaddressed_blockers(risk, human)
+                blocker.model_dump(mode="json") for blocker in unaddressed_blockers(risk, human)
             ],
         }
 
@@ -358,12 +361,12 @@ def build_team(
         looping the queue.
         """
 
-        existing = context.store.load_case_review(context.case_id)
+        existing = context.store.load_current_review(context.claim)
         if existing is not None and existing.status == "PENDING":
             return existing.model_dump(mode="json")
         assert_new_review_cycle_permitted(existing, case_id=context.case_id)
         recommendation = DecisionKind(agent_recommendation)
-        critique = context.store.load_critique(context.case_id)
+        critique = context.store.load_current_critique(context.claim)
         extra_reasons: list[str] = []
         if (
             recommendation is DecisionKind.APPROVE
@@ -381,6 +384,7 @@ def build_team(
             recommendation,
             agent_rationale,
             context.store,
+            context.claim,
             extra_reasons=extra_reasons,
         )
         context.audit.record(
@@ -405,8 +409,8 @@ def build_team(
 
         selected = DecisionKind(decision)
         risk = context.risk()
-        critique = context.store.load_critique(context.case_id)
-        review = context.store.load_case_review(context.case_id)
+        critique = context.store.load_current_critique(context.claim)
+        review = context.store.load_current_review(context.claim)
         validate_final_decision(
             selected,
             payment_eligible,

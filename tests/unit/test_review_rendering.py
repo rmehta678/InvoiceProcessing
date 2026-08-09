@@ -8,7 +8,7 @@ import pytest
 from invoice_agents.config import Settings
 from invoice_agents.db.store import WorkflowStore
 from invoice_agents.hitl.service import create_review_request
-from invoice_agents.models import Critique, DecisionKind, ReviewRequest
+from invoice_agents.models import CaseStatus, Critique, DecisionKind, ReviewRequest
 from invoice_agents.orchestration import prepare_case
 from invoice_agents.tools.comparison import (
     InventoryReader,
@@ -38,12 +38,16 @@ def build_review(name: str, settings: Settings) -> ReviewRequest:
     case_id = prepared[0]
     store = WorkflowStore(settings.workflow_db)
     invoice = store.load_extraction(case_id)
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.adopt_latest_evidence(claim)
     comparisons, _unresolved = compare_inventory(invoice, InventoryReader(settings.inventory_db))
     risk = build_risk_assessment(
         invoice, comparisons, [], compute_invoice_totals(invoice), settings
     )
     assert risk.policy_review_reasons
-    return create_review_request(
+    review = create_review_request(
         case_id,
         invoice,
         risk,
@@ -51,7 +55,10 @@ def build_review(name: str, settings: Settings) -> ReviewRequest:
         DecisionKind.HOLD,
         ["deterministic review rationale"],
         store,
+        claim,
     )
+    store.release_case_execution(claim)
+    return review
 
 
 def test_pdf_review_renders_page_one_with_verifiable_hash(

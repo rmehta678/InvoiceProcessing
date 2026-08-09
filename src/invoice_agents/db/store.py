@@ -139,8 +139,7 @@ def _validate_supersession(
     invoice_number = _normalized_invoice_field(invoice, "invoice_number")
     vendor = _normalized_invoice_field(invoice, "vendor")
     rows = connection.execute(
-        "SELECT case_id, invoice_number, vendor, started_at FROM cases "
-        "WHERE case_id IN (?, ?)",
+        "SELECT case_id, invoice_number, vendor, started_at FROM cases WHERE case_id IN (?, ?)",
         (review.case_id, superseded_case_id),
     ).fetchall()
     cases = {str(row["case_id"]): row for row in rows}
@@ -248,7 +247,10 @@ def _validate_human_decision(
             )
         validated_mappings.append((normalized, sku))
 
-    if decision.superseded_case_id and decision.decision is not HumanDecisionKind.SUPERSEDE_REVISION:
+    if (
+        decision.superseded_case_id
+        and decision.decision is not HumanDecisionKind.SUPERSEDE_REVISION
+    ):
         raise InvoiceAgentsError(
             ErrorCategory.TOOL,
             "superseded_case_id is permitted only for SUPERSEDE_REVISION",
@@ -338,21 +340,33 @@ class WorkflowStore:
             raise ValueError("expected_statuses must not be empty")
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
-        claimed_at = datetime.now(UTC)
-        expires_at = claimed_at + timedelta(seconds=lease_seconds)
         token = f"exec_{uuid4().hex}"
         placeholders = ", ".join("?" for _ in expected_statuses)
         statuses = tuple(str(status) for status in sorted(expected_statuses))
         with connect_database(self.path) as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                claimed_at = datetime.now(UTC)
+                expires_at = claimed_at + timedelta(seconds=lease_seconds)
                 updated = connection.execute(
                     "UPDATE cases SET execution_token = ?, "
                     "execution_generation = execution_generation + 1, "
                     "execution_state = 'RUNNING', lease_expires_at = ?, updated_at = ? "
                     f"WHERE case_id = ? AND status IN ({placeholders}) "
-                    "AND (execution_token IS NULL OR execution_state <> 'RUNNING' "
-                    "OR lease_expires_at IS NULL OR lease_expires_at <= ?)",
+                    "AND ((execution_state = 'IDLE' AND execution_token IS NULL "
+                    "AND lease_expires_at IS NULL "
+                    "AND typeof(execution_generation) = 'integer' "
+                    "AND execution_generation >= 0) "
+                    "OR (execution_state = 'FINISHED' AND execution_token IS NOT NULL "
+                    "AND execution_token <> '' AND lease_expires_at IS NULL "
+                    "AND typeof(execution_generation) = 'integer' "
+                    "AND execution_generation >= 1) "
+                    "OR (execution_state = 'RUNNING' AND execution_token IS NOT NULL "
+                    "AND execution_token <> '' AND lease_expires_at IS NOT NULL "
+                    "AND datetime(lease_expires_at) IS NOT NULL "
+                    "AND typeof(execution_generation) = 'integer' "
+                    "AND execution_generation >= 1 "
+                    "AND lease_expires_at <= ?))",
                     (
                         token,
                         expires_at.isoformat(),
@@ -364,7 +378,8 @@ class WorkflowStore:
                 )
                 if updated.rowcount != 1:
                     row = connection.execute(
-                        "SELECT status, execution_state, lease_expires_at FROM cases "
+                        "SELECT status, execution_token, execution_generation, "
+                        "execution_state, lease_expires_at FROM cases "
                         "WHERE case_id = ?",
                         (case_id,),
                     ).fetchone()
@@ -375,6 +390,13 @@ class WorkflowStore:
                             f"case does not exist: {case_id}",
                             case_id=case_id,
                             stop_reason="CASE_NOT_FOUND",
+                        )
+                    if not self._authority_tuple_is_valid(row):
+                        raise InvoiceAgentsError(
+                            ErrorCategory.DATABASE,
+                            f"case {case_id} has a contradictory execution authority tuple",
+                            case_id=case_id,
+                            stop_reason="EXECUTION_AUTHORITY_CORRUPT",
                         )
                     if str(row["status"]) not in statuses:
                         raise InvoiceAgentsError(
@@ -406,17 +428,15 @@ class WorkflowStore:
                 raise
         return ExecutionClaim(case_id, token, generation, expires_at)
 
-    def renew_case_execution(
-        self, claim: ExecutionClaim, lease_seconds: int
-    ) -> ExecutionClaim:
+    def renew_case_execution(self, claim: ExecutionClaim, lease_seconds: int) -> ExecutionClaim:
         """Renew only the still-current, unexpired execution claim."""
 
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
-        renewed_at = datetime.now(UTC)
-        expires_at = renewed_at + timedelta(seconds=lease_seconds)
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            renewed_at = datetime.now(UTC)
+            expires_at = renewed_at + timedelta(seconds=lease_seconds)
             updated = connection.execute(
                 "UPDATE cases SET lease_expires_at = ?, updated_at = ? "
                 "WHERE case_id = ? AND execution_token = ? AND execution_generation = ? "
@@ -436,6 +456,74 @@ class WorkflowStore:
             connection.commit()
         return ExecutionClaim(claim.case_id, claim.token, claim.generation, expires_at)
 
+    def release_case_execution(self, claim: ExecutionClaim) -> None:
+        """Release a preparation-only claim without fabricating a terminal result."""
+
+        with connect_database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            released_at = datetime.now(UTC)
+            updated = connection.execute(
+                "UPDATE cases SET execution_token = NULL, execution_state = 'IDLE', "
+                "lease_expires_at = NULL, updated_at = ? WHERE case_id = ? "
+                "AND execution_token = ? AND execution_generation = ? "
+                "AND execution_state = 'RUNNING' AND lease_expires_at > ?",
+                (
+                    released_at.isoformat(),
+                    claim.case_id,
+                    claim.token,
+                    claim.generation,
+                    released_at.isoformat(),
+                ),
+            )
+            if updated.rowcount != 1:
+                connection.rollback()
+                self._raise_stale_execution_claim(claim)
+            connection.commit()
+
+    @staticmethod
+    def _authority_tuple_is_valid(row: sqlite3.Row) -> bool:
+        state = row["execution_state"]
+        token = row["execution_token"]
+        raw_generation = row["execution_generation"]
+        lease = row["lease_expires_at"]
+        if not isinstance(state, str) or not isinstance(raw_generation, int):
+            return False
+        generation = raw_generation
+        valid_token = isinstance(token, str) and bool(token)
+        valid_lease = False
+        if isinstance(lease, str):
+            try:
+                parsed_lease = datetime.fromisoformat(lease)
+            except ValueError:
+                pass
+            else:
+                valid_lease = parsed_lease.tzinfo is not None
+        return (
+            (state == "IDLE" and token is None and lease is None and generation >= 0)
+            or (state == "RUNNING" and valid_token and valid_lease and generation >= 1)
+            or (state == "FINISHED" and valid_token and lease is None and generation >= 1)
+        )
+
+    def _require_current_claim(
+        self,
+        connection: sqlite3.Connection,
+        claim: ExecutionClaim,
+        checked_at: datetime,
+    ) -> None:
+        row = connection.execute(
+            "SELECT 1 FROM cases WHERE case_id = ? AND execution_token = ? "
+            "AND execution_generation = ? AND execution_state = 'RUNNING' "
+            "AND lease_expires_at > ?",
+            (
+                claim.case_id,
+                claim.token,
+                claim.generation,
+                checked_at.isoformat(),
+            ),
+        ).fetchone()
+        if row is None:
+            self._raise_stale_execution_claim(claim)
+
     @staticmethod
     def _raise_stale_execution_claim(claim: ExecutionClaim) -> None:
         raise InvoiceAgentsError(
@@ -446,30 +534,51 @@ class WorkflowStore:
             details={"execution_generation": claim.generation},
         )
 
-    def save_extraction(self, case_id: str, invoice: ExtractedInvoice) -> str:
+    def save_extraction(
+        self, case_id: str, invoice: ExtractedInvoice, claim: ExecutionClaim
+    ) -> str:
+        if claim.case_id != case_id:
+            self._raise_stale_execution_claim(claim)
         extraction_id = f"ext_{uuid4().hex}"
         with connect_database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            written_at = datetime.now(UTC)
+            self._require_current_claim(connection, claim, written_at)
             version_row = connection.execute(
                 "SELECT COALESCE(MAX(version), 0) AS version FROM extractions WHERE case_id = ?",
                 (case_id,),
             ).fetchone()
             version = int(version_row["version"]) + 1
             connection.execute(
-                "INSERT INTO extractions(extraction_id, case_id, version, payload_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (extraction_id, case_id, version, invoice.model_dump_json(), now_iso()),
+                "INSERT INTO extractions(extraction_id, case_id, version, payload_json, "
+                "created_at, execution_generation) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    extraction_id,
+                    case_id,
+                    version,
+                    invoice.model_dump_json(),
+                    written_at.isoformat(),
+                    claim.generation,
+                ),
             )
-            connection.execute(
+            updated = connection.execute(
                 "UPDATE cases SET invoice_number = ?, vendor = ?, revision = ?, updated_at = ? "
-                "WHERE case_id = ?",
+                "WHERE case_id = ? AND execution_token = ? AND execution_generation = ? "
+                "AND execution_state = 'RUNNING' AND lease_expires_at > ?",
                 (
                     invoice.invoice_number.normalized_value,
                     invoice.vendor.normalized_value,
                     invoice.revision.normalized_value if invoice.revision else None,
-                    now_iso(),
+                    written_at.isoformat(),
                     case_id,
+                    claim.token,
+                    claim.generation,
+                    written_at.isoformat(),
                 ),
             )
+            if updated.rowcount != 1:
+                connection.rollback()
+                self._raise_stale_execution_claim(claim)
             connection.commit()
         return extraction_id
 
@@ -489,22 +598,61 @@ class WorkflowStore:
             )
         return ExtractedInvoice.model_validate_json(row["payload_json"])
 
-    def save_identity(self, case_id: str, payload: list[dict[str, Any]]) -> str:
+    def load_current_extraction(self, claim: ExecutionClaim) -> ExtractedInvoice:
+        with connect_database(self.path, read_only=True) as connection:
+            self._begin_current_read(connection, claim)
+            row = connection.execute(
+                "SELECT payload_json FROM extractions WHERE case_id = ? "
+                "AND execution_generation = ? ORDER BY version DESC LIMIT 1",
+                (claim.case_id, claim.generation),
+            ).fetchone()
+        if row is None:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                f"current execution has no extraction for case {claim.case_id}",
+                case_id=claim.case_id,
+                stop_reason="EXTRACTION_GENERATION_MISMATCH",
+            )
+        return ExtractedInvoice.model_validate_json(row["payload_json"])
+
+    def save_identity(
+        self, case_id: str, payload: list[dict[str, Any]], claim: ExecutionClaim
+    ) -> str:
         identity_id = f"ident_{uuid4().hex}"
-        self._insert_payload("identity_results", "identity_id", identity_id, case_id, payload)
+        self._insert_payload(
+            "identity_results", "identity_id", identity_id, case_id, payload, claim
+        )
         return identity_id
 
     def load_identity(self, case_id: str) -> list[dict[str, Any]]:
         return cast(list[dict[str, Any]], self._load_latest_payload("identity_results", case_id))
 
-    def save_comparison(self, case_id: str, kind: str, payload: Any) -> str:
+    def load_current_identity(self, claim: ExecutionClaim) -> list[dict[str, Any]]:
+        return cast(
+            list[dict[str, Any]],
+            self._load_current_payload("identity_results", claim),
+        )
+
+    def save_comparison(self, case_id: str, kind: str, payload: Any, claim: ExecutionClaim) -> str:
+        if claim.case_id != case_id:
+            self._raise_stale_execution_claim(claim)
         comparison_id = f"cmp_{uuid4().hex}"
         with connect_database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            written_at = datetime.now(UTC)
+            self._require_current_claim(connection, claim, written_at)
             connection.execute(
                 "INSERT INTO comparison_results("
-                "comparison_id, case_id, comparison_type, payload_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (comparison_id, case_id, kind, encode(payload), now_iso()),
+                "comparison_id, case_id, comparison_type, payload_json, created_at, "
+                "execution_generation) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    comparison_id,
+                    case_id,
+                    kind,
+                    encode(payload),
+                    written_at.isoformat(),
+                    claim.generation,
+                ),
             )
             connection.commit()
         return comparison_id
@@ -518,9 +666,22 @@ class WorkflowStore:
             ).fetchone()
         return json.loads(row["payload_json"]) if row else None
 
-    def save_critique(self, case_id: str, critique: Critique) -> str:
+    def load_current_comparison(self, claim: ExecutionClaim, kind: str) -> Any:
+        with connect_database(self.path, read_only=True) as connection:
+            self._begin_current_read(connection, claim)
+            row = connection.execute(
+                "SELECT payload_json FROM comparison_results WHERE case_id = ? "
+                "AND comparison_type = ? AND execution_generation = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (claim.case_id, kind, claim.generation),
+            ).fetchone()
+        return json.loads(row["payload_json"]) if row else None
+
+    def save_critique(self, case_id: str, critique: Critique, claim: ExecutionClaim) -> str:
         critique_id = f"crit_{uuid4().hex}"
-        self._insert_payload("critique_results", "critique_id", critique_id, case_id, critique)
+        self._insert_payload(
+            "critique_results", "critique_id", critique_id, case_id, critique, claim
+        )
         return critique_id
 
     def load_critique(self, case_id: str) -> Critique:
@@ -534,7 +695,99 @@ class WorkflowStore:
             )
         return Critique.model_validate(payload)
 
-    def save_review(self, review: ReviewRequest) -> ReviewRequest:
+    def load_current_critique(self, claim: ExecutionClaim) -> Critique:
+        payload = self._load_current_payload("critique_results", claim)
+        if not payload:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                f"current execution has no critique for case {claim.case_id}",
+                case_id=claim.case_id,
+                stop_reason="CRITIQUE_GENERATION_MISMATCH",
+            )
+        return Critique.model_validate(payload)
+
+    def adopt_latest_evidence(self, claim: ExecutionClaim) -> None:
+        """Copy the prior stopped generation's evidence into a newly claimed resume."""
+
+        with connect_database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            adopted_at = datetime.now(UTC)
+            self._require_current_claim(connection, claim, adopted_at)
+            extraction = connection.execute(
+                "SELECT payload_json, version FROM extractions WHERE case_id = ? "
+                "ORDER BY version DESC LIMIT 1",
+                (claim.case_id,),
+            ).fetchone()
+            if (
+                extraction is not None
+                and connection.execute(
+                    "SELECT 1 FROM extractions WHERE case_id = ? AND execution_generation = ?",
+                    (claim.case_id, claim.generation),
+                ).fetchone()
+                is None
+            ):
+                connection.execute(
+                    "INSERT INTO extractions(extraction_id, case_id, version, payload_json, "
+                    "created_at, execution_generation) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        f"ext_{uuid4().hex}",
+                        claim.case_id,
+                        int(extraction["version"]) + 1,
+                        extraction["payload_json"],
+                        adopted_at.isoformat(),
+                        claim.generation,
+                    ),
+                )
+            for table, id_column, prefix in (
+                ("identity_results", "identity_id", "ident"),
+                ("critique_results", "critique_id", "crit"),
+            ):
+                row = connection.execute(
+                    f"SELECT payload_json FROM {table} WHERE case_id = ? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (claim.case_id,),
+                ).fetchone()
+                if row is not None:
+                    connection.execute(
+                        f"INSERT INTO {table}({id_column}, case_id, payload_json, created_at, "
+                        "execution_generation) VALUES (?, ?, ?, ?, ?)",
+                        (
+                            f"{prefix}_{uuid4().hex}",
+                            claim.case_id,
+                            row["payload_json"],
+                            adopted_at.isoformat(),
+                            claim.generation,
+                        ),
+                    )
+            for comparison_type in ("inventory", "risk"):
+                row = connection.execute(
+                    "SELECT payload_json FROM comparison_results WHERE case_id = ? "
+                    "AND comparison_type = ? ORDER BY created_at DESC LIMIT 1",
+                    (claim.case_id, comparison_type),
+                ).fetchone()
+                if row is not None:
+                    connection.execute(
+                        "INSERT INTO comparison_results(comparison_id, case_id, "
+                        "comparison_type, payload_json, created_at, execution_generation) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            f"cmp_{uuid4().hex}",
+                            claim.case_id,
+                            comparison_type,
+                            row["payload_json"],
+                            adopted_at.isoformat(),
+                            claim.generation,
+                        ),
+                    )
+            connection.execute(
+                "UPDATE review_requests SET execution_generation = ? WHERE review_id = ("
+                "SELECT review_id FROM review_requests WHERE case_id = ? "
+                "ORDER BY sequence DESC LIMIT 1)",
+                (claim.generation, claim.case_id),
+            )
+            connection.commit()
+
+    def save_review(self, review: ReviewRequest, claim: ExecutionClaim) -> ReviewRequest:
         """Persist the next review cycle for the case and return it with its sequence.
 
         The UNIQUE(case_id, sequence) index turns a concurrent double-insert into a
@@ -542,6 +795,11 @@ class WorkflowStore:
         """
 
         with connect_database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            written_at = datetime.now(UTC)
+            self._require_current_claim(connection, claim, written_at)
+            if claim.case_id != review.case_id:
+                self._raise_stale_execution_claim(claim)
             row = connection.execute(
                 "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM review_requests "
                 "WHERE case_id = ?",
@@ -550,8 +808,8 @@ class WorkflowStore:
             sequenced = review.model_copy(update={"sequence": int(row["sequence"]) + 1}, deep=True)
             connection.execute(
                 "INSERT INTO review_requests("
-                "review_id, case_id, sequence, status, payload_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "review_id, case_id, sequence, status, payload_json, created_at, "
+                "execution_generation) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     sequenced.review_id,
                     sequenced.case_id,
@@ -559,6 +817,7 @@ class WorkflowStore:
                     sequenced.status,
                     sequenced.model_dump_json(),
                     sequenced.created_at.isoformat(),
+                    claim.generation,
                 ),
             )
             connection.commit()
@@ -588,6 +847,18 @@ class WorkflowStore:
             ).fetchone()
         return ReviewRequest.model_validate_json(row["payload_json"]) if row else None
 
+    def load_current_review(self, claim: ExecutionClaim) -> ReviewRequest | None:
+        """Return only the latest review owned by the current unexpired generation."""
+
+        with connect_database(self.path, read_only=True) as connection:
+            self._begin_current_read(connection, claim)
+            row = connection.execute(
+                "SELECT payload_json FROM review_requests WHERE case_id = ? "
+                "AND execution_generation = ? ORDER BY sequence DESC LIMIT 1",
+                (claim.case_id, claim.generation),
+            ).fetchone()
+        return ReviewRequest.model_validate_json(row["payload_json"]) if row else None
+
     def list_reviews(self, pending_only: bool = True) -> list[ReviewRequest]:
         sql = "SELECT payload_json FROM review_requests"
         params: tuple[str, ...] = ()
@@ -613,16 +884,12 @@ class WorkflowStore:
             return None
         return _resolved_human_decision_replay(review, decision)
 
-    def save_human_decision(
-        self, decision: HumanDecision, inventory_db: Path
-    ) -> ReviewRequest:
+    def save_human_decision(self, decision: HumanDecision, inventory_db: Path) -> ReviewRequest:
         """Atomically commit a validated decision and its aliases across both DB files."""
 
         with connect_database(self.path) as connection:
             # ATTACH accepts a bound filename expression; never interpolate a path into SQL.
-            connection.execute(
-                "ATTACH DATABASE ? AS inventory_db", (str(inventory_db.resolve()),)
-            )
+            connection.execute("ATTACH DATABASE ? AS inventory_db", (str(inventory_db.resolve()),))
             modes = {
                 "workflow": str(connection.execute("PRAGMA main.journal_mode").fetchone()[0]),
                 "inventory": str(
@@ -711,9 +978,32 @@ class WorkflowStore:
     ) -> None:
         if claim.case_id != case_id:
             self._raise_stale_execution_claim(claim)
-        written_at = now_iso()
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            written_at = datetime.now(UTC).isoformat()
+            self._require_current_claim(connection, claim, datetime.fromisoformat(written_at))
+            paid = connection.execute(
+                "SELECT 1 FROM payments WHERE case_id = ? AND status = 'PAID' LIMIT 1",
+                (case_id,),
+            ).fetchone()
+            if paid is not None:
+                connection.rollback()
+                raise InvoiceAgentsError(
+                    ErrorCategory.PAYMENT,
+                    f"paid case {case_id} has an immutable final decision",
+                    case_id=case_id,
+                    stop_reason="PAID_FINAL_DECISION_IMMUTABLE",
+                )
+            missing = self._missing_generation_evidence(connection, case_id, claim.generation)
+            if missing:
+                connection.rollback()
+                raise InvoiceAgentsError(
+                    ErrorCategory.DATABASE,
+                    f"final decision requires current-generation evidence: {missing}",
+                    case_id=case_id,
+                    stop_reason="EVIDENCE_GENERATION_MISMATCH",
+                    details={"missing_or_stale": missing},
+                )
             updated = connection.execute(
                 "INSERT INTO final_decisions("
                 "decision_id, case_id, payload_json, created_at, decision_generation) "
@@ -752,14 +1042,24 @@ class WorkflowStore:
             ).fetchone()
         return FinalDecision.model_validate_json(row["payload_json"]) if row else None
 
-    def save_team_state(
-        self, case_id: str, state: dict[str, Any], claim: ExecutionClaim
-    ) -> None:
+    def load_current_final_decision(self, claim: ExecutionClaim) -> FinalDecision | None:
+        """Return only a final decision owned by the current unexpired generation."""
+
+        with connect_database(self.path, read_only=True) as connection:
+            self._begin_current_read(connection, claim)
+            row = connection.execute(
+                "SELECT payload_json FROM final_decisions WHERE case_id = ? "
+                "AND decision_generation = ?",
+                (claim.case_id, claim.generation),
+            ).fetchone()
+        return FinalDecision.model_validate_json(row["payload_json"]) if row else None
+
+    def save_team_state(self, case_id: str, state: dict[str, Any], claim: ExecutionClaim) -> None:
         if claim.case_id != case_id:
             self._raise_stale_execution_claim(claim)
-        written_at = now_iso()
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            written_at = datetime.now(UTC).isoformat()
             updated = connection.execute(
                 "UPDATE cases SET team_state_json = ?, updated_at = ? WHERE case_id = ? "
                 "AND execution_token = ? AND execution_generation = ? "
@@ -795,9 +1095,9 @@ class WorkflowStore:
     def finish_case(self, result: CaseResult, claim: ExecutionClaim) -> None:
         if claim.case_id != result.case_id:
             self._raise_stale_execution_claim(claim)
-        written_at = now_iso()
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            written_at = datetime.now(UTC).isoformat()
             updated = connection.execute(
                 "UPDATE cases SET status = ?, stop_reason = ?, result_json = ?, updated_at = ?, "
                 "finished_at = ?, execution_state = 'FINISHED', lease_expires_at = NULL "
@@ -819,6 +1119,51 @@ class WorkflowStore:
                 connection.rollback()
                 self._raise_stale_execution_claim(claim)
             connection.commit()
+
+    @staticmethod
+    def _missing_generation_evidence(
+        connection: sqlite3.Connection, case_id: str, generation: int
+    ) -> list[str]:
+        required = {
+            "extraction": (
+                "SELECT execution_generation FROM extractions WHERE case_id = ? "
+                "ORDER BY version DESC LIMIT 1",
+                (case_id,),
+            ),
+            "identity": (
+                "SELECT execution_generation FROM identity_results WHERE case_id = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (case_id,),
+            ),
+            "inventory": (
+                "SELECT execution_generation FROM comparison_results WHERE case_id = ? "
+                "AND comparison_type = 'inventory' ORDER BY created_at DESC LIMIT 1",
+                (case_id,),
+            ),
+            "risk": (
+                "SELECT execution_generation FROM comparison_results WHERE case_id = ? "
+                "AND comparison_type = 'risk' ORDER BY created_at DESC LIMIT 1",
+                (case_id,),
+            ),
+            "critique": (
+                "SELECT execution_generation FROM critique_results WHERE case_id = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (case_id,),
+            ),
+        }
+        missing: list[str] = []
+        for name, (sql, parameters) in required.items():
+            row = connection.execute(sql, parameters).fetchone()
+            if row is None or int(row["execution_generation"]) != generation:
+                missing.append(name)
+        review = connection.execute(
+            "SELECT execution_generation FROM review_requests WHERE case_id = ? "
+            "ORDER BY sequence DESC LIMIT 1",
+            (case_id,),
+        ).fetchone()
+        if review is not None and int(review["execution_generation"]) != generation:
+            missing.append("review")
+        return missing
 
     def load_result(self, case_id: str) -> CaseResult | None:
         with connect_database(self.path, read_only=True) as connection:
@@ -863,15 +1208,28 @@ class WorkflowStore:
         record_id: str,
         case_id: str,
         payload: Any,
+        claim: ExecutionClaim,
     ) -> None:
         allowed = {"identity_results", "critique_results"}
         if table not in allowed:
             raise ValueError(f"unsupported payload table: {table}")
+        if claim.case_id != case_id:
+            self._raise_stale_execution_claim(claim)
         with connect_database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            written_at = datetime.now(UTC)
+            self._require_current_claim(connection, claim, written_at)
             connection.execute(
-                f"INSERT INTO {table}({id_column}, case_id, payload_json, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (record_id, case_id, encode(payload), now_iso()),
+                f"INSERT INTO {table}("
+                f"{id_column}, case_id, payload_json, created_at, execution_generation) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    record_id,
+                    case_id,
+                    encode(payload),
+                    written_at.isoformat(),
+                    claim.generation,
+                ),
             )
             connection.commit()
 
@@ -886,3 +1244,22 @@ class WorkflowStore:
                 (case_id,),
             ).fetchone()
         return json.loads(row["payload_json"]) if row else []
+
+    def _load_current_payload(self, table: str, claim: ExecutionClaim) -> Any:
+        allowed = {"identity_results", "critique_results"}
+        if table not in allowed:
+            raise ValueError(f"unsupported payload table: {table}")
+        with connect_database(self.path, read_only=True) as connection:
+            self._begin_current_read(connection, claim)
+            row = connection.execute(
+                f"SELECT payload_json FROM {table} WHERE case_id = ? "
+                "AND execution_generation = ? ORDER BY created_at DESC LIMIT 1",
+                (claim.case_id, claim.generation),
+            ).fetchone()
+        return json.loads(row["payload_json"]) if row else []
+
+    def _begin_current_read(self, connection: sqlite3.Connection, claim: ExecutionClaim) -> None:
+        """Pin a read snapshot after proving the claim is current in that snapshot."""
+
+        connection.execute("BEGIN")
+        self._require_current_claim(connection, claim, datetime.now(UTC))

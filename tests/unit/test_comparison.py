@@ -6,7 +6,13 @@ from pathlib import Path
 
 from invoice_agents.config import Settings
 from invoice_agents.db.store import WorkflowStore
-from invoice_agents.models import IdentityRelationship, InventoryStatus, ToolStatus
+from invoice_agents.models import (
+    CaseStatus,
+    ExtractedInvoice,
+    IdentityRelationship,
+    InventoryStatus,
+    ToolStatus,
+)
 from invoice_agents.source_store import snapshot_source
 from invoice_agents.tools.comparison import (
     InventoryReader,
@@ -21,6 +27,16 @@ from invoice_agents.tools.evidence import extract_invoice_evidence
 def invoice(invoice_dir: Path, name: str, archive: Path):  # type: ignore[no-untyped-def]
     source = snapshot_source(invoice_dir / name, archive, max_bytes=10_485_760)
     return extract_invoice_evidence(source)
+
+
+def persist_extraction(store: WorkflowStore, case_id: str, extracted: ExtractedInvoice) -> None:
+    store.register_source(extracted.source)
+    store.create_case(case_id, extracted.source, datetime.now(UTC))
+    claim = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    store.save_extraction(case_id, extracted, claim)
+    store.release_case_execution(claim)
 
 
 def test_stock_excess_unknown_and_negative(
@@ -99,24 +115,16 @@ def test_identity_representation_and_revision(
 ) -> None:
     store = WorkflowStore(workflow_db)
     first = invoice(invoice_dir, "invoice_1011.txt", tmp_path / "sources")
-    store.register_source(first.source)
-    store.create_case("case_first", first.source, datetime.now(UTC))
-    store.save_extraction("case_first", first)
+    persist_extraction(store, "case_first", first)
     second = invoice(invoice_dir, "invoice_1011.pdf", tmp_path / "sources")
-    store.register_source(second.source)
-    store.create_case("case_second", second.source, datetime.now(UTC))
-    store.save_extraction("case_second", second)
+    persist_extraction(store, "case_second", second)
     candidates = find_prior_invoice_candidates("case_second", second, store)
     assert candidates[0].relationship is IdentityRelationship.DUPLICATE_REPRESENTATION
 
     original = invoice(invoice_dir, "invoice_1004.json", tmp_path / "sources")
-    store.register_source(original.source)
-    store.create_case("case_original", original.source, datetime.now(UTC))
-    store.save_extraction("case_original", original)
+    persist_extraction(store, "case_original", original)
     revised = invoice(invoice_dir, "invoice_1004_revised.json", tmp_path / "sources")
-    store.register_source(revised.source)
-    store.create_case("case_revised", revised.source, datetime.now(UTC))
-    store.save_extraction("case_revised", revised)
+    persist_extraction(store, "case_revised", revised)
     revision_candidates = find_prior_invoice_candidates("case_revised", revised, store)
     assert any(
         candidate.relationship is IdentityRelationship.POSSIBLE_REVISION
