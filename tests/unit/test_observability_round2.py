@@ -5,12 +5,14 @@ from __future__ import annotations
 import io
 import json
 import logging
+import math
 
 import pytest
 
 from invoice_agents import orchestration
 from invoice_agents.db.core import connect_database
 from invoice_agents.errors import InvoiceAgentsError
+from invoice_agents.observability import audit as audit_module
 from invoice_agents.observability.audit import (
     AuditRecorder,
     RedactingFilter,
@@ -210,3 +212,94 @@ def test_live_autogen_wrong_shape_is_not_copied_to_an_audit_row(workflow_db: obj
         "type": "ToolCallRequestEvent",
     }
     assert "round2-live-body" not in row["payload_json"]
+
+
+@pytest.mark.parametrize("mark", ["\u0301", "\u0903", "\u20dd"])
+def test_combining_marks_cannot_split_credential_markers_or_sensitive_keys(mark: str) -> None:
+    token_marker = "abcdefgh_12345678"
+    text = sanitize_text(f"provider rejected s{mark}k-{token_marker}")
+
+    assert text == "provider rejected [REDACTED]"
+    assert token_marker not in text
+    assert redact({f"api{mark}_key": "round3-map-canary"}) == {f"api{mark}_key": "[REDACTED]"}
+    with pytest.raises(InvoiceAgentsError) as failure:
+        orchestration._validated_tool_call_ids([f"call_s{mark}k-{token_marker}"], "case_round3")
+    assert failure.value.stop_reason == "TOOL_CALL_ID_INVALID"
+
+
+def test_control_split_and_complete_quoted_credential_values_are_redacted() -> None:
+    markers = (
+        "round3-control-canary",
+        "round3 double quoted canary",
+        "round3 single quoted canary",
+        "round3 unterminated canary",
+    )
+    cleaned = sanitize_text(
+        f"api\n_key={markers[0]}\n"
+        f'api_key="{markers[1]}"\n'
+        f"client_secret='{markers[2]}'\n"
+        f'auth_token="{markers[3]}'
+    )
+
+    for marker in markers:
+        assert marker not in cleaned
+    assert cleaned.count("[REDACTED]") == len(markers)
+
+
+def test_unrelated_decomposed_unicode_is_preserved_exactly() -> None:
+    ordinary = "Résumé हिंदी العربية 日本語 cafe\u0301"
+
+    assert sanitize_text(ordinary) == ordinary
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"safe":1e309}',
+        '{"safe":-0}',
+        '{"safe":1e0}',
+        ' {"safe":1}',
+        '{"safe":1} ',
+    ],
+)
+def test_nonfinite_or_noncanonical_json_numbers_and_outer_space_are_opaque(raw: str) -> None:
+    assert sanitize_json_text(raw) == REJECTED_JSON
+
+
+def test_valid_finite_json_numbers_remain_structured() -> None:
+    assert json.loads(sanitize_json_text('{"count":1,"ratio":1.5}')) == {
+        "count": 1,
+        "ratio": 1.5,
+    }
+
+
+def test_overdeep_json_is_rejected_before_calling_json_parser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = '{"safe":' + ("[" * 21) + "0" + ("]" * 21) + "}"
+
+    def forbidden_loads(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("overdeep JSON reached json.loads")
+
+    monkeypatch.setattr(audit_module.json, "loads", forbidden_loads)
+
+    assert sanitize_json_text(raw) == REJECTED_JSON
+
+
+def test_nonfinite_python_values_never_serialize_as_json_constants(workflow_db: object) -> None:
+    assert redact({"safe": math.inf}) == {"safe": "[VALUE_REJECTED]"}
+
+    recorder = AuditRecorder(workflow_db, "case_round3_nonfinite")
+    recorder.record("autogen.ToolCallRequestEvent", {"safe": math.inf})
+
+    with connect_database(workflow_db, read_only=True) as connection:
+        row = connection.execute(
+            "SELECT payload_json FROM events WHERE case_id = ?",
+            ("case_round3_nonfinite",),
+        ).fetchone()
+    assert row is not None
+    assert json.loads(row["payload_json"]) == {
+        "error": REJECTED_EVENT,
+        "type": "ToolCallRequestEvent",
+    }
+    assert "Infinity" not in row["payload_json"]

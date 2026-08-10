@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import traceback
 import unicodedata
@@ -95,11 +96,123 @@ _CURRENT_AUDIT: ContextVar[AuditRecorder | None] = ContextVar(
     "invoice_agents_current_audit", default=None
 )
 
+_DETECTION_JOINER = "\ufff0"
+_DETECTION_JOINER_PATTERN = rf"[\t\r\n{_DETECTION_JOINER}]"
+_DETECTION_GAP = rf"(?:[ ]|{_DETECTION_JOINER_PATTERN})*"
+
+
+def _flexible_identifier(value: str) -> str:
+    components = [r"[-_]" if character == "_" else re.escape(character) for character in value]
+    return f"{_DETECTION_JOINER_PATTERN}*".join(components)
+
+
+_FLEXIBLE_CREDENTIAL_KEY = (
+    "(?:"
+    + "|".join(_flexible_identifier(key) for key in sorted(SENSITIVE_KEYS, key=len, reverse=True))
+    + ")"
+)
+_FLEXIBLE_AUTHORIZATION_KEY = (
+    "(?:"
+    + "|".join(_flexible_identifier(key) for key in ("proxy_authorization", "authorization"))
+    + ")"
+)
+_FLEXIBLE_COOKIE_KEY = (
+    "(?:" + "|".join(_flexible_identifier(key) for key in ("set_cookie", "cookie")) + ")"
+)
+FLEXIBLE_DOUBLE_QUOTED_CREDENTIAL = re.compile(
+    rf"(?i)(?P<prefix>(?<![A-Za-z0-9-]){_FLEXIBLE_CREDENTIAL_KEY}"
+    rf'["\']?{_DETECTION_GAP}[:=]{_DETECTION_GAP}")'
+    r'(?P<value>(?:\\.|[^"\\\r\n])*)(?:"|$|(?=\r?\n))'
+)
+FLEXIBLE_SINGLE_QUOTED_CREDENTIAL = re.compile(
+    rf"(?i)(?P<prefix>(?<![A-Za-z0-9-]){_FLEXIBLE_CREDENTIAL_KEY}"
+    rf"[\"']?{_DETECTION_GAP}[:=]{_DETECTION_GAP}')"
+    r"(?P<value>(?:\\.|[^'\\\r\n])*)(?:'|$|(?=\r?\n))"
+)
+FLEXIBLE_UNQUOTED_CREDENTIAL = re.compile(
+    rf"(?i)(?P<prefix>(?<![A-Za-z0-9-]){_FLEXIBLE_CREDENTIAL_KEY}"
+    rf"[\"']?{_DETECTION_GAP}[:=]{_DETECTION_GAP})(?![\"'])"
+    r"(?P<value>[^\r\n,}\]]+)"
+)
+FLEXIBLE_AUTHORIZATION_HEADER = re.compile(
+    rf"(?i)(?P<prefix>(?<![A-Za-z0-9-]){_FLEXIBLE_AUTHORIZATION_KEY}"
+    rf"{_DETECTION_GAP}:{_DETECTION_GAP})"
+    r"(?P<value>[^\r\n]*(?:(?:\r(?!\n)[^\r\n]*)|(?:\r?\n(?:[ \t]+|"
+    r"(?:bearer|basic|digest|token)\b)[^\r\n]*))*)"
+)
+FLEXIBLE_COOKIE_HEADER = re.compile(
+    rf"(?i)(?P<prefix>(?<![A-Za-z0-9-]){_FLEXIBLE_COOKIE_KEY}"
+    rf"{_DETECTION_GAP}:{_DETECTION_GAP})"
+    r"(?P<value>[^\r\n]*(?:\r?\n[ \t]+(?![A-Za-z0-9-]+[ \t]*:)[^\r\n]*)*)"
+)
+FLEXIBLE_BEARER_VALUE = re.compile(
+    rf"(?i)(?P<prefix>(?<![A-Za-z0-9-]){_flexible_identifier('bearer')}"
+    rf"(?:[ ]|{_DETECTION_JOINER_PATTERN})+)"
+    r"(?P<value>[A-Za-z0-9._~+/=-]+)"
+)
+FLEXIBLE_PROVIDER_CREDENTIAL = re.compile(
+    rf"(?i)(?<![A-Za-z0-9-])(?:{_flexible_identifier('xai')}|"
+    rf"{_flexible_identifier('sk')})(?:{_DETECTION_JOINER_PATTERN}*[-]"
+    rf"{_DETECTION_JOINER_PATTERN}*{_flexible_identifier('proj')})?"
+    rf"{_DETECTION_JOINER_PATTERN}*[-]{_DETECTION_JOINER_PATTERN}*"
+    rf"[A-Za-z0-9_-](?:{_DETECTION_JOINER_PATTERN}*[A-Za-z0-9_-]){{7,}}"
+)
+
+
+def _credential_detection_projection(value: str) -> tuple[str, list[int]]:
+    """Normalize only the detection view while retaining source-span indexes."""
+
+    projected: list[str] = []
+    source_indexes: list[int] = []
+    for source_index, character in enumerate(value):
+        if unicodedata.category(character) in {"Mn", "Mc", "Me"}:
+            normalized = _DETECTION_JOINER
+        else:
+            normalized = unicodedata.normalize("NFKC", character).casefold()
+        for normalized_character in normalized:
+            projected.append(normalized_character)
+            source_indexes.append(source_index)
+    return "".join(projected), source_indexes
+
+
+def _redact_projected_spans(
+    value: str,
+    pattern: re.Pattern[str],
+    *,
+    group: str | int = 0,
+) -> str:
+    projected, source_indexes = _credential_detection_projection(value)
+    spans: list[tuple[int, int]] = []
+    for match in pattern.finditer(projected):
+        projected_start, projected_end = match.span(group)
+        if projected_start == projected_end:
+            continue
+        spans.append(
+            (
+                source_indexes[projected_start],
+                source_indexes[projected_end - 1] + 1,
+            )
+        )
+    for source_start, source_end in reversed(spans):
+        value = f"{value[:source_start]}[REDACTED]{value[source_end:]}"
+    return value
+
 
 def _redact_text_patterns(value: str) -> str:
+    span_safe = value
+    for pattern in (
+        FLEXIBLE_DOUBLE_QUOTED_CREDENTIAL,
+        FLEXIBLE_SINGLE_QUOTED_CREDENTIAL,
+        FLEXIBLE_UNQUOTED_CREDENTIAL,
+        FLEXIBLE_AUTHORIZATION_HEADER,
+        FLEXIBLE_COOKIE_HEADER,
+        FLEXIBLE_BEARER_VALUE,
+    ):
+        span_safe = _redact_projected_spans(span_safe, pattern, group="value")
+    span_safe = _redact_projected_spans(span_safe, FLEXIBLE_PROVIDER_CREDENTIAL)
     double_cookie_safe = DOUBLE_QUOTED_COOKIE_FIELD_VALUE.sub(
         lambda match: f"{match.group('prefix')}[REDACTED]{match.group('suffix')}",
-        value,
+        span_safe,
     )
     quoted_cookie_safe = SINGLE_QUOTED_COOKIE_FIELD_VALUE.sub(
         lambda match: f"{match.group('prefix')}[REDACTED]{match.group('suffix')}",
@@ -184,7 +297,13 @@ def safe_provider_request_id(value: object) -> str | None:
 
 def _normalized_key(value: str) -> str:
     safe = _normalize_lines(_strip_unsafe_controls(value))
-    return unicodedata.normalize("NFKC", safe).casefold().replace("-", "_")
+    detection_key = "".join(
+        character
+        for character in safe
+        if unicodedata.category(character) not in {"Mn", "Mc", "Me"}
+        and character not in {"\t", "\n", "\r"}
+    )
+    return unicodedata.normalize("NFKC", detection_key).casefold().replace("-", "_")
 
 
 def _is_sensitive_key(value: str) -> bool:
@@ -212,6 +331,8 @@ def _redact(value: Any, *, depth: int, budget: list[int]) -> Any:
         return sanitize_text(bytes(value).decode("utf-8", errors="replace"))
     if isinstance(value, Sequence):
         return [_redact(item, depth=depth + 1, budget=budget) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return VALUE_REJECTED
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return sanitize_text(str(value))
@@ -236,14 +357,54 @@ def _reject_json_constant(_value: str) -> object:
     raise ValueError("non-finite JSON number")
 
 
+def _canonical_json_int(value: str) -> int:
+    parsed = int(value)
+    if json.dumps(parsed, allow_nan=False) != value:
+        raise ValueError("non-canonical JSON integer")
+    return parsed
+
+
+def _canonical_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or json.dumps(parsed, allow_nan=False) != value:
+        raise ValueError("non-canonical JSON float")
+    return parsed
+
+
+def _reject_excessive_json_nesting(value: str) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "{[":
+            depth += 1
+            if depth > JSON_MAX_DEPTH + 1:
+                raise ValueError("JSON nesting exceeds the audit boundary")
+        elif character in "}]":
+            depth -= 1
+
+
 def _bounded_json_mapping(value: str) -> dict[str, object]:
-    if len(value) > JSON_TEXT_MAX_CHARS:
+    if len(value) > JSON_TEXT_MAX_CHARS or value != value.strip():
         raise ValueError("JSON text exceeds the audit boundary")
+    _reject_excessive_json_nesting(value)
     try:
         parsed = json.loads(
             value,
             object_pairs_hook=_strict_json_object,
             parse_constant=_reject_json_constant,
+            parse_float=_canonical_json_float,
+            parse_int=_canonical_json_int,
         )
     except RecursionError as exc:
         raise ValueError("JSON nesting exceeds the parser boundary") from exc
@@ -277,7 +438,11 @@ def _json_value_within_limits(value: object) -> bool:
         if isinstance(item, str):
             character_budget[0] += len(item)
             return character_budget[0] <= JSON_TEXT_MAX_CHARS
-        return item is None or type(item) in {str, bool, int, float}
+        return (
+            item is None
+            or type(item) in {str, bool, int}
+            or (type(item) is float and math.isfinite(item))
+        )
 
     return visit(value, 0)
 
@@ -307,6 +472,7 @@ def sanitize_json_text(value: str) -> str:
         return _rejected_json_payload()
     return json.dumps(
         redact(parsed),
+        allow_nan=False,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -400,6 +566,7 @@ def sanitize_stored_event_payload(event_type: str, value: str) -> str:
         )
     return json.dumps(
         safe_payload,
+        allow_nan=False,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -523,7 +690,13 @@ class AuditRecorder:
             )
         else:
             safe_payload = redact(payload)
-        encoded = json.dumps(safe_payload, default=str, ensure_ascii=False, sort_keys=True)
+        encoded = json.dumps(
+            safe_payload,
+            allow_nan=False,
+            default=str,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
         sanitized_provider_request_id = safe_provider_request_id(provider_request_id)
         created_at = datetime.now(UTC).isoformat()
         with self.tracer.start_as_current_span(event_type) as span:

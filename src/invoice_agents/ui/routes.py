@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -53,6 +54,7 @@ UPLOAD_DIR_NAME = "uploads"
 SUPPORTED_SUFFIXES = {".txt", ".json", ".csv", ".xml", ".pdf"}
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 RESULT_ARTIFACT_MAX_BYTES = 1_048_576
+RESULT_ARTIFACT_MAX_DEPTH = 64
 
 # One-line consequence per HumanDecisionKind, matching decision_rules exactly:
 # an authorizing decision permits APPROVE (or HOLD when blocking evidence remains),
@@ -189,7 +191,7 @@ def _read_exact_bound_result_artifact(
             return None
         artifact_descriptor = os.open(
             target_name,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
             dir_fd=directory_descriptor,
         )
         opened_identity = os.fstat(artifact_descriptor)
@@ -290,12 +292,44 @@ def _reject_result_constant(_value: str) -> object:
     raise ValueError("non-finite result artifact number")
 
 
+def _finite_result_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("non-finite result artifact number")
+    return parsed
+
+
+def _reject_excessive_result_nesting(value: str) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "{[":
+            depth += 1
+            if depth > RESULT_ARTIFACT_MAX_DEPTH:
+                raise ValueError("result artifact nesting exceeds the parser boundary")
+        elif character in "}]":
+            depth -= 1
+
+
 def _decode_canonical_result_artifact(raw: bytes) -> CaseResult:
     text = raw.decode("utf-8", errors="strict")
+    _reject_excessive_result_nesting(text)
     payload = json.loads(
         text,
         object_pairs_hook=_strict_result_object,
         parse_constant=_reject_result_constant,
+        parse_float=_finite_result_float,
     )
     if type(payload) is not dict:
         raise ValueError("result artifact is not an object")
@@ -468,7 +502,7 @@ async def case_result_json(request: Request, case_id: str) -> Response:
         return _artifact_binding_conflict(result)
     try:
         artifact = _decode_canonical_result_artifact(payload)
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (RecursionError, TypeError, ValueError):
         return _invalid_result_artifact(request, case_id)
     authoritative = sanitize_case_result(result)
     if artifact.case_id != case_id or artifact != authoritative:
