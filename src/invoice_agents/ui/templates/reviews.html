@@ -35,8 +35,8 @@
       {% for review in reviews %}
       {% set age_seconds = (now_utc - review.created_at).total_seconds() %}
       {% set aging = review.status == 'PENDING' and age_seconds > age_amber_hours * 3600 %}
-      <tr data-href="/reviews/{{ review.review_id }}" tabindex="0">
-        <th scope="row"><a class="mono" href="/reviews/{{ review.review_id }}">{{ review.review_id|middle }}</a></th>
+      <tr data-href="/reviews/{{ review.review_id }}">
+        <th scope="row"><a class="mono" href="/reviews/{{ review.review_id }}" data-row-link>{{ review.review_id|middle }}</a></th>
         <td><a class="mono" href="/cases/{{ review.case_id }}">{{ review.case_id|middle }}</a></td>
         <td class="num">{{ review.sequence }}</td>
         <td class="num">{% if review.amount %}{{ m.money(review.amount.amount, review.amount.currency) }}{% else %}<span class="dim">-</span>{% endif %}</td>

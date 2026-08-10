@@ -20,7 +20,7 @@
         <th scope="row" class="mono small">{{ row.entry.path.name }}</th>
         <td>
           {% if row.header %}
-            <a class="mono small" href="/cases/{{ row.entry.case_id }}">{{ row.entry.case_id|middle }}</a>
+            <a class="mono small" href="/cases/{{ row.entry.case_id }}" data-row-link>{{ row.entry.case_id|middle }}</a>
           {% else %}
             <span class="dim small" title="preparation failed before a case row could be persisted">{{ row.entry.case_id|middle }}</span>
           {% endif %}

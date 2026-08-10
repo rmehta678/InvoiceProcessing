@@ -16,6 +16,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl
 
 import pytest
 from factories import make_pending_review_case, make_succeeded_case
@@ -60,7 +61,7 @@ def server_url(
     ) -> CaseResult:
         assert claim is not None
         store = WorkflowStore(run_settings.workflow_db)
-        invoice = store.load_extraction(case_id)
+        invoice = store.load_current_extraction(claim)
         result = CaseResult(
             case_id=case_id,
             source_id=invoice.source.source_id,
@@ -134,6 +135,70 @@ def page(server_url: str) -> Iterator[Any]:
         browser.close()
 
 
+def _csrf_diagnostics(
+    page: Any,
+    server_url: str,
+    request: Any,
+    hidden_tokens: list[str],
+) -> dict[str, Any]:
+    """Describe CSRF metadata without exposing cookie or token values."""
+
+    headers = request.all_headers()
+    content_type = headers.get("content-type", "")
+    post_data = request.post_data or ""
+    if content_type.startswith("application/x-www-form-urlencoded"):
+        posted_tokens = [value for name, value in parse_qsl(post_data) if name == "csrf_token"]
+    else:
+        marker = 'name="csrf_token"\r\n\r\n'
+        posted_tokens = [part.split("\r\n", 1)[0] for part in post_data.split(marker)[1:]]
+    session_cookies = [
+        cookie
+        for cookie in page.context.cookies([server_url])
+        if cookie["name"] == "galatiq_session"
+    ]
+    cookie_metadata = [
+        {
+            "name": cookie["name"],
+            "domain": cookie["domain"],
+            "path": cookie["path"],
+            "sameSite": cookie["sameSite"],
+            "secure": cookie["secure"],
+        }
+        for cookie in session_cookies
+    ]
+    combined_token_count = len(posted_tokens) + int("x-csrf-token" in headers)
+    posted_tokens_match_hidden = (
+        len(posted_tokens) == 1
+        and posted_tokens[0] in hidden_tokens
+        and len(set(hidden_tokens)) == 1
+    )
+    origin = headers.get("origin")
+    referer = headers.get("referer")
+    if origin != server_url and not (origin is None and referer and referer.startswith(server_url)):
+        inferred_reject = "strict same-origin metadata"
+    elif "galatiq_session=" not in headers.get("cookie", ""):
+        inferred_reject = "signed session cookie absent from request"
+    elif combined_token_count != 1:
+        inferred_reject = "submitted CSRF token multiplicity"
+    elif not posted_tokens_match_hidden:
+        inferred_reject = "submitted CSRF token differs from rendered token"
+    else:
+        inferred_reject = "session signature or server-side token validation"
+    return {
+        "origin": origin,
+        "referer": referer,
+        "host": headers.get("host"),
+        "content_type": content_type,
+        "hidden_token_count": len(hidden_tokens),
+        "posted_csrf_field_count": len(posted_tokens),
+        "csrf_header_present": "x-csrf-token" in headers,
+        "posted_tokens_match_hidden": posted_tokens_match_hidden,
+        "request_session_cookie_present": "galatiq_session=" in headers.get("cookie", ""),
+        "session_cookies": cookie_metadata,
+        "inferred_reject": inferred_reject,
+    }
+
+
 def test_u0_dashboard_and_case_detail_render_stored_state(
     page: Any, server_url: str, settings: Settings
 ) -> None:
@@ -151,12 +216,29 @@ def test_u0_dashboard_and_case_detail_render_stored_state(
 def test_u1_decide_reject_and_resume_in_browser(
     page: Any, server_url: str, settings: Settings
 ) -> None:
+    console_messages: list[str] = []
+    page.on("console", lambda message: console_messages.append(f"{message.type}: {message.text}"))
     case_id, review = make_pending_review_case(settings)
     page.goto(f"{server_url}/reviews/{review.review_id}")
+    hidden_tokens = page.locator("input[name='csrf_token']").evaluate_all(
+        "nodes => nodes.map(node => node.value)"
+    )
     page.fill("#reviewer", "vp@example.com")
     page.check("input[name='decision'][value='REJECT']")
     page.fill("#reason", "Requested quantity is not authorized.")
-    page.click("button:has-text('Record decision')")
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "POST"
+            and response.url.endswith(f"/reviews/{review.review_id}/decision")
+        )
+    ) as post_info:
+        page.click("button:has-text('Record decision')")
+    post = post_info.value
+    assert post.status == 303, (
+        f"decision POST status={post.status} final_url={page.url!r} "
+        f"body={post.text()[:1000]!r} console={console_messages!r} "
+        f"csrf={_csrf_diagnostics(page, server_url, post.request, hidden_tokens)!r}"
+    )
     page.wait_for_url("**?decided=1")
     assert "Decision recorded." in page.content()
     stored = WorkflowStore(settings.workflow_db).load_review(review.review_id)
@@ -174,17 +256,25 @@ def test_u1_decide_reject_and_resume_in_browser(
 def test_u2_submit_from_browser_reaches_terminal_banner(
     page: Any, server_url: str, settings: Settings
 ) -> None:
+    console_messages: list[str] = []
+    page.on("console", lambda message: console_messages.append(f"{message.type}: {message.text}"))
     loaded = page.goto(server_url + "/submit")
     assert loaded is not None
+    hidden_tokens = page.locator("input[name='csrf_token']").evaluate_all(
+        "nodes => nodes.map(node => node.value)"
+    )
     page.check("input[name='existing'][value='invoice_1001.txt']")
-    with page.expect_request(
-        lambda request: request.method == "POST" and request.url == server_url + "/submit"
-    ) as submitted_request:
+    with page.expect_response(
+        lambda response: response.request.method == "POST" and response.url.endswith("/submit")
+    ) as post_info:
         page.click("button:has-text('Process invoice')")
-    submitted_response = submitted_request.value.response()
-    assert submitted_response is not None
-    assert submitted_response.status == 303
-    request_headers = submitted_request.value.all_headers()
+    post = post_info.value
+    assert post.status == 303, (
+        f"submit POST status={post.status} final_url={page.url!r} "
+        f"body={post.text()[:1000]!r} console={console_messages!r} "
+        f"csrf={_csrf_diagnostics(page, server_url, post.request, hidden_tokens)!r}"
+    )
+    request_headers = post.request.all_headers()
     assert request_headers["origin"] == server_url
     assert request_headers["referer"] == server_url + "/submit"
     assert loaded.headers["referrer-policy"] == "same-origin"
@@ -225,3 +315,202 @@ def test_recovery_error_event_closes_eventsource_without_retry(
     assert "Execution recovery unavailable" in page.inner_text(".terminal-banner")
     page.wait_for_timeout(250)
     assert event_requests == 1
+
+
+def _assert_narrow_document_is_contained(page: Any) -> None:
+    dimensions = page.evaluate(
+        """() => ({
+          documentClientWidth: document.documentElement.clientWidth,
+          documentScrollWidth: document.documentElement.scrollWidth,
+          navLinksContained: Array.from(document.querySelectorAll('.topbar nav a')).every(
+            (link) => {
+              const rect = link.getBoundingClientRect();
+              return rect.left >= 0 && rect.right <= document.documentElement.clientWidth;
+            }
+          )
+        })"""
+    )
+    assert dimensions["documentScrollWidth"] == dimensions["documentClientWidth"]
+    assert dimensions["navLinksContained"] is True
+
+    table = page.locator(".table-wrap").first
+    table_dimensions = table.evaluate(
+        """(node) => ({
+          clientWidth: node.clientWidth,
+          scrollWidth: node.scrollWidth,
+          right: node.getBoundingClientRect().right,
+          documentClientWidth: document.documentElement.clientWidth
+        })"""
+    )
+    assert table_dimensions["right"] <= table_dimensions["documentClientWidth"]
+    assert table_dimensions["scrollWidth"] > table_dimensions["clientWidth"]
+
+
+def _tab_to_href(page: Any, href: str, *, limit: int = 40) -> None:
+    for _ in range(limit):
+        page.keyboard.press("Tab")
+        focused = page.evaluate(
+            """() => ({
+              tag: document.activeElement && document.activeElement.tagName,
+              href: document.activeElement && document.activeElement.getAttribute('href'),
+              rowLink: document.activeElement && document.activeElement.hasAttribute('data-row-link')
+            })"""
+        )
+        if focused["href"] == href:
+            assert focused == {"tag": "A", "href": href, "rowLink": True}
+            return
+    raise AssertionError(f"Tab did not reach semantic row link {href!r}")
+
+
+def test_320px_dashboard_and_reviews_contain_wide_tables_and_literal_statuses(
+    page: Any, server_url: str, settings: Settings
+) -> None:
+    make_succeeded_case(settings)
+    make_pending_review_case(settings)
+    page.set_viewport_size({"width": 320, "height": 720})
+
+    page.goto(server_url + "/")
+    _assert_narrow_document_is_contained(page)
+    assert page.locator("#case-table").get_by_text("SUCCEEDED", exact=True).is_visible()
+
+    page.goto(server_url + "/reviews")
+    _assert_narrow_document_is_contained(page)
+    assert page.locator("table.data").get_by_text("PENDING", exact=True).is_visible()
+
+
+def test_tab_and_enter_activate_case_and_review_row_links_natively(
+    page: Any, server_url: str, settings: Settings
+) -> None:
+    case_id = make_succeeded_case(settings)
+    _, review = make_pending_review_case(settings)
+
+    page.goto(server_url + "/")
+    case_href = f"/cases/{case_id}"
+    _tab_to_href(page, case_href)
+    page.keyboard.press("Enter")
+    page.wait_for_url(f"**{case_href}")
+
+    page.goto(server_url + "/reviews")
+    review_href = f"/reviews/{review.review_id}"
+    _tab_to_href(page, review_href)
+    page.keyboard.press("Enter")
+    page.wait_for_url(f"**{review_href}")
+
+
+def test_j_and_k_move_real_focus_between_row_links_before_native_enter(
+    page: Any, server_url: str, settings: Settings
+) -> None:
+    make_succeeded_case(settings, "invoice_1001.txt")
+    make_succeeded_case(settings, "invoice_1004.json")
+    page.goto(server_url + "/")
+    links = page.locator("#case-table tbody a[data-row-link]")
+    assert links.count() == 2
+    hrefs = [links.nth(index).get_attribute("href") for index in range(2)]
+
+    page.keyboard.press("j")
+    assert page.evaluate("document.activeElement.matches('a[data-row-link]')") is True
+    assert page.evaluate("document.activeElement.getAttribute('href')") == hrefs[0]
+    focus_style = links.nth(0).evaluate(
+        """(node) => ({
+          style: getComputedStyle(node).outlineStyle,
+          width: getComputedStyle(node).outlineWidth
+        })"""
+    )
+    assert focus_style["style"] != "none"
+    assert focus_style["width"] != "0px"
+
+    page.keyboard.press("j")
+    assert page.evaluate("document.activeElement.getAttribute('href')") == hrefs[1]
+    page.keyboard.press("k")
+    assert page.evaluate("document.activeElement.getAttribute('href')") == hrefs[0]
+
+    assert hrefs[0] is not None
+    page.keyboard.press("Enter")
+    page.wait_for_url(f"**{hrefs[0]}")
+
+
+def test_clicking_a_secondary_row_link_does_not_trigger_the_primary_row_link(
+    page: Any, server_url: str, settings: Settings
+) -> None:
+    case_id, review = make_pending_review_case(settings)
+    page.goto(server_url + "/reviews")
+
+    row = page.locator(f"tr[data-href='/reviews/{review.review_id}']")
+    row.locator(f"a[href='/cases/{case_id}']").click()
+
+    page.wait_for_url(f"**/cases/{case_id}")
+
+
+def test_row_click_never_synthesizes_its_primary_link_from_hostile_descendants(
+    page: Any, server_url: str, settings: Settings
+) -> None:
+    make_succeeded_case(settings)
+    page.goto(server_url + "/")
+    page.evaluate(
+        """() => {
+          const row = document.querySelector('#case-table tbody tr[data-href]');
+          const primary = row.querySelector('a[data-row-link]');
+          window.primaryRowLinkClicks = 0;
+          primary.addEventListener('click', (event) => {
+            window.primaryRowLinkClicks += 1;
+            event.preventDefault();
+          });
+
+          const cell = document.createElement('td');
+          cell.innerHTML = `
+            <a href="#secondary" data-hostile="anchor">secondary</a>
+            <button type="button" data-hostile="button">button</button>
+            <input type="text" data-hostile="input" value="input">
+            <select data-hostile="select"><option>option</option></select>
+            <textarea data-hostile="textarea">textarea</textarea>
+            <label data-hostile="label">label</label>
+            <form><span data-hostile="form-child">form child</span></form>
+            <details open>
+              <summary data-hostile="summary">summary</summary>
+              <span data-hostile="details-child">details child</span>
+            </details>
+            <audio controls data-hostile="audio"></audio>
+            <video controls data-hostile="video"></video>
+            <span contenteditable data-hostile="contenteditable-empty">editable empty</span>
+            <span contenteditable="plaintext-only" data-hostile="contenteditable-plaintext">editable text</span>
+            <span contenteditable="false" data-hostile="contenteditable-false">editable attribute</span>
+            <span tabindex="-1" data-hostile="tabindex">programmatic target</span>
+            <span role="switch" data-hostile="role-switch">switch</span>
+            <span role="link" data-hostile="role-link">role link</span>
+          `;
+          row.appendChild(cell);
+        }"""
+    )
+
+    hostile_kinds = (
+        "anchor",
+        "button",
+        "input",
+        "select",
+        "textarea",
+        "label",
+        "form-child",
+        "summary",
+        "details-child",
+        "audio",
+        "video",
+        "contenteditable-empty",
+        "contenteditable-plaintext",
+        "contenteditable-false",
+        "tabindex",
+        "role-switch",
+        "role-link",
+    )
+    unguarded: list[str] = []
+    for kind in hostile_kinds:
+        if kind == "details-child":
+            page.locator("details").evaluate("node => { node.open = true; }")
+        before = page.evaluate("window.primaryRowLinkClicks")
+        descendant = page.locator(f"[data-hostile='{kind}']")
+        descendant.click(force=True)
+        if kind in {"audio", "video"}:
+            descendant.dispatch_event("click")
+        after = page.evaluate("window.primaryRowLinkClicks")
+        if after != before:
+            unguarded.append(kind)
+    assert not unguarded, f"unguarded hostile descendants: {unguarded!r}"

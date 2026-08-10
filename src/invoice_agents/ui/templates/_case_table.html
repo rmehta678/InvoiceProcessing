@@ -25,8 +25,8 @@
       </thead>
       <tbody>
         {% for row in rows %}
-        <tr data-href="/cases/{{ row.case_id }}" tabindex="0">
-          <th scope="row"><a href="/cases/{{ row.case_id }}" class="mono">{{ row.invoice_number or '(missing)' }}</a></th>
+        <tr data-href="/cases/{{ row.case_id }}">
+          <th scope="row"><a href="/cases/{{ row.case_id }}" class="mono" data-row-link>{{ row.invoice_number or '(missing)' }}</a></th>
           <td>{{ row.vendor or '(missing)' }}</td>
           <td>{{ m.format_chip(row.source_format) }}</td>
           <td class="num">{{ m.money(row.declared_total, row.currency) }}</td>

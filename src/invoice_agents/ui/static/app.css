@@ -69,7 +69,7 @@ h3 { font-size: 16px; margin: 0 0 8px; font-weight: 600; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible,
-textarea:focus-visible, summary:focus-visible, tr:focus-visible {
+textarea:focus-visible, summary:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
@@ -229,10 +229,17 @@ a.tile:hover { text-decoration: none; border-color: var(--accent); }
 
 /* ------------------------------------------------------------------- tables */
 
-.table-wrap { overflow-x: auto; }
+.table-wrap {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+}
 
 table.data {
   width: 100%;
+  min-width: max-content;
   border-collapse: collapse;
   font-size: 13px;
   line-height: 1.35;
@@ -268,8 +275,13 @@ table.data tbody th[scope="row"] { font-weight: 600; }
 table.data td.num, table.data th.num { text-align: right; font-variant-numeric: tabular-nums; }
 table.data td.mono { font-family: var(--font-mono); }
 table.data tr[data-href] { cursor: pointer; }
-table.data tr[data-href]:hover td { background: var(--accent-bg); }
-table.data tr.kb-focus td { background: var(--accent-bg); box-shadow: inset 2px 0 0 var(--accent); }
+table.data tr[data-href]:hover > th, table.data tr[data-href]:hover > td {
+  background: var(--accent-bg);
+}
+table.data tr.kb-focus > th, table.data tr.kb-focus > td {
+  background: var(--accent-bg);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
 table.data tr.sticky-first td:first-child, table.data tr.sticky-first th:first-child {
   position: sticky; left: 0; background: var(--surface);
 }
@@ -478,6 +490,37 @@ form.filters input[type="search"] { flex: 1 1 220px; }
 
 @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.35; } 100% { opacity: 1; } }
 .pulsing { animation: pulse 1.6s ease-in-out infinite; }
+
+/* ---------------------------------------------------------- narrow screens */
+
+@media (max-width: 600px) {
+  main {
+    min-width: 0;
+    padding: 16px 12px 36px;
+  }
+
+  .topbar nav {
+    min-width: 0;
+    min-height: 0;
+    padding: 8px 12px;
+    gap: 2px 12px;
+    flex-wrap: wrap;
+  }
+
+  .topbar .brand {
+    flex: 1 0 100%;
+    margin-right: 0;
+  }
+
+  .topbar a { padding: 6px 2px; }
+
+  footer.cli-hint {
+    padding: 0 12px 24px;
+    overflow-wrap: anywhere;
+  }
+
+  .card { padding: 12px; }
+}
 
 /* -------------------------------------------------------------- empty state */
 

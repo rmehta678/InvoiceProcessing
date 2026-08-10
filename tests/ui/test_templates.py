@@ -8,7 +8,10 @@ normalized ones.
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
+from html.parser import HTMLParser
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from jinja2 import Environment
@@ -35,6 +38,40 @@ def env() -> Environment:
 def render_macro(env: Environment, call: str, **context: object) -> str:
     template = env.from_string("{% import '_macros.html' as m %}" + call)
     return template.render(**context)
+
+
+class _NavigableRowParser(HTMLParser):
+    """Collect the actual row and anchor attributes emitted by a template."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._row: dict[str, str | None] | None = None
+        self._row_links: list[dict[str, str | None]] = []
+        self.rows: list[tuple[dict[str, str | None], list[dict[str, str | None]]]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if tag == "tr":
+            self._row = attributes
+            self._row_links = []
+        elif tag == "a" and self._row is not None and "data-row-link" in attributes:
+            self._row_links.append(attributes)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "tr" and self._row is not None:
+            self.rows.append((self._row, self._row_links))
+            self._row = None
+            self._row_links = []
+
+
+def assert_semantic_row_link(html: str, expected_href: str) -> None:
+    parser = _NavigableRowParser()
+    parser.feed(html)
+    matches = [(row, links) for row, links in parser.rows if row.get("data-href") == expected_href]
+    assert len(matches) == 1
+    row, links = matches[0]
+    assert "tabindex" not in row, "table rows must not become synthetic keyboard controls"
+    assert [link.get("href") for link in links] == [expected_href]
 
 
 def test_status_badges_map_one_to_one(env: Environment) -> None:
@@ -193,3 +230,75 @@ def test_htmx_indicator_configuration_is_csp_safe_and_static() -> None:
     assert ".htmx-request .htmx-indicator" in css
     assert "visibility: hidden" in css
     assert "visibility: visible" in css
+
+
+def test_case_table_uses_its_real_invoice_link_as_the_row_keyboard_target(
+    env: Environment,
+) -> None:
+    now = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
+    row = SimpleNamespace(
+        case_id="case_semantic",
+        invoice_number="INV-SEMANTIC",
+        vendor="Accessible Vendor",
+        source_format="txt",
+        declared_total="12.34",
+        currency="USD",
+        status="SUCCEEDED",
+        decision="APPROVE",
+        payment_status="PAID",
+        started_at=now,
+        finished_at=now,
+    )
+    filters = SimpleNamespace(status=None, decision=None, fmt=None, q=None)
+
+    html = env.get_template("_case_table.html").render(rows=[row], filters=filters, db_error=None)
+
+    assert_semantic_row_link(html, "/cases/case_semantic")
+    assert "SUCCEEDED" in html, "status remains literal text at every viewport"
+
+
+def test_review_table_uses_its_real_review_link_as_the_row_keyboard_target(
+    env: Environment,
+) -> None:
+    now = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
+    review = SimpleNamespace(
+        review_id="review_semantic",
+        case_id="case_for_review",
+        sequence=1,
+        amount=None,
+        agent_recommendation="HOLD",
+        reasons=["policy review required"],
+        created_at=now,
+        status="PENDING",
+    )
+
+    html = env.get_template("reviews.html").render(
+        reviews=[review],
+        now_utc=now,
+        age_amber_hours=24,
+        show_all=False,
+        nav="reviews",
+        csrf_token="test-token",
+    )
+
+    assert_semantic_row_link(html, "/reviews/review_semantic")
+    assert "PENDING" in html, "review status remains literal text at every viewport"
+
+
+def test_batch_table_uses_its_real_case_link_as_the_row_keyboard_target(
+    env: Environment,
+) -> None:
+    entry = SimpleNamespace(case_id="case_from_batch", path=Path("invoice.txt"), result=None)
+    header = SimpleNamespace(status="SUCCEEDED", stop_reason="APPROVED")
+    row = SimpleNamespace(
+        entry=entry,
+        header=header,
+        run_state="finished",
+        run_error=None,
+    )
+    batch = SimpleNamespace(entries=[entry], running=False)
+
+    html = env.get_template("_batch_rows.html").render(batch=batch, rows=[row])
+
+    assert_semantic_row_link(html, "/cases/case_from_batch")
+    assert "SUCCEEDED" in html, "batch status remains literal text at every viewport"

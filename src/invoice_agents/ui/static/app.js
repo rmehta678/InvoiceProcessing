@@ -78,20 +78,23 @@
 
   /* --------------------------------------------------- keyboard navigation */
 
-  function focusableRows() {
+  function rowLinks() {
     return Array.prototype.slice.call(
-      document.querySelectorAll("table.data tbody tr[data-href]")
+      document.querySelectorAll("table.data tbody tr[data-href] a[data-row-link]")
     );
   }
 
-  var kbIndex = -1;
-
-  function setKbFocus(rows, index) {
-    rows.forEach(function (row) { row.classList.remove("kb-focus"); });
-    if (index >= 0 && index < rows.length) {
-      kbIndex = index;
-      rows[index].classList.add("kb-focus");
-      rows[index].scrollIntoView({ block: "nearest" });
+  function setKbFocus(links, index) {
+    links.forEach(function (link) {
+      var row = link.closest("tr");
+      if (row) row.classList.remove("kb-focus");
+    });
+    if (index >= 0 && index < links.length) {
+      var link = links[index];
+      var row = link.closest("tr");
+      if (row) row.classList.add("kb-focus");
+      link.focus();
+      link.scrollIntoView({ block: "nearest", inline: "nearest" });
     }
   }
 
@@ -108,20 +111,47 @@
       return;
     }
     if (typing) return;
-    var rows = focusableRows();
-    if (!rows.length) return;
-    if (event.key === "j") setKbFocus(rows, Math.min(kbIndex + 1, rows.length - 1));
-    else if (event.key === "k") setKbFocus(rows, Math.max(kbIndex - 1, 0));
-    else if (event.key === "Enter" && kbIndex >= 0 && rows[kbIndex]) {
-      window.location.href = rows[kbIndex].getAttribute("data-href");
+    var links = rowLinks();
+    if (!links.length) return;
+    var activeIndex = links.indexOf(document.activeElement);
+    if (event.key === "j") {
+      event.preventDefault();
+      setKbFocus(links, Math.min(activeIndex + 1, links.length - 1));
+    } else if (event.key === "k") {
+      event.preventDefault();
+      setKbFocus(links, Math.max(activeIndex - 1, 0));
     }
   });
 
   document.addEventListener("click", function (event) {
     var row = event.target.closest("tr[data-href]");
     if (!row) return;
-    if (event.target.closest("a, button, input, select, label")) return;
-    window.location.href = row.getAttribute("data-href");
+    var interactive = [
+      "a",
+      "area",
+      "button",
+      "input",
+      "select",
+      "textarea",
+      "label",
+      "form",
+      "details",
+      "summary",
+      "audio[controls]",
+      "video[controls]",
+      "iframe",
+      "embed",
+      "object",
+      "[contenteditable]",
+      "[tabindex]",
+      "[role]"
+    ].join(", ");
+    if (
+      event.defaultPrevented ||
+      event.target.closest(interactive)
+    ) return;
+    var link = row.querySelector("a[data-row-link]");
+    if (link) link.click();
   });
 
   /* ------------------------------------------------------- live SSE timeline */
