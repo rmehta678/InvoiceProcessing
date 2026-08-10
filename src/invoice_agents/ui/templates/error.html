@@ -3,7 +3,7 @@
 {% block title %}Error - Galatiq Invoice Console{% endblock %}
 
 {% block content %}
-<section class="error-list" style="margin-top:24px">
+<section class="error-list error-page">
   <h2><span class="badge tone-fail">{{ error.category }}</span>
     {% if error.stop_reason %}<span class="mono">{{ error.stop_reason }}</span>{% endif %}</h2>
   <p>{{ error.message }}</p>

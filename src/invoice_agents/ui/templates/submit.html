@@ -16,7 +16,7 @@
     <fieldset {% if not preflight.ok %}disabled{% endif %}>
       <legend>Pick one or more existing files under <span class="mono">{{ invoice_dir }}</span></legend>
       {% if files %}
-      <div class="table-wrap" style="max-height:320px; overflow-y:auto">
+      <div class="table-wrap source-picker-scroll">
         <table class="data">
           <caption class="small">Supported formats: txt, json, csv, xml, pdf</caption>
           <thead><tr>

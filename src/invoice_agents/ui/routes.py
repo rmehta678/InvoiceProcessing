@@ -40,6 +40,7 @@ from invoice_agents.orchestration import validate_case_concurrency
 from invoice_agents.ui import queries
 from invoice_agents.ui.preflight import key_present, run_preflight
 from invoice_agents.ui.runs import RunRegistry
+from invoice_agents.ui.security import secure_cookie
 from invoice_agents.ui.sse import case_event_stream
 
 router = APIRouter()
@@ -657,7 +658,11 @@ async def review_decide(
     if reviewer and reviewer.strip():
         # URL-encoded so addresses with @ survive the cookie layer unquoted.
         response.set_cookie(
-            "ui_reviewer", quote(reviewer.strip()), max_age=180 * 24 * 3600, samesite="lax"
+            "ui_reviewer",
+            quote(reviewer.strip()),
+            max_age=180 * 24 * 3600,
+            samesite="lax",
+            secure=secure_cookie(request),
         )
     return response
 

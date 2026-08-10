@@ -146,7 +146,7 @@
           <label for="reviewer">Reviewer <span class="dim">(required)</span></label><br>
           <input type="text" id="reviewer" name="reviewer" required
                  value="{{ form_values.get('reviewer') or reviewer_prefill }}"
-                 placeholder="vp@example.com" style="width:100%">
+                 placeholder="vp@example.com" class="full-width">
         </p>
 
         <div class="kinds" role="radiogroup" aria-label="Decision">
@@ -208,7 +208,7 @@
             <div class="subform" data-for="SUPERSEDE_REVISION">
               {% if prior_cases %}
               <label for="superseded_case_id" class="small">Superseded prior case</label>
-              <select name="superseded_case_id" id="superseded_case_id" style="width:100%">
+              <select name="superseded_case_id" id="superseded_case_id" class="full-width">
                 <option value="">- select the superseded case -</option>
                 {% for prior in prior_cases %}
                 <option value="{{ prior.case_id }}" {% if form_values.get('superseded_case_id') == prior.case_id %}selected{% endif %}>
@@ -228,7 +228,7 @@
 
         <p>
           <label for="reason">Reason <span class="dim">(required, recorded verbatim)</span></label><br>
-          <textarea id="reason" name="reason" rows="3" required style="width:100%"
+          <textarea id="reason" name="reason" rows="3" required class="full-width"
                     placeholder="Why this decision is correct, based on the evidence.">{{ form_values.get('reason', '') }}</textarea>
         </p>
 

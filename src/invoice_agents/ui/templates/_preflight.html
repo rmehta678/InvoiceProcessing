@@ -13,7 +13,7 @@
     <span class="small {{ 'dim' if item.ok else 'text-fail' }}">{{ item.detail }}</span>
   </div>
   {% endfor %}
-  <a class="small" href="/system" style="margin-left:auto">System</a>
+  <a class="small preflight-system-link" href="/system">System</a>
   {% for item in preflight.items if not item.ok and item.fix_command %}
   <div class="fix">
     <code>{{ item.fix_command }}</code>

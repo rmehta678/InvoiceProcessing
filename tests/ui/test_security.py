@@ -13,6 +13,7 @@ import pytest
 from factories import make_pending_review_case
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import SecretStr, ValidationError
 from starlette.responses import Response
 
 from invoice_agents.config import Settings
@@ -23,6 +24,7 @@ from invoice_agents.ui.security import (
     CSRF_SCOPE_KEY,
     SESSION_COOKIE_NAME,
     CSRFMiddleware,
+    ExactTrustedHostMiddleware,
 )
 from invoice_agents.ui.server import create_app
 
@@ -100,9 +102,11 @@ def _rendered_token(client: TestClient, *, path: str = "/submit", action: str = 
 
 
 def _assert_security_headers(response: Any) -> None:
-    assert response.headers["content-security-policy"] == (
-        "default-src 'self'; frame-ancestors 'none'"
-    )
+    policy = response.headers["content-security-policy"]
+    assert "'unsafe-inline'" not in policy
+    assert "script-src 'self'" in policy
+    assert "style-src 'self'" in policy
+    assert "frame-ancestors 'none'" in policy
     assert response.headers["x-frame-options"] == "DENY"
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["referrer-policy"] == "no-referrer"
@@ -278,6 +282,7 @@ def test_session_cookie_is_http_only_strict_and_token_is_stable_per_session(
     assert "httponly" in set_cookie
     assert "samesite=strict" in set_cookie
     assert "path=/" in set_cookie
+    assert "secure" not in set_cookie
 
     second = raw_client.get("/submit")
     assert _rendered_token(raw_client) == token
@@ -341,6 +346,127 @@ def test_new_application_secret_invalidates_an_old_signed_session(settings: Sett
     assert response.status_code == 403
 
 
+def test_explicit_shared_session_secret_survives_application_recreation(
+    settings: Settings,
+) -> None:
+    shared_settings = settings.model_copy(update={"ui_session_secret": SecretStr("S" * 43)})
+    first_app = create_app(
+        shared_settings,
+        allowed_hosts=("testserver",),
+        allowed_origins=("https://testserver",),
+    )
+    with TestClient(first_app, base_url="https://testserver") as first:
+        token = _rendered_token(first)
+        cookie = first.cookies.get(SESSION_COOKIE_NAME)
+    assert cookie is not None
+
+    second_app = create_app(
+        shared_settings,
+        allowed_hosts=("testserver",),
+        allowed_origins=("https://testserver",),
+    )
+    with TestClient(second_app, base_url="https://testserver") as second:
+        second.cookies.set(SESSION_COOKIE_NAME, cookie)
+        response = second.post(
+            "/submit",
+            data={"existing": "missing.txt", "csrf_token": token},
+            headers={"Origin": "https://testserver"},
+            follow_redirects=False,
+        )
+    assert response.status_code == 404
+
+
+def test_short_explicit_session_secret_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="session secret"):
+        Settings(ui_session_secret=SecretStr("predictable-short-secret"))
+
+
+def test_blank_session_secret_keeps_local_random_key_mode() -> None:
+    assert Settings(ui_session_secret="").ui_session_secret is None
+
+
+@pytest.mark.parametrize(
+    ("origin", "host", "secure"),
+    [
+        ("http://127.0.0.1:8787", "127.0.0.1", False),
+        ("https://testserver", "testserver", True),
+    ],
+)
+def test_cookie_secure_attribute_is_derived_from_the_single_allowed_scheme(
+    settings: Settings,
+    origin: str,
+    host: str,
+    secure: bool,
+) -> None:
+    scheme_app = create_app(
+        settings,
+        allowed_hosts=(host,),
+        allowed_origins=(origin,),
+    )
+    with TestClient(scheme_app, base_url=origin) as client:
+        response = client.get("/submit")
+    cookie = SimpleCookie()
+    cookie.load(response.headers["set-cookie"])
+    assert bool(cookie[SESSION_COOKIE_NAME]["secure"]) is secure
+
+
+def test_mixed_http_and_https_allowed_origins_are_rejected(settings: Settings) -> None:
+    with pytest.raises(ValueError, match="single scheme"):
+        create_app(
+            settings,
+            allowed_hosts=("testserver",),
+            allowed_origins=("http://testserver", "https://testserver"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("origin", "host", "secure"),
+    [
+        ("http://127.0.0.1:8787", "127.0.0.1", False),
+        ("https://testserver", "testserver", True),
+    ],
+)
+def test_reviewer_preference_cookie_uses_the_configured_origin_scheme(
+    settings: Settings,
+    origin: str,
+    host: str,
+    secure: bool,
+) -> None:
+    _, review = make_pending_review_case(settings)
+    scheme_app = create_app(
+        settings,
+        allowed_hosts=(host,),
+        allowed_origins=(origin,),
+    )
+    action = f"/reviews/{review.review_id}/decision"
+    with TestClient(scheme_app, base_url=origin) as client:
+        token = _rendered_token(
+            client,
+            path=f"/reviews/{review.review_id}",
+            action=action,
+        )
+        response = client.post(
+            action,
+            data={
+                "reviewer": "vp@example.com",
+                "decision": "REJECT",
+                "reason": "The evidence does not authorize payment.",
+                "csrf_token": token,
+            },
+            headers={"Origin": origin},
+            follow_redirects=False,
+        )
+    assert response.status_code == 303
+    reviewer_header = next(
+        value
+        for value in response.headers.get_list("set-cookie")
+        if value.startswith("ui_reviewer=")
+    )
+    reviewer_cookie = SimpleCookie()
+    reviewer_cookie.load(reviewer_header)
+    assert bool(reviewer_cookie["ui_reviewer"]["secure"]) is secure
+
+
 @pytest.mark.parametrize(
     ("headers", "expected_status"),
     [
@@ -371,6 +497,9 @@ def test_new_application_secret_invalidates_an_old_signed_session(settings: Sett
         ({"Origin": "http://testserver/path"}, 403),
         ({"Origin": "http://user@testserver"}, 403),
         ({"Origin": "http://testserver#fragment"}, 403),
+        ({"Origin": "http://testserver:"}, 403),
+        ({"Origin": "http://testserver?"}, 403),
+        ({"Origin": "http://testserver#"}, 403),
         ({"Origin": "http://testserver https://evil.example"}, 403),
         ({"Origin": "http://testserver", "Forwarded": "host=evil.example"}, 403),
         ({"Origin": "http://testserver", "X-Forwarded-Host": "evil.example"}, 403),
@@ -406,6 +535,14 @@ def test_duplicate_origin_headers_are_rejected(raw_client: TestClient) -> None:
         follow_redirects=False,
     )
     assert response.status_code == 403
+
+
+def test_duplicate_host_headers_are_rejected(raw_client: TestClient) -> None:
+    response = raw_client.get(
+        "/submit",
+        headers=[("Host", "testserver"), ("Host", "testserver")],
+    )
+    assert response.status_code == 400
 
 
 def test_header_only_token_supports_htmx_mutations(raw_client: TestClient) -> None:
@@ -497,12 +634,192 @@ def test_untrusted_host_is_rejected(raw_client: TestClient) -> None:
     assert response.status_code == 400
 
 
+@pytest.mark.parametrize(
+    "host",
+    [
+        "testserver:",
+        "testserver:not-a-port",
+        "testserver:0",
+        "testserver:65536",
+        "testserver:80:81",
+        "user@testserver:80",
+        "[::1",
+        "[::1]extra",
+    ],
+)
+def test_malformed_host_authorities_are_rejected(
+    raw_client: TestClient,
+    host: str,
+) -> None:
+    assert raw_client.get("/submit", headers={"Host": host}).status_code == 400
+
+
+def test_dns_host_matching_is_case_insensitive(settings: Settings) -> None:
+    dns_app = create_app(
+        settings,
+        allowed_hosts=("console.example",),
+        allowed_origins=("http://console.example",),
+    )
+    with TestClient(dns_app, base_url="http://console.example") as client:
+        response = client.get("/submit", headers={"Host": "CONSOLE.EXAMPLE"})
+    assert response.status_code == 200
+
+
+def test_dns_host_and_origin_case_normalize_together(settings: Settings) -> None:
+    dns_app = create_app(
+        settings,
+        allowed_hosts=("console.example",),
+        allowed_origins=("http://console.example",),
+    )
+    with TestClient(dns_app, base_url="http://console.example") as client:
+        token = _rendered_token(client)
+        response = client.post(
+            "/submit",
+            data={"existing": "missing.txt", "csrf_token": token},
+            headers={"Host": "CONSOLE.EXAMPLE", "Origin": "http://CONSOLE.EXAMPLE"},
+            follow_redirects=False,
+        )
+    assert response.status_code == 404
+
+
+def test_configured_dns_host_case_is_normalized() -> None:
+    settings = Settings(ui_allowed_hosts=("Console.Example",))
+    assert settings.ui_allowed_hosts == ("console.example",)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "127.0.0.1:8787",
+        "console.example:8787",
+        "[::1]:8787",
+        "user@console.example",
+        "fe80::1%lo0",
+    ],
+)
+def test_configured_host_authority_variants_are_rejected(host: str) -> None:
+    with pytest.raises(ValidationError, match="invalid UI allowed host"):
+        Settings(ui_allowed_hosts=(host,))
+
+
+def test_ipv6_loopback_host_and_origin_are_accepted(settings: Settings) -> None:
+    ipv6_app = create_app(
+        settings,
+        allowed_hosts=("::1",),
+        allowed_origins=("http://[::1]:8787",),
+    )
+    with TestClient(ipv6_app, base_url="http://test-transport") as client:
+        page = client.get("/submit", headers={"Host": "[::1]:8787"})
+        parser = _MutationFormTokens()
+        parser.feed(page.text)
+        token = parser.tokens["/submit"][0]
+        assert page.status_code == 200
+        response = client.post(
+            "/submit",
+            data={"existing": "missing.txt", "csrf_token": token},
+            headers={"Host": "[::1]:8787", "Origin": "http://[::1]:8787"},
+            follow_redirects=False,
+        )
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "::1",
+        "[::2]:8787",
+        "[::1%25lo0]:8787",
+        "user@[::1]:8787",
+        "[::1]:",
+        "[::1]:not-a-port",
+        "[::1]:0",
+        "[::1]:65536",
+        "[::1]:8787:8788",
+    ],
+)
+def test_ipv6_host_authority_variants_fail_closed(
+    settings: Settings,
+    host: str,
+) -> None:
+    ipv6_app = create_app(
+        settings,
+        allowed_hosts=("::1",),
+        allowed_origins=("http://[::1]:8787",),
+    )
+    with TestClient(ipv6_app, base_url="http://test-transport") as client:
+        response = client.get("/submit", headers={"Host": host})
+    assert response.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://[::2]:8787",
+        "http://::1:8787",
+        "http://[::1%25lo0]:8787",
+        "http://user@[::1]:8787",
+        "http://[::1]:",
+        "http://[::1]:8788",
+        "http://[::1]:08787",
+    ],
+)
+def test_ipv6_origin_variants_fail_closed(
+    settings: Settings,
+    origin: str,
+) -> None:
+    ipv6_app = create_app(
+        settings,
+        allowed_hosts=("::1",),
+        allowed_origins=("http://[::1]:8787",),
+    )
+    with TestClient(ipv6_app, base_url="http://test-transport") as client:
+        page = client.get("/submit", headers={"Host": "[::1]:8787"})
+        parser = _MutationFormTokens()
+        parser.feed(page.text)
+        token = parser.tokens["/submit"][0]
+        response = client.post(
+            "/submit",
+            data={"existing": "missing.txt", "csrf_token": token},
+            headers={"Host": "[::1]:8787", "Origin": origin},
+            follow_redirects=False,
+        )
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://console.example:",
+        "http://console.example?",
+        "http://console.example#",
+        "http://console.example?#",
+        "http://[::1]:",
+        "http://::1:8787",
+        "http://user@[::1]:8787",
+        "http://[::1%25lo0]:8787",
+    ],
+)
+def test_delimiter_only_and_empty_port_allowed_origins_are_rejected(
+    settings: Settings,
+    origin: str,
+) -> None:
+    allowed_host = "::1" if "[::1]" in origin else "console.example"
+    with pytest.raises(ValueError, match="invalid UI origin"):
+        create_app(
+            settings,
+            allowed_hosts=(allowed_host,),
+            allowed_origins=(origin,),
+        )
+
+
 def test_default_app_allows_loopback_names_but_not_testclient_host(settings: Settings) -> None:
     local_app = create_app(settings)
     with TestClient(local_app, base_url="http://127.0.0.1:8787") as ipv4:
         assert ipv4.get("/submit").status_code == 200
     with TestClient(local_app, base_url="http://localhost:8787") as localhost:
         assert localhost.get("/submit").status_code == 200
+    with TestClient(local_app, base_url="http://test-transport") as ipv6:
+        assert ipv6.get("/submit", headers={"Host": "[::1]:8787"}).status_code == 200
     with TestClient(local_app, base_url="http://testserver") as implicit_test_host:
         assert implicit_test_host.get("/submit").status_code == 400
 
@@ -594,7 +911,7 @@ async def test_foreign_origin_is_rejected_without_reading_a_large_body(
     assert start["status"] == 403
     response_headers = {name.decode(): value.decode() for name, value in start["headers"]}
     assert response_headers["content-security-policy"] == (
-        "default-src 'self'; frame-ancestors 'none'"
+        "default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'"
     )
 
 
@@ -682,3 +999,40 @@ async def test_csrf_middleware_itself_rejects_a_missing_token_before_inner_app()
     )
     assert post_start["status"] == 403
     assert inner_methods == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_exact_host_validation_also_covers_websocket_scopes() -> None:
+    inner_calls = 0
+    sent: list[dict[str, Any]] = []
+
+    async def inner(_scope: Any, _receive: Any, _send: Any) -> None:
+        nonlocal inner_calls
+        inner_calls += 1
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "websocket.disconnect"}
+
+    async def capture(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    middleware = ExactTrustedHostMiddleware(inner, allowed_hosts=("testserver",))
+    await middleware(
+        {
+            "type": "websocket",
+            "asgi": {"version": "3.0"},
+            "scheme": "ws",
+            "path": "/socket",
+            "raw_path": b"/socket",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(b"host", b"evil.example")],
+            "client": ("127.0.0.1", 12345),
+            "server": ("testserver", 80),
+            "subprotocols": [],
+        },
+        receive,
+        capture,
+    )
+    assert inner_calls == 0
+    assert sent[0]["status"] == 400

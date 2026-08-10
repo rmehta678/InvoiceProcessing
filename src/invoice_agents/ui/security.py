@@ -8,28 +8,35 @@ import hmac
 import re
 import secrets
 from collections.abc import Sequence
+from dataclasses import dataclass
 from http.cookies import CookieError, SimpleCookie
+from ipaddress import IPv6Address, ip_address
 from typing import Any
-from urllib.parse import SplitResult, urlsplit
 
 from fastapi import Request
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.responses import PlainTextResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from invoice_agents.config import normalize_ui_host
+
 CSRF_FIELD_NAME = "csrf_token"
 CSRF_HEADER_NAME = "x-csrf-token"
 SESSION_COOKIE_NAME = "galatiq_session"
 CSRF_SCOPE_KEY = "invoice_agents.csrf_token"
+COOKIE_SECURE_SCOPE_KEY = "invoice_agents.cookie_secure"
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{43}$")
 DEFAULT_ALLOWED_ORIGINS = (
     "http://127.0.0.1:8787",
     "http://localhost:8787",
+    "http://[::1]:8787",
 )
-DEFAULT_ALLOWED_HOSTS = ("127.0.0.1", "localhost")
+DEFAULT_ALLOWED_HOSTS = ("127.0.0.1", "localhost", "::1")
 SECURITY_HEADERS = {
-    "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'",
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'"
+    ),
     "X-Frame-Options": "DENY",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
@@ -43,7 +50,17 @@ _PROXY_ORIGIN_HEADERS = (
 DEFAULT_MUTATION_BODY_MAX_BYTES = 16_777_216
 
 Origin = tuple[str, str, int]
-_HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+Authority = tuple[str, int | None]
+
+
+@dataclass(frozen=True)
+class OriginPolicy:
+    origins: frozenset[Origin]
+    scheme: str
+
+    @property
+    def cookie_secure(self) -> bool:
+        return self.scheme == "https"
 
 
 def validate_allowed_hosts(values: Sequence[str]) -> tuple[str, ...]:
@@ -55,20 +72,7 @@ def validate_allowed_hosts(values: Sequence[str]) -> tuple[str, ...]:
     for value in values:
         if not isinstance(value, str):
             raise ValueError("UI allowed hosts must be strings")
-        host = value.strip().lower()
-        labels = host.split(".")
-        if (
-            not host
-            or host != value
-            or len(host) > 253
-            or "*" in host
-            or any(character.isspace() for character in host)
-            or ":" in host
-            or "/" in host
-            or "\\" in host
-            or any(not _HOST_LABEL.fullmatch(label) for label in labels)
-        ):
-            raise ValueError(f"invalid UI allowed host: {value!r}")
+        host = normalize_ui_host(value)
         if host not in normalized:
             normalized.append(host)
     return tuple(normalized)
@@ -78,48 +82,124 @@ def _encoded_digest(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
-def _effective_port(parsed: SplitResult) -> int | None:
+def _parsed_port(value: str) -> int | None:
+    if not value or not value.isascii() or not value.isdigit():
+        return None
+    port = int(value)
+    if not 1 <= port <= 65_535 or str(port) != value:
+        return None
+    return port
+
+
+def _parsed_authority(value: str) -> Authority | None:
+    """Parse one RFC-style host[:port], requiring brackets around IPv6."""
+
+    if (
+        not value
+        or value != value.strip()
+        or any(ord(character) <= 0x20 or ord(character) == 0x7F for character in value)
+        or any(delimiter in value for delimiter in ("/", "\\", "?", "#", "@"))
+    ):
+        return None
+
+    port: int | None = None
+    if value.startswith("["):
+        closing = value.find("]")
+        if closing <= 1 or value.find("[", 1) != -1 or value.find("]", closing + 1) != -1:
+            return None
+        serialized_host = value[1:closing]
+        suffix = value[closing + 1 :]
+        if suffix:
+            if not suffix.startswith(":"):
+                return None
+            port = _parsed_port(suffix[1:])
+            if port is None:
+                return None
+        try:
+            host = normalize_ui_host(serialized_host)
+            if not isinstance(ip_address(host), IPv6Address):
+                return None
+        except ValueError:
+            return None
+        return host, port
+
+    if "[" in value or "]" in value or value.count(":") > 1:
+        return None
+    serialized_host = value
+    if ":" in value:
+        serialized_host, serialized_port = value.split(":", 1)
+        port = _parsed_port(serialized_port)
+        if port is None:
+            return None
     try:
-        port = parsed.port
+        host = normalize_ui_host(serialized_host)
     except ValueError:
         return None
-    if port is not None:
-        return port
-    return 80 if parsed.scheme.lower() == "http" else 443
+    try:
+        address = ip_address(host)
+    except ValueError:
+        return host, port
+    if isinstance(address, IPv6Address):
+        return None
+    return host, port
 
 
 def _parsed_origin(value: str, *, referer: bool) -> Origin | None:
-    if not value or value != value.strip() or any(character.isspace() for character in value):
+    if (
+        not value
+        or value != value.strip()
+        or any(ord(character) <= 0x20 or ord(character) == 0x7F for character in value)
+        or "\\" in value
+    ):
         return None
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
+    if value.startswith("http://"):
+        scheme = "http"
+        remainder = value[len("http://") :]
+    elif value.startswith("https://"):
+        scheme = "https"
+        remainder = value[len("https://") :]
+    else:
         return None
-    scheme = parsed.scheme.lower()
-    if scheme not in {"http", "https"}:
+
+    delimiter_positions = [
+        position for delimiter in "/?#" if (position := remainder.find(delimiter)) >= 0
+    ]
+    authority_end = min(delimiter_positions, default=len(remainder))
+    authority = remainder[:authority_end]
+    suffix = remainder[authority_end:]
+    if (not referer and suffix) or (referer and "#" in suffix):
         return None
-    if parsed.username is not None or parsed.password is not None or parsed.hostname is None:
+    parsed_authority = _parsed_authority(authority)
+    if parsed_authority is None:
         return None
-    if parsed.fragment:
-        return None
-    if not referer and (parsed.path or parsed.query):
-        return None
-    port = _effective_port(parsed)
-    if port is None:
-        return None
-    return scheme, parsed.hostname.lower(), port
+    host, explicit_port = parsed_authority
+    port = explicit_port if explicit_port is not None else (80 if scheme == "http" else 443)
+    return scheme, host, port
 
 
-def _configured_origins(values: Sequence[str]) -> frozenset[Origin]:
+def _configured_origin_policy(values: Sequence[str]) -> OriginPolicy:
     if not values:
         raise ValueError("at least one explicit UI origin is required")
     parsed: set[Origin] = set()
+    schemes: set[str] = set()
     for value in values:
+        if not isinstance(value, str):
+            raise ValueError("UI origins must be strings")
         origin = _parsed_origin(value, referer=False)
         if origin is None:
             raise ValueError(f"invalid UI origin: {value!r}")
         parsed.add(origin)
-    return frozenset(parsed)
+        schemes.add(origin[0])
+    if len(schemes) != 1:
+        raise ValueError("UI allowed origins must use a single scheme")
+    return OriginPolicy(frozenset(parsed), schemes.pop())
+
+
+def validate_allowed_origins(values: Sequence[str]) -> tuple[str, ...]:
+    """Eagerly validate exact origins and their unambiguous cookie scheme."""
+
+    _configured_origin_policy(values)
+    return tuple(values)
 
 
 def _request_origin(scope: Scope, headers: Headers) -> Origin | None:
@@ -266,6 +346,25 @@ async def _submitted_form_tokens(
         return None
 
 
+class ExactTrustedHostMiddleware:
+    """Reject malformed authorities and hosts outside one exact allowlist."""
+
+    def __init__(self, app: ASGIApp, *, allowed_hosts: Sequence[str]) -> None:
+        self.app = app
+        self.allowed_hosts = frozenset(validate_allowed_hosts(allowed_hosts))
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] not in {"http", "websocket"}:
+            await self.app(scope, receive, send)
+            return
+        host_values = Headers(scope=scope).getlist("host")
+        authority = _parsed_authority(host_values[0]) if len(host_values) == 1 else None
+        if authority is None or authority[0] not in self.allowed_hosts:
+            await PlainTextResponse("Invalid host header", status_code=400)(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 class CSRFMiddleware:
     """Create signed sessions and reject non-same-origin mutations before body reads."""
 
@@ -275,7 +374,6 @@ class CSRFMiddleware:
         *,
         secret: bytes,
         allowed_origins: Sequence[str],
-        cookie_secure: bool = False,
         cookie_max_age: int = 8 * 60 * 60,
         max_body_bytes: int = DEFAULT_MUTATION_BODY_MAX_BYTES,
     ) -> None:
@@ -287,8 +385,9 @@ class CSRFMiddleware:
             raise ValueError("the mutation body limit must be positive")
         self.app = app
         self.secret = secret
-        self.allowed_origins = _configured_origins(allowed_origins)
-        self.cookie_secure = cookie_secure
+        origin_policy = _configured_origin_policy(allowed_origins)
+        self.allowed_origins = origin_policy.origins
+        self.cookie_secure = origin_policy.cookie_secure
         self.cookie_max_age = cookie_max_age
         self.max_body_bytes = max_body_bytes
 
@@ -298,6 +397,7 @@ class CSRFMiddleware:
             return
         headers = Headers(scope=scope)
         method = str(scope.get("method") or "").upper()
+        scope[COOKIE_SECURE_SCOPE_KEY] = self.cookie_secure
         if method not in SAFE_METHODS and not _has_strict_same_origin(
             scope, headers, self.allowed_origins
         ):
@@ -391,4 +491,13 @@ def csrf_token(request: Request) -> str:
     value: Any = request.scope.get(CSRF_SCOPE_KEY)
     if not isinstance(value, str) or not TOKEN_PATTERN.fullmatch(value):
         raise RuntimeError("CSRF session context is unavailable")
+    return value
+
+
+def secure_cookie(request: Request) -> bool:
+    """Return the scheme-derived cookie policy installed by CSRF middleware."""
+
+    value: Any = request.scope.get(COOKIE_SECURE_SCOPE_KEY)
+    if not isinstance(value, bool):
+        raise RuntimeError("cookie security context is unavailable")
     return value

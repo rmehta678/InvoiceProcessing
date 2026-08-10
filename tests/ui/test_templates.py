@@ -7,6 +7,9 @@ normalized ones.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 from jinja2 import Environment
 
@@ -165,3 +168,28 @@ def test_display_filters() -> None:
 def test_tone_defaults_to_neutral_for_unknown_values() -> None:
     assert tone("case", "SOMETHING_NEW") == "pause"
     assert tone("unknown-kind", "X") == "pause"
+
+
+def test_templates_have_no_inline_style_declarations() -> None:
+    template_dir = Path(__file__).resolve().parents[2] / "src/invoice_agents/ui/templates"
+    violations = {
+        template.name: re.findall(r"\bstyle\s*=", template.read_text(encoding="utf-8"), re.I)
+        for template in template_dir.glob("*.html")
+    }
+    assert {name: matches for name, matches in violations.items() if matches} == {}
+
+
+def test_htmx_indicator_configuration_is_csp_safe_and_static() -> None:
+    static_dir = Path(__file__).resolve().parents[2] / "src/invoice_agents/ui/static"
+    base = (
+        Path(__file__).resolve().parents[2] / "src/invoice_agents/ui/templates/base.html"
+    ).read_text(encoding="utf-8")
+    css = (static_dir / "app.css").read_text(encoding="utf-8")
+    config_position = base.index('name="htmx-config"')
+    script_position = base.index('src="/static/htmx.min.js"')
+    assert config_position < script_position
+    assert '"includeIndicatorStyles":false' in base
+    assert ".htmx-indicator" in css
+    assert ".htmx-request .htmx-indicator" in css
+    assert "visibility: hidden" in css
+    assert "visibility: visible" in css

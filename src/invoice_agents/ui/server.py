@@ -21,7 +21,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from invoice_agents.config import Settings
 from invoice_agents.db.store import WorkflowStore
@@ -33,9 +32,11 @@ from invoice_agents.ui.security import (
     DEFAULT_ALLOWED_ORIGINS,
     SECURITY_HEADERS,
     CSRFMiddleware,
+    ExactTrustedHostMiddleware,
     SecurityHeadersMiddleware,
     csrf_token,
     validate_allowed_hosts,
+    validate_allowed_origins,
 )
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -216,17 +217,17 @@ def create_app(
         lifespan=lifespan,
     )
     configured_hosts = validate_allowed_hosts(allowed_hosts)
-    configured_origins = tuple(allowed_origins)
+    configured_origins = validate_allowed_origins(allowed_origins)
+    configured_secret = selected_settings.configured_ui_session_secret()
     app.add_middleware(
         CSRFMiddleware,
-        secret=secrets.token_bytes(32),
+        secret=configured_secret if configured_secret is not None else secrets.token_bytes(32),
         allowed_origins=configured_origins,
         max_body_bytes=selected_settings.source_max_bytes + 1_048_576,
     )
     app.add_middleware(
-        TrustedHostMiddleware,
+        ExactTrustedHostMiddleware,
         allowed_hosts=configured_hosts,
-        www_redirect=False,
     )
     app.add_middleware(SecurityHeadersMiddleware)
     app.state.settings = selected_settings

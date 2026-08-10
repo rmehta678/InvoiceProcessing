@@ -12,7 +12,12 @@ from rich.console import Console
 from rich.table import Table
 
 from invoice_agents.compatibility import run_live_contracts
-from invoice_agents.config import Settings
+from invoice_agents.config import (
+    Settings,
+    is_ui_loopback_host,
+    normalize_ui_host,
+    serialize_ui_origin,
+)
 from invoice_agents.db.cli import app as db_app
 from invoice_agents.db.core import ensure_databases
 from invoice_agents.db.store import WorkflowStore
@@ -253,7 +258,7 @@ def review_resume(case_id: str) -> None:
     _exit_for(result)
 
 
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 @app.command("ui")
@@ -277,9 +282,15 @@ def ui_command(
 ) -> None:
     """Bring up the databases (idempotent) and serve the local web console."""
 
-    if host not in LOOPBACK_HOSTS and not allow_remote:
+    try:
+        bind_host = normalize_ui_host(host)
+    except ValueError as exc:
+        console.print(f"invalid UI bind host: {host!r}", style="red")
+        raise typer.Exit(1) from exc
+    is_loopback = is_ui_loopback_host(bind_host)
+    if not is_loopback and not allow_remote:
         console.print(
-            f"refusing to bind {host}: the console has no authentication and is "
+            f"refusing to bind {bind_host}: the console has no authentication and is "
             "localhost-only by design. Add auth before any remote exposure, or pass "
             "--allow-remote-i-understand to accept the risk explicitly.",
             style="red",
@@ -295,16 +306,31 @@ def ui_command(
                 style="red",
             )
             raise typer.Exit(1) from exc
+        if any("ui_session_secret" in error["loc"] for error in exc.errors()):
+            console.print(
+                "invalid INVOICE_UI_SESSION_SECRET; configure at least 32 random bytes",
+                style="red",
+            )
+            raise typer.Exit(1) from exc
         raise
-    if host not in LOOPBACK_HOSTS and not settings.ui_allowed_hosts:
+    if not is_loopback and not settings.ui_allowed_hosts:
         console.print(
             "remote binding also requires an explicit INVOICE_UI_ALLOWED_HOSTS JSON list "
             "of exact browser host names",
             style="red",
         )
         raise typer.Exit(1)
-    configured_hosts = (host,) if host in LOOPBACK_HOSTS else settings.ui_allowed_hosts
-    configured_origins = tuple(f"http://{allowed_host}:{port}" for allowed_host in configured_hosts)
+    if not is_loopback and settings.ui_session_secret is None:
+        console.print(
+            "remote binding requires INVOICE_UI_SESSION_SECRET so every worker and restart "
+            "uses the same explicit random session key",
+            style="red",
+        )
+        raise typer.Exit(1)
+    configured_hosts = (bind_host,) if is_loopback else settings.ui_allowed_hosts
+    configured_origins = tuple(
+        serialize_ui_origin("http", allowed_host, port) for allowed_host in configured_hosts
+    )
     try:
         import uvicorn
 
@@ -324,14 +350,17 @@ def ui_command(
         for kind, versions in applied.items():
             state = f"applied migrations {versions}" if versions else "already migrated"
             console.print(f"{kind} database ready ({state}), verified")
-    console.print(f"Galatiq invoice console on http://{host}:{port} (Ctrl+C stops it)")
+    console.print(
+        f"Galatiq invoice console on {serialize_ui_origin('http', bind_host, port)} "
+        "(Ctrl+C stops it)"
+    )
     uvicorn.run(
         create_app(
             settings,
             allowed_hosts=configured_hosts,
             allowed_origins=configured_origins,
         ),
-        host=host,
+        host=bind_host,
         port=port,
         log_level="warning",
     )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import date
 from decimal import Decimal
+from ipaddress import IPv6Address, ip_address
 from pathlib import Path
 
 from pydantic import Field, SecretStr, field_validator
@@ -15,6 +16,62 @@ from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 XAI_MODEL = "grok-4.5"
 XAI_BASE_URL = "https://api.x.ai/v1"
 _UI_HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def normalize_ui_host(value: str) -> str:
+    """Return one canonical bare IP address or case-folded ASCII DNS host."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 253
+        or any(ord(character) <= 0x20 or ord(character) == 0x7F for character in value)
+        or any(delimiter in value for delimiter in ("*", "/", "\\", "@", "[", "]", "%"))
+    ):
+        raise ValueError(f"invalid UI allowed host: {value!r}")
+    try:
+        address = ip_address(value)
+    except ValueError:
+        host = value.lower()
+        labels = host.split(".")
+        if (
+            ":" in host
+            or all(character.isdigit() or character == "." for character in host)
+            or any(not _UI_HOST_LABEL.fullmatch(label) for label in labels)
+        ):
+            raise ValueError(f"invalid UI allowed host: {value!r}") from None
+        return host
+    return address.compressed
+
+
+def is_ui_loopback_host(value: str) -> bool:
+    """Return whether a validated UI bind host is local loopback."""
+
+    host = normalize_ui_host(value)
+    if host == "localhost":
+        return True
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def serialize_ui_origin(scheme: str, host: str, port: int) -> str:
+    """Serialize a validated UI origin, including required IPv6 brackets."""
+
+    if scheme not in {"http", "https"}:
+        raise ValueError(f"invalid UI origin scheme: {scheme!r}")
+    if not 1 <= port <= 65_535:
+        raise ValueError(f"invalid UI origin port: {port!r}")
+    normalized = normalize_ui_host(host)
+    try:
+        authority_host = (
+            f"[{normalized}]" if isinstance(ip_address(normalized), IPv6Address) else normalized
+        )
+    except ValueError:
+        authority_host = normalized
+    return f"{scheme}://{authority_host}:{port}"
 
 
 class Settings(BaseSettings):
@@ -62,6 +119,7 @@ class Settings(BaseSettings):
     transient_retries: int = Field(default=2, ge=0, le=5)
     case_concurrency: int = Field(default=2, ge=1, le=8)
     ui_allowed_hosts: tuple[str, ...] = ()
+    ui_session_secret: SecretStr | None = None
     log_level: str = "INFO"
 
     @field_validator("review_threshold_currency")
@@ -86,23 +144,41 @@ class Settings(BaseSettings):
     def validate_ui_allowed_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         normalized: list[str] = []
         for raw_host in value:
-            host = raw_host.strip().lower()
-            labels = host.split(".")
-            if (
-                not host
-                or raw_host != host
-                or len(host) > 253
-                or "*" in host
-                or any(character.isspace() for character in host)
-                or ":" in host
-                or "/" in host
-                or "\\" in host
-                or any(not _UI_HOST_LABEL.fullmatch(label) for label in labels)
-            ):
-                raise ValueError(f"invalid UI allowed host: {raw_host!r}")
+            host = normalize_ui_host(raw_host)
             if host not in normalized:
                 normalized.append(host)
         return tuple(normalized)
+
+    @field_validator("ui_session_secret", mode="before")
+    @classmethod
+    def empty_ui_session_secret_is_unconfigured(cls, value: object) -> object:
+        if value == "" or (isinstance(value, SecretStr) and value.get_secret_value() == ""):
+            return None
+        return value
+
+    @field_validator("ui_session_secret")
+    @classmethod
+    def validate_ui_session_secret(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        secret = value.get_secret_value()
+        if (
+            len(secret.encode("utf-8")) < 32
+            or secret != secret.strip()
+            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in secret)
+        ):
+            raise ValueError(
+                "UI session secret must contain at least 32 bytes without surrounding "
+                "whitespace or control characters"
+            )
+        return value
+
+    def configured_ui_session_secret(self) -> bytes | None:
+        """Return explicit shared session key bytes only at app construction."""
+
+        if self.ui_session_secret is None:
+            return None
+        return self.ui_session_secret.get_secret_value().encode("utf-8")
 
     def assert_delete_journal_mode(self) -> None:
         """Defend production boundaries even if model validation was explicitly bypassed."""

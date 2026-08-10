@@ -35,8 +35,6 @@ def test_ui_remote_acknowledgement_also_requires_explicit_allowed_hosts(
 def test_ui_remote_binding_passes_explicit_hosts_and_origins_to_the_app(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from starlette.middleware.trustedhost import TrustedHostMiddleware
-
     from invoice_agents.ui.security import CSRFMiddleware
 
     captured: list[tuple[object, dict[str, object]]] = []
@@ -46,6 +44,7 @@ def test_ui_remote_binding_passes_explicit_hosts_and_origins_to_the_app(
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("INVOICE_UI_ALLOWED_HOSTS", '["console.example"]')
+    monkeypatch.setenv("INVOICE_UI_SESSION_SECRET", "S" * 43)
     monkeypatch.setattr("uvicorn.run", fake_run)
     result = runner.invoke(
         app,
@@ -58,13 +57,57 @@ def test_ui_remote_binding_passes_explicit_hosts_and_origins_to_the_app(
     trusted = next(
         middleware
         for middleware in application.user_middleware
-        if middleware.cls is TrustedHostMiddleware
+        if middleware.cls.__name__ == "ExactTrustedHostMiddleware"
     )
     csrf = next(
         middleware for middleware in application.user_middleware if middleware.cls is CSRFMiddleware
     )
     assert trusted.kwargs["allowed_hosts"] == ("console.example",)
     assert csrf.kwargs["allowed_origins"] == ("http://console.example:8787",)
+
+
+def test_ui_remote_binding_requires_a_shared_session_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("INVOICE_UI_ALLOWED_HOSTS", '["console.example"]')
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+    result = runner.invoke(
+        app,
+        ["ui", "--host", "0.0.0.0", "--allow-remote-i-understand", "--no-init-db"],
+    )
+    assert result.exit_code == 1
+    assert "INVOICE_UI_SESSION_SECRET" in result.output
+
+
+def test_ui_ipv6_loopback_needs_no_remote_ack_and_uses_bracketed_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from invoice_agents.ui.security import CSRFMiddleware
+
+    captured: list[tuple[object, dict[str, object]]] = []
+
+    def fake_run(application: object, **kwargs: object) -> None:
+        captured.append((application, kwargs))
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("uvicorn.run", fake_run)
+    result = runner.invoke(app, ["ui", "--host", "::1", "--no-init-db"])
+    assert result.exit_code == 0
+    assert "http://[::1]:8787" in result.output
+    assert len(captured) == 1
+    application, kwargs = captured[0]
+    assert kwargs["host"] == "::1"
+    trusted = next(
+        middleware
+        for middleware in application.user_middleware
+        if middleware.cls.__name__ == "ExactTrustedHostMiddleware"
+    )
+    csrf = next(
+        middleware for middleware in application.user_middleware if middleware.cls is CSRFMiddleware
+    )
+    assert trusted.kwargs["allowed_hosts"] == ("::1",)
+    assert csrf.kwargs["allowed_origins"] == ("http://[::1]:8787",)
 
 
 def test_ui_remote_binding_rejects_wildcard_allowed_host(

@@ -24,7 +24,14 @@ uv run invoice-agents ui
 The last command brings everything up: it creates, migrates, and seeds both SQLite databases
 (idempotent, so it is safe on every start) and serves the web console at
 <http://127.0.0.1:8787>. Use `--port` to change the port and `--no-init-db` to skip database
-setup. The server is localhost-only by design.
+setup. The server is localhost-only by default and rejects remote binds without an explicit risk
+acknowledgement.
+
+Local startup uses one Uvicorn worker and a fresh random session-signing key; restarting the
+console intentionally invalidates every prior browser session. Remote binding additionally
+requires exact `INVOICE_UI_ALLOWED_HOSTS`, `--allow-remote-i-understand`, and an explicit random
+`INVOICE_UI_SESSION_SECRET` of at least 32 bytes. Use that same secret for every process when a
+deployment runs multiple workers; there is no deterministic fallback.
 
 `data/invoices/` is a source-repository demonstration corpus; it is not installed with the
 application. Installed users provide their own directory with `--invoice-dir PATH` when running
