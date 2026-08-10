@@ -4,7 +4,7 @@ The operational reference: exact commands, provider contract checks, framework f
 boundaries, data limitations, and troubleshooting. How to run the system is covered in the
 [README](../README.md). How it works - the architecture, the eight agents, the decision safety
 net, review and resume, payment idempotency, storage, and the web console - is covered with
-diagrams in [`SYSTEM_GUIDE.md`](SYSTEM_GUIDE.md); [`DEMO.md`](../DEMO.md) is the short business
+diagrams in [`SYSTEM_GUIDE.md`](SYSTEM_GUIDE.md); [`DEMO.md`](DEMO.md) is the short business
 walkthrough.
 
 ## Database lifecycle

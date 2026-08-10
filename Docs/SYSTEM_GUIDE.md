@@ -6,7 +6,7 @@ machinery (tools, decision rules, human review, payments, storage, and the web c
 guarantees that every outcome is explicit and auditable.
 
 This guide complements [`REFERENCE.md`](REFERENCE.md) (operational reference) and
-[`DEMO.md`](../DEMO.md) (business walkthrough). Everything below was derived from the code;
+[`DEMO.md`](DEMO.md) (business walkthrough). Everything below was derived from the code;
 module names are given so you can go one level deeper when you need to.
 
 ---

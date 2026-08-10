@@ -91,6 +91,6 @@ compatibility, and `$env:RUN_LIVE_XAI="1"; uv run pytest -m live` runs the live 
 - [`Docs/REFERENCE.md`](Docs/REFERENCE.md) - operational reference: database lifecycle and review
   CLI commands, provider contract, quality gates, module boundaries, data limitations, and
   troubleshooting
-- [`DEMO.md`](DEMO.md) - a short business-facing walkthrough
+- [`DEMO.md`](Docs/DEMO.md) - a short business-facing walkthrough
 - [`plans/UI_PLAN.md`](plans/UI_PLAN.md), [`plans/IMPLEMENTATION_PLAN.md`](plans/IMPLEMENTATION_PLAN.md),
   [`plans/PHASE8_RECONCILIATION.md`](plans/PHASE8_RECONCILIATION.md)

@@ -5,7 +5,7 @@ composite tools and grant the critic its own granular tools.
 
 Related: [`IMPLEMENTATION_PLAN.md`](../IMPLEMENTATION_PLAN.md) §5.1/§6 (original granular design;
 §5.1 carries a one-line amendment pointing here), [`REMEDIATION_PLAN.md`](../REMEDIATION_PLAN.md)
-§2 (R0) and §6.1 (observed live costs), [README module table](../../README.md#module-boundaries).
+§2 (R0) and §6.1 (observed live costs), [module boundaries](../../Docs/REFERENCE.md#module-boundaries).
 
 ## Context
 

@@ -5,7 +5,7 @@ Status: **Accepted**, 2026-08-06. Recorded as part of remediation phase R3
 
 Related: [`IMPLEMENTATION_PLAN.md`](../IMPLEMENTATION_PLAN.md) §11 (the fourteen compatibility
 items), `src/invoice_agents/compatibility.py` (`run_live_contracts`),
-[README "Prove provider compatibility"](../../README.md#prove-provider-compatibility),
+[provider compatibility contract](../../Docs/REFERENCE.md#provider-compatibility-contract),
 [ADR-001](001-composite-agent-tools.md).
 
 ## Context
