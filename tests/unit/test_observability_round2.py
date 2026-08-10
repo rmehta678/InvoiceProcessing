@@ -452,3 +452,133 @@ def test_python_object_budget_allows_shared_acyclic_references() -> None:
         "first": {"invoice_number": "INV-42", "prompt_tokens": 47},
         "second": {"invoice_number": "INV-42", "prompt_tokens": 47},
     }
+
+
+@pytest.mark.parametrize(
+    ("credential", "expected"),
+    [
+        ("provider sκ-abcdefgh_12345678", "provider [REDACTED]"),
+        ("provider ѕκ-abcdefgh_12345678", "provider [REDACTED]"),
+        ("\u03b1\u03c1i_key=round5-canary", "\u03b1\u03c1i_key=[REDACTED]"),
+        ("api_κey=round5-canary", "api_κey=[REDACTED]"),
+        ("t\u03bfken=round5-canary", "t\u03bfken=[REDACTED]"),
+    ],
+)
+def test_unknown_mixed_script_letters_cannot_evade_credential_boundaries(
+    credential: str,
+    expected: str,
+) -> None:
+    assert sanitize_text(credential) == expected
+
+
+@pytest.mark.parametrize(
+    "credential_key",
+    ["\u03b1\u03c1i_key", "api_κey", "t\u03bfken"],
+)
+def test_mixed_script_sensitive_mapping_keys_redact_without_changing_the_key(
+    credential_key: str,
+) -> None:
+    assert redact({credential_key: "round5-map-canary", "prompt_tokens": 47}) == {
+        credential_key: "[REDACTED]",
+        "prompt_tokens": 47,
+    }
+
+
+@pytest.mark.parametrize(
+    "tool_call_id",
+    [
+        "call_sκ-abcdefgh_12345678",
+        "call_ѕκ-abcdefgh_12345678",
+        "call_\u03b1\u03c1i_key=round5-canary",
+        "call_api_κey=round5-canary",
+        "call_t\u03bfken=round5-canary",
+    ],
+)
+def test_mixed_script_credential_tool_ids_are_rejected_at_both_persistence_boundaries(
+    workflow_db: object,
+    tool_call_id: str,
+) -> None:
+    with pytest.raises(InvoiceAgentsError) as failure:
+        orchestration._validated_tool_call_ids([tool_call_id], "case_round5")
+    assert failure.value.stop_reason == "TOOL_CALL_ID_INVALID"
+
+    recorder = AuditRecorder(workflow_db, "case_round5_raw_tool_id")
+    with pytest.raises(ValueError, match="tool call"):
+        recorder.record("test.raw-tool-id", {"safe": True}, tool_call_id=tool_call_id)
+    with connect_database(workflow_db, read_only=True) as connection:
+        rows = connection.execute(
+            "SELECT tool_call_id FROM events WHERE case_id = ?",
+            ("case_round5_raw_tool_id",),
+        ).fetchall()
+    assert rows == []
+
+
+def test_mixed_script_credentials_are_removed_from_exception_logs_and_audit_rows(
+    workflow_db: object,
+) -> None:
+    marker = "round5-exception-audit-canary"
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.addFilter(RedactingFilter())
+    logger = logging.getLogger("invoice_agents.tests.observability_round5")
+    previous = (logger.handlers[:], logger.level, logger.propagate)
+    logger.handlers = [handler]
+    logger.setLevel(logging.ERROR)
+    logger.propagate = False
+    try:
+        try:
+            raise RuntimeError(f"api_κey={marker}")
+        except RuntimeError:
+            logger.exception("mixed-script provider failure")
+    finally:
+        logger.handlers, logger.level, logger.propagate = previous
+
+    recorder = AuditRecorder(workflow_db, "case_round5_audit")
+    recorder.record(
+        "provider.failure",
+        {
+            "message": f"provider sκ-abcdefgh_{marker}",
+            "prompt_tokens": 47,
+        },
+    )
+    with connect_database(workflow_db, read_only=True) as connection:
+        row = connection.execute(
+            "SELECT payload_json FROM events WHERE case_id = ?",
+            ("case_round5_audit",),
+        ).fetchone()
+    assert row is not None
+    combined = f"{stream.getvalue()} {row['payload_json']}"
+    assert marker not in combined
+    assert "abcdefgh" not in combined
+    assert "[REDACTED]" in combined
+    assert json.loads(row["payload_json"])["prompt_tokens"] == 47
+
+
+@pytest.mark.parametrize(
+    "ordinary",
+    [
+        "résumé=Alice",
+        "κόστος=15",
+        "日本語=ordinary",
+        "المدينة=Chicago",
+    ],
+)
+def test_unrelated_unicode_assignments_are_preserved_without_false_redaction(
+    ordinary: str,
+) -> None:
+    assert sanitize_text(ordinary) == ordinary
+    assert redact({ordinary.split("=", 1)[0]: ordinary.split("=", 1)[1]}) == {
+        ordinary.split("=", 1)[0]: ordinary.split("=", 1)[1]
+    }
+
+
+@pytest.mark.parametrize(
+    "redacted",
+    [
+        "api_key=[REDACTED]",
+        "api_κey=[REDACTED]",
+        "t\u03bfken=[REDACTED]",
+    ],
+)
+def test_opaque_redaction_marker_is_a_sanitizer_fixed_point(redacted: str) -> None:
+    assert sanitize_text(redacted) == redacted

@@ -255,6 +255,7 @@ def create_app(
     )
     app.add_middleware(SecurityHeadersMiddleware)
     app.state.settings = selected_settings
+    app.state.result_artifact_root = Path.cwd().absolute() / "artifacts" / "results"
     app.state.registry = RunRegistry()
     app.state.recovery_coordinator = recovery_coordinator
     app.state.templates = build_templates()

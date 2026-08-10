@@ -104,8 +104,9 @@ _CURRENT_AUDIT: ContextVar[AuditRecorder | None] = ContextVar(
 _DETECTION_JOINER = "\ufff0"
 _DETECTION_JOINER_PATTERN = rf"[\t\r\n{_DETECTION_JOINER}]"
 _DETECTION_GAP = rf"(?:[ ]|{_DETECTION_JOINER_PATTERN})*"
+_DETECTION_NON_ASCII_LETTER = "\ufff1"
 _ASCII_WHITESPACE = frozenset(" \t\r\n\f\v")
-_CONFUSABLE_ASCII = {
+_KNOWN_CONFUSABLE_ASCII = {
     "\u0430": "a",
     "\u0435": "e",
     "\u0456": "i",
@@ -187,7 +188,15 @@ def _credential_detection_projection(value: str) -> tuple[str, list[int]]:
         for normalized_character in normalized:
             if unicodedata.category(normalized_character) in {"Mn", "Mc", "Me"}:
                 continue
-            projected.append(_CONFUSABLE_ASCII.get(normalized_character, normalized_character))
+            known = _KNOWN_CONFUSABLE_ASCII.get(normalized_character)
+            if known is not None:
+                projected.append(known)
+            elif not normalized_character.isascii() and unicodedata.category(
+                normalized_character
+            ).startswith("L"):
+                projected.append(_DETECTION_NON_ASCII_LETTER)
+            else:
+                projected.append(normalized_character)
             source_indexes.append(source_index)
     return "".join(projected), source_indexes
 
@@ -198,7 +207,16 @@ def _skip_detection_whitespace(value: str, position: int) -> int:
     return position
 
 
+def _is_detection_boundary_word_character(value: str) -> bool:
+    return value in "abcdefghijklmnopqrstuvwxyz0123456789-" or value == _DETECTION_NON_ASCII_LETTER
+
+
+def _is_provider_token_character(value: str) -> bool:
+    return value == "_" or _is_detection_boundary_word_character(value)
+
+
 def _match_detection_identifier(value: str, position: int, identifier: str) -> int | None:
+    matched_ascii_letter = False
     for offset, expected in enumerate(identifier):
         if offset:
             position = _skip_detection_whitespace(value, position)
@@ -208,10 +226,15 @@ def _match_detection_identifier(value: str, position: int, identifier: str) -> i
         if expected == "_":
             if actual not in {"_", "-"}:
                 return None
+        elif actual == _DETECTION_NON_ASCII_LETTER:
+            if not expected.isascii() or not expected.isalpha():
+                return None
         elif actual != expected:
             return None
+        else:
+            matched_ascii_letter = True
         position += 1
-    return position
+    return position if matched_ascii_letter else None
 
 
 def _quoted_value_end(value: str, start: int, quote: str) -> int:
@@ -235,7 +258,7 @@ def _assignment_credential_spans(
     spans: list[tuple[int, int]] = []
     sensitive_keys = sorted(SENSITIVE_KEYS, key=len, reverse=True)
     for position in range(len(projected)):
-        if position and projected[position - 1] in "abcdefghijklmnopqrstuvwxyz0123456789-":
+        if position and _is_detection_boundary_word_character(projected[position - 1]):
             continue
         for sensitive_key in sensitive_keys:
             identifier_end = _match_detection_identifier(projected, position, sensitive_key)
@@ -254,6 +277,8 @@ def _assignment_credential_spans(
             if opening in {'"', "'"}:
                 source_start += 1
                 source_end = _quoted_value_end(value, source_start, opening)
+            elif value.startswith("[REDACTED]", source_start):
+                source_end = source_start + len("[REDACTED]")
             elif sensitive_key in {
                 "authorization",
                 "proxy_authorization",
@@ -284,7 +309,7 @@ def _provider_token_end(projected: str, position: int) -> tuple[int, int] | None
     has_separator = False
     while position < len(projected):
         character = projected[position]
-        if character in "abcdefghijklmnopqrstuvwxyz0123456789_-":
+        if _is_provider_token_character(character):
             token_characters += 1
             has_separator = has_separator or character in "_-"
             last_token_position = position + 1
@@ -296,9 +321,8 @@ def _provider_token_end(projected: str, position: int) -> tuple[int, int] | None
         if character == " " and not ordinary_space_used:
             continuation_start = _skip_detection_whitespace(projected, position)
             continuation_end = continuation_start
-            while (
-                continuation_end < len(projected)
-                and projected[continuation_end] in "abcdefghijklmnopqrstuvwxyz0123456789_-"
+            while continuation_end < len(projected) and _is_provider_token_character(
+                projected[continuation_end]
             ):
                 continuation_end += 1
             continuation = projected[continuation_start:continuation_end]
@@ -319,7 +343,7 @@ def _provider_credential_spans(
 ) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     for position in range(len(projected)):
-        if position and projected[position - 1] in "abcdefghijklmnopqrstuvwxyz0123456789-":
+        if position and _is_detection_boundary_word_character(projected[position - 1]):
             continue
         prefix_end = _match_detection_identifier(projected, position, "sk")
         if prefix_end is None:
@@ -506,7 +530,12 @@ def safe_tool_call_id(value: object) -> str | None:
 
 
 def _is_sensitive_key(value: str) -> bool:
-    return _normalized_key(value) in SENSITIVE_KEYS
+    projected = _normalized_key(value)
+    return any(
+        (identifier_end := _match_detection_identifier(projected, 0, sensitive_key)) is not None
+        and identifier_end == len(projected)
+        for sensitive_key in SENSITIVE_KEYS
+    )
 
 
 def _redact(value: Any, *, depth: int, budget: list[int]) -> Any:

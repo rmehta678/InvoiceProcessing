@@ -7,6 +7,7 @@ composes no SQL of its own beyond the read-only queries in :mod:`queries`.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -14,6 +15,7 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
@@ -29,6 +31,7 @@ from invoice_agents.db.core import DatabaseKind, verify_database
 from invoice_agents.db.store import ResultArtifactBinding, WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError, SourceEvidenceError
 from invoice_agents.hitl.service import record_human_decision
+from invoice_agents.isolated_process import run_isolated_process
 from invoice_agents.models import (
     CanonicalMapping,
     CaseResult,
@@ -46,6 +49,7 @@ from invoice_agents.ui.recovery import RecoveryCoordinator
 from invoice_agents.ui.runs import RunRegistry
 from invoice_agents.ui.security import secure_cookie
 from invoice_agents.ui.sse import case_event_stream
+from invoice_agents.worker_environment import sanitized_worker_environment
 
 router = APIRouter()
 
@@ -55,9 +59,20 @@ SUPPORTED_SUFFIXES = {".txt", ".json", ".csv", ".xml", ".pdf"}
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 RESULT_ARTIFACT_MAX_BYTES = 1_048_576
 RESULT_ARTIFACT_MAX_DEPTH = 64
+RESULT_ARTIFACT_WORKER_MAX_RESPONSE_BYTES = RESULT_ARTIFACT_MAX_BYTES + 64
+RESULT_ARTIFACT_WORKER_MAX_REQUEST_BYTES = 4_096
+RESULT_ARTIFACT_WORKER_TIMEOUT_SECONDS = 5.0
+_RESULT_ARTIFACT_OK = b"RESULT_ARTIFACT_OK\n"
+_RESULT_ARTIFACT_MISSING = b"RESULT_ARTIFACT_MISSING\n"
+_RESULT_ARTIFACT_INVALID = b"RESULT_ARTIFACT_INVALID\n"
 _OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 _STAT_SUPPORTS_DIR_FD = os.stat in os.supports_dir_fd
 _STAT_SUPPORTS_NOFOLLOW = os.stat in os.supports_follow_symlinks
+_RESULT_ARTIFACT_WORKER_BINDING: ResultArtifactBinding | None = None
+
+
+class _ResultArtifactMissing(FileNotFoundError):
+    pass
 
 
 # One-line consequence per HumanDecisionKind, matching decision_rules exactly:
@@ -166,14 +181,22 @@ def _validate_result_parent_relationships(
             raise ValueError("result artifact parent changed during its bounded read")
 
 
-def _read_exact_bound_result_artifact(
-    case_id: str,
-    binding: ResultArtifactBinding,
-) -> bytes | None:
-    """Read only the exact no-follow file identity authorized by ``binding``."""
+def _read_bounded_regular_file(target: Path) -> bytes:
+    """Read the exact worker-request binding through disposable descriptor ownership."""
 
+    binding = _RESULT_ARTIFACT_WORKER_BINDING
+    if binding is None:
+        raise ValueError("result artifact worker binding is missing")
     if not (_OPEN_SUPPORTS_DIR_FD and _STAT_SUPPORTS_DIR_FD and _STAT_SUPPORTS_NOFOLLOW):
         raise ValueError("descriptor-relative artifact validation is unavailable")
+    if (
+        not target.is_absolute()
+        or target.anchor != os.sep
+        or not target.name
+        or target.name in {".", ".."}
+        or target.name != f"{binding.case_id}.json"
+    ):
+        raise ValueError("result artifact target is not bound to the requested case")
     read_only = _required_open_flag("O_RDONLY")
     close_exec = _required_open_flag("O_CLOEXEC")
     no_follow = _required_open_flag("O_NOFOLLOW")
@@ -183,9 +206,8 @@ def _read_exact_bound_result_artifact(
     file_flags = read_only | close_exec | no_follow | nonblocking
     descriptors: list[int] = []
     relationships: list[tuple[int, str, os.stat_result]] = []
-    payload: bytes | None = None
-    cleanup_failed = False
-    target_name = f"{case_id}.json"
+    raw: bytes | None = None
+    primary_error: BaseException | None = None
     expected_identity = (
         binding.artifact_device,
         binding.artifact_inode,
@@ -193,12 +215,14 @@ def _read_exact_bound_result_artifact(
         binding.artifact_size_bytes,
     )
     if not 0 < binding.artifact_size_bytes <= RESULT_ARTIFACT_MAX_BYTES:
-        return None
+        raise ValueError("result artifact binding exceeds its size bound")
     try:
-        root_descriptor = os.open(".", directory_flags)
+        root_descriptor = os.open(target.anchor, directory_flags)
         descriptors.append(root_descriptor)
         parent_descriptor = root_descriptor
-        for component in ("artifacts", "results"):
+        for component in target.parent.parts[1:]:
+            if not component or component in {".", ".."} or os.sep in component:
+                raise ValueError("result artifact parent component is invalid")
             directory_descriptor = os.open(
                 component,
                 directory_flags,
@@ -207,11 +231,11 @@ def _read_exact_bound_result_artifact(
             descriptors.append(directory_descriptor)
             opened_directory = os.fstat(directory_descriptor)
             if not stat.S_ISDIR(opened_directory.st_mode):
-                return None
+                raise ValueError("result artifact parent is not a directory")
             relationships.append((parent_descriptor, component, opened_directory))
             parent_descriptor = directory_descriptor
         namespace_identity = os.stat(
-            target_name,
+            target.name,
             dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
@@ -226,9 +250,9 @@ def _read_exact_bound_result_artifact(
             or not stat.S_ISREG(namespace_identity.st_mode)
             or namespace_identity.st_nlink != 1
         ):
-            return None
+            raise ValueError("result artifact namespace is not the exact binding")
         artifact_descriptor = os.open(
-            target_name,
+            target.name,
             file_flags,
             dir_fd=parent_descriptor,
         )
@@ -245,7 +269,7 @@ def _read_exact_bound_result_artifact(
             or not stat.S_ISREG(opened_identity.st_mode)
             or opened_identity.st_nlink != 1
         ):
-            return None
+            raise ValueError("opened result artifact is not the exact binding")
         digest = hashlib.sha256()
         chunks: list[bytes] = []
         observed_size = 0
@@ -255,12 +279,12 @@ def _read_exact_bound_result_artifact(
                 break
             observed_size += len(chunk)
             if observed_size > binding.artifact_size_bytes:
-                return None
+                raise ValueError("result artifact exceeded the exact bound while reading")
             digest.update(chunk)
             chunks.append(chunk)
         final_opened_identity = os.fstat(artifact_descriptor)
         final_namespace_identity = os.stat(
-            target_name,
+            target.name,
             dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
@@ -284,18 +308,40 @@ def _read_exact_bound_result_artifact(
             or final_opened_identity.st_nlink != 1
             or final_namespace_identity.st_nlink != 1
         ):
-            return None
+            raise ValueError("result artifact changed during its exact bounded read")
         _validate_result_parent_relationships(relationships)
-        payload = b"".join(chunks)
-    except OSError:
-        payload = None
+        raw = b"".join(chunks)
+    except FileNotFoundError as exc:
+        if exc.errno == errno.ENOENT:
+            try:
+                _validate_result_parent_relationships(relationships)
+            except BaseException as relationship_error:
+                primary_error = relationship_error
+            else:
+                primary_error = _ResultArtifactMissing(
+                    exc.errno,
+                    exc.strerror,
+                    target.name,
+                )
+        else:
+            primary_error = exc
+    except BaseException as exc:
+        primary_error = exc
     finally:
+        cleanup_error: BaseException | None = None
         for descriptor in reversed(descriptors):
             try:
                 os.close(descriptor)
-            except OSError:
-                cleanup_failed = True
-    return None if cleanup_failed else payload
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if primary_error is not None:
+            raise primary_error.with_traceback(primary_error.__traceback__)
+        if cleanup_error is not None:
+            raise cleanup_error.with_traceback(cleanup_error.__traceback__)
+    if raw is None:
+        raise ValueError("result artifact read produced no bounded payload")
+    return raw
 
 
 def _invalid_result_artifact(request: Request, case_id: str) -> Response:
@@ -349,6 +395,142 @@ def _reject_excessive_result_nesting(value: str) -> None:
                 raise ValueError("result artifact nesting exceeds the parser boundary")
         elif character in "}]":
             depth -= 1
+
+
+def _result_artifact_worker_command() -> list[str]:
+    return [sys.executable, "-I", "-m", "invoice_agents.ui.result_artifact_worker"]
+
+
+def _encode_result_artifact_worker_request(
+    target: Path,
+    binding: ResultArtifactBinding,
+) -> bytes:
+    if (
+        not target.is_absolute()
+        or target.anchor != os.sep
+        or target.name != f"{binding.case_id}.json"
+    ):
+        raise ValueError("result artifact worker requires the exact bound target")
+    encoded = json.dumps(
+        {
+            "artifact_device": binding.artifact_device,
+            "artifact_file_type": binding.artifact_file_type,
+            "artifact_inode": binding.artifact_inode,
+            "artifact_sha256": binding.artifact_sha256,
+            "artifact_size_bytes": binding.artifact_size_bytes,
+            "case_id": binding.case_id,
+            "execution_generation": binding.execution_generation,
+            "path": str(target),
+            "protocol_version": 2,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if not encoded or len(encoded) > RESULT_ARTIFACT_WORKER_MAX_REQUEST_BYTES:
+        raise ValueError("result artifact worker request exceeds its bound")
+    return encoded
+
+
+def _decode_result_artifact_worker_request(encoded: bytes) -> Path:
+    global _RESULT_ARTIFACT_WORKER_BINDING
+
+    if _RESULT_ARTIFACT_WORKER_BINDING is not None:
+        raise ValueError("result artifact worker binding was already established")
+    if not encoded or len(encoded) > RESULT_ARTIFACT_WORKER_MAX_REQUEST_BYTES:
+        raise ValueError("invalid result artifact worker request size")
+    payload = json.loads(
+        encoded.decode("utf-8"),
+        object_pairs_hook=_strict_result_object,
+        parse_constant=_reject_result_constant,
+    )
+    if type(payload) is not dict or set(payload) != {
+        "artifact_device",
+        "artifact_file_type",
+        "artifact_inode",
+        "artifact_sha256",
+        "artifact_size_bytes",
+        "case_id",
+        "execution_generation",
+        "path",
+        "protocol_version",
+    }:
+        raise ValueError("invalid result artifact worker request shape")
+    if type(payload["protocol_version"]) is not int or payload["protocol_version"] != 2:
+        raise ValueError("invalid result artifact worker protocol version")
+    case_id = payload["case_id"]
+    generation = payload["execution_generation"]
+    artifact_sha256 = payload["artifact_sha256"]
+    artifact_device = payload["artifact_device"]
+    artifact_inode = payload["artifact_inode"]
+    artifact_file_type = payload["artifact_file_type"]
+    artifact_size_bytes = payload["artifact_size_bytes"]
+    if type(case_id) is not str or SAFE_ID.fullmatch(case_id) is None:
+        raise ValueError("invalid result artifact worker case binding")
+    if type(generation) is not int or generation < 0:
+        raise ValueError("invalid result artifact worker generation binding")
+    if (
+        type(artifact_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", artifact_sha256) is None
+    ):
+        raise ValueError("invalid result artifact worker digest binding")
+    if type(artifact_device) is not int or artifact_device < 0:
+        raise ValueError("invalid result artifact worker device binding")
+    if type(artifact_inode) is not int or artifact_inode <= 0:
+        raise ValueError("invalid result artifact worker inode binding")
+    if type(artifact_file_type) is not int or artifact_file_type != stat.S_IFREG:
+        raise ValueError("invalid result artifact worker type binding")
+    if (
+        type(artifact_size_bytes) is not int
+        or not 0 < artifact_size_bytes <= RESULT_ARTIFACT_MAX_BYTES
+    ):
+        raise ValueError("invalid result artifact worker size binding")
+    raw_path = payload["path"]
+    if type(raw_path) is not str:
+        raise ValueError("invalid result artifact worker target")
+    target = Path(raw_path)
+    if (
+        str(target) != raw_path
+        or not target.is_absolute()
+        or target.anchor != os.sep
+        or not target.name
+        or target.name in {".", ".."}
+        or target.name != f"{case_id}.json"
+    ):
+        raise ValueError("invalid result artifact worker target")
+    _RESULT_ARTIFACT_WORKER_BINDING = ResultArtifactBinding(
+        case_id=case_id,
+        execution_generation=generation,
+        artifact_sha256=artifact_sha256,
+        artifact_device=artifact_device,
+        artifact_inode=artifact_inode,
+        artifact_file_type=artifact_file_type,
+        artifact_size_bytes=artifact_size_bytes,
+    )
+    return target
+
+
+def _read_bounded_regular_file_isolated(
+    target: Path,
+    binding: ResultArtifactBinding,
+) -> bytes | None:
+    outcome = run_isolated_process(
+        command=_result_artifact_worker_command(),
+        request=_encode_result_artifact_worker_request(target, binding),
+        timeout_seconds=RESULT_ARTIFACT_WORKER_TIMEOUT_SECONDS,
+        max_response_bytes=RESULT_ARTIFACT_WORKER_MAX_RESPONSE_BYTES,
+        env=sanitized_worker_environment(),
+    )
+    if outcome.failure is not None or outcome.response is None:
+        raise ValueError("result artifact worker failed without trusted output")
+    if outcome.response in {_RESULT_ARTIFACT_MISSING, _RESULT_ARTIFACT_INVALID}:
+        return None
+    if not outcome.response.startswith(_RESULT_ARTIFACT_OK):
+        raise ValueError("result artifact worker returned an invalid frame")
+    raw = outcome.response[len(_RESULT_ARTIFACT_OK) :]
+    if not raw or len(raw) > RESULT_ARTIFACT_MAX_BYTES:
+        raise ValueError("result artifact worker returned an invalid payload")
+    return raw
 
 
 def _decode_canonical_result_artifact(raw: bytes) -> CaseResult:
@@ -526,8 +708,10 @@ def case_result_json(request: Request, case_id: str) -> Response:
         )
     if binding is None or binding.execution_generation != generation:
         return _artifact_binding_conflict(result)
+    artifact_root: Path = request.app.state.result_artifact_root
+    target = artifact_root / f"{case_id}.json"
     try:
-        payload = _read_exact_bound_result_artifact(case_id, binding)
+        payload = _read_bounded_regular_file_isolated(target, binding)
         if payload is None:
             return _artifact_binding_conflict(result)
         artifact = _decode_canonical_result_artifact(payload)

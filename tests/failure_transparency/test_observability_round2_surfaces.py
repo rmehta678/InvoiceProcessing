@@ -36,6 +36,7 @@ def test_unicode_split_and_continued_credentials_never_reach_ui_or_cli(
     cookie_a = "round2-surface-cookie-a"
     cookie_b = "round2-surface-cookie-b"
     split_marker = "abcdefgh_12345678"
+    mixed_script_marker = "round5-surface-canary"
     result = CaseResult(
         case_id=case_id,
         source_id=invoice.source.source_id,
@@ -47,7 +48,10 @@ def test_unicode_split_and_continued_credentials_never_reach_ui_or_cli(
                 message=f"cookie=session={cookie_a}; preference={cookie_b}",
                 case_id=case_id,
                 stop_reason="PROVIDER_REQUEST_FAILED",
-                details={"cause": f"provider rejected sk-abcd\u2064efgh_{split_marker}"},
+                details={
+                    "cause": f"provider rejected sk-abcd\u2064efgh_{split_marker}",
+                    "mixed_script": f"api_κey={mixed_script_marker}",
+                },
             )
         ],
         usage=UsageSummary(prompt_tokens=47, completion_tokens=12),
@@ -72,6 +76,7 @@ def test_unicode_split_and_continued_credentials_never_reach_ui_or_cli(
         assert cookie_a not in output
         assert cookie_b not in output
         assert split_marker not in output
+        assert mixed_script_marker not in output
         assert "[REDACTED]" in output
     assert "47" in ui_output and "12" in ui_output
     assert '"prompt_tokens": 47' in cli_output

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
+import multiprocessing
 import os
 import socket
 import time
+from multiprocessing.connection import Connection
 from pathlib import Path
 
 import httpx
@@ -15,6 +18,7 @@ from factories import make_succeeded_case
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from invoice_agents import isolated_process
 from invoice_agents.config import Settings
 from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import WorkflowStore
@@ -45,6 +49,100 @@ def _legacy_result(settings: Settings, case_id: str, marker: str) -> str:
         )
         connection.commit()
     return encoded
+
+
+def _descriptor_cleanup_probe(
+    connection: Connection,
+    target: str,
+    fault_index: int,
+    timing: str,
+) -> None:
+    real_open = os.open
+    real_close = os.close
+    opened: list[int] = []
+    attempts: list[int] = []
+    replacements: list[int] = []
+
+    def tracking_open(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        opened.append(descriptor)
+        return descriptor
+
+    def faulting_close(descriptor: int) -> None:
+        attempt_index = len(attempts)
+        attempts.append(descriptor)
+        if attempt_index == fault_index:
+            if timing == "after":
+                real_close(descriptor)
+                replacements.append(real_open(os.devnull, os.O_RDONLY))
+            raise OSError(errno.EIO, "injected descriptor close failure")
+        real_close(descriptor)
+
+    routes.os.open = tracking_open
+    routes.os.close = faulting_close
+    error_type: str | None = None
+    error_number: int | None = None
+    try:
+        routes._read_bounded_regular_file(Path(target))
+    except BaseException as exc:
+        error_type = type(exc).__name__
+        error_number = exc.errno if isinstance(exc, OSError) else None
+    alive: list[int] = []
+    for descriptor in dict.fromkeys([*opened, *replacements]):
+        try:
+            os.fstat(descriptor)
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                raise
+        else:
+            alive.append(descriptor)
+    connection.send(
+        {
+            "alive": alive,
+            "attempts": attempts,
+            "error_number": error_number,
+            "error_type": error_type,
+            "opened": opened,
+            "replacements": replacements,
+        }
+    )
+    connection.close()
+
+
+def _run_descriptor_cleanup_probe(
+    target: Path,
+    *,
+    fault_index: int = -1,
+    timing: str = "before",
+) -> dict[str, object]:
+    context = multiprocessing.get_context("spawn")
+    parent_connection, child_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_descriptor_cleanup_probe,
+        args=(child_connection, str(target), fault_index, timing),
+    )
+    try:
+        process.start()
+        child_connection.close()
+        assert parent_connection.poll(10), "descriptor probe did not report a bounded outcome"
+        report = parent_connection.recv()
+        process.join(10)
+        assert not process.is_alive(), "descriptor probe survived its ownership domain"
+        assert process.exitcode == 0
+        assert isinstance(report, dict)
+        return report
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(10)
+        parent_connection.close()
+        child_connection.close()
 
 
 def test_result_artifact_is_bounded_bound_to_database_and_newly_sanitized(
@@ -178,7 +276,6 @@ def test_result_artifact_rejects_excessive_nesting_without_parser_crash(
 
 
 def test_result_artifact_open_is_descriptor_first_and_nonblocking(
-    client: TestClient,
     settings: Settings,
     ui_workdir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -213,9 +310,7 @@ def test_result_artifact_open_is_descriptor_first_and_nonblocking(
     monkeypatch.setattr(routes.os, "open", checked_open)
     monkeypatch.setattr(Path, "is_file", forbidden_is_file)
 
-    response = client.get(f"/cases/{case_id}/result.json")
-
-    assert response.status_code == 200
+    assert routes._read_bounded_regular_file(target) == raw.encode("utf-8")
 
 
 @pytest.mark.parametrize("parent_kind", ["live_symlink", "dangling_symlink"])
@@ -298,7 +393,6 @@ def test_result_artifact_rejects_unix_socket_without_blocking(
 
 
 def test_result_artifact_rejects_parent_swap_during_descriptor_walk(
-    client: TestClient,
     settings: Settings,
     ui_workdir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -332,14 +426,11 @@ def test_result_artifact_rejects_parent_swap_during_descriptor_walk(
 
     monkeypatch.setattr(routes.os, "open", swapping_open)
 
-    response = client.get(f"/cases/{case_id}/result.json")
-
-    assert response.status_code == 409
-    assert "RESULT_ARTIFACT_INVALID" in response.text
+    with pytest.raises(ValueError, match="parent changed"):
+        routes._read_bounded_regular_file((results / f"{case_id}.json").absolute())
 
 
 def test_result_artifact_parent_swap_cannot_turn_final_enoent_into_missing(
-    client: TestClient,
     settings: Settings,
     ui_workdir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -370,10 +461,8 @@ def test_result_artifact_parent_swap_cannot_turn_final_enoent_into_missing(
 
     monkeypatch.setattr(routes.os, "open", swapping_open)
 
-    response = client.get(f"/cases/{case_id}/result.json")
-
-    assert response.status_code == 409
-    assert "RESULT_ARTIFACT_INVALID" in response.text
+    with pytest.raises(ValueError, match="parent changed"):
+        routes._read_bounded_regular_file((results / f"{case_id}.json").absolute())
 
 
 @pytest.mark.parametrize(
@@ -381,18 +470,17 @@ def test_result_artifact_parent_swap_cannot_turn_final_enoent_into_missing(
     ["O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"],
 )
 def test_result_artifact_fails_closed_when_required_open_flag_is_unavailable(
-    client: TestClient,
     settings: Settings,
+    ui_workdir: Path,
     monkeypatch: pytest.MonkeyPatch,
     required_flag: str,
 ) -> None:
     case_id = make_succeeded_case(settings)
     monkeypatch.delattr(routes.os, required_flag)
 
-    response = client.get(f"/cases/{case_id}/result.json")
-
-    assert response.status_code == 409
-    assert "RESULT_ARTIFACT_INVALID" in response.text
+    target = (ui_workdir / "artifacts" / "results" / f"{case_id}.json").absolute()
+    with pytest.raises(ValueError, match="required artifact open flag"):
+        routes._read_bounded_regular_file(target)
 
 
 @pytest.mark.asyncio
@@ -407,13 +495,13 @@ async def test_result_artifact_blocking_work_does_not_stall_the_event_loop(
     artifact_dir = ui_workdir / "artifacts" / "results"
     artifact_dir.mkdir(parents=True)
     (artifact_dir / f"{case_id}.json").write_text(raw, encoding="utf-8")
-    original_read = routes._read_bounded_regular_file
+    original_read = routes._read_bounded_regular_file_isolated
 
     def slow_read(target: Path) -> bytes:
         time.sleep(0.15)
         return original_read(target)
 
-    monkeypatch.setattr(routes, "_read_bounded_regular_file", slow_read)
+    monkeypatch.setattr(routes, "_read_bounded_regular_file_isolated", slow_read)
     ticked_at: list[float] = []
     began = time.monotonic()
 
@@ -430,3 +518,115 @@ async def test_result_artifact_blocking_work_does_not_stall_the_event_loop(
 
     assert response.status_code == 200
     assert ticked_at[0] - began < 0.1
+
+
+def test_result_artifact_cleanup_attempts_every_owned_descriptor_and_contains_reuse(
+    settings: Settings,
+    ui_workdir: Path,
+) -> None:
+    case_id = make_succeeded_case(settings)
+    raw = _legacy_result(settings, case_id, "round5-cleanup-canary")
+    artifact_dir = ui_workdir / "artifacts" / "results"
+    artifact_dir.mkdir(parents=True)
+    target = (artifact_dir / f"{case_id}.json").absolute()
+    target.write_text(raw, encoding="utf-8")
+    baseline = _run_descriptor_cleanup_probe(target)
+    opened = baseline["opened"]
+    assert isinstance(opened, list)
+    assert baseline["error_type"] is None
+    descriptor_count = len(opened)
+    assert descriptor_count >= 4
+    baseline_parent_fds = len(os.listdir("/dev/fd"))
+
+    for timing in ("before", "after"):
+        for fault_index in range(descriptor_count):
+            report = _run_descriptor_cleanup_probe(
+                target,
+                fault_index=fault_index,
+                timing=timing,
+            )
+            assert report["error_type"] == "OSError"
+            assert report["error_number"] == errno.EIO
+            assert report["attempts"] == report["opened"][::-1]
+            assert report["alive"] == [report["attempts"][fault_index]]
+            if timing == "after":
+                assert report["replacements"] == [report["attempts"][fault_index]]
+            else:
+                assert report["replacements"] == []
+
+    assert len(os.listdir("/dev/fd")) == baseline_parent_fds
+
+
+@pytest.mark.parametrize(
+    ("primary", "expected_error"),
+    [("missing", "_ResultArtifactMissing"), ("directory", "ValueError")],
+)
+def test_result_artifact_primary_error_precedes_descriptor_cleanup_error(
+    ui_workdir: Path,
+    primary: str,
+    expected_error: str,
+) -> None:
+    artifact_dir = ui_workdir / "artifacts" / "results"
+    artifact_dir.mkdir(parents=True)
+    target = (artifact_dir / f"case_round5_{primary}.json").absolute()
+    if primary == "directory":
+        target.mkdir()
+
+    report = _run_descriptor_cleanup_probe(target, fault_index=0, timing="before")
+
+    assert report["error_type"] == expected_error
+    assert report["attempts"] == report["opened"][::-1]
+
+
+def test_result_artifact_requests_use_reaped_descriptor_ownership_processes(
+    client: TestClient,
+    settings: Settings,
+    ui_workdir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case_id = make_succeeded_case(settings)
+    raw = _legacy_result(settings, case_id, "round5-process-canary")
+    artifact_dir = ui_workdir / "artifacts" / "results"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / f"{case_id}.json").write_text(raw, encoding="utf-8")
+    real_popen = isolated_process.subprocess.Popen
+    artifact_processes: list[object] = []
+
+    def capturing_popen(*args: object, **kwargs: object) -> object:
+        process = real_popen(*args, **kwargs)
+        command = args[0] if args else kwargs.get("args")
+        if "invoice_agents.ui.result_artifact_worker" in str(command):
+            artifact_processes.append(process)
+        return process
+
+    monkeypatch.setattr(isolated_process.subprocess, "Popen", capturing_popen)
+    baseline_parent_fds = len(os.listdir("/dev/fd"))
+
+    responses = [client.get(f"/cases/{case_id}/result.json") for _ in range(4)]
+
+    assert [response.status_code for response in responses] == [200, 200, 200, 200]
+    assert len(artifact_processes) == 4
+    assert all(process.poll() is not None for process in artifact_processes)  # type: ignore[attr-defined]
+    assert len(os.listdir("/dev/fd")) == baseline_parent_fds
+
+
+def test_result_artifact_root_is_captured_before_concurrent_cwd_changes(
+    client: TestClient,
+    settings: Settings,
+    ui_workdir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case_id = make_succeeded_case(settings)
+    raw = _legacy_result(settings, case_id, "round5-cwd-canary")
+    artifact_dir = ui_workdir / "artifacts" / "results"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / f"{case_id}.json").write_text(raw, encoding="utf-8")
+    attacker_cwd = tmp_path / "attacker-cwd"
+    attacker_cwd.mkdir()
+
+    monkeypatch.chdir(attacker_cwd)
+    response = client.get(f"/cases/{case_id}/result.json")
+
+    assert response.status_code == 200
+    assert response.json()["case_id"] == case_id
