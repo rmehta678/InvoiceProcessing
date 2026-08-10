@@ -8,6 +8,7 @@ composes no SQL of its own beyond the read-only queries in :mod:`queries`.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -36,7 +37,7 @@ from invoice_agents.models import (
     HumanDecisionKind,
     ReviewRequest,
 )
-from invoice_agents.observability.audit import sanitize_text
+from invoice_agents.observability.audit import sanitize_case_result, sanitize_text
 from invoice_agents.orchestration import validate_case_concurrency
 from invoice_agents.ui import queries
 from invoice_agents.ui.preflight import key_present, run_preflight
@@ -51,6 +52,7 @@ INVOICE_DIR = Path("data/invoices")
 UPLOAD_DIR_NAME = "uploads"
 SUPPORTED_SUFFIXES = {".txt", ".json", ".csv", ".xml", ".pdf"}
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
+RESULT_ARTIFACT_MAX_BYTES = 1_048_576
 
 # One-line consequence per HumanDecisionKind, matching decision_rules exactly:
 # an authorizing decision permits APPROVE (or HOLD when blocking evidence remains),
@@ -152,6 +154,8 @@ def _read_exact_bound_result_artifact(
         binding.artifact_file_type,
         binding.artifact_size_bytes,
     )
+    if not 0 < binding.artifact_size_bytes <= RESULT_ARTIFACT_MAX_BYTES:
+        return None
     try:
         directory_path = Path.cwd() / "artifacts" / "results"
         classified_directory = os.lstat(directory_path)
@@ -163,7 +167,7 @@ def _read_exact_bound_result_artifact(
         )
         directory_descriptor = os.open(
             directory_path,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
         )
         opened_directory = os.fstat(directory_descriptor)
         if (
@@ -185,7 +189,7 @@ def _read_exact_bound_result_artifact(
             return None
         artifact_descriptor = os.open(
             target_name,
-            os.O_RDONLY | os.O_NOFOLLOW,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
             dir_fd=directory_descriptor,
         )
         opened_identity = os.fstat(artifact_descriptor)
@@ -232,7 +236,7 @@ def _read_exact_bound_result_artifact(
             return None
         validation_directory_descriptor = os.open(
             directory_path,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
         )
         validation_directory = os.fstat(validation_directory_descriptor)
         if (
@@ -261,6 +265,49 @@ def _read_exact_bound_result_artifact(
             except OSError:
                 cleanup_failed = True
     return None if cleanup_failed else payload
+
+
+def _invalid_result_artifact(request: Request, case_id: str) -> Response:
+    error = InvoiceAgentsError(
+        ErrorCategory.DATABASE,
+        "result artifact failed validation against the authoritative case",
+        case_id=case_id,
+        stop_reason="RESULT_ARTIFACT_INVALID",
+    )
+    return _render(request, "error.html", {"nav": None, "error": error}, status_code=409)
+
+
+def _strict_result_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError("duplicate result artifact key")
+        payload[key] = value
+    return payload
+
+
+def _reject_result_constant(_value: str) -> object:
+    raise ValueError("non-finite result artifact number")
+
+
+def _decode_canonical_result_artifact(raw: bytes) -> CaseResult:
+    text = raw.decode("utf-8", errors="strict")
+    payload = json.loads(
+        text,
+        object_pairs_hook=_strict_result_object,
+        parse_constant=_reject_result_constant,
+    )
+    if type(payload) is not dict:
+        raise ValueError("result artifact is not an object")
+    result = CaseResult.model_validate_json(text, strict=True)
+    canonical_payload = json.loads(
+        result.model_dump_json(),
+        object_pairs_hook=_strict_result_object,
+        parse_constant=_reject_result_constant,
+    )
+    if payload != canonical_payload:
+        raise ValueError("result artifact is not canonically encoded")
+    return sanitize_case_result(result)
 
 
 def _invoice_files() -> list[Path]:
@@ -389,7 +436,7 @@ async def case_detail(request: Request, case_id: str) -> Response:
 
 @router.get("/cases/{case_id}/result.json")
 async def case_result_json(request: Request, case_id: str) -> Response:
-    if not SAFE_ID.match(case_id):
+    if SAFE_ID.fullmatch(case_id) is None:
         return _not_found(request, f"case does not exist: {case_id}", "CASE_NOT_FOUND")
     try:
         result, generation, binding = _store(request).load_result_with_artifact_binding(case_id)
@@ -398,7 +445,7 @@ async def case_result_json(request: Request, case_id: str) -> Response:
             return _not_found(request, exc.message, exc.stop_reason)
         if exc.stop_reason == "RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED":
             return _artifact_binding_durability_conflict(case_id)
-        raise
+        return _invalid_result_artifact(request, case_id)
     if result is not None and result.stop_reason == "RESULT_ARTIFACT_DURABILITY_UNRESOLVED":
         return JSONResponse(
             status_code=409,
@@ -419,7 +466,14 @@ async def case_result_json(request: Request, case_id: str) -> Response:
     payload = _read_exact_bound_result_artifact(case_id, binding)
     if payload is None:
         return _artifact_binding_conflict(result)
-    return Response(content=payload, media_type="application/json")
+    try:
+        artifact = _decode_canonical_result_artifact(payload)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return _invalid_result_artifact(request, case_id)
+    authoritative = sanitize_case_result(result)
+    if artifact.case_id != case_id or artifact != authoritative:
+        return _invalid_result_artifact(request, case_id)
+    return Response(content=artifact.model_dump_json(), media_type="application/json")
 
 
 @router.get("/cases/{case_id}/live")

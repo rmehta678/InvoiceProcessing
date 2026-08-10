@@ -64,27 +64,51 @@ async def test_round1_live_evidence_uses_only_stable_safe_fields_without_network
         "https://local.invalid/v1/chat/completions",
         headers={"Cookie": f"session={cookie_marker}"},
     )
-    response = httpx.Response(
-        400,
+    auth_response = httpx.Response(
+        401,
         request=request,
         headers={
-            "x-request-id": "req_round1_bad_request",
+            "x-request-id": "req_round1_authentication",
             "Set-Cookie": f"session={cookie_marker}",
         },
         json={"error": {"message": body_marker}},
     )
-    bad_request = openai.BadRequestError(
+    authentication_error = openai.AuthenticationError(
         exception_marker,
-        response=response,
-        body={"error": {"message": body_marker}},
+        response=auth_response,
+        body={
+            "error": {
+                "type": "authentication_error",
+                "code": "invalid_api_key",
+                "message": body_marker,
+            }
+        },
+    )
+    schema_response = httpx.Response(
+        400,
+        request=request,
+        headers={"x-request-id": "req_round1_bad_schema"},
+    )
+    schema_error = openai.BadRequestError(
+        exception_marker,
+        response=schema_response,
+        body={
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_json_schema",
+                "param": "response_format",
+                "message": body_marker,
+            }
+        },
     )
 
     class _RejectingClient:
-        def __init__(self) -> None:
+        def __init__(self, failure: openai.APIError) -> None:
+            self.failure = failure
             self.chat = SimpleNamespace(completions=self)
 
         async def create(self, **_kwargs: object) -> object:
-            raise bad_request
+            raise self.failure
 
         async def close(self) -> None:
             return None
@@ -92,9 +116,14 @@ async def test_round1_live_evidence_uses_only_stable_safe_fields_without_network
     monkeypatch.setattr(
         compatibility.openai,
         "AsyncOpenAI",
-        lambda **_kwargs: _RejectingClient(),
+        lambda **_kwargs: _RejectingClient(authentication_error),
     )
     invalid_key_check = await compatibility._live_invalid_key_rejection()
+    monkeypatch.setattr(
+        compatibility.openai,
+        "AsyncOpenAI",
+        lambda **_kwargs: _RejectingClient(schema_error),
+    )
     schema_check = await compatibility._structured_output_rejection_live(settings)
 
     class _AcceptingClient:
@@ -121,10 +150,11 @@ async def test_round1_live_evidence_uses_only_stable_safe_fields_without_network
         "category=MODEL_IDENTITY; status=MATCHED; provider_request_id=req_round1_model"
     )
     assert invalid_key_check.evidence == (
-        "category=PROVIDER; status=400; provider_request_id=req_round1_bad_request"
+        "category=AUTHENTICATION_REJECTION; status=401; "
+        "provider_request_id=req_round1_authentication"
     )
     assert schema_check.evidence == (
-        "category=PROVIDER; status=400; provider_request_id=req_round1_bad_request"
+        "category=SCHEMA_REJECTION; status=400; provider_request_id=req_round1_bad_schema"
     )
     assert accepted_invalid_key_check.passed is False
     assert accepted_invalid_key_check.evidence == (

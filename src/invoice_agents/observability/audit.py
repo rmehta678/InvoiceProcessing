@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import traceback
+import unicodedata
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -20,24 +21,50 @@ from opentelemetry.sdk.trace import TracerProvider
 from invoice_agents.db.core import connect_database
 from invoice_agents.models import CaseResult
 
-SENSITIVE_KEY = re.compile(r"(authorization|api[_-]?key|secret|token|cookie)", re.IGNORECASE)
+SENSITIVE_KEYS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "authorization",
+        "auth_token",
+        "access_token",
+        "client_secret",
+        "cookie",
+        "id_token",
+        "proxy_authorization",
+        "refresh_token",
+        "secret",
+        "session_token",
+        "set_cookie",
+        "token",
+        "xai_api_key",
+        "xai_apikey",
+    }
+)
+CREDENTIAL_TEXT_KEY = (
+    r"(?:xai[-_]?api[-_]?key|api[-_]?key|authorization|proxy[-_]?authorization|"
+    r"client[-_]?secret|secret|set[-_]?cookie|cookie|access[-_]?token|"
+    r"refresh[-_]?token|session[-_]?token|auth[-_]?token|id[-_]?token|token)"
+)
 BEARER_VALUE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
-AUTHORIZATION_SCHEME_VALUE = re.compile(
-    r"(?i)\bauthorization[\"']?\s*[:=]\s*[\"']?"
-    r"(?:bearer|basic|digest|token)\s+[A-Za-z0-9._~+/=-]+[\"']?"
+AUTHORIZATION_HEADER_VALUE = re.compile(
+    r"(?im)(?P<prefix>(?<![\w-])(?:proxy-)?authorization[ \t]*:[ \t]*)"
+    r"[^\r\n]*(?:(?:\r(?!\n)[^\r\n]*)|(?:\r?\n(?:[ \t]+|"
+    r"(?:bearer|basic|digest|token)\b)[^\r\n]*))*"
 )
 PROVIDER_CREDENTIAL_VALUE = re.compile(r"(?i)\b(?:xai|sk)(?:-proj)?-[A-Za-z0-9_-]{8,}\b")
 KEYED_CREDENTIAL_VALUE = re.compile(
-    r"(?i)(?P<prefix>\b[A-Za-z0-9_-]*"
-    r"(?:api[_-]?key|authorization|secret|token(?!s(?:$|[_-])))"
-    r"[A-Za-z0-9_-]*[\"']?\s*[:=]\s*[\"']?)"
+    rf"(?i)(?P<prefix>(?<![\w-]){CREDENTIAL_TEXT_KEY}"
+    r"[\"']?\s*[:=]\s*[\"']?)"
     r"(?P<value>\[REDACTED\]|[^\s\"',}\]]+)(?P<suffix>[\"']?)"
 )
 COOKIE_HEADER_VALUE = re.compile(
     r"(?im)(?P<prefix>(?<![\w-])(?:set-cookie|cookie)[ \t]*:[ \t]*)"
-    r"[^\n]*(?:\n[ \t]+(?![A-Za-z0-9-]+[ \t]*:)[^\n]*)*"
+    r"[^\r\n]*(?:\r?\n[ \t]+(?![A-Za-z0-9-]+[ \t]*:)[^\r\n]*)*"
 )
-COOKIE_ASSIGNMENT_VALUE = re.compile(r"(?i)\bcookie[\"']?\s*=\s*[\"']?[^\s\"',}\]]+[\"']?")
+COOKIE_ASSIGNMENT_VALUE = re.compile(
+    r"(?im)(?P<prefix>(?<![\w-])cookie[\"']?[ \t]*=[ \t]*)[^\r\n]*"
+)
 DOUBLE_QUOTED_COOKIE_FIELD_VALUE = re.compile(
     r'(?i)(?P<prefix>"(?:set-cookie|cookie)"\s*:\s*")'
     r'(?P<value>(?:\\.|[^"\\\r\n])*)(?P<suffix>"?)'
@@ -47,21 +74,23 @@ SINGLE_QUOTED_COOKIE_FIELD_VALUE = re.compile(
     r"(?P<value>(?:\\.|[^'\\\r\n])*)(?P<suffix>'?)"
 )
 SPLIT_PROVIDER_CREDENTIAL = re.compile(
-    r"(?i)\b(?:x[\t\n]*a[\t\n]*i|s[\t\n]*k)"
-    r"(?:[\t\n]*-[\t\n]*p[\t\n]*r[\t\n]*o[\t\n]*j)?"
-    r"[\t\n]*-[\t\n]*(?:[A-Za-z0-9_-][\t\n]*){8,}"
+    r"(?i)\b(?:x[\t\r\n]*a[\t\r\n]*i|s[\t\r\n]*k)"
+    r"(?:[\t\r\n]*-[\t\r\n]*p[\t\r\n]*r[\t\r\n]*o[\t\r\n]*j)?"
+    r"[\t\r\n]*-[\t\r\n]*(?:[A-Za-z0-9_-][\t\r\n]*){8,}"
 )
 ANSI_ESCAPE = re.compile(
     r"(?:\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_])|"
     r"\x9b[0-?]*[ -/]*[@-~])"
 )
-UNSAFE_CONTROL_CHARACTER = re.compile(
-    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u200b-\u200f\u2060\ufeff]"
-)
 SAFE_PROVIDER_REQUEST_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 SANITIZED_TEXT_MAX_CHARS = 4096
 TRUNCATION_MARKER = "…[TRUNCATED]"
-NUMERIC_USAGE_TOKEN_KEYS = frozenset({"prompt_tokens", "completion_tokens"})
+JSON_TEXT_MAX_CHARS = 65_536
+JSON_MAX_DEPTH = 20
+JSON_MAX_NODES = 1_000
+JSON_PAYLOAD_REJECTED = "JSON_PAYLOAD_REJECTED"
+EVENT_PAYLOAD_REJECTED = "EVENT_PAYLOAD_REJECTED"
+VALUE_REJECTED = "[VALUE_REJECTED]"
 _CURRENT_AUDIT: ContextVar[AuditRecorder | None] = ContextVar(
     "invoice_agents_current_audit", default=None
 )
@@ -80,27 +109,63 @@ def _redact_text_patterns(value: str) -> str:
         lambda match: f"{match.group('prefix')}[REDACTED]",
         quoted_cookie_safe,
     )
-    provider_safe = SPLIT_PROVIDER_CREDENTIAL.sub("[REDACTED]", cookie_safe)
-    authorization_safe = AUTHORIZATION_SCHEME_VALUE.sub("[REDACTED]", provider_safe)
-    bearer_safe = BEARER_VALUE.sub("Bearer [REDACTED]", authorization_safe)
+    authorization_header_safe = AUTHORIZATION_HEADER_VALUE.sub(
+        lambda match: f"{match.group('prefix')}[REDACTED]",
+        cookie_safe,
+    )
+    provider_safe = SPLIT_PROVIDER_CREDENTIAL.sub("[REDACTED]", authorization_header_safe)
+    bearer_safe = BEARER_VALUE.sub("Bearer [REDACTED]", provider_safe)
     keyed_safe = KEYED_CREDENTIAL_VALUE.sub(
         lambda match: f"{match.group('prefix')}[REDACTED]{match.group('suffix')}",
         PROVIDER_CREDENTIAL_VALUE.sub("[REDACTED]", bearer_safe),
     )
-    return COOKIE_ASSIGNMENT_VALUE.sub("[REDACTED]", keyed_safe)
+    return COOKIE_ASSIGNMENT_VALUE.sub(
+        lambda match: f"{match.group('prefix')}[REDACTED]",
+        keyed_safe,
+    )
 
 
-def _neutralize_controls(value: str) -> str:
+def _is_default_ignorable(codepoint: int) -> bool:
+    return (
+        codepoint in {0x00AD, 0x034F, 0x061C, 0x3164, 0xFEFF, 0xFFA0}
+        or 0x115F <= codepoint <= 0x1160
+        or 0x17B4 <= codepoint <= 0x17B5
+        or 0x180B <= codepoint <= 0x180F
+        or 0x200B <= codepoint <= 0x200F
+        or 0x202A <= codepoint <= 0x202E
+        or 0x2060 <= codepoint <= 0x206F
+        or 0xFE00 <= codepoint <= 0xFE0F
+        or 0xFFF0 <= codepoint <= 0xFFF8
+        or 0x1BCA0 <= codepoint <= 0x1BCA3
+        or 0x1D173 <= codepoint <= 0x1D17A
+        or 0xE0000 <= codepoint <= 0xE0FFF
+    )
+
+
+def _strip_unsafe_controls(value: str) -> str:
     without_ansi = ANSI_ESCAPE.sub("", value)
-    normalized_lines = without_ansi.replace("\r\n", "\n").replace("\r", "\n")
-    normalized_lines = normalized_lines.replace("\u2028", "\n").replace("\u2029", "\n")
-    return UNSAFE_CONTROL_CHARACTER.sub("", normalized_lines)
+    cleaned: list[str] = []
+    for character in without_ansi:
+        codepoint = ord(character)
+        if character in {"\t", "\n", "\r"}:
+            cleaned.append(character)
+        elif character in {"\u2028", "\u2029"}:
+            cleaned.append("\n")
+        elif _is_default_ignorable(codepoint) or unicodedata.category(character) in {"Cc", "Cs"}:
+            continue
+        else:
+            cleaned.append(character)
+    return "".join(cleaned)
+
+
+def _normalize_lines(value: str) -> str:
+    return value.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def sanitize_text(value: str) -> str:
     """Redact credential-like free text and apply one deterministic size ceiling."""
 
-    sanitized = _redact_text_patterns(_neutralize_controls(value))
+    sanitized = _normalize_lines(_redact_text_patterns(_strip_unsafe_controls(value)))
     if len(sanitized) <= SANITIZED_TEXT_MAX_CHARS:
         return sanitized
     visible_chars = SANITIZED_TEXT_MAX_CHARS - len(TRUNCATION_MARKER)
@@ -117,30 +182,45 @@ def safe_provider_request_id(value: object) -> str | None:
     return value
 
 
-def redact(value: Any) -> Any:
-    """Redact known secret keys and sanitize every serializable text boundary."""
+def _normalized_key(value: str) -> str:
+    safe = _normalize_lines(_strip_unsafe_controls(value))
+    return unicodedata.normalize("NFKC", safe).casefold().replace("-", "_")
 
+
+def _is_sensitive_key(value: str) -> bool:
+    return _normalized_key(value) in SENSITIVE_KEYS
+
+
+def _redact(value: Any, *, depth: int, budget: list[int]) -> Any:
+    budget[0] += 1
+    if depth > JSON_MAX_DEPTH or budget[0] > JSON_MAX_NODES:
+        return VALUE_REJECTED
     if isinstance(value, Mapping):
         cleaned: dict[str, Any] = {}
         for key, item in value.items():
             raw_key = str(key)
             safe_key = sanitize_text(raw_key)
-            if raw_key in NUMERIC_USAGE_TOKEN_KEYS and type(item) is int and item >= 0:
-                cleaned[safe_key] = item
-            elif SENSITIVE_KEY.search(raw_key) or SENSITIVE_KEY.search(safe_key):
-                cleaned[safe_key] = "[REDACTED]"
-            else:
-                cleaned[safe_key] = redact(item)
+            cleaned[safe_key] = (
+                "[REDACTED]"
+                if _is_sensitive_key(raw_key) or _is_sensitive_key(safe_key)
+                else _redact(item, depth=depth + 1, budget=budget)
+            )
         return cleaned
     if isinstance(value, str):
         return sanitize_text(value)
     if isinstance(value, (bytes, bytearray, memoryview)):
         return sanitize_text(bytes(value).decode("utf-8", errors="replace"))
     if isinstance(value, Sequence):
-        return [redact(item) for item in value]
+        return [_redact(item, depth=depth + 1, budget=budget) for item in value]
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return sanitize_text(str(value))
+
+
+def redact(value: Any) -> Any:
+    """Redact exact secret keys and sanitize every serializable text boundary."""
+
+    return _redact(value, depth=0, budget=[0])
 
 
 def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -156,17 +236,75 @@ def _reject_json_constant(_value: str) -> object:
     raise ValueError("non-finite JSON number")
 
 
-def sanitize_json_text(value: str) -> str:
-    """Redact one JSON string structurally or return one bounded text fallback."""
-
+def _bounded_json_mapping(value: str) -> dict[str, object]:
+    if len(value) > JSON_TEXT_MAX_CHARS:
+        raise ValueError("JSON text exceeds the audit boundary")
     try:
         parsed = json.loads(
             value,
             object_pairs_hook=_strict_json_object,
             parse_constant=_reject_json_constant,
         )
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return sanitize_text(value)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting exceeds the parser boundary") from exc
+    if type(parsed) is not dict:
+        raise ValueError("JSON audit payload is not an object")
+    if not _json_value_within_limits(parsed):
+        raise ValueError("JSON audit payload exceeds structural limits")
+    return parsed
+
+
+def _json_value_within_limits(value: object) -> bool:
+    node_budget = [0]
+    character_budget = [0]
+
+    def visit(item: object, depth: int) -> bool:
+        node_budget[0] += 1
+        if depth > JSON_MAX_DEPTH or node_budget[0] > JSON_MAX_NODES:
+            return False
+        if isinstance(item, Mapping):
+            safe_keys: set[str] = set()
+            for key, nested in item.items():
+                raw_key = str(key)
+                character_budget[0] += len(raw_key)
+                safe_key = sanitize_text(raw_key)
+                if safe_key in safe_keys or not visit(nested, depth + 1):
+                    return False
+                safe_keys.add(safe_key)
+            return character_budget[0] <= JSON_TEXT_MAX_CHARS
+        if isinstance(item, list):
+            return all(visit(nested, depth + 1) for nested in item)
+        if isinstance(item, str):
+            character_budget[0] += len(item)
+            return character_budget[0] <= JSON_TEXT_MAX_CHARS
+        return item is None or type(item) in {str, bool, int, float}
+
+    return visit(value, 0)
+
+
+def _rejected_json_payload() -> str:
+    return json.dumps(
+        {"error": JSON_PAYLOAD_REJECTED, "original": "[REDACTED]"},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _rejected_event_payload(event_type: str) -> dict[str, str]:
+    return {
+        "error": EVENT_PAYLOAD_REJECTED,
+        "type": sanitize_text(event_type.removeprefix("autogen.")),
+    }
+
+
+def sanitize_json_text(value: str) -> str:
+    """Redact one JSON object or emit an explicit opaque rejection marker."""
+
+    try:
+        parsed = _bounded_json_mapping(value)
+    except (TypeError, ValueError):
+        return _rejected_json_payload()
     return json.dumps(
         redact(parsed),
         ensure_ascii=False,
@@ -209,7 +347,11 @@ def _normalized_tool_items(event_name: str, value: object) -> list[dict[str, Any
         json_field = "arguments" if request else "content"
         json_value = raw_item.get(json_field)
         if isinstance(json_value, str):
-            item[json_field] = sanitize_json_text(json_value)
+            item[json_field] = (
+                sanitize_json_text(json_value)
+                if request or json_value.lstrip().startswith(("{", "[", '"'))
+                else sanitize_text(json_value)
+            )
         elif json_value is not None:
             item[json_field] = redact(json_value)
         if not request and type(raw_item.get("is_error")) is bool:
@@ -247,17 +389,15 @@ def sanitize_stored_event_payload(event_type: str, value: str) -> str:
     """Present current or legacy event JSON without exposing historical secrets."""
 
     try:
-        parsed = json.loads(
-            value,
-            object_pairs_hook=_strict_json_object,
-            parse_constant=_reject_json_constant,
-        )
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return sanitize_text(value)
-    if event_type.startswith("autogen.") and isinstance(parsed, Mapping):
-        safe_payload: Any = normalize_autogen_event_payload(event_type, parsed)
+        parsed = _bounded_json_mapping(value)
+    except (TypeError, ValueError):
+        safe_payload: Any = _rejected_event_payload(event_type)
     else:
-        safe_payload = redact(parsed)
+        safe_payload = (
+            normalize_autogen_event_payload(event_type, parsed)
+            if event_type.startswith("autogen.")
+            else redact(parsed)
+        )
     return json.dumps(
         safe_payload,
         ensure_ascii=False,
@@ -375,11 +515,14 @@ class AuditRecorder:
         """Persist one event and mirror its timing/correlation in a local span."""
 
         event_id = f"evt_{uuid4().hex}"
-        safe_payload = (
-            normalize_autogen_event_payload(event_type, payload)
-            if event_type.startswith("autogen.") and isinstance(payload, Mapping)
-            else redact(payload)
-        )
+        if event_type.startswith("autogen."):
+            safe_payload = (
+                normalize_autogen_event_payload(event_type, payload)
+                if isinstance(payload, Mapping) and _json_value_within_limits(payload)
+                else _rejected_event_payload(event_type)
+            )
+        else:
+            safe_payload = redact(payload)
         encoded = json.dumps(safe_payload, default=str, ensure_ascii=False, sort_keys=True)
         sanitized_provider_request_id = safe_provider_request_id(provider_request_id)
         created_at = datetime.now(UTC).isoformat()

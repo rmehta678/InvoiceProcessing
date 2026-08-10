@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -27,7 +28,6 @@ from pydantic import BaseModel, ConfigDict
 from invoice_agents.agents.team import create_model_client
 from invoice_agents.config import XAI_BASE_URL, XAI_MODEL, Settings
 from invoice_agents.db.core import DatabaseKind, migrate_database
-from invoice_agents.errors import ErrorCategory
 from invoice_agents.models import UsageSummary
 from invoice_agents.observability.audit import AuditRecorder, safe_provider_request_id
 from invoice_agents.orchestration import _error_record
@@ -55,6 +55,56 @@ def _stable_evidence(category: str, status: str | int, request_id: object = None
     return (
         f"category={category}; status={status}; provider_request_id="
         f"{validated_request_id or '<absent>'}"
+    )
+
+
+def _structured_error_field(exc: BaseException, field: str) -> str | None:
+    """Read one bounded machine field from an OpenAI error body without using prose."""
+
+    body = getattr(exc, "body", None)
+    if not isinstance(body, Mapping):
+        return None
+    error = body.get("error")
+    source = error if isinstance(error, Mapping) else body
+    value = source.get(field)
+    if (
+        type(value) is not str
+        or not 1 <= len(value) <= 128
+        or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_.-" for character in value)
+    ):
+        return None
+    return value
+
+
+def _is_explicit_authentication_rejection(exc: BaseException) -> bool:
+    if not isinstance(exc, openai.APIStatusError):
+        return False
+    status = exc.status_code
+    error_type = _structured_error_field(exc, "type")
+    code = _structured_error_field(exc, "code")
+    return (isinstance(exc, openai.AuthenticationError) and status in {401, 403}) or (
+        status in {400, 401, 403}
+        and (
+            error_type == "authentication_error"
+            or code in {"authentication_failed", "incorrect_api_key", "invalid_api_key"}
+        )
+    )
+
+
+def _is_explicit_schema_rejection(exc: BaseException) -> bool:
+    if (
+        not isinstance(exc, (openai.BadRequestError, openai.UnprocessableEntityError))
+        or isinstance(exc, (openai.AuthenticationError, openai.RateLimitError))
+        or exc.status_code not in {400, 422}
+    ):
+        return False
+    error_type = _structured_error_field(exc, "type")
+    code = _structured_error_field(exc, "code")
+    param = _structured_error_field(exc, "param")
+    return (
+        error_type == "invalid_request_error"
+        and code in {"invalid_json_schema", "unsupported_json_schema"}
+        and param in {"json_schema", "response_format", "response_format.json_schema"}
     )
 
 
@@ -350,12 +400,11 @@ async def _live_invalid_key_rejection() -> ContractCheck:
     """A deliberately incorrect key must be explicitly rejected, never accepted.
 
     Measured live 2026-08-06: xAI signals incorrect credentials as HTTP 400
-    code=invalid-argument ("Incorrect API key provided.") for both sk- and
-    xai-shaped keys - it does not emit the OpenAI-conventional 401, so the SDK
-    raises BadRequestError, which _error_record keeps as a hard PROVIDER failure.
-    This check asserts that observed contract; ADR-002 records the deviation. The
-    AuthenticationError -> AUTHENTICATION mapping stays covered synthetically for
-    providers/endpoints that do send 401.
+    code=invalid-argument rather than the OpenAI-conventional 401. That generic
+    machine code does not distinguish a bad credential from another bad request,
+    and provider prose is not durable evidence. The probe therefore passes only
+    for HTTP authentication semantics or an exact structured authentication code;
+    a provider that omits both leaves this contract unproven.
     """
 
     invalid = openai.AsyncOpenAI(
@@ -375,16 +424,12 @@ async def _live_invalid_key_rejection() -> ContractCheck:
         )
     except openai.APIStatusError as exc:
         record = _error_record(exc)
-        rejected_as_bad_credential = (
-            exc.status_code in (400, 401)
-            and record.category in (ErrorCategory.PROVIDER, ErrorCategory.AUTHENTICATION)
-            and record.stop_reason in ("PROVIDER_REQUEST_FAILED", "PROVIDER_AUTHENTICATION_FAILED")
-        )
+        rejected_as_bad_credential = _is_explicit_authentication_rejection(exc)
         return ContractCheck(
             name="live_invalid_key_rejection",
             passed=rejected_as_bad_credential,
             evidence=_stable_evidence(
-                str(record.category),
+                "AUTHENTICATION_REJECTION" if rejected_as_bad_credential else str(record.category),
                 exc.status_code,
                 record.provider_request_id or safe_provider_request_id(exc.request_id),
             ),
@@ -491,11 +536,12 @@ async def _structured_output_rejection_live(settings: Settings) -> ContractCheck
     except openai.APIError as exc:
         status = getattr(exc, "status_code", None)
         record = _error_record(exc)
+        explicitly_rejected = _is_explicit_schema_rejection(exc)
         return ContractCheck(
             name="structured_output_rejection_live",
-            passed=True,
+            passed=explicitly_rejected,
             evidence=_stable_evidence(
-                str(record.category),
+                "SCHEMA_REJECTION" if explicitly_rejected else str(record.category),
                 status if type(status) is int else "ERROR",
                 record.provider_request_id
                 or safe_provider_request_id(getattr(exc, "request_id", None)),
