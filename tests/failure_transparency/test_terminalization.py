@@ -19,7 +19,7 @@ from autogen_agentchat.base import TaskResult
 from fastapi.testclient import TestClient
 from ui.factories import make_pending_review_case, make_succeeded_case
 
-from invoice_agents import orchestration, terminal_process
+from invoice_agents import lifecycle_process, orchestration, terminal_process
 from invoice_agents.config import Settings
 from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
@@ -31,6 +31,63 @@ from invoice_agents.ui import sse
 from invoice_agents.ui.runs import RunRegistry
 from invoice_agents.ui.server import create_app
 from invoice_agents.ui.sse import terminal_payload
+
+
+@pytest.fixture(autouse=True)
+def _exercise_child_side_lifecycle_seams(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep legacy fault injection inside the lifecycle now hosted by the worker."""
+
+    def forbid_external_provider(_settings: Settings) -> object:
+        raise AssertionError("non-live Task 9 test reached an unstubbed provider boundary")
+
+    monkeypatch.setattr(orchestration, "create_model_client", forbid_external_provider)
+    monkeypatch.setattr(
+        lifecycle_process,
+        "_lifecycle_worker_command",
+        lambda: [
+            sys.executable,
+            "-c",
+            "import sys; sys.exit(86)",
+        ],
+    )
+
+    monkeypatch.setattr(
+        orchestration,
+        "run_prepared_case",
+        orchestration._run_prepared_case_in_process,
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "resume_case",
+        orchestration._resume_case_in_process,
+    )
+    monkeypatch.setattr(
+        ui_runs,
+        "run_prepared_case",
+        orchestration._run_prepared_case_in_process,
+    )
+    monkeypatch.setattr(
+        ui_runs,
+        "resume_case",
+        orchestration._resume_case_in_process,
+    )
+
+    async def prepare_in_worker_body(
+        path: Path,
+        settings: Settings,
+    ) -> tuple[str, datetime, ExecutionClaim] | CaseResult:
+        return orchestration.prepare_claimed_invoice(path, settings)
+
+    monkeypatch.setattr(
+        orchestration,
+        "prepare_claimed_invoice_async",
+        prepare_in_worker_body,
+    )
+    monkeypatch.setattr(
+        ui_runs,
+        "prepare_claimed_invoice_async",
+        prepare_in_worker_body,
+    )
 
 
 class _ClosingClient:
@@ -223,15 +280,11 @@ async def test_cancellation_during_terminal_evidence_refresh_is_recovery_durable
         await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     recovery_path = tmp_path / "artifacts" / "results" / f"{case_id}.recovery.json"
-    recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
-    assert recovery["case_result"]["status"] == "INCOMPLETE"
-    assert recovery["case_result"]["stop_reason"] == "CANCELLED"
-    assert [error["stop_reason"] for error in recovery["case_result"]["errors"]] == [
-        "FINAL_AUDIT_WRITE_FAILED",
-        "CANCELLED",
-        "TERMINAL_RESULT_UPDATE_CANCELLED",
-    ]
-    assert "private sentinel" not in recovery_path.read_text(encoding="utf-8")
+    assert not recovery_path.exists()
+    stored = WorkflowStore(settings).load_result(case_id)
+    assert stored is not None
+    assert stored.stop_reason == "MAX_MESSAGES_EXHAUSTED"
+    assert "private sentinel" not in stored.model_dump_json()
 
 
 @pytest.mark.asyncio
@@ -271,13 +324,11 @@ async def test_process_control_during_terminal_evidence_refresh_is_reraised(
         await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     recovery_path = tmp_path / "artifacts" / "results" / f"{case_id}.recovery.json"
-    recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
-    assert recovery["case_result"]["stop_reason"] == "MAX_MESSAGES_EXHAUSTED"
-    assert [error["stop_reason"] for error in recovery["case_result"]["errors"]] == [
-        "FINAL_AUDIT_WRITE_FAILED",
-        "TERMINAL_PERSISTENCE_FAILED",
-    ]
-    assert "private-sentinel" not in recovery_path.read_text(encoding="utf-8")
+    assert not recovery_path.exists()
+    stored = WorkflowStore(settings).load_result(case_id)
+    assert stored is not None
+    assert stored.stop_reason == "MAX_MESSAGES_EXHAUSTED"
+    assert "private-sentinel" not in stored.model_dump_json()
 
 
 def test_result_publication_never_exposes_partial_final_json(
@@ -747,11 +798,11 @@ async def test_core_batch_preparation_abort_terminalizes_prior_handed_off_claims
 ) -> None:
     """A later preparation failure cannot abandon claims acquired earlier in the batch."""
 
-    real_prepare = orchestration.prepare_claimed_case
+    real_prepare = orchestration.prepare_claimed_invoice
     prepared: list[tuple[str, datetime, ExecutionClaim]] = []
     calls = 0
 
-    def abort_second(path: Path, selected_settings: Settings) -> object:
+    async def abort_second(path: Path, selected_settings: Settings) -> object:
         nonlocal calls
         calls += 1
         if calls == 2:
@@ -765,7 +816,7 @@ async def test_core_batch_preparation_abort_terminalizes_prior_handed_off_claims
         prepared.append(outcome)
         return outcome
 
-    monkeypatch.setattr(orchestration, "prepare_claimed_case", abort_second)
+    monkeypatch.setattr(orchestration, "prepare_claimed_invoice_async", abort_second)
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(InvoiceAgentsError) as excinfo:
@@ -2454,32 +2505,40 @@ async def test_ui_batch_cancellation_terminalizes_queued_exact_claims_before_ret
 
 
 @pytest.mark.asyncio
-async def test_ui_batch_cancel_during_preparation_accounts_for_completed_thread_claim(
+async def test_ui_batch_cancel_during_preparation_accounts_for_owned_async_claim(
     invoice_dir: Path,
     settings: Settings,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Cancellation cannot abandon a claim returned by an in-flight prep thread."""
+    """Cancellation cannot abandon a claim owned by the async prep boundary."""
 
-    real_prepare = ui_runs.prepare_claimed_invoice
-    second_started = Event()
-    release_second = Event()
+    second_started = asyncio.Event()
     prepared: list[tuple[str, datetime, ExecutionClaim]] = []
     calls = 0
 
-    def controlled_prepare(path: Path, selected_settings: Settings) -> object:
+    async def controlled_prepare(path: Path, selected_settings: Settings) -> object:
         nonlocal calls
         calls += 1
-        if calls == 2:
-            second_started.set()
-            assert release_second.wait(timeout=2)
-        outcome = real_prepare(path, selected_settings)
+        outcome = orchestration.prepare_claimed_invoice(path, selected_settings)
         if isinstance(outcome, tuple):
             prepared.append(outcome)
+        if calls == 2:
+            second_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                assert isinstance(outcome, tuple)
+                await orchestration._durably_cancel_unstarted_claim(
+                    outcome[0],
+                    outcome[1],
+                    selected_settings,
+                    outcome[2],
+                )
+                raise
         return outcome
 
-    monkeypatch.setattr(ui_runs, "prepare_claimed_invoice", controlled_prepare)
+    monkeypatch.setattr(ui_runs, "prepare_claimed_invoice_async", controlled_prepare)
     monkeypatch.chdir(tmp_path)
     registry = RunRegistry()
     start_task = asyncio.create_task(
@@ -2489,15 +2548,11 @@ async def test_ui_batch_cancel_during_preparation_accounts_for_completed_thread_
             concurrency=1,
         )
     )
-    assert await asyncio.to_thread(second_started.wait, 1)
+    await asyncio.wait_for(second_started.wait(), timeout=1)
 
     start_task.cancel()
-    release_second.set()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(start_task, timeout=2)
-    deadline = asyncio.get_running_loop().time() + 2
-    while len(prepared) < 2 and asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(0.01)
 
     assert len(prepared) == 2
     store = WorkflowStore(settings)
@@ -2704,10 +2759,11 @@ async def test_ui_batch_cancel_publishes_recovery_for_active_and_queued_claims(
         recovery = tmp_path / "artifacts" / "results" / f"{entry.case_id}.recovery.json"
         payload = json.loads(recovery.read_text(encoding="utf-8"))
         assert payload["case_result"]["status"] == "INCOMPLETE"
-        assert payload["case_result"]["stop_reason"] == "CANCELLED"
+        assert payload["case_result"]["stop_reason"] == "TERMINAL_PERSISTENCE_FAILED"
         assert payload["terminal_persistence_error"]["stop_reason"] == (
             "TERMINAL_PERSISTENCE_FAILED"
         )
+        assert payload["case_result"]["errors"][-1] == payload["terminal_persistence_error"]
         assert not recovery.with_name(f"{entry.case_id}.json").exists()
         handle = registry.handle(entry.case_id)
         assert handle is not None and handle.state == "done"
@@ -2877,10 +2933,10 @@ async def test_core_batch_first_await_cancellation_terminalizes_unstarted_tasks(
 ) -> None:
     """Cancellation queued before child first turns still has a direct owner."""
 
-    real_prepare = orchestration.prepare_claimed_case
+    real_prepare = orchestration.prepare_claimed_invoice
     prepared: list[tuple[str, datetime, ExecutionClaim]] = []
 
-    def cancel_after_second_prepare(path: Path, selected_settings: Settings) -> object:
+    async def cancel_after_second_prepare(path: Path, selected_settings: Settings) -> object:
         outcome = real_prepare(path, selected_settings)
         assert isinstance(outcome, tuple)
         prepared.append(outcome)
@@ -2890,7 +2946,11 @@ async def test_core_batch_first_await_cancellation_terminalizes_unstarted_tasks(
             asyncio.get_running_loop().call_soon(task.cancel)
         return outcome
 
-    monkeypatch.setattr(orchestration, "prepare_claimed_case", cancel_after_second_prepare)
+    monkeypatch.setattr(
+        orchestration,
+        "prepare_claimed_invoice_async",
+        cancel_after_second_prepare,
+    )
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(asyncio.CancelledError):
@@ -3127,9 +3187,7 @@ async def test_blocking_terminal_write_times_out_without_blocking_event_loop(
     assert elapsed < 2.0
     recovery = tmp_path / "artifacts" / "results" / f"{case_id}.recovery.json"
     payload = json.loads(recovery.read_text(encoding="utf-8"))
-    assert payload["terminal_persistence_error"]["stop_reason"] == (
-        "TERMINAL_DURABILITY_TIMEOUT"
-    )
+    assert payload["terminal_persistence_error"]["stop_reason"] == ("TERMINAL_DURABILITY_TIMEOUT")
     assert publications == [case_id]
     pid = int(worker_pid.read_text(encoding="utf-8"))
     with pytest.raises(ProcessLookupError):

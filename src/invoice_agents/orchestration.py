@@ -7,10 +7,12 @@ import json
 import os
 import re
 import sqlite3
+import threading
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from time import monotonic
 from typing import Any, Literal, cast
@@ -24,12 +26,13 @@ from autogen_agentchat.messages import (
     ToolCallExecutionEvent,
     ToolCallRequestEvent,
 )
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from invoice_agents.agents.team import AgentCaseContext, build_team, create_model_client
 from invoice_agents.config import XAI_BASE_URL, XAI_MODEL, Settings
 from invoice_agents.db.core import DatabaseKind, verify_database
 from invoice_agents.db.store import (
+    CaseExecutionSnapshot,
     ExecutionClaim,
     WorkflowStore,
     parse_canonical_utc,
@@ -399,10 +402,10 @@ class _RecoveryEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     recovery_format: Literal[2]
-    case_id: str
-    execution_token: str
-    execution_generation: int
-    lease_expires_at: str
+    case_id: str = Field(min_length=1)
+    execution_token: str = Field(min_length=1)
+    execution_generation: int = Field(ge=1)
+    lease_expires_at: str = Field(min_length=1)
     case_result: CaseResult
     terminal_persistence_error: ErrorRecord
 
@@ -414,6 +417,141 @@ class _RecoveryAuthority:
 
 
 _RECOVERY_AUTHORITY: ContextVar[_RecoveryAuthority] = ContextVar("task9_recovery_authority")
+
+
+class _ExactClaimEvidenceState(StrEnum):
+    """The only two trustworthy states for one already-inspected exact claim."""
+
+    DURABLE_DATABASE_RESULT = "DURABLE_DATABASE_RESULT"
+    RECOVERABLE_RUNNING = "RECOVERABLE_RUNNING"
+
+
+@dataclass(frozen=True, slots=True)
+class _ExactClaimEvidence:
+    state: _ExactClaimEvidenceState
+    result: CaseResult | None
+
+
+_RECOVERY_PERSISTENCE_STOPS = frozenset(
+    {
+        "TERMINAL_PERSISTENCE_FAILED",
+        "TERMINAL_DURABILITY_TIMEOUT",
+        "TERMINAL_RESULT_UPDATE_CANCELLED",
+    }
+)
+
+
+def _canonical_recovery_persistence_error(
+    case_id: str,
+    stop_reason: str,
+) -> ErrorRecord:
+    """Reconstruct an exact parent-owned recovery error from one stable stop code."""
+
+    if stop_reason == "TERMINAL_PERSISTENCE_FAILED":
+        category = ErrorCategory.DATABASE
+        message = "terminal database write failed"
+    elif stop_reason == "TERMINAL_DURABILITY_TIMEOUT":
+        category = ErrorCategory.TIMEOUT
+        message = "terminal durability work exceeded its monotonic deadline"
+    elif stop_reason == "TERMINAL_RESULT_UPDATE_CANCELLED":
+        category = ErrorCategory.CANCELLED
+        message = "terminal database result update was cancelled"
+    else:
+        raise ValueError("unrecognized terminal recovery persistence stop")
+    return ErrorRecord(
+        category=category,
+        message=message,
+        case_id=case_id,
+        stop_reason=stop_reason,
+        provider_request_id=None,
+        details={},
+    )
+
+
+def _recovery_only_result(result: CaseResult, persistence_error: ErrorRecord) -> CaseResult:
+    """Make failed persistence explicit without laundering a successful terminal result."""
+
+    canonical_error = _canonical_recovery_persistence_error(
+        result.case_id,
+        persistence_error.stop_reason or "",
+    )
+    retained_errors = [
+        error for error in result.errors if error.stop_reason not in _RECOVERY_PERSISTENCE_STOPS
+    ]
+    return result.model_copy(
+        update={
+            "status": CaseStatus.INCOMPLETE,
+            "stop_reason": canonical_error.stop_reason,
+            "errors": [*retained_errors, canonical_error],
+        },
+        deep=True,
+    )
+
+
+def _canonical_recovery_bytes(envelope: _RecoveryEnvelope) -> bytes:
+    return json.dumps(
+        envelope.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _recovery_semantics_are_exact(envelope: _RecoveryEnvelope) -> bool:
+    result = envelope.case_result
+    error = envelope.terminal_persistence_error
+    try:
+        canonical_error = _canonical_recovery_persistence_error(
+            envelope.case_id,
+            error.stop_reason or "",
+        )
+    except ValueError:
+        return False
+    return (
+        error == canonical_error
+        and result.status is CaseStatus.INCOMPLETE
+        and result.stop_reason == canonical_error.stop_reason
+        and result.finished_at >= result.started_at
+        and bool(result.errors)
+        and result.errors[-1] == canonical_error
+        and sum(item.stop_reason in _RECOVERY_PERSISTENCE_STOPS for item in result.errors) == 1
+    )
+
+
+def _inspect_exact_claim_evidence(
+    store: WorkflowStore,
+    claim: ExecutionClaim,
+) -> _ExactClaimEvidence:
+    """Classify only an exact case/token/generation/lease tuple; contradictions fail closed."""
+
+    claim = validate_execution_claim(claim)
+    snapshot = store.load_case_execution_snapshot(claim.case_id)
+    exact_identity = (
+        snapshot is not None
+        and type(snapshot.execution_token) is str
+        and snapshot.execution_token == claim.token
+        and type(snapshot.execution_generation) is int
+        and snapshot.execution_generation == claim.generation
+    )
+    if not exact_identity:
+        raise _unresolved_durability_error(claim.case_id) from None
+    assert snapshot is not None
+    if (
+        snapshot.execution_state == "FINISHED"
+        and snapshot.lease_expires_at is None
+        and type(snapshot.result) is CaseResult
+    ):
+        return _ExactClaimEvidence(
+            _ExactClaimEvidenceState.DURABLE_DATABASE_RESULT,
+            store.merge_relational_case_evidence(snapshot.result),
+        )
+    if (
+        snapshot.execution_state == "RUNNING"
+        and type(snapshot.lease_expires_at) is datetime
+        and snapshot.lease_expires_at == claim.expires_at
+    ):
+        return _ExactClaimEvidence(_ExactClaimEvidenceState.RECOVERABLE_RUNNING, None)
+    raise _unresolved_durability_error(claim.case_id) from None
 
 
 def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -436,26 +574,11 @@ def _recovery_result_bound_to_authority(
     """Validate current DB authority and return a source-bound recovery aggregate."""
 
     claim = validate_execution_claim(authority.claim, expected_case_id=result.case_id)
-    snapshot = authority.store.load_case_execution_snapshot(result.case_id)
-    exact_running_authority = (
-        snapshot is not None
-        and snapshot.execution_state == "RUNNING"
-        and snapshot.lease_expires_at == claim.expires_at
-    )
-    exact_finished_authority = (
-        snapshot is not None
-        and snapshot.execution_state == "FINISHED"
-        and snapshot.lease_expires_at is None
-    )
-    if (
-        snapshot is None
-        or snapshot.execution_token != claim.token
-        or snapshot.execution_generation != claim.generation
-        or not (exact_running_authority or exact_finished_authority)
-    ):
+    evidence = _inspect_exact_claim_evidence(authority.store, claim)
+    if evidence.state is not _ExactClaimEvidenceState.RECOVERABLE_RUNNING:
         raise InvoiceAgentsError(
             ErrorCategory.ORCHESTRATION,
-            "recovery artifact authority is no longer the exact active claim",
+            "recovery artifacts require the exact still-running claim",
             case_id=result.case_id,
             stop_reason="TERMINAL_DURABILITY_UNRESOLVED",
         ) from None
@@ -473,10 +596,15 @@ def _recovery_result_bound_to_authority(
 
 def _write_recovery_artifact(result: CaseResult, terminal_persistence_error: ErrorRecord) -> Path:
     authority = _RECOVERY_AUTHORITY.get()
-    result = _recovery_result_bound_to_authority(result, authority)
     claim = validate_execution_claim(authority.claim, expected_case_id=result.case_id)
     if terminal_persistence_error.case_id != result.case_id:
         raise ValueError("recovery persistence error is not case-bound")
+    terminal_persistence_error = _canonical_recovery_persistence_error(
+        result.case_id,
+        terminal_persistence_error.stop_reason or "",
+    )
+    result = _recovery_only_result(result, terminal_persistence_error)
+    result = _recovery_result_bound_to_authority(result, authority)
     output_dir = Path("artifacts/results").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     target = output_dir / f"{result.case_id}.recovery.json"
@@ -489,13 +617,7 @@ def _write_recovery_artifact(result: CaseResult, terminal_persistence_error: Err
         case_result=result,
         terminal_persistence_error=terminal_persistence_error,
     )
-    payload = json.dumps(
-        envelope.model_dump(mode="json"),
-        default=str,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
+    payload = _canonical_recovery_bytes(envelope)
     if len(payload) > RECOVERY_ARTIFACT_MAX_BYTES:
         raise ValueError("recovery artifact exceeds its bounded envelope")
     _atomic_publish(target, payload)
@@ -695,6 +817,7 @@ async def _terminal_process_write(
     """Run one terminal write outside the event loop and return only authoritative reread."""
 
     settings = execution.store._snapshot_settings()
+
     def invoke() -> tuple[TerminalProcessOutcome, BaseException | None]:
         try:
             return (
@@ -734,20 +857,16 @@ async def _terminal_process_write(
                 case_id=execution.case_id,
             )
             boundary_control = worker_control or exc
-    snapshot = await asyncio.to_thread(
-        execution.store.load_case_execution_snapshot,
-        execution.case_id,
+    evidence = await asyncio.to_thread(
+        _inspect_exact_claim_evidence,
+        execution.store,
+        execution.claim,
     )
-    stored: CaseResult | None = None
-    if (
-        snapshot is not None
-        and snapshot.execution_state == "FINISHED"
-        and snapshot.result is not None
-    ):
-        stored = await asyncio.to_thread(
-            execution.store.merge_relational_case_evidence,
-            snapshot.result,
-        )
+    stored = (
+        evidence.result
+        if evidence.state is _ExactClaimEvidenceState.DURABLE_DATABASE_RESULT
+        else None
+    )
     return outcome, stored, boundary_control
 
 
@@ -829,18 +948,12 @@ async def _persist_terminal_result_safely(
             )
         outcome = retry_outcome
         result = cancelled
-    snapshot = await asyncio.to_thread(
-        execution.store.load_case_execution_snapshot,
-        execution.case_id,
+    evidence = await asyncio.to_thread(
+        _inspect_exact_claim_evidence,
+        execution.store,
+        execution.claim,
     )
-    exact_claim_remains = (
-        snapshot is not None
-        and snapshot.execution_state == "RUNNING"
-        and snapshot.execution_token == execution.claim.token
-        and snapshot.execution_generation == execution.claim.generation
-        and snapshot.lease_expires_at == execution.claim.expires_at
-    )
-    if not exact_claim_remains:
+    if evidence.state is not _ExactClaimEvidenceState.RECOVERABLE_RUNNING:
         raise _unresolved_durability_error(execution.case_id) from None
     persistence_error = _terminal_process_error(
         outcome,
@@ -876,6 +989,11 @@ async def _refresh_terminal_evidence_safely(
     control_exception = control_exception or boundary_control
     if stored == result:
         return _PersistenceOutcome(result, True, persistence_error, control_exception)
+    if stored is not None:
+        # An update failure cannot turn an already exact FINISHED row back into
+        # recoverable RUNNING authority.  Keep the sole durable database result;
+        # a recovery frame here would be a conflicting second result channel.
+        return _PersistenceOutcome(stored, True, persistence_error, control_exception)
     if isinstance(boundary_control, asyncio.CancelledError):
         if _cancellation_may_define_outcome(prior_control):
             result = _cancelled_result(
@@ -969,8 +1087,42 @@ async def _execute_claimed_case(
     lifecycle: Callable[[_ClaimedExecution], Awaitable[CaseResult]],
     *,
     finished_event_type: str,
+    terminal_writes_in_process: bool = False,
 ) -> CaseResult:
     """Run setup through terminal persistence under one claimed outer boundary."""
+
+    async def persist_terminal(
+        execution: _ClaimedExecution,
+        result: CaseResult,
+        control_exception: BaseException | None,
+    ) -> _PersistenceOutcome:
+        if terminal_writes_in_process:
+            return _persist_terminal_result(execution, result, control_exception)
+        return await _persist_terminal_result_safely(execution, result, control_exception)
+
+    async def refresh_terminal(
+        execution: _ClaimedExecution,
+        result: CaseResult,
+        *,
+        persisted: bool,
+        persistence_error: ErrorRecord | None,
+        control_exception: BaseException | None,
+    ) -> _PersistenceOutcome:
+        if terminal_writes_in_process:
+            return _refresh_terminal_evidence(
+                execution,
+                result,
+                persisted=persisted,
+                persistence_error=persistence_error,
+                control_exception=control_exception,
+            )
+        return await _refresh_terminal_evidence_safely(
+            execution,
+            result,
+            persisted=persisted,
+            persistence_error=persistence_error,
+            control_exception=control_exception,
+        )
 
     execution = _ClaimedExecution(
         store=store,
@@ -1065,7 +1217,7 @@ async def _execute_claimed_case(
     persistence_error: ErrorRecord | None = None
     # Cancellation becomes durable before cleanup, then is re-raised after bounded cleanup.
     if cancelled:
-        persistence = await _persist_terminal_result_safely(
+        persistence = await persist_terminal(
             execution,
             result,
             control_exception,
@@ -1126,7 +1278,7 @@ async def _execute_claimed_case(
             control_exception = control_exception or exc
 
     if persisted:
-        refresh = await _refresh_terminal_evidence_safely(
+        refresh = await refresh_terminal(
             execution,
             result,
             persisted=persisted,
@@ -1138,7 +1290,7 @@ async def _execute_claimed_case(
         persistence_error = refresh.persistence_error
         control_exception = refresh.control_exception
     elif not terminal_write_attempted:
-        persistence = await _persist_terminal_result_safely(
+        persistence = await persist_terminal(
             execution,
             result,
             control_exception,
@@ -1173,7 +1325,7 @@ async def _execute_claimed_case(
                     stop_reason="FINAL_AUDIT_WRITE_CANCELLED",
                 ),
             )
-            refresh = await _refresh_terminal_evidence_safely(
+            refresh = await refresh_terminal(
                 execution,
                 result,
                 persisted=persisted,
@@ -1197,7 +1349,7 @@ async def _execute_claimed_case(
             )
             if not isinstance(exc, Exception):
                 control_exception = control_exception or exc
-            refresh = await _refresh_terminal_evidence_safely(
+            refresh = await refresh_terminal(
                 execution,
                 result,
                 persisted=persisted,
@@ -1229,7 +1381,7 @@ async def _execute_claimed_case(
                     stop_reason="RESULT_ARTIFACT_WRITE_CANCELLED",
                 ),
             )
-            refresh = await _refresh_terminal_evidence_safely(
+            refresh = await refresh_terminal(
                 execution,
                 result,
                 persisted=persisted,
@@ -1253,7 +1405,7 @@ async def _execute_claimed_case(
             )
             if not isinstance(exc, Exception):
                 control_exception = control_exception or exc
-            refresh = await _refresh_terminal_evidence_safely(
+            refresh = await refresh_terminal(
                 execution,
                 result,
                 persisted=persisted,
@@ -1328,6 +1480,10 @@ def _prepare_case(
     settings: Settings,
     *,
     retain_execution_claim: bool,
+    case_id: str | None = None,
+    started_at: datetime | None = None,
+    preparation_token: str | None = None,
+    run_token: str | None = None,
 ) -> tuple[str, datetime] | tuple[str, datetime, ExecutionClaim] | _PreparationFailure:
     """Create immutable source/case evidence before any model request.
 
@@ -1335,8 +1491,25 @@ def _prepare_case(
     representations and revisions even though independent Swarms run concurrently.
     """
 
-    started_at = _now()
-    case_id = f"case_{uuid4().hex}"
+    parent_assigned = any(
+        value is not None for value in (case_id, started_at, preparation_token, run_token)
+    )
+    if parent_assigned:
+        if (
+            type(case_id) is not str
+            or not case_id.startswith("case_")
+            or type(started_at) is not datetime
+            or started_at.tzinfo is not UTC
+            or type(preparation_token) is not str
+            or type(run_token) is not str
+            or preparation_token == run_token
+            or not retain_execution_claim
+        ):
+            raise ValueError("invalid parent-assigned preparation authority")
+    else:
+        case_id = f"case_{uuid4().hex}"
+        started_at = _now()
+    assert case_id is not None and started_at is not None
     source_id: str | None = None
     case_created = False
     claim: ExecutionClaim | None = None
@@ -1353,6 +1526,7 @@ def _prepare_case(
             case_id,
             frozenset({CaseStatus.INCOMPLETE}),
             EXECUTION_LEASE_SECONDS,
+            requested_token=preparation_token,
         )
         invoice = extract_invoice_evidence(source)
         store.save_extraction(case_id, invoice, claim)
@@ -1366,7 +1540,11 @@ def _prepare_case(
             source_id=source.source_id,
         )
         if retain_execution_claim:
-            run_claim = store.handoff_case_execution(claim, EXECUTION_LEASE_SECONDS)
+            run_claim = store.handoff_case_execution(
+                claim,
+                EXECUTION_LEASE_SECONDS,
+                requested_token=run_token,
+            )
             return case_id, started_at, run_claim
         store.release_case_execution(claim)
         return case_id, started_at
@@ -1380,6 +1558,7 @@ def _prepare_case(
                     case_id,
                     frozenset({CaseStatus.INCOMPLETE}),
                     EXECUTION_LEASE_SECONDS,
+                    requested_token=preparation_token,
                 )
             except BaseException as claim_failure:
                 raise _unresolved_durability_error(case_id, claim_failure) from None
@@ -1598,14 +1777,15 @@ def _atomic_publish(target: Path, payload: bytes) -> None:
             temporary.unlink(missing_ok=True)
 
 
-async def run_prepared_case(
+async def _run_prepared_case_in_process(
     case_id: str,
     started_at: datetime,
     settings: Settings,
     *,
     claim: ExecutionClaim | None = None,
+    terminal_writes_in_process: bool = False,
 ) -> CaseResult:
-    """Run one fresh Swarm and convert every terminal path to an explicit case status."""
+    """Child-side fresh Swarm lifecycle; public callers use the process boundary."""
 
     if claim is None:
         raise InvoiceAgentsError(
@@ -1691,6 +1871,410 @@ async def run_prepared_case(
         claim,
         heartbeat_lifecycle,
         finished_event_type="case.finished",
+        terminal_writes_in_process=terminal_writes_in_process,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _LifecycleBoundaryOutcome:
+    acknowledged: bool
+    error_code: str | None
+
+
+def _lifecycle_boundary_error(case_id: str, code: str) -> InvoiceAgentsError:
+    contracts: dict[str, tuple[ErrorCategory, str]] = {
+        "LIFECYCLE_FAILED": (
+            ErrorCategory.ORCHESTRATION,
+            "isolated case lifecycle failed",
+        ),
+        "LIFECYCLE_WORKER_CRASHED": (
+            ErrorCategory.ORCHESTRATION,
+            "isolated case lifecycle worker exited unexpectedly",
+        ),
+        "LIFECYCLE_WORKER_PROTOCOL_INVALID": (
+            ErrorCategory.ORCHESTRATION,
+            "isolated case lifecycle worker returned an invalid acknowledgement",
+        ),
+        "LIFECYCLE_WORKER_TIMED_OUT": (
+            ErrorCategory.TIMEOUT,
+            "isolated case lifecycle exceeded its bounded deadline",
+        ),
+    }
+    category, message = contracts.get(
+        code,
+        (ErrorCategory.ORCHESTRATION, "isolated case lifecycle failed"),
+    )
+    return InvoiceAgentsError(
+        category,
+        message,
+        case_id=case_id,
+        stop_reason=code,
+    )
+
+
+async def _invoke_lifecycle_boundary(
+    *,
+    mode: Literal["process", "resume"],
+    settings: Settings,
+    claim: ExecutionClaim,
+    started_at: datetime,
+) -> tuple[_LifecycleBoundaryOutcome, asyncio.CancelledError | None]:
+    """Drain a cancellation-aware process controller without retaining raw failures."""
+
+    cancel_requested = threading.Event()
+
+    def invoke() -> _LifecycleBoundaryOutcome:
+        try:
+            from invoice_agents import lifecycle_process
+
+            outcome = lifecycle_process.run_lifecycle_process(
+                mode=mode,
+                settings=settings,
+                claim=claim,
+                started_at=started_at,
+                timeout_seconds=float(EXECUTION_LEASE_SECONDS),
+                cancel_requested=cancel_requested,
+            )
+            return _LifecycleBoundaryOutcome(
+                acknowledged=outcome.acknowledged,
+                error_code=outcome.error_code,
+            )
+        except BaseException:
+            return _LifecycleBoundaryOutcome(False, "LIFECYCLE_WORKER_CRASHED")
+
+    controller = asyncio.create_task(
+        asyncio.to_thread(invoke),
+        name=f"invoice-lifecycle-controller-{claim.case_id}",
+    )
+    cancellation: asyncio.CancelledError | None = None
+    try:
+        outcome = await asyncio.shield(controller)
+    except asyncio.CancelledError as exc:
+        cancellation = exc
+        cancel_requested.set()
+        try:
+            outcome = await _await_task_despite_cancellation(
+                controller,
+                deadline=(
+                    monotonic()
+                    + DURABILITY_DEADLINE_SECONDS
+                    + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+                ),
+                case_id=claim.case_id,
+            )
+        except BaseException:
+            outcome = _LifecycleBoundaryOutcome(
+                False,
+                "LIFECYCLE_WORKER_CLEANUP_FAILED",
+            )
+    return outcome, cancellation
+
+
+def _same_running_claim(
+    issued: ExecutionClaim,
+    snapshot: CaseExecutionSnapshot,
+) -> ExecutionClaim | None:
+    if (
+        snapshot.execution_state == "RUNNING"
+        and snapshot.execution_token == issued.token
+        and snapshot.execution_generation == issued.generation
+        and snapshot.lease_expires_at is not None
+    ):
+        return ExecutionClaim(
+            issued.case_id,
+            issued.token,
+            issued.generation,
+            snapshot.lease_expires_at,
+        )
+    return None
+
+
+async def _publish_parent_terminal_result(
+    execution: _ClaimedExecution,
+    persistence: _PersistenceOutcome,
+) -> CaseResult:
+    """Publish the parent-owned result or its sole claim-bound recovery frame."""
+
+    result = persistence.result
+    persisted = persistence.persisted
+    persistence_error = persistence.persistence_error
+    control_exception = persistence.control_exception
+    if not persisted:
+        assert persistence_error is not None
+        _recovery_artifact_or_raise(
+            result,
+            persistence_error,
+            store=execution.store,
+            claim=execution.claim,
+        )
+    else:
+        artifact_failure: BaseException | None = None
+        try:
+            _write_result(result)
+        except asyncio.CancelledError as exc:
+            cancellation_may_define_outcome = _cancellation_may_define_outcome(control_exception)
+            control_exception = control_exception or exc
+            if cancellation_may_define_outcome:
+                result = _cancelled_result(
+                    execution.case_id,
+                    execution.source_id,
+                    execution.started_at,
+                    result,
+                )
+            _append_error(
+                result,
+                ErrorRecord(
+                    category=ErrorCategory.CANCELLED,
+                    message="result artifact publication was cancelled",
+                    case_id=execution.case_id,
+                    stop_reason="RESULT_ARTIFACT_WRITE_CANCELLED",
+                ),
+            )
+            artifact_failure = exc
+        except BaseException as exc:
+            _append_error(
+                result,
+                _secondary_error(
+                    exc,
+                    case_id=execution.case_id,
+                    category=ErrorCategory.ORCHESTRATION,
+                    stop_reason="RESULT_ARTIFACT_WRITE_FAILED",
+                    message="atomic result artifact publication failed",
+                ),
+            )
+            if not isinstance(exc, Exception):
+                control_exception = control_exception or exc
+            artifact_failure = exc
+        if artifact_failure is not None:
+            refreshed = await _refresh_terminal_evidence_safely(
+                execution,
+                result,
+                persisted=True,
+                persistence_error=persistence_error,
+                control_exception=control_exception,
+            )
+            result = refreshed.result
+            persisted = refreshed.persisted
+            control_exception = refreshed.control_exception
+            if not persisted:
+                raise _unresolved_durability_error(execution.case_id) from None
+    if control_exception is not None:
+        raise control_exception
+    return result
+
+
+async def _terminalize_lifecycle_boundary_failure(
+    *,
+    store: WorkflowStore,
+    claim: ExecutionClaim,
+    started_at: datetime,
+    failure: BaseException,
+    load_previous: bool = True,
+) -> CaseResult:
+    """Publish one parent-owned terminal result after the worker session is empty."""
+
+    try:
+        source_id = store.load_authoritative_case_source_id(claim)
+        previous = store.load_result(claim.case_id) if load_previous else None
+    except BaseException as exc:
+        raise _unresolved_durability_error(claim.case_id, exc) from None
+    result = (
+        _cancelled_result(claim.case_id, source_id, started_at, previous)
+        if isinstance(failure, asyncio.CancelledError)
+        else _preserve_prior_result_evidence(
+            _failed_result(claim.case_id, source_id, started_at, failure),
+            previous,
+        )
+    )
+    try:
+        result = store.merge_relational_case_evidence(result)
+    except BaseException as exc:
+        _append_error(
+            result,
+            _secondary_error(
+                exc,
+                case_id=claim.case_id,
+                category=ErrorCategory.DATABASE,
+                stop_reason="TERMINAL_EVIDENCE_RECONCILIATION_FAILED",
+                message="durable terminal evidence reconciliation failed",
+            ),
+        )
+    execution = _ClaimedExecution(
+        store=store,
+        claim=claim,
+        case_id=claim.case_id,
+        started_at=started_at,
+        source_id=source_id,
+        usage=result.usage,
+        clock=monotonic(),
+    )
+    persistence = await _persist_terminal_result_safely(
+        execution,
+        result,
+        failure if not isinstance(failure, Exception) else None,
+    )
+    return await _publish_parent_terminal_result(execution, persistence)
+
+
+async def _cancel_exact_finished_lifecycle(
+    *,
+    store: WorkflowStore,
+    claim: ExecutionClaim,
+    started_at: datetime,
+    result: CaseResult,
+    cancellation: asyncio.CancelledError,
+) -> CaseResult:
+    cancelled = _cancelled_result(
+        claim.case_id,
+        result.source_id,
+        started_at,
+        result,
+    )
+    execution = _ClaimedExecution(
+        store=store,
+        claim=claim,
+        case_id=claim.case_id,
+        started_at=started_at,
+        source_id=result.source_id,
+        usage=cancelled.usage,
+        clock=monotonic(),
+    )
+    persistence = await _refresh_terminal_evidence_safely(
+        execution,
+        cancelled,
+        persisted=True,
+        persistence_error=None,
+        control_exception=cancellation,
+    )
+    return await _publish_parent_terminal_result(execution, persistence)
+
+
+async def _reconcile_lifecycle_boundary(
+    *,
+    case_id: str,
+    started_at: datetime,
+    settings: Settings,
+    issued_claim: ExecutionClaim,
+    outcome: _LifecycleBoundaryOutcome,
+    cancellation: asyncio.CancelledError | None,
+) -> CaseResult:
+    """Trust only an exact post-reap database snapshot, never worker output."""
+
+    store = WorkflowStore(settings)
+    try:
+        snapshot = store.load_case_execution_snapshot(case_id)
+    except BaseException as exc:
+        raise _unresolved_durability_error(case_id, exc) from None
+    if snapshot is None:
+        raise _unresolved_durability_error(case_id) from None
+    exact_identity = (
+        snapshot.execution_token == issued_claim.token
+        and snapshot.execution_generation == issued_claim.generation
+    )
+    if not exact_identity:
+        raise _unresolved_durability_error(case_id) from None
+    if outcome.error_code == "LIFECYCLE_WORKER_CLEANUP_FAILED":
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "isolated lifecycle worker session cleanup could not be proven",
+            case_id=case_id,
+            stop_reason="LIFECYCLE_WORKER_CLEANUP_FAILED",
+        ) from None
+    if snapshot.execution_state == "FINISHED":
+        if snapshot.lease_expires_at is not None or snapshot.result is None:
+            raise _unresolved_durability_error(case_id) from None
+        result = snapshot.result
+        if cancellation is not None:
+            result = await _cancel_exact_finished_lifecycle(
+                store=store,
+                claim=issued_claim,
+                started_at=started_at,
+                result=result,
+                cancellation=cancellation,
+            )
+            raise cancellation
+        execution = _ClaimedExecution(
+            store=store,
+            claim=issued_claim,
+            case_id=case_id,
+            started_at=started_at,
+            source_id=result.source_id,
+            usage=result.usage,
+            clock=monotonic(),
+        )
+        return await _publish_parent_terminal_result(
+            execution,
+            _PersistenceOutcome(result, True, None, None),
+        )
+    current_claim = _same_running_claim(issued_claim, snapshot)
+    if current_claim is None:
+        raise _unresolved_durability_error(case_id) from None
+    recovery_result = _load_valid_recovery_result(case_id, store, current_claim)
+    if recovery_result is not None:
+        if cancellation is not None:
+            raise cancellation
+        return recovery_result
+    if cancellation is not None:
+        await _terminalize_lifecycle_boundary_failure(
+            store=store,
+            claim=current_claim,
+            started_at=started_at,
+            failure=cancellation,
+        )
+        raise cancellation
+    code = outcome.error_code or "LIFECYCLE_WORKER_PROTOCOL_INVALID"
+    return await _terminalize_lifecycle_boundary_failure(
+        store=store,
+        claim=current_claim,
+        started_at=started_at,
+        failure=_lifecycle_boundary_error(case_id, code),
+    )
+
+
+async def run_prepared_case(
+    case_id: str,
+    started_at: datetime,
+    settings: Settings,
+    *,
+    claim: ExecutionClaim | None = None,
+) -> CaseResult:
+    """Run all provider/model/team work in one terminable fresh interpreter."""
+
+    if claim is None:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "an exact execution claim is required to run a prepared case",
+            case_id=case_id,
+            stop_reason="EXECUTION_CLAIM_MISSING",
+        ) from None
+    claim = validate_execution_claim(claim, expected_case_id=case_id)
+    store = WorkflowStore(settings)
+    store.require_current_execution_claim(claim)
+    try:
+        settings.provider_key()
+    except BaseException as failure:
+        result = await _terminalize_lifecycle_boundary_failure(
+            store=store,
+            claim=claim,
+            started_at=started_at,
+            failure=failure,
+        )
+        if not isinstance(failure, Exception):
+            raise failure
+        return result
+    outcome, cancellation = await _invoke_lifecycle_boundary(
+        mode="process",
+        settings=settings,
+        claim=claim,
+        started_at=started_at,
+    )
+    return await _reconcile_lifecycle_boundary(
+        case_id=case_id,
+        started_at=started_at,
+        settings=settings,
+        issued_claim=claim,
+        outcome=outcome,
+        cancellation=cancellation,
     )
 
 
@@ -1746,10 +2330,272 @@ def prepare_claimed_invoice(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparationBoundaryOutcome:
+    acknowledged: bool
+    error_code: str | None
+
+
+def _preparation_boundary_error(case_id: str, code: str) -> InvoiceAgentsError:
+    contracts: dict[str, tuple[ErrorCategory, str]] = {
+        "PREPARATION_FAILED": (
+            ErrorCategory.ORCHESTRATION,
+            "isolated claimed preparation failed",
+        ),
+        "PREPARATION_WORKER_CRASHED": (
+            ErrorCategory.ORCHESTRATION,
+            "isolated claimed preparation worker exited unexpectedly",
+        ),
+        "PREPARATION_WORKER_PROTOCOL_INVALID": (
+            ErrorCategory.ORCHESTRATION,
+            "isolated claimed preparation worker returned an invalid acknowledgement",
+        ),
+        "PREPARATION_WORKER_TIMED_OUT": (
+            ErrorCategory.TIMEOUT,
+            "isolated claimed preparation exceeded its bounded deadline",
+        ),
+    }
+    category, message = contracts.get(
+        code,
+        (ErrorCategory.ORCHESTRATION, "isolated claimed preparation failed"),
+    )
+    return InvoiceAgentsError(
+        category,
+        message,
+        case_id=case_id,
+        stop_reason=code,
+    )
+
+
+async def _invoke_preparation_boundary(
+    *,
+    path: Path,
+    settings: Settings,
+    case_id: str,
+    started_at: datetime,
+    preparation_token: str,
+    run_token: str,
+) -> tuple[_PreparationBoundaryOutcome, asyncio.CancelledError | None]:
+    cancel_requested = threading.Event()
+
+    def invoke() -> _PreparationBoundaryOutcome:
+        try:
+            from invoice_agents import preparation_process
+
+            outcome = preparation_process.run_preparation_process(
+                path=path,
+                settings=settings,
+                case_id=case_id,
+                started_at=started_at,
+                preparation_token=preparation_token,
+                run_token=run_token,
+                timeout_seconds=300.0,
+                cancel_requested=cancel_requested,
+            )
+            return _PreparationBoundaryOutcome(
+                acknowledged=outcome.acknowledged,
+                error_code=outcome.error_code,
+            )
+        except BaseException:
+            return _PreparationBoundaryOutcome(False, "PREPARATION_WORKER_CRASHED")
+
+    controller = asyncio.create_task(
+        asyncio.to_thread(invoke),
+        name=f"invoice-preparation-controller-{case_id}",
+    )
+    cancellation: asyncio.CancelledError | None = None
+    try:
+        outcome = await asyncio.shield(controller)
+    except asyncio.CancelledError as exc:
+        cancellation = exc
+        cancel_requested.set()
+        try:
+            outcome = await _await_task_despite_cancellation(
+                controller,
+                deadline=(
+                    monotonic()
+                    + DURABILITY_DEADLINE_SECONDS
+                    + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+                ),
+                case_id=case_id,
+            )
+        except BaseException:
+            outcome = _PreparationBoundaryOutcome(
+                False,
+                "PREPARATION_WORKER_CLEANUP_FAILED",
+            )
+    return outcome, cancellation
+
+
+async def _reconcile_preparation_boundary(
+    *,
+    case_id: str,
+    started_at: datetime,
+    settings: Settings,
+    preparation_token: str,
+    run_token: str,
+    outcome: _PreparationBoundaryOutcome,
+    cancellation: asyncio.CancelledError | None,
+) -> tuple[str, datetime, ExecutionClaim] | CaseResult:
+    store = WorkflowStore(settings)
+    try:
+        snapshot = store.load_case_execution_snapshot(case_id)
+    except BaseException as exc:
+        raise _unresolved_durability_error(case_id, exc) from None
+    if outcome.error_code == "PREPARATION_WORKER_CLEANUP_FAILED":
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "isolated preparation worker session cleanup could not be proven",
+            case_id=case_id,
+            stop_reason="PREPARATION_WORKER_CLEANUP_FAILED",
+        ) from None
+    if snapshot is None:
+        if cancellation is not None:
+            raise cancellation
+        code = outcome.error_code or "PREPARATION_WORKER_PROTOCOL_INVALID"
+        result = _failed_result(
+            case_id,
+            None,
+            started_at,
+            _preparation_boundary_error(case_id, code),
+        )
+        _write_result(result)
+        return result
+    if snapshot.started_at != started_at:
+        raise _unresolved_durability_error(case_id) from None
+
+    known_finished = (
+        snapshot.execution_state == "FINISHED"
+        and snapshot.lease_expires_at is None
+        and snapshot.result is not None
+        and (
+            (snapshot.execution_token == preparation_token and snapshot.execution_generation == 1)
+            or (snapshot.execution_token == run_token and snapshot.execution_generation == 2)
+        )
+    )
+    if known_finished:
+        assert snapshot.result is not None
+        _write_result(snapshot.result)
+        if cancellation is not None:
+            raise cancellation
+        return snapshot.result
+
+    if (
+        snapshot.execution_state == "RUNNING"
+        and snapshot.execution_token == run_token
+        and snapshot.execution_generation == 2
+        and snapshot.lease_expires_at is not None
+    ):
+        run_claim = ExecutionClaim(case_id, run_token, 2, snapshot.lease_expires_at)
+        if cancellation is not None:
+            await _terminalize_lifecycle_boundary_failure(
+                store=store,
+                claim=run_claim,
+                started_at=started_at,
+                failure=cancellation,
+            )
+            raise cancellation
+        return case_id, started_at, run_claim
+
+    preparation_claim: ExecutionClaim | None = None
+    if (
+        snapshot.execution_state == "RUNNING"
+        and snapshot.execution_token == preparation_token
+        and snapshot.execution_generation == 1
+        and snapshot.lease_expires_at is not None
+    ):
+        preparation_claim = ExecutionClaim(
+            case_id,
+            preparation_token,
+            1,
+            snapshot.lease_expires_at,
+        )
+        recovery_result = _load_valid_recovery_result(
+            case_id,
+            store,
+            preparation_claim,
+        )
+        if recovery_result is not None:
+            if cancellation is not None:
+                raise cancellation
+            return recovery_result
+    elif (
+        snapshot.execution_state == "IDLE"
+        and snapshot.execution_token is None
+        and snapshot.execution_generation == 0
+        and snapshot.lease_expires_at is None
+    ):
+        try:
+            preparation_claim = store.claim_case_execution(
+                case_id,
+                frozenset({CaseStatus.INCOMPLETE}),
+                EXECUTION_LEASE_SECONDS,
+                requested_token=preparation_token,
+            )
+        except BaseException as exc:
+            raise _unresolved_durability_error(case_id, exc) from None
+    if preparation_claim is None:
+        raise _unresolved_durability_error(case_id) from None
+    failure: BaseException = (
+        cancellation
+        if cancellation is not None
+        else _preparation_boundary_error(
+            case_id,
+            outcome.error_code or "PREPARATION_WORKER_PROTOCOL_INVALID",
+        )
+    )
+    result = await _terminalize_lifecycle_boundary_failure(
+        store=store,
+        claim=preparation_claim,
+        started_at=started_at,
+        failure=failure,
+    )
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
+async def prepare_claimed_invoice_async(
+    path: Path,
+    settings: Settings,
+) -> tuple[str, datetime, ExecutionClaim] | CaseResult:
+    """Prepare and hand off one claim through a fully terminable child session."""
+
+    started_at = _now()
+    try:
+        preflight(settings)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        result = _failed_result(f"case_{uuid4().hex}", None, started_at, exc)
+        _write_result(result)
+        return result
+    case_id = f"case_{uuid4().hex}"
+    preparation_token = f"exec_{uuid4().hex}"
+    run_token = f"exec_{uuid4().hex}"
+    outcome, cancellation = await _invoke_preparation_boundary(
+        path=path,
+        settings=settings,
+        case_id=case_id,
+        started_at=started_at,
+        preparation_token=preparation_token,
+        run_token=run_token,
+    )
+    return await _reconcile_preparation_boundary(
+        case_id=case_id,
+        started_at=started_at,
+        settings=settings,
+        preparation_token=preparation_token,
+        run_token=run_token,
+        outcome=outcome,
+        cancellation=cancellation,
+    )
+
+
 async def process_invoice(path: Path, settings: Settings) -> CaseResult:
     """Preflight, prepare, and process one source artifact."""
 
-    prepared = prepare_claimed_invoice(path, settings)
+    prepared = await prepare_claimed_invoice_async(path, settings)
     if isinstance(prepared, CaseResult):
         return prepared
     return await run_prepared_case(
@@ -1800,37 +2646,39 @@ async def _await_task_despite_cancellation[ResultT](
     return task.result()
 
 
-def _recovery_artifact_is_valid(
+def _load_valid_recovery_result(
     case_id: str,
     store: WorkflowStore,
     claim: ExecutionClaim,
-) -> bool:
-    """Validate one bounded strict envelope against current DB and exact claim authority."""
+) -> CaseResult | None:
+    """Return one bounded strict recovery result bound to current exact authority."""
 
     try:
         claim = validate_execution_claim(claim, expected_case_id=case_id)
     except InvoiceAgentsError:
-        return False
+        return None
     target = Path("artifacts/results").resolve() / f"{case_id}.recovery.json"
     try:
         raw = target.read_bytes()
         if not raw or len(raw) > RECOVERY_ARTIFACT_MAX_BYTES:
-            return False
-        json.loads(
+            return None
+        parsed = json.loads(
             raw.decode("utf-8"),
             object_pairs_hook=_strict_json_object,
             parse_constant=_reject_json_constant,
         )
         envelope = _RecoveryEnvelope.model_validate_json(raw, strict=True)
+        if type(parsed) is not dict or raw != _canonical_recovery_bytes(envelope):
+            return None
         expires_at = parse_canonical_utc(envelope.lease_expires_at)
         if expires_at is None or expires_at.tzinfo is not UTC:
-            return False
-        snapshot = store.load_case_execution_snapshot(case_id)
+            return None
+        evidence = _inspect_exact_claim_evidence(store, claim)
         source_id = store.load_recovery_case_source_id(claim)
         merged = store.merge_relational_case_evidence(envelope.case_result)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, InvoiceAgentsError, ValueError):
-        return False
-    return (
+        return None
+    valid = (
         envelope.recovery_format == RECOVERY_ARTIFACT_FORMAT
         and envelope.case_id == case_id
         and envelope.execution_token == claim.token
@@ -1840,23 +2688,20 @@ def _recovery_artifact_is_valid(
         and envelope.case_result.case_id == case_id
         and envelope.case_result.source_id == source_id
         and merged == envelope.case_result
-        and envelope.terminal_persistence_error.case_id == case_id
-        and envelope.terminal_persistence_error.stop_reason
-        in {
-            "TERMINAL_PERSISTENCE_FAILED",
-            "TERMINAL_DURABILITY_TIMEOUT",
-            "TERMINAL_RESULT_UPDATE_CANCELLED",
-        }
-        and snapshot is not None
-        and snapshot.execution_state in {"RUNNING", "FINISHED"}
-        and snapshot.execution_token == claim.token
-        and snapshot.execution_generation == claim.generation
-        and (
-            snapshot.lease_expires_at == claim.expires_at
-            if snapshot.execution_state == "RUNNING"
-            else snapshot.lease_expires_at is None
-        )
+        and _recovery_semantics_are_exact(envelope)
+        and evidence.state is _ExactClaimEvidenceState.RECOVERABLE_RUNNING
     )
+    return envelope.case_result if valid else None
+
+
+def _recovery_artifact_is_valid(
+    case_id: str,
+    store: WorkflowStore,
+    claim: ExecutionClaim,
+) -> bool:
+    """Validate one bounded strict envelope against current DB and exact claim authority."""
+
+    return _load_valid_recovery_result(case_id, store, claim) is not None
 
 
 def _claim_has_durable_terminal_evidence(
@@ -1865,13 +2710,9 @@ def _claim_has_durable_terminal_evidence(
     claim: ExecutionClaim,
 ) -> bool:
     store = WorkflowStore(settings)
-    snapshot = store.load_case_execution_snapshot(case_id)
-    if (
-        snapshot is not None
-        and snapshot.execution_state == "FINISHED"
-        and snapshot.result is not None
-    ):
-        store.merge_relational_case_evidence(snapshot.result)
+    claim = validate_execution_claim(claim, expected_case_id=case_id)
+    evidence = _inspect_exact_claim_evidence(store, claim)
+    if evidence.state is _ExactClaimEvidenceState.DURABLE_DATABASE_RESULT:
         return True
     return _recovery_artifact_is_valid(case_id, store, claim)
 
@@ -2014,9 +2855,7 @@ async def _terminalize_unstarted_claim(
         outcome = await _await_task_despite_cancellation(
             worker,
             deadline=(
-                monotonic()
-                + DURABILITY_DEADLINE_SECONDS
-                + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+                monotonic() + DURABILITY_DEADLINE_SECONDS + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
             ),
             case_id=case_id,
         )
@@ -2028,22 +2867,10 @@ async def _terminalize_unstarted_claim(
             stop_reason="TERMINAL_WORKER_CLEANUP_FAILED",
         ) from None
 
-    snapshot = await asyncio.to_thread(store.load_case_execution_snapshot, case_id)
-    if (
-        snapshot is not None
-        and snapshot.execution_state == "FINISHED"
-        and snapshot.result is not None
-    ):
-        await asyncio.to_thread(store.merge_relational_case_evidence, snapshot.result)
+    evidence = await asyncio.to_thread(_inspect_exact_claim_evidence, store, claim)
+    if evidence.state is _ExactClaimEvidenceState.DURABLE_DATABASE_RESULT:
         return
-    exact_claim_remains = (
-        snapshot is not None
-        and snapshot.execution_state == "RUNNING"
-        and snapshot.execution_token == claim.token
-        and snapshot.execution_generation == claim.generation
-        and snapshot.lease_expires_at == claim.expires_at
-    )
-    if not exact_claim_remains:
+    if evidence.state is not _ExactClaimEvidenceState.RECOVERABLE_RUNNING:
         raise _unresolved_durability_error(case_id) from None
     if outcome.result is not None or outcome.error_code is None:
         raise _unresolved_durability_error(case_id) from None
@@ -2113,9 +2940,7 @@ async def _durably_cancel_unstarted_claims(
     return await _await_task_despite_cancellation(
         drain_task,
         deadline=(
-            monotonic()
-            + (3 * DURABILITY_DEADLINE_SECONDS)
-            + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+            monotonic() + (3 * DURABILITY_DEADLINE_SECONDS) + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
         ),
     )
 
@@ -2141,11 +2966,9 @@ async def process_batch(
     selected_failure: BaseException | None = None
     try:
         for path in paths:
-            item = prepare_claimed_case(path, settings)
-            if isinstance(item, _PreparationFailure):
-                if not item.recovery_published:
-                    _write_result(item.result)
-                results.append(item.result)
+            item = await prepare_claimed_invoice_async(path, settings)
+            if isinstance(item, CaseResult):
+                results.append(item)
             else:
                 prepared.append(item)
     except BaseException as primary_failure:
@@ -2313,13 +3136,14 @@ def claim_resumable_case(case_id: str, settings: Settings) -> ExecutionClaim:
         raise
 
 
-async def resume_case(
+async def _resume_case_in_process(
     case_id: str,
     settings: Settings,
     *,
     claim: ExecutionClaim | None = None,
+    terminal_writes_in_process: bool = False,
 ) -> CaseResult:
-    """Load a stopped Swarm only after an attributable human decision and resume it."""
+    """Child-side resume lifecycle; public callers use the process boundary."""
 
     if claim is None:
         raise InvoiceAgentsError(
@@ -2430,4 +3254,75 @@ async def resume_case(
         claim,
         resume_lifecycle,
         finished_event_type="case.resumed_finished",
+        terminal_writes_in_process=terminal_writes_in_process,
+    )
+
+
+async def resume_case(
+    case_id: str,
+    settings: Settings,
+    *,
+    claim: ExecutionClaim | None = None,
+) -> CaseResult:
+    """Resume provider/model/team work in one terminable fresh interpreter."""
+
+    if claim is None:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "an exact execution claim is required to resume a case",
+            case_id=case_id,
+            stop_reason="EXECUTION_CLAIM_MISSING",
+        ) from None
+    claim = validate_execution_claim(claim, expected_case_id=case_id)
+    store = WorkflowStore(settings)
+    store.require_current_execution_claim(claim)
+    try:
+        started_at = store.load_authoritative_case_started_at(claim)
+    except BaseException as exc:
+        raise _unresolved_durability_error(case_id, exc) from None
+    try:
+        previous = store.load_result(case_id)
+        if previous is not None and previous.started_at != started_at:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "case result start does not match its authoritative row",
+                case_id=case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from None
+    except BaseException as failure:
+        result = await _terminalize_lifecycle_boundary_failure(
+            store=store,
+            claim=claim,
+            started_at=started_at,
+            failure=failure,
+            load_previous=False,
+        )
+        if not isinstance(failure, Exception):
+            raise failure
+        return result
+    try:
+        settings.provider_key()
+    except BaseException as failure:
+        result = await _terminalize_lifecycle_boundary_failure(
+            store=store,
+            claim=claim,
+            started_at=started_at,
+            failure=failure,
+        )
+        if not isinstance(failure, Exception):
+            raise failure
+        return result
+    outcome, cancellation = await _invoke_lifecycle_boundary(
+        mode="resume",
+        settings=settings,
+        claim=claim,
+        started_at=started_at,
+    )
+    return await _reconcile_lifecycle_boundary(
+        case_id=case_id,
+        started_at=started_at,
+        settings=settings,
+        issued_claim=claim,
+        outcome=outcome,
+        cancellation=cancellation,
     )

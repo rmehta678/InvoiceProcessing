@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -45,6 +46,13 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 
 REQUIRED_JOURNAL_MODE = "delete"
 _DATETIME_WIRE_TYPE = datetime
+_REQUESTED_EXECUTION_TOKEN = re.compile(r"^exec_[0-9a-f]{32}$")
+
+
+def _validated_requested_execution_token(token: object) -> str:
+    if type(token) is not str or _REQUESTED_EXECUTION_TOKEN.fullmatch(token) is None:
+        raise ValueError("requested execution token is not canonical")
+    return token
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +69,7 @@ class ExecutionClaim:
 class CaseExecutionSnapshot:
     """One authoritative cases-row view for SSE terminal/lease decisions."""
 
+    started_at: datetime
     result: CaseResult | None
     execution_state: str
     has_valid_lease: bool
@@ -1008,6 +1017,26 @@ class WorkflowStore:
                     stop_reason="PERSISTED_RESULT_INVALID",
                 ) from None
 
+    def load_authoritative_case_started_at(self, claim: ExecutionClaim) -> datetime:
+        """Return the canonical case start from the exact running claim's snapshot."""
+
+        claim = validate_execution_claim(claim)
+        with connect_database(self.path, read_only=True) as connection:
+            self._begin_current_read(connection, claim)
+            row = connection.execute(
+                "SELECT started_at FROM cases WHERE case_id = ?",
+                (claim.case_id,),
+            ).fetchone()
+        started_at = parse_canonical_utc(row["started_at"] if row is not None else None)
+        if started_at is None:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "case has a noncanonical persisted start timestamp",
+                case_id=claim.case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from None
+        return started_at
+
     def load_recovery_case_source_id(self, claim: ExecutionClaim) -> str:
         """Load source authority for this exact running or finished generation."""
 
@@ -1114,6 +1143,8 @@ class WorkflowStore:
         case_id: str,
         expected_statuses: frozenset[CaseStatus],
         lease_seconds: int,
+        *,
+        requested_token: str | None = None,
     ) -> ExecutionClaim:
         """Atomically claim one fresh or resumable case and return its fencing token."""
 
@@ -1121,7 +1152,11 @@ class WorkflowStore:
             raise ValueError("expected_statuses must not be empty")
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
-        token = f"exec_{uuid4().hex}"
+        token = (
+            f"exec_{uuid4().hex}"
+            if requested_token is None
+            else _validated_requested_execution_token(requested_token)
+        )
         statuses = tuple(str(status) for status in sorted(expected_statuses))
         with connect_database(self.path) as connection:
             try:
@@ -1261,13 +1296,25 @@ class WorkflowStore:
                 self._raise_stale_execution_claim(claim)
             connection.commit()
 
-    def handoff_case_execution(self, claim: ExecutionClaim, lease_seconds: int) -> ExecutionClaim:
+    def handoff_case_execution(
+        self,
+        claim: ExecutionClaim,
+        lease_seconds: int,
+        *,
+        requested_token: str | None = None,
+    ) -> ExecutionClaim:
         """Atomically replace preparation authority with the claim used by its run."""
 
         claim = validate_execution_claim(claim)
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
-        token = f"exec_{uuid4().hex}"
+        token = (
+            f"exec_{uuid4().hex}"
+            if requested_token is None
+            else _validated_requested_execution_token(requested_token)
+        )
+        if token == claim.token:
+            raise ValueError("handoff execution token must be a distinct authority")
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             handed_off_at = datetime.now(UTC)
@@ -1338,7 +1385,7 @@ class WorkflowStore:
             self._require_canonical_utc_clock(checked_at)
         with connect_database(self.path, read_only=True) as connection:
             row = connection.execute(
-                "SELECT case_id, source_id, status, stop_reason, result_json, "
+                "SELECT case_id, source_id, status, stop_reason, result_json, started_at, "
                 "execution_token, execution_generation, execution_state, lease_expires_at "
                 "FROM cases WHERE case_id = ?",
                 (case_id,),
@@ -1352,6 +1399,14 @@ class WorkflowStore:
                 f"case {case_id} has a contradictory execution authority tuple",
                 case_id=case_id,
                 stop_reason="EXECUTION_AUTHORITY_CORRUPT",
+            )
+        started_at = parse_canonical_utc(row["started_at"])
+        if started_at is None:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "case has a noncanonical persisted start timestamp",
+                case_id=case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
             )
         result: CaseResult | None = None
         if row["result_json"] is not None:
@@ -1379,6 +1434,7 @@ class WorkflowStore:
         lease = parse_canonical_utc(row["lease_expires_at"])
         execution_state = str(row["execution_state"])
         return CaseExecutionSnapshot(
+            started_at=started_at,
             result=result,
             execution_state=execution_state,
             has_valid_lease=(

@@ -32,7 +32,7 @@ from invoice_agents.orchestration import (
     _inspect_claim_durability,
     _select_drained_failure,
     claim_resumable_case,
-    prepare_claimed_invoice,
+    prepare_claimed_invoice_async,
     resume_case,
     run_prepared_case,
     validate_case_concurrency,
@@ -97,27 +97,9 @@ def _stable_run_error(exc: BaseException) -> str:
 async def _prepare_claimed_for_launch(
     path: Path, settings: Settings
 ) -> tuple[str, datetime, ExecutionClaim] | CaseResult:
-    """Drain a prep thread and account for any claim if its caller is cancelled."""
+    """Prepare through the shared session-owned, cancellation-safe boundary."""
 
-    preparation = asyncio.create_task(
-        asyncio.to_thread(prepare_claimed_invoice, path, settings),
-        name=f"invoice-ui-prepare-{path.name}",
-    )
-    try:
-        return await asyncio.shield(preparation)
-    except asyncio.CancelledError as cancellation:
-        outcome = await _await_task_despite_cancellation(
-            preparation,
-            deadline=monotonic() + DURABILITY_DEADLINE_SECONDS,
-        )
-        if isinstance(outcome, tuple):
-            await _durably_cancel_unstarted_claim(
-                outcome[0],
-                outcome[1],
-                settings,
-                outcome[2],
-            )
-        raise cancellation
+    return await prepare_claimed_invoice_async(path, settings)
 
 
 class RunRegistry:
@@ -168,6 +150,24 @@ class RunRegistry:
             exc = task.exception()
             if exc is not None:
                 handle.error = _stable_run_error(exc)
+                exc.__traceback__ = None
+                exc.__cause__ = None
+                exc.__context__ = None
+        if task is not None and task.done():
+            handle.task = None
+
+    def _finish_batch(self, batch: BatchState) -> None:
+        """Retain only stable batch display state after its owner has completed."""
+
+        task = batch.task
+        if task is not None and task.done() and not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                exc.__traceback__ = None
+                exc.__cause__ = None
+                exc.__context__ = None
+        if task is not None and task.done():
+            batch.task = None
 
     async def start_process(self, path: Path, settings: Settings) -> str | CaseResult:
         """Prepare and launch one case; terminal prepare failures are returned as-is."""
@@ -403,6 +403,7 @@ class RunRegistry:
             self._run_batch(batch, prepared_entries, settings, ownership_installed),
             name=f"invoice-ui-{batch.batch_id}",
         )
+        batch.task.add_done_callback(lambda _task: self._finish_batch(batch))
         try:
             await asyncio.shield(ownership_installed.wait())
         except asyncio.CancelledError as cancellation:

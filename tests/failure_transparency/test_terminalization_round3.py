@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from pydantic import SecretStr
 
-from invoice_agents import orchestration, terminal_process
+from invoice_agents import lifecycle_process, orchestration, terminal_process
 from invoice_agents.agents.team import AgentCaseContext
 from invoice_agents.config import Settings
 from invoice_agents.db import store as store_module
@@ -25,6 +25,20 @@ from invoice_agents.models import CaseResult, CaseStatus, ErrorRecord
 from invoice_agents.payment import service as payment_service
 from invoice_agents.ui import runs as ui_runs
 from invoice_agents.ui.runs import RunHandle, RunRegistry
+
+
+@pytest.fixture(autouse=True)
+def _forbid_external_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        lifecycle_process,
+        "_lifecycle_worker_command",
+        lambda: [sys.executable, "-c", "import sys; sys.exit(86)"],
+    )
+
+    def forbidden(_settings: Settings) -> object:
+        raise AssertionError("non-live round3 test reached an unstubbed provider boundary")
+
+    monkeypatch.setattr(orchestration, "create_model_client", forbidden)
 
 
 @pytest.mark.asyncio
@@ -87,9 +101,7 @@ async def test_round3_terminal_timeout_cannot_later_commit_after_recovery(
     monkeypatch.setattr(orchestration, "DURABILITY_DEADLINE_SECONDS", 0.02)
     monkeypatch.chdir(tmp_path)
     with pytest.raises(InvoiceAgentsError) as excinfo:
-        await orchestration._durably_cancel_unstarted_claim(
-            case_id, started_at, settings, claim
-        )
+        await orchestration._durably_cancel_unstarted_claim(case_id, started_at, settings, claim)
     assert excinfo.value.stop_reason == "TERMINAL_DURABILITY_TIMEOUT"
     recovery = tmp_path / "artifacts" / "results" / f"{case_id}.recovery.json"
     assert recovery.is_file()

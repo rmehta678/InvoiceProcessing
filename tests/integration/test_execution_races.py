@@ -58,7 +58,12 @@ from invoice_agents.models import (
     RiskAssessment,
 )
 from invoice_agents.observability.audit import AuditRecorder
-from invoice_agents.orchestration import claim_resumable_case, resume_case
+from invoice_agents.orchestration import (
+    _resume_case_in_process as resume_case,
+)
+from invoice_agents.orchestration import (
+    claim_resumable_case,
+)
 from invoice_agents.payment.service import mock_payment
 from invoice_agents.source_store import snapshot_source
 from invoice_agents.tools.comparison import (
@@ -70,6 +75,14 @@ from invoice_agents.tools.comparison import (
     find_prior_invoice_candidates,
 )
 from invoice_agents.tools.evidence import extract_invoice_evidence
+
+
+@pytest.fixture(autouse=True)
+def _forbid_unstubbed_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden(_settings: Settings) -> object:
+        raise AssertionError("non-live race test reached an unstubbed provider boundary")
+
+    monkeypatch.setattr(orchestration, "create_model_client", forbidden)
 
 
 def _persist_case(
@@ -654,7 +667,12 @@ async def test_heartbeat_threads_renewed_claim_through_context_and_finish(
         lambda context, _client: RenewalObservingTeam(context),
     )
 
-    result = await orchestration.run_prepared_case(case_id, started_at, settings, claim=issued)
+    result = await orchestration._run_prepared_case_in_process(
+        case_id,
+        started_at,
+        settings,
+        claim=issued,
+    )
 
     assert result.stop_reason == "MAX_MESSAGES_EXHAUSTED"
     assert len(observed) == 1

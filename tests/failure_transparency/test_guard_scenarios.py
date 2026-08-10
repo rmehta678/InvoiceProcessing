@@ -46,7 +46,9 @@ from invoice_agents.orchestration import (
     is_max_messages_stop,
     prepare_case,
     process_invoice,
-    run_prepared_case,
+)
+from invoice_agents.orchestration import (
+    _run_prepared_case_in_process as run_prepared_case,
 )
 from invoice_agents.payment.service import mock_payment
 from invoice_agents.source_store import snapshot_source
@@ -59,6 +61,15 @@ from invoice_agents.tools.comparison import (
     find_prior_invoice_candidates,
 )
 from invoice_agents.tools.evidence import extract_invoice_evidence
+
+
+@pytest.fixture(autouse=True)
+def _forbid_unstubbed_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden(_settings: Settings) -> object:
+        raise AssertionError("non-live guard test reached an unstubbed provider boundary")
+
+    monkeypatch.setattr(orchestration, "create_model_client", forbidden)
+
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
 
