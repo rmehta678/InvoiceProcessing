@@ -355,7 +355,7 @@ def test_round7_persistent_close_fault_precedes_every_terminal_path_without_a_se
     monkeypatch: pytest.MonkeyPatch,
     worker_mode: str,
 ) -> None:
-    """Every terminal path closes all socket identities and reports cleanup failure."""
+    """Every terminal path retires secret identities and retains an uncertain close."""
 
     canary = f"round7-{worker_mode}-persistent-close-canary".encode()
     settings, started_at, claim = _lifecycle_inputs(tmp_path, canary.decode())
@@ -454,28 +454,41 @@ def test_round7_persistent_close_fault_precedes_every_terminal_path_without_a_se
         cancel_requested=cancel_requested,
     )
 
-    assert outcome.error_code == "LIFECYCLE_WORKER_CLEANUP_FAILED"
     assert target_descriptor and original_identity and stable_descriptors
-    _assert_descriptor_absent(target_descriptor[0])
-    for stable_descriptor in stable_descriptors:
-        _assert_descriptor_absent(stable_descriptor)
-    assert socket_close_calls == 0
-    assert drained_buffers and all(not any(buffer) for buffer in drained_buffers)
-    assert retained_buffers and all(not any(buffer) for buffer in retained_buffers)
-    assert all(canary not in surface for surface in invocation_surfaces)
-    if worker_mode == "start":
-        assert spawned_processes == []
-    else:
-        _assert_no_external_secret_surface(
-            canary=canary,
-            invocation_surfaces=invocation_surfaces,
-            retained_buffers=retained_buffers,
-            spawned_processes=spawned_processes,
-            tmp_path=tmp_path,
-        )
-    for artifact in tmp_path.rglob("*"):
-        if artifact.is_file():
-            assert canary not in artifact.read_bytes()
+    descriptor = target_descriptor[0]
+    try:
+        assert outcome.error_code == "LIFECYCLE_WORKER_CLEANUP_FAILED"
+        assert _original_descriptor_is_gone(descriptor, original_identity[0])
+        assert _recover_original_datagram(descriptor, original_identity[0]) == b""
+        for stable_descriptor in stable_descriptors:
+            _assert_descriptor_absent(stable_descriptor)
+        with isolated_process._UNPROVEN_DESCRIPTOR_OWNERSHIP_LOCK:
+            retained_references = {
+                reference.descriptor
+                for owner in isolated_process._UNPROVEN_DESCRIPTOR_OWNERSHIP.values()
+                for reference in owner.retained_references.values()
+            }
+        assert descriptor in retained_references
+        assert socket_close_calls == 0
+        assert drained_buffers and all(not any(buffer) for buffer in drained_buffers)
+        assert retained_buffers and all(not any(buffer) for buffer in retained_buffers)
+        assert all(canary not in surface for surface in invocation_surfaces)
+        if worker_mode == "start":
+            assert spawned_processes == []
+        else:
+            _assert_no_external_secret_surface(
+                canary=canary,
+                invocation_surfaces=invocation_surfaces,
+                retained_buffers=retained_buffers,
+                spawned_processes=spawned_processes,
+                tmp_path=tmp_path,
+            )
+        for artifact in tmp_path.rglob("*"):
+            if artifact.is_file():
+                assert canary not in artifact.read_bytes()
+    finally:
+        with suppress(OSError):
+            real_os_close(descriptor)
 
 
 @pytest.mark.parametrize("fault_profile", ["fstat", "drain", "drain_and_shutdown"])
@@ -1075,7 +1088,7 @@ def test_round7_cleanup_process_control_is_reraised_after_independently_proven_c
     control_point: str,
     control_type: type[BaseException],
 ) -> None:
-    """Control flow raised by a real cleanup primitive survives proven cleanup."""
+    """Control survives only when every interrupted cleanup action is proven."""
 
     canary = f"round7-{control_point}-control-credential-canary".encode()
     settings, started_at, claim = _lifecycle_inputs(tmp_path, canary.decode())
@@ -1205,19 +1218,38 @@ def test_round7_cleanup_process_control_is_reraised_after_independently_proven_c
         escaped = exc
 
     assert injected
-    assert outcome is None
-    assert isinstance(escaped, control_type)
     assert reaped_before_control == [True]
-    assert target_descriptor and stable_descriptors
-    _assert_descriptor_absent(target_descriptor[0])
-    for stable_descriptor in stable_descriptors:
-        _assert_descriptor_absent(stable_descriptor)
-    with isolated_process._UNPROVEN_DESCRIPTOR_OWNERSHIP_LOCK:
-        assert isolated_process._UNPROVEN_DESCRIPTOR_OWNERSHIP == {}
-    _assert_no_external_secret_surface(
-        canary=canary,
-        invocation_surfaces=invocation_surfaces,
-        retained_buffers=retained_buffers,
-        spawned_processes=spawned_processes,
-        tmp_path=tmp_path,
-    )
+    assert target_descriptor and original_identity and stable_descriptors
+    descriptor = target_descriptor[0]
+    try:
+        if control_point == "recv":
+            assert outcome is None
+            assert isinstance(escaped, control_type)
+            _assert_descriptor_absent(descriptor)
+            with isolated_process._UNPROVEN_DESCRIPTOR_OWNERSHIP_LOCK:
+                assert isolated_process._UNPROVEN_DESCRIPTOR_OWNERSHIP == {}
+        else:
+            assert escaped is None
+            assert outcome is not None
+            assert outcome.error_code == "LIFECYCLE_WORKER_CLEANUP_FAILED"
+            assert _original_descriptor_is_gone(descriptor, original_identity[0])
+            assert _recover_original_datagram(descriptor, original_identity[0]) == b""
+            with isolated_process._UNPROVEN_DESCRIPTOR_OWNERSHIP_LOCK:
+                retained_references = {
+                    reference.descriptor
+                    for owner in isolated_process._UNPROVEN_DESCRIPTOR_OWNERSHIP.values()
+                    for reference in owner.retained_references.values()
+                }
+            assert descriptor in retained_references
+        for stable_descriptor in stable_descriptors:
+            _assert_descriptor_absent(stable_descriptor)
+        _assert_no_external_secret_surface(
+            canary=canary,
+            invocation_surfaces=invocation_surfaces,
+            retained_buffers=retained_buffers,
+            spawned_processes=spawned_processes,
+            tmp_path=tmp_path,
+        )
+    finally:
+        with suppress(OSError):
+            real_close(descriptor)

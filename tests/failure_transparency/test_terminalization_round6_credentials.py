@@ -56,10 +56,15 @@ def _lifecycle_inputs(
     return settings, started_at, claim
 
 
-def _recover_queued_datagram(descriptor: int) -> tuple[bool, bytes]:
+def _recover_queued_datagram(
+    descriptor: int,
+    original: os.stat_result,
+) -> tuple[bool, bytes]:
     try:
-        os.fstat(descriptor)
+        current = os.fstat(descriptor)
     except OSError:
+        return False, b""
+    if _stable_identity(current) != _stable_identity(original):
         return False, b""
     with socket.socket(fileno=os.dup(descriptor)) as probe:
         probe.settimeout(0.25)
@@ -81,7 +86,7 @@ def _original_descriptor_is_gone(
     return _stable_identity(current) != _stable_identity(original)
 
 
-def _close_if_original_descriptor(
+def _close_if_original_or_retained_descriptor(
     descriptor: int,
     original: os.stat_result,
     close: Callable[[int], None],
@@ -90,7 +95,19 @@ def _close_if_original_descriptor(
         current = os.fstat(descriptor)
     except OSError:
         return
-    if _stable_identity(current) == _stable_identity(original):
+    current_identity = isolated_process._descriptor_identity(descriptor)
+    with isolated_process._UNPROVEN_DESCRIPTOR_OWNERSHIP_LOCK:
+        retained_identities = {
+            identity
+            for owner in isolated_process._UNPROVEN_DESCRIPTOR_OWNERSHIP.values()
+            for reference in owner.retained_references.values()
+            if reference.descriptor == descriptor
+            for identity in reference.expected_identities
+        }
+    if (
+        _stable_identity(current) == _stable_identity(original)
+        or current_identity in retained_identities
+    ):
         with suppress(OSError):
             close(descriptor)
 
@@ -148,7 +165,10 @@ def test_round6_parent_credential_close_failure_is_cleanup_failure_and_secret_is
     assert target_descriptor and original_identity and injected
     descriptor = target_descriptor[0]
     try:
-        descriptor_open, recovered = _recover_queued_datagram(descriptor)
+        descriptor_open, recovered = _recover_queued_datagram(
+            descriptor,
+            original_identity[0],
+        )
         observed = (
             outcome.error_code,
             descriptor_open,
@@ -165,7 +185,11 @@ def test_round6_parent_credential_close_failure_is_cleanup_failure_and_secret_is
             True,
         )
     finally:
-        _close_if_original_descriptor(descriptor, original_identity[0], real_close)
+        _close_if_original_or_retained_descriptor(
+            descriptor,
+            original_identity[0],
+            real_close,
+        )
 
 
 def _worker_command(worker_mode: str, tmp_path: Path) -> list[str]:
@@ -278,7 +302,11 @@ def test_round6_close_failure_precedes_every_lifecycle_terminal_path(
             if artifact.is_file():
                 assert canary.encode() not in artifact.read_bytes()
     finally:
-        _close_if_original_descriptor(descriptor, original_identity[0], real_close)
+        _close_if_original_or_retained_descriptor(
+            descriptor,
+            original_identity[0],
+            real_close,
+        )
 
 
 @pytest.mark.parametrize("descriptor_remains_open", [False, True])
@@ -331,7 +359,11 @@ def test_round6_ebadf_only_proves_cleanup_when_descriptor_is_absent(
         )
         assert _original_descriptor_is_gone(descriptor, original_identity[0])
     finally:
-        _close_if_original_descriptor(descriptor, original_identity[0], real_close)
+        _close_if_original_or_retained_descriptor(
+            descriptor,
+            original_identity[0],
+            real_close,
+        )
 
 
 def test_round6_eintr_reuse_never_closes_the_replacement_descriptor(

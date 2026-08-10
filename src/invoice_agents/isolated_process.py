@@ -12,14 +12,20 @@ import tempfile
 import threading
 import time
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from invoice_agents.db.migration_process import (
+    _QUARANTINED_WORKERS,
+    _QUARANTINED_WORKERS_LOCK,
     _capture_worker_session,
+    _cleanup_worker_session,
+    _quarantine_worker,
+    _remove_quarantined_worker,
     _retry_quarantined_workers,
     _stop_worker,
     _uncertain_worker_session,
+    _WorkerSession,
 )
 from invoice_agents.worker_environment import (
     sanitized_worker_environment as _sanitized_worker_environment,
@@ -52,6 +58,21 @@ class _OwnedDescriptor:
     identity: _DescriptorIdentity | None
     stable_descriptor: int | None
     stable_identity: _DescriptorIdentity | None
+    retained_references: dict[int, _RetainedDescriptorReference] = field(default_factory=dict)
+    credential_invalidated: bool = False
+    child_session_empty: bool = False
+    is_socket: bool = True
+
+
+@dataclass(slots=True)
+class _RetainedDescriptorReference:
+    """Identity evidence retained after a descriptor operation became uncertain."""
+
+    descriptor: int
+    expected_identities: tuple[_DescriptorIdentity, ...]
+    stable_alias: bool
+    secret_bearing: bool
+    close_uncertain: bool = False
 
 
 @dataclass(slots=True)
@@ -71,6 +92,20 @@ class _CleanupOutcome:
             self.control_error = other.control_error
 
 
+@dataclass(slots=True)
+class _WorkerCleanupOutcome:
+    """Independent proof that a worker is reaped or durably quarantined."""
+
+    contained: bool = False
+    reaped: bool = False
+    failed: bool = False
+    control_error: BaseException | None = None
+
+    def capture_control(self, error: BaseException) -> None:
+        if self.control_error is None:
+            self.control_error = error
+
+
 _UNPROVEN_DESCRIPTOR_OWNERSHIP: dict[int, _OwnedDescriptor] = {}
 _UNPROVEN_DESCRIPTOR_OWNERSHIP_LOCK = threading.Lock()
 
@@ -85,52 +120,208 @@ def _descriptor_identity(descriptor: int) -> _DescriptorIdentity:
     )
 
 
-def _unproven_descriptor_ownership_exists() -> bool:
-    with _UNPROVEN_DESCRIPTOR_OWNERSHIP_LOCK:
-        return bool(_UNPROVEN_DESCRIPTOR_OWNERSHIP)
-
-
 def _retain_unproven_descriptor_ownership(owned: _OwnedDescriptor) -> None:
     with _UNPROVEN_DESCRIPTOR_OWNERSHIP_LOCK:
         _UNPROVEN_DESCRIPTOR_OWNERSHIP[id(owned)] = owned
 
 
-def _capture_owned_fds(descriptors: set[int]) -> tuple[dict[int, _OwnedDescriptor], bool]:
+def _expected_identities(
+    *identities: _DescriptorIdentity | None,
+) -> tuple[_DescriptorIdentity, ...]:
+    unique: list[_DescriptorIdentity] = []
+    for identity in identities:
+        if identity is not None and identity not in unique:
+            unique.append(identity)
+    return tuple(unique)
+
+
+def _retain_reference(
+    owned: _OwnedDescriptor,
+    *,
+    descriptor: int,
+    expected_identities: tuple[_DescriptorIdentity, ...],
+    stable_alias: bool,
+    secret_bearing: bool,
+    close_uncertain: bool = False,
+) -> None:
+    existing = owned.retained_references.get(descriptor)
+    if existing is not None:
+        expected_identities = _expected_identities(
+            *existing.expected_identities,
+            *expected_identities,
+        )
+        secret_bearing = secret_bearing or existing.secret_bearing
+        close_uncertain = close_uncertain or existing.close_uncertain
+        stable_alias = stable_alias and existing.stable_alias
+    owned.retained_references[descriptor] = _RetainedDescriptorReference(
+        descriptor=descriptor,
+        expected_identities=expected_identities,
+        stable_alias=stable_alias,
+        secret_bearing=secret_bearing,
+        close_uncertain=close_uncertain,
+    )
+
+
+def _retain_internal_reference(
+    descriptor: int,
+    identity: _DescriptorIdentity | None,
+) -> None:
+    owned = _OwnedDescriptor(
+        descriptor=descriptor,
+        identity=identity,
+        stable_descriptor=None,
+        stable_identity=None,
+        credential_invalidated=True,
+        child_session_empty=True,
+        is_socket=False,
+    )
+    _retain_reference(
+        owned,
+        descriptor=descriptor,
+        expected_identities=_expected_identities(identity),
+        stable_alias=False,
+        secret_bearing=False,
+        close_uncertain=True,
+    )
+    _retain_unproven_descriptor_ownership(owned)
+
+
+def _retained_reference_state(
+    reference: _RetainedDescriptorReference,
+    outcome: _CleanupOutcome,
+) -> Literal["match", "absent", "mismatch", "unknown"]:
+    """Observe retained identity only; never turn an observation into a raw retry."""
+
+    try:
+        current_identity = _descriptor_identity(reference.descriptor)
+    except OSError as exc:
+        if exc.errno == errno.EBADF:
+            return "absent"
+        outcome.failed = True
+        return "unknown"
+    except Exception:
+        outcome.failed = True
+        return "unknown"
+    except BaseException as exc:
+        outcome.capture_control(exc)
+        return "unknown"
+    if not reference.expected_identities:
+        outcome.failed = True
+        return "unknown"
+    if current_identity not in reference.expected_identities:
+        return "mismatch"
+    return "match"
+
+
+def _reconcile_retained_owner(owned: _OwnedDescriptor) -> tuple[bool, _CleanupOutcome]:
+    """Boundedly retire stable aliases and observe every uncertain raw identity."""
+
+    outcome = _CleanupOutcome()
+    for descriptor, reference in tuple(owned.retained_references.items()):
+        state = _retained_reference_state(reference, outcome)
+        if state in {"absent", "mismatch"}:
+            del owned.retained_references[descriptor]
+            continue
+        if state != "match" or not reference.stable_alias or reference.close_uncertain:
+            continue
+        if reference.secret_bearing and owned.is_socket and not owned.credential_invalidated:
+            drained, drain_outcome = _drain_socket_descriptor(descriptor)
+            outcome.merge(drain_outcome)
+            if not drained:
+                continue
+            owned.credential_invalidated = True
+        try:
+            os.close(descriptor)
+        except Exception:
+            reference.close_uncertain = True
+            outcome.failed = True
+        except BaseException as exc:
+            reference.close_uncertain = True
+            outcome.capture_control(exc)
+            outcome.failed = True
+        else:
+            del owned.retained_references[descriptor]
+
+    secret_references_remain = any(
+        reference.secret_bearing for reference in owned.retained_references.values()
+    )
+    secret_destroyed = owned.credential_invalidated or (
+        owned.child_session_empty and not secret_references_remain
+    )
+    resolved = not owned.retained_references and secret_destroyed
+    if not resolved:
+        outcome.failed = True
+    return resolved, outcome
+
+
+def _reconcile_unproven_descriptor_ownership() -> _CleanupOutcome:
+    """Make one bounded production reconciliation pass over retained identities."""
+
+    outcome = _CleanupOutcome()
+    with _UNPROVEN_DESCRIPTOR_OWNERSHIP_LOCK:
+        for key, owned in tuple(_UNPROVEN_DESCRIPTOR_OWNERSHIP.items()):
+            resolved, owner_outcome = _reconcile_retained_owner(owned)
+            outcome.merge(owner_outcome)
+            if not resolved:
+                continue
+            if _UNPROVEN_DESCRIPTOR_OWNERSHIP.get(key) is owned:
+                del _UNPROVEN_DESCRIPTOR_OWNERSHIP[key]
+        if _UNPROVEN_DESCRIPTOR_OWNERSHIP:
+            outcome.failed = True
+    return outcome
+
+
+def _capture_owned_fds(
+    descriptors: set[int],
+) -> tuple[dict[int, _OwnedDescriptor], _CleanupOutcome]:
     """Capture identities and stable aliases before any descriptor can be uncertain."""
 
     owned: dict[int, _OwnedDescriptor] = {}
-    capture_failed = False
+    outcome = _CleanupOutcome()
     for descriptor in descriptors:
         identity: _DescriptorIdentity | None = None
         try:
             identity = _descriptor_identity(descriptor)
-        except BaseException as exc:
-            if isinstance(exc, OSError) and exc.errno == errno.EBADF:
+        except OSError as exc:
+            if exc.errno == errno.EBADF:
                 continue
-            capture_failed = True
+            outcome.failed = True
+        except Exception:
+            outcome.failed = True
+        except BaseException as exc:
+            outcome.capture_control(exc)
         stable_descriptor: int | None = None
         stable_identity: _DescriptorIdentity | None = None
         try:
             stable_descriptor = os.dup(descriptor)
             os.set_inheritable(stable_descriptor, False)
-        except BaseException:
-            capture_failed = True
+        except Exception:
+            outcome.failed = True
+        except BaseException as exc:
+            outcome.capture_control(exc)
         if stable_descriptor is not None:
+            # A successful dup return binds this alias to the captured original
+            # identity even if the independent verification is interrupted.
+            stable_identity = identity
             try:
-                stable_identity = _descriptor_identity(stable_descriptor)
-            except BaseException:
-                capture_failed = True
+                verified_identity = _descriptor_identity(stable_descriptor)
+            except Exception:
+                outcome.failed = True
+            except BaseException as exc:
+                outcome.capture_control(exc)
+            else:
+                stable_identity = verified_identity
             if identity is None:
                 identity = stable_identity
             elif stable_identity is not None and stable_identity != identity:
-                capture_failed = True
+                outcome.failed = True
         owned[descriptor] = _OwnedDescriptor(
             descriptor=descriptor,
             identity=identity,
             stable_descriptor=stable_descriptor,
             stable_identity=stable_identity,
         )
-    return owned, capture_failed
+    return owned, outcome
 
 
 def _zero_buffer(buffer: bytearray) -> None:
@@ -335,52 +526,29 @@ def _close_replaced_descriptor(
     descriptor: int,
     replacement_identity: _DescriptorIdentity | None,
 ) -> tuple[bool, _CleanupOutcome]:
-    """Close a harmless replacement once without retrying an uncertain number."""
+    """Close a harmless replacement once and never act on an uncertain number."""
 
     outcome = _CleanupOutcome()
-    close_was_failure = False
     try:
         os.close(descriptor)
-    except Exception as close_error:
-        state = _descriptor_state(
-            descriptor,
-            replacement_identity,
-            outcome,
-        )
-        confirmed_absent = (
-            isinstance(close_error, OSError)
-            and close_error.errno == errno.EBADF
-            and state == "absent"
-        )
-        if confirmed_absent:
-            return True, outcome
-        close_was_failure = True
-        outcome.failed = True
-    except BaseException as exc:
-        outcome.capture_control(exc)
-        state = _descriptor_state(descriptor, replacement_identity, outcome)
-    else:
-        return True, outcome
-    if state == "match" and replacement_identity is not None:
-        try:
-            # This number is proven to name our harmless replacement, never the
-            # original socket.  Contain that nonsecret leak without invoking the
-            # uncertain close primitive again or touching a changed identity.
-            os.closerange(descriptor, descriptor + 1)
-        except Exception:
-            outcome.failed = True
-        except BaseException as exc:
-            outcome.capture_control(exc)
-        final_state = _descriptor_state(descriptor, replacement_identity, outcome)
-        if final_state not in {"absent", "mismatch"}:
-            outcome.failed = True
-        return final_state in {"absent", "mismatch"}, outcome
-    if state == "unknown":
+    except OSError as exc:
+        if exc.errno == errno.EBADF:
+            # EBADF has no side effect. A read-only absence observation can
+            # prove retirement, but it can never authorize another close.
+            state = _descriptor_state(descriptor, replacement_identity, outcome)
+            if state == "absent":
+                return True, outcome
         outcome.failed = True
         return False, outcome
-    if close_was_failure:
+    except Exception:
         outcome.failed = True
-    return True, outcome
+        return False, outcome
+    except BaseException as exc:
+        outcome.capture_control(exc)
+        outcome.failed = True
+        return False, outcome
+    else:
+        return True, outcome
 
 
 def _retire_owned_fds(
@@ -399,18 +567,16 @@ def _retire_owned_fds(
     outcome = _CleanupOutcome()
     if not owned:
         return outcome
-    invalidation_proven: dict[int, bool] = {}
-    socket_owned: dict[int, bool] = {}
-    for descriptor, descriptor_owner in owned.items():
+    for descriptor_owner in owned.values():
+        descriptor_owner.child_session_empty = child_session_empty
         is_socket, socket_outcome = _descriptor_is_socket(descriptor_owner)
         outcome.merge(socket_outcome)
         if is_socket is None:
             is_socket = True
-        socket_owned[descriptor] = is_socket
+        descriptor_owner.is_socket = is_socket
         if not is_socket:
-            invalidation_proven[descriptor] = True
+            descriptor_owner.credential_invalidated = True
             continue
-        invalidation_proven[descriptor] = False
         drain_candidates = (
             (
                 descriptor_owner.stable_descriptor,
@@ -428,7 +594,7 @@ def _retire_owned_fds(
                 continue
             drained, drain_outcome = _drain_socket_descriptor(drain_descriptor)
             outcome.merge(drain_outcome)
-            invalidation_proven[descriptor] = drained
+            descriptor_owner.credential_invalidated = drained
             break
 
     harmless_descriptor: int | None = None
@@ -444,22 +610,34 @@ def _retire_owned_fds(
     except BaseException as exc:
         outcome.capture_control(exc)
 
-    replaced: dict[int, int] = {}
-    secret_references_retired: dict[int, bool] = {}
-    for descriptor, descriptor_owner in owned.items():
+    replaced: dict[int, _OwnedDescriptor] = {}
+    for descriptor_owner in owned.values():
         references = (
-            (descriptor_owner.descriptor, descriptor_owner.identity),
-            (descriptor_owner.stable_descriptor, descriptor_owner.stable_identity),
+            (
+                descriptor_owner.descriptor,
+                descriptor_owner.identity,
+                False,
+            ),
+            (
+                descriptor_owner.stable_descriptor,
+                descriptor_owner.stable_identity,
+                True,
+            ),
         )
-        all_references_retired = True
-        for reference, expected_identity in references:
+        for reference, expected_identity, stable_alias in references:
             if reference is None:
                 continue
             state = _descriptor_state(reference, expected_identity, outcome)
             if state in {"absent", "mismatch"}:
                 continue
             if state == "unknown" or harmless_descriptor is None:
-                all_references_retired = False
+                _retain_reference(
+                    descriptor_owner,
+                    descriptor=reference,
+                    expected_identities=_expected_identities(expected_identity),
+                    stable_alias=stable_alias,
+                    secret_bearing=True,
+                )
                 continue
             try:
                 os.dup2(harmless_descriptor, reference, inheritable=False)
@@ -472,9 +650,24 @@ def _retire_owned_fds(
                     outcome,
                 )
                 if replacement_state == "replaced":
-                    replaced[reference] = descriptor
+                    _retain_reference(
+                        descriptor_owner,
+                        descriptor=reference,
+                        expected_identities=_expected_identities(harmless_identity),
+                        stable_alias=False,
+                        secret_bearing=False,
+                    )
                 elif replacement_state == "unresolved":
-                    all_references_retired = False
+                    _retain_reference(
+                        descriptor_owner,
+                        descriptor=reference,
+                        expected_identities=_expected_identities(
+                            expected_identity,
+                            harmless_identity,
+                        ),
+                        stable_alias=False,
+                        secret_bearing=True,
+                    )
             except BaseException as exc:
                 outcome.capture_control(exc)
                 replacement_state = _reconcile_replacement(
@@ -484,19 +677,39 @@ def _retire_owned_fds(
                     outcome,
                 )
                 if replacement_state == "replaced":
-                    replaced[reference] = descriptor
+                    _retain_reference(
+                        descriptor_owner,
+                        descriptor=reference,
+                        expected_identities=_expected_identities(harmless_identity),
+                        stable_alias=False,
+                        secret_bearing=False,
+                    )
                 elif replacement_state == "unresolved":
-                    outcome.failed = True
-                    all_references_retired = False
+                    _retain_reference(
+                        descriptor_owner,
+                        descriptor=reference,
+                        expected_identities=_expected_identities(
+                            expected_identity,
+                            harmless_identity,
+                        ),
+                        stable_alias=False,
+                        secret_bearing=True,
+                    )
             else:
-                replaced[reference] = descriptor
-        secret_references_retired[descriptor] = all_references_retired
+                replaced[reference] = descriptor_owner
 
-    for reference, owner_descriptor in replaced.items():
+    for reference, descriptor_owner in replaced.items():
         retired, close_outcome = _close_replaced_descriptor(reference, harmless_identity)
         outcome.merge(close_outcome)
         if not retired:
-            secret_references_retired[owner_descriptor] = False
+            _retain_reference(
+                descriptor_owner,
+                descriptor=reference,
+                expected_identities=_expected_identities(harmless_identity),
+                stable_alias=False,
+                secret_bearing=False,
+                close_uncertain=True,
+            )
     if harmless_descriptor is not None and harmless_descriptor not in replaced:
         retired, close_outcome = _close_replaced_descriptor(
             harmless_descriptor,
@@ -504,7 +717,7 @@ def _retire_owned_fds(
         )
         outcome.merge(close_outcome)
         if not retired:
-            outcome.failed = True
+            _retain_internal_reference(harmless_descriptor, harmless_identity)
     if harmless_writer is not None:
         retired, close_outcome = _close_replaced_descriptor(
             harmless_writer,
@@ -512,21 +725,18 @@ def _retire_owned_fds(
         )
         outcome.merge(close_outcome)
         if not retired:
-            outcome.failed = True
+            _retain_internal_reference(harmless_writer, harmless_writer_identity)
 
-    for descriptor, is_socket in socket_owned.items():
-        references_retired = secret_references_retired.get(descriptor, False)
-        secret_destroyed = (
-            (not is_socket)
-            or invalidation_proven.get(
-                descriptor,
-                False,
-            )
-            or (child_session_empty and references_retired)
+    for descriptor_owner in owned.values():
+        secret_references_remain = any(
+            reference.secret_bearing for reference in descriptor_owner.retained_references.values()
         )
-        if not references_retired or not secret_destroyed:
+        secret_destroyed = descriptor_owner.credential_invalidated or (
+            child_session_empty and not secret_references_remain
+        )
+        if descriptor_owner.retained_references or not secret_destroyed:
             outcome.failed = True
-            _retain_unproven_descriptor_ownership(owned[descriptor])
+            _retain_unproven_descriptor_ownership(descriptor_owner)
     owned.clear()
     return outcome
 
@@ -541,6 +751,129 @@ class IsolatedProcessResult:
 
 class IsolatedProcessCleanupError(Exception):
     """The Task 8 session primitive could not prove cleanup."""
+
+
+def _fallback_worker_session(process: subprocess.Popen[bytes]) -> _WorkerSession:
+    """Construct the reserved start_new_session identity without a fallible seam."""
+
+    return _WorkerSession(
+        process=process,
+        process_id=process.pid,
+        process_group_id=process.pid,
+        session_id=process.pid,
+        exit_watcher=None,
+        watcher_initialized=False,
+        identity_verified=False,
+    )
+
+
+def _worker_containment_is_proven(worker: object) -> tuple[bool, bool]:
+    reaped = bool(worker.cleaned)  # type: ignore[attr-defined]
+    if reaped:
+        return True, True
+    with _QUARANTINED_WORKERS_LOCK:
+        quarantined = (
+            _QUARANTINED_WORKERS.get(
+                worker.process_id  # type: ignore[attr-defined]
+            )
+            is worker
+        )
+    return quarantined, False
+
+
+def _run_worker_cleanup_phase(
+    worker: object,
+    outcome: _WorkerCleanupOutcome,
+) -> None:
+    """Stop through the public seam, then independently reap or quarantine."""
+
+    stop_failed = False
+    try:
+        cleanup_error = _stop_worker(worker)  # type: ignore[arg-type]
+    except Exception:
+        stop_failed = True
+    except BaseException as exc:
+        outcome.capture_control(exc)
+    else:
+        stop_failed = cleanup_error is not None
+
+    contained, _reaped = _worker_containment_is_proven(worker)
+    if not contained:
+        try:
+            _cleanup_worker_session(worker)  # type: ignore[arg-type]
+        except Exception:
+            stop_failed = True
+        except BaseException as exc:
+            outcome.capture_control(exc)
+        else:
+            _remove_quarantined_worker(worker)  # type: ignore[arg-type]
+
+    contained, _reaped = _worker_containment_is_proven(worker)
+    if not contained:
+        try:
+            _quarantine_worker(worker)  # type: ignore[arg-type]
+        except Exception:
+            stop_failed = True
+        except BaseException as exc:
+            outcome.capture_control(exc)
+
+    outcome.contained, outcome.reaped = _worker_containment_is_proven(worker)
+    outcome.failed = not outcome.contained or (stop_failed and outcome.control_error is None)
+
+
+def _stop_or_quarantine_worker(worker: object) -> _WorkerCleanupOutcome:
+    """Run worker containment independently and wait through caller cancellation."""
+
+    outcome = _WorkerCleanupOutcome()
+    finished = threading.Event()
+
+    def cleanup_target() -> None:
+        try:
+            _run_worker_cleanup_phase(worker, outcome)
+        except Exception:
+            outcome.failed = True
+        except BaseException as exc:
+            outcome.capture_control(exc)
+        finally:
+            contained, _reaped = _worker_containment_is_proven(worker)
+            if not contained:
+                try:
+                    _quarantine_worker(worker)  # type: ignore[arg-type]
+                except Exception:
+                    outcome.failed = True
+                except BaseException as exc:
+                    outcome.capture_control(exc)
+            outcome.contained, outcome.reaped = _worker_containment_is_proven(worker)
+            if not outcome.contained:
+                outcome.failed = True
+            finished.set()
+
+    cleanup_thread = threading.Thread(
+        target=cleanup_target,
+        name="isolated-worker-containment",
+        daemon=True,
+    )
+    wait_control: BaseException | None = None
+    try:
+        cleanup_thread.start()
+    except Exception:
+        cleanup_target()
+    except BaseException as exc:
+        wait_control = exc
+        if cleanup_thread.ident is None:
+            cleanup_target()
+    while not finished.is_set():
+        try:
+            finished.wait(_POLL_SECONDS)
+        except BaseException as exc:
+            if wait_control is None:
+                wait_control = exc
+    if outcome.control_error is None:
+        outcome.control_error = wait_control
+    outcome.contained, outcome.reaped = _worker_containment_is_proven(worker)
+    if not outcome.contained:
+        outcome.failed = True
+    return outcome
 
 
 def _read_response(
@@ -613,7 +946,7 @@ def run_isolated_process(
     descriptor_numbers = {
         descriptor for descriptor in pass_fds if type(descriptor) is int and descriptor >= 3
     }
-    owned_descriptors, descriptor_capture_failed = _capture_owned_fds(descriptor_numbers)
+    owned_descriptors, descriptor_capture = _capture_owned_fds(descriptor_numbers)
     descriptors_are_valid = all(
         type(descriptor) is int and descriptor >= 3 for descriptor in pass_fds
     ) and len(set(pass_fds)) == len(pass_fds)
@@ -632,31 +965,51 @@ def run_isolated_process(
             owned_descriptors,
             child_session_empty=True,
         )
-        if descriptor_capture_failed or descriptor_cleanup.failed:
+        descriptor_capture.merge(descriptor_cleanup)
+        if descriptor_capture.failed:
             raise IsolatedProcessCleanupError from None
-        if descriptor_cleanup.control_error is not None:
-            raise descriptor_cleanup.control_error
+        if descriptor_capture.control_error is not None:
+            raise descriptor_capture.control_error
         raise ValueError("invalid isolated worker controller input")
-    if descriptor_capture_failed:
-        _retire_owned_fds(owned_descriptors, child_session_empty=True)
-        raise IsolatedProcessCleanupError from None
-    try:
-        if not _retry_quarantined_workers() or _unproven_descriptor_ownership_exists():
-            raise IsolatedProcessCleanupError from None
-    except BaseException:
+    if descriptor_capture.failed or descriptor_capture.control_error is not None:
         descriptor_cleanup = _retire_owned_fds(
             owned_descriptors,
             child_session_empty=True,
         )
-        if descriptor_cleanup.failed:
+        descriptor_capture.merge(descriptor_cleanup)
+        if descriptor_capture.failed:
             raise IsolatedProcessCleanupError from None
-        raise
+        assert descriptor_capture.control_error is not None
+        raise descriptor_capture.control_error
+
+    preflight = _CleanupOutcome()
+    try:
+        workers_clear = _retry_quarantined_workers()
+    except Exception:
+        workers_clear = False
+        preflight.failed = True
+    except BaseException as exc:
+        preflight.capture_control(exc)
+        with _QUARANTINED_WORKERS_LOCK:
+            workers_clear = not _QUARANTINED_WORKERS
+    if not workers_clear:
+        preflight.failed = True
+    preflight.merge(_reconcile_unproven_descriptor_ownership())
+    if preflight.failed or preflight.control_error is not None:
+        descriptor_cleanup = _retire_owned_fds(
+            owned_descriptors,
+            child_session_empty=True,
+        )
+        preflight.merge(descriptor_cleanup)
+        if preflight.failed:
+            raise IsolatedProcessCleanupError from None
+        assert preflight.control_error is not None
+        raise preflight.control_error
     process: subprocess.Popen[bytes] | None = None
     worker: object | None = None
     start_failed = False
     primary_error: BaseException | None = None
-    cleanup_control_error: BaseException | None = None
-    cleanup_error: object | None = None
+    worker_cleanup = _WorkerCleanupOutcome(contained=True, reaped=True)
     response: bytes | None = None
     response_failure: Literal["timeout", "cancelled", "protocol"] | None = None
     try:
@@ -715,27 +1068,25 @@ def run_isolated_process(
                 except BaseException as exc:
                     primary_error = exc
     finally:
+        if worker is None and process is not None:
+            worker = _fallback_worker_session(process)
         if worker is not None:
-            try:
-                cleanup_error = _stop_worker(worker)  # type: ignore[arg-type]
-            except BaseException as exc:
-                cleanup_control_error = exc
-        child_session_empty = (process is None) or bool(
-            worker is not None and worker.cleaned  # type: ignore[attr-defined]
-        )
+            worker_cleanup = _stop_or_quarantine_worker(worker)
+        else:
+            worker_cleanup.contained = process is None
+            worker_cleanup.reaped = process is None
+            worker_cleanup.failed = process is not None
+        child_session_empty = process is None or worker_cleanup.reaped
         descriptor_cleanup = _retire_owned_fds(
             owned_descriptors,
             child_session_empty=child_session_empty,
         )
-    worker_cleanup_failed = cleanup_error is not None or (
-        process is not None and not child_session_empty
-    )
-    if descriptor_cleanup.failed or worker_cleanup_failed:
+    if descriptor_cleanup.failed or worker_cleanup.failed or not worker_cleanup.contained:
         raise IsolatedProcessCleanupError from None
     if primary_error is not None:
         raise primary_error
-    if cleanup_control_error is not None:
-        raise cleanup_control_error
+    if worker_cleanup.control_error is not None:
+        raise worker_cleanup.control_error
     if descriptor_cleanup.control_error is not None:
         raise descriptor_cleanup.control_error
     if worker is None:
