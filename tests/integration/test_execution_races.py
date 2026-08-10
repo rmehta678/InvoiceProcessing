@@ -221,7 +221,8 @@ def _finish_needs_human(
     review: Any,
 ) -> None:
     invoice = store.load_current_extraction(claim)
-    finished_at = datetime.now(UTC)
+    started_at = store.load_authoritative_case_started_at(claim)
+    finished_at = max(datetime.now(UTC), started_at)
     store.finish_case(
         CaseResult(
             case_id=case_id,
@@ -229,7 +230,7 @@ def _finish_needs_human(
             status=CaseStatus.NEEDS_HUMAN,
             stop_reason="HUMAN_REVIEW_REQUESTED",
             review_request=review,
-            started_at=finished_at,
+            started_at=started_at,
             finished_at=finished_at,
         ),
         claim,
@@ -398,6 +399,7 @@ async def test_two_orchestration_resume_attempts_have_one_database_owner(
         extra_reasons=["race fixture requires a persisted ruling"],
     )
     store.save_team_state(case_id, {"fixture": "stopped"}, setup_claim)
+    started_at = store.load_authoritative_case_started_at(setup_claim)
     store.finish_case(
         CaseResult(
             case_id=case_id,
@@ -405,8 +407,8 @@ async def test_two_orchestration_resume_attempts_have_one_database_owner(
             status=CaseStatus.NEEDS_HUMAN,
             stop_reason="HUMAN_REVIEW_REQUESTED",
             review_request=review,
-            started_at=datetime.now(UTC),
-            finished_at=datetime.now(UTC),
+            started_at=started_at,
+            finished_at=max(datetime.now(UTC), started_at),
         ),
         setup_claim,
     )
@@ -1271,7 +1273,7 @@ def test_schema_rejects_noncanonical_execution_lease(settings: Settings, lease: 
             "UPDATE cases SET execution_state = 'RUNNING', execution_token = ?, "
             "execution_generation = execution_generation + 1, lease_expires_at = ? "
             "WHERE case_id = ?",
-            ("exec_noncanonical", lease, case_id),
+            (f"exec_{'a' * 32}", lease, case_id),
         )
 
 
@@ -1286,7 +1288,7 @@ def test_claim_rejects_noncanonical_expired_lease_before_cas_adoption(
             "UPDATE cases SET execution_state = 'RUNNING', execution_token = ?, "
             "execution_generation = execution_generation + 1, lease_expires_at = ? "
             "WHERE case_id = ?",
-            ("exec_noncanonical", "2000-01-01 00:00:00", case_id),
+            (f"exec_{'b' * 32}", "2000-01-01 00:00:00", case_id),
         )
         connection.commit()
 
@@ -1301,7 +1303,7 @@ def test_claim_rejects_noncanonical_expired_lease_before_cas_adoption(
             "WHERE case_id = ?",
             (case_id,),
         ).fetchone()
-    assert row["execution_token"] == "exec_noncanonical"
+    assert row["execution_token"] == f"exec_{'b' * 32}"
     assert row["execution_generation"] == 2
     assert row["lease_expires_at"] == "2000-01-01 00:00:00"
 
@@ -2149,7 +2151,7 @@ def test_mapping_review_authorizes_only_its_exact_recomputed_successor_and_payme
             DatabaseKind.WORKFLOW,
             settings=settings,
         )["schema_version"]
-        == 3
+        == 4
     )
     with connect_database(settings.inventory_db, read_only=True) as connection:
         alias = connection.execute(
@@ -2845,13 +2847,13 @@ def test_migration_003_rolls_back_and_is_retryable_after_mid_migration_failure(
         )
         connection.commit()
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4]
     inventory = tmp_path / "inventory-atomic.db"
     migrate_database(inventory, DatabaseKind.INVENTORY)
     seed_inventory(inventory)
     audit_settings = Settings(workflow_db=path, inventory_db=inventory)
     assert (
-        verify_database(path, DatabaseKind.WORKFLOW, settings=audit_settings)["schema_version"] == 3
+        verify_database(path, DatabaseKind.WORKFLOW, settings=audit_settings)["schema_version"] == 4
     )
     with real_connect(path, read_only=True) as connection:
         identity_columns = {
@@ -3076,13 +3078,13 @@ def test_migration_003_rejects_unanchored_legacy_authorization_atomically_and_re
         confirmed=True,
     )
     assert receipt.record_count == 1 + int(include_payment)
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4]
     inventory = tmp_path / "inventory-legacy-authorization.db"
     migrate_database(inventory, DatabaseKind.INVENTORY)
     seed_inventory(inventory)
     audit_settings = Settings(workflow_db=path, inventory_db=inventory)
     assert (
-        verify_database(path, DatabaseKind.WORKFLOW, settings=audit_settings)["schema_version"] == 3
+        verify_database(path, DatabaseKind.WORKFLOW, settings=audit_settings)["schema_version"] == 4
     )
 
 
@@ -3107,7 +3109,7 @@ def test_workflow_preflight_rejects_unanchored_v3_authorization_rows(
             DatabaseKind.WORKFLOW,
             settings=settings,
         )["schema_version"]
-        == 3
+        == 4
     )
 
     trigger_name = "trg_validated_evidence_snapshots_delete"
@@ -3233,7 +3235,7 @@ def test_workflow_preflight_accepts_complete_review_bound_payment_authorization(
         settings=settings,
     )
 
-    assert report["schema_version"] == 3
+    assert report["schema_version"] == 4
 
 
 def test_workflow_v3_verification_requires_explicit_settings_context(
@@ -4039,7 +4041,7 @@ async def test_lease_heartbeat_propagates_renewal_failure_without_masking() -> N
     renew_attempted = asyncio.Event()
     claim = ExecutionClaim(
         case_id="case_heartbeat",
-        token="exec_heartbeat",
+        token=f"exec_{'c' * 32}",
         generation=1,
         expires_at=datetime.now(UTC),
     )

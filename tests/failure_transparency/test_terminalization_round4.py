@@ -837,12 +837,6 @@ async def test_round4_registry_detaches_completed_raw_task_and_traceback() -> No
         state="running",
         started_at=datetime.now(UTC),
         task=task,
-        claim=ExecutionClaim(
-            "case_round4_registry",
-            "exec_round4_registry",
-            1,
-            datetime.now(UTC).replace(microsecond=0),
-        ),
     )
     registry = RunRegistry()
     registry._runs[handle.case_id] = handle

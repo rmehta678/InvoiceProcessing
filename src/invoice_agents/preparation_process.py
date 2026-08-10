@@ -13,12 +13,12 @@ from pathlib import Path
 from typing import Any
 
 from invoice_agents.config import Settings
-from invoice_agents.db.migration_process import _serialize_settings
 from invoice_agents.isolated_process import (
     IsolatedProcessCleanupError,
     run_isolated_process,
     sanitized_worker_environment,
 )
+from invoice_agents.wire_settings import decode_wire_settings, serialize_wire_settings
 
 PREPARATION_PROTOCOL_VERSION = 1
 PREPARATION_MAX_MESSAGE_BYTES = 1_048_576
@@ -76,8 +76,8 @@ def _canonical_token(value: str) -> str:
 
 
 def _redacted_settings(settings: Settings) -> dict[str, object]:
-    payload = _serialize_settings(settings)
-    if type(payload) is not dict or payload.get("xai_api_key") is not None:
+    payload = serialize_wire_settings(settings)
+    if payload.get("xai_api_key") is not None:
         raise ValueError("preparation settings serialization is not redacted")
     payload = dict(payload)
     payload["inventory_db"] = os.fspath(settings.inventory_db.resolve())
@@ -168,7 +168,7 @@ def decode_preparation_request(
     run_token = _canonical_token(payload["run_token"])
     if preparation_token == run_token:
         raise ValueError("preparation tokens collide")
-    settings = Settings(**payload["settings"])
+    settings = decode_wire_settings(payload["settings"])
     if settings.xai_api_key is not None:
         raise ValueError("preparation worker received provider credentials")
     return (

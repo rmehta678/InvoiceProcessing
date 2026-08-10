@@ -19,6 +19,8 @@ from typing import Any
 from invoice_agents.config import Settings
 from invoice_agents.db.core import DatabaseKind
 from invoice_agents.errors import DatabaseVerificationError, ErrorCategory
+from invoice_agents.wire_settings import decode_wire_settings, serialize_wire_settings
+from invoice_agents.worker_environment import sanitized_worker_environment
 
 MIGRATION_WORKER_PROTOCOL_VERSION = 1
 MIGRATION_WORKER_MAX_MESSAGE_BYTES = 65_536
@@ -27,31 +29,6 @@ _WORKER_SHUTDOWN_SECONDS = 2.0
 _WORKER_POLL_SECONDS = 0.05
 _WORKER_QUARANTINE_RETRY_ATTEMPTS = 3
 _WORKER_QUARANTINE_RETRY_SECONDS = 0.1
-_SERIALIZED_SETTINGS_FIELDS = frozenset(
-    {
-        "xai_api_key",
-        "inventory_db",
-        "workflow_db",
-        "sqlite_journal_mode",
-        "source_archive_dir",
-        "source_max_bytes",
-        "pdf_max_pages",
-        "pdf_parse_timeout_seconds",
-        "pdf_worker_cpu_seconds",
-        "pdf_worker_memory_bytes",
-        "pdf_worker_result_max_bytes",
-        "review_threshold_amount",
-        "review_threshold_currency",
-        "review_threshold_effective_date",
-        "due_date_tolerance_days",
-        "review_age_amber_hours",
-        "max_messages",
-        "model_timeout_seconds",
-        "transient_retries",
-        "case_concurrency",
-        "log_level",
-    }
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,29 +284,7 @@ def _worker_command() -> list[str]:
 def _serialize_settings(settings: Settings | None) -> dict[str, object] | None:
     if settings is None:
         return None
-    return {
-        "xai_api_key": None,
-        "inventory_db": os.fspath(settings.inventory_db),
-        "workflow_db": os.fspath(settings.workflow_db),
-        "sqlite_journal_mode": settings.sqlite_journal_mode,
-        "source_archive_dir": os.fspath(settings.source_archive_dir),
-        "source_max_bytes": settings.source_max_bytes,
-        "pdf_max_pages": settings.pdf_max_pages,
-        "pdf_parse_timeout_seconds": settings.pdf_parse_timeout_seconds,
-        "pdf_worker_cpu_seconds": settings.pdf_worker_cpu_seconds,
-        "pdf_worker_memory_bytes": settings.pdf_worker_memory_bytes,
-        "pdf_worker_result_max_bytes": settings.pdf_worker_result_max_bytes,
-        "review_threshold_amount": str(settings.review_threshold_amount),
-        "review_threshold_currency": settings.review_threshold_currency,
-        "review_threshold_effective_date": settings.review_threshold_effective_date.isoformat(),
-        "due_date_tolerance_days": settings.due_date_tolerance_days,
-        "review_age_amber_hours": settings.review_age_amber_hours,
-        "max_messages": settings.max_messages,
-        "model_timeout_seconds": settings.model_timeout_seconds,
-        "transient_retries": settings.transient_retries,
-        "case_concurrency": settings.case_concurrency,
-        "log_level": settings.log_level,
-    }
+    return serialize_wire_settings(settings)
 
 
 def _protocol_error(stop_reason: str, _message: str) -> DatabaseVerificationError:
@@ -1094,6 +1049,7 @@ def _run_migration_in_subprocess(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
+                env=sanitized_worker_environment(),
             )
         worker = _capture_worker_session(process)
     except Exception:
@@ -1205,15 +1161,22 @@ def decode_worker_request(encoded: bytes) -> tuple[Path, DatabaseKind, Settings 
 
     if not encoded or len(encoded) > MIGRATION_WORKER_MAX_MESSAGE_BYTES:
         raise ValueError("invalid worker request size")
-    payload = json.loads(encoded)
-    if not isinstance(payload, dict) or set(payload) != {
+    payload = json.loads(
+        encoded,
+        object_pairs_hook=_strict_json_object,
+        parse_constant=_reject_json_constant,
+    )
+    if type(payload) is not dict or set(payload) != {
         "protocol_version",
         "path",
         "kind",
         "settings",
     }:
         raise ValueError("invalid worker request shape")
-    if payload["protocol_version"] != MIGRATION_WORKER_PROTOCOL_VERSION:
+    if (
+        type(payload["protocol_version"]) is not int
+        or payload["protocol_version"] != MIGRATION_WORKER_PROTOCOL_VERSION
+    ):
         raise ValueError("invalid worker protocol version")
     if not isinstance(payload["path"], str) or not 1 <= len(payload["path"]) <= 16_384:
         raise ValueError("invalid worker path")
@@ -1223,10 +1186,8 @@ def decode_worker_request(encoded: bytes) -> tuple[Path, DatabaseKind, Settings 
     settings_payload = payload["settings"]
     if settings_payload is None:
         settings = None
-    elif isinstance(settings_payload, dict):
-        if set(settings_payload) != _SERIALIZED_SETTINGS_FIELDS:
-            raise ValueError("invalid worker settings shape")
-        settings = Settings(**settings_payload)
+    elif type(settings_payload) is dict:
+        settings = decode_wire_settings(settings_payload)
     else:
         raise ValueError("invalid worker settings")
     return Path(payload["path"]), kind, settings

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import sys
 from typing import Any
 
@@ -31,20 +32,28 @@ def _disable_core_dumps() -> None:
 
 
 def _read_private_credential(descriptor: int) -> bytearray:
-    credential = bytearray()
+    if type(descriptor) is not int or descriptor < 3:
+        raise ValueError("invalid private credential descriptor")
+    credential = bytearray(LIFECYCLE_MAX_CREDENTIAL_BYTES + 1)
+    transport: socket.socket | None = None
     try:
-        while len(credential) <= LIFECYCLE_MAX_CREDENTIAL_BYTES:
-            chunk = os.read(
-                descriptor,
-                min(8_192, LIFECYCLE_MAX_CREDENTIAL_BYTES + 1 - len(credential)),
-            )
-            if not chunk:
-                break
-            credential.extend(chunk)
+        transport = socket.socket(fileno=descriptor)
+        if (
+            transport.family != socket.AF_UNIX
+            or transport.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_DGRAM
+        ):
+            raise ValueError("invalid private credential transport")
+        received = transport.recv_into(credential, LIFECYCLE_MAX_CREDENTIAL_BYTES + 1)
     finally:
-        os.close(descriptor)
-    if not credential or len(credential) > LIFECYCLE_MAX_CREDENTIAL_BYTES:
+        if transport is None:
+            os.close(descriptor)
+        else:
+            transport.close()
+    if received < 1 or received > LIFECYCLE_MAX_CREDENTIAL_BYTES:
+        for index in range(len(credential)):
+            credential[index] = 0
         raise ValueError("invalid private credential size")
+    del credential[received:]
     return credential
 
 

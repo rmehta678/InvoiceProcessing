@@ -113,7 +113,7 @@ def test_dashboard_empty_state(client: TestClient) -> None:
     assert response.status_code == 200
     assert "No cases yet" in response.text
     assert "invoice-agents process" in response.text
-    assert "schema v3, integrity ok" in response.text
+    assert "schema v4, integrity ok" in response.text
 
 
 def test_dashboard_lists_stored_case(client: TestClient, settings: Settings) -> None:

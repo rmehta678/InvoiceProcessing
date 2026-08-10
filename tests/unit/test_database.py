@@ -347,7 +347,7 @@ def test_workflow_manifest_accepts_harmless_trigger_formatting(settings: Setting
             DatabaseKind.WORKFLOW,
             settings=settings,
         )["schema_version"]
-        == 3
+        == 4
     )
 
 
@@ -356,7 +356,7 @@ def test_ensure_databases_creates_seeds_and_is_repeatable(tmp_path: Path) -> Non
     workflow = tmp_path / "workflow.db"
     settings = Settings(inventory_db=inventory, workflow_db=workflow)
     first = ensure_databases(settings)
-    assert first == {"inventory": [1], "workflow": [1, 2, 3]}
+    assert first == {"inventory": [1], "workflow": [1, 2, 3, 4]}
     assert verify_database(inventory, DatabaseKind.INVENTORY)["integrity"] == "ok"
     assert verify_database(workflow, DatabaseKind.WORKFLOW, settings=settings)["integrity"] == "ok"
     second = ensure_databases(settings)
@@ -397,7 +397,7 @@ def test_workflow_verify_cli_requires_explicit_inventory_context(tmp_path: Path)
     assert missing_context.exit_code == 2
     assert "--inventory-db is required" in missing_context.stderr
     assert verified.exit_code == 0
-    assert "'schema_version': 3" in verified.stdout
+    assert "'schema_version': 4" in verified.stdout
 
 
 @pytest.mark.parametrize("journal_mode", ["PERSIST", "TRUNCATE", "WAL"])
@@ -483,6 +483,9 @@ def test_workflow_migrate_cli_binds_legacy_v3_retrofit_to_inventory_context(
         ).fetchall():
             connection.execute(f'DROP TRIGGER "{row["name"]}"')
         connection.execute("DROP TABLE schema_migration_history")
+        connection.execute("DROP TRIGGER trg_cases_execution_token_grammar_insert")
+        connection.execute("DROP TRIGGER trg_cases_execution_token_grammar_update")
+        connection.execute("DELETE FROM schema_version WHERE version = 4")
         connection.commit()
     base = [
         "migrate",
@@ -501,7 +504,7 @@ def test_workflow_migrate_cli_binds_legacy_v3_retrofit_to_inventory_context(
     assert missing_context.exit_code == 1
     assert "error_code=DATABASE_AUTHORIZATION_CONTEXT_REQUIRED" in missing_context.stderr
     assert migrated.exit_code == 0
-    assert "applied=[]" in migrated.stdout
+    assert "applied=[4]" in migrated.stdout
 
 
 def test_workflow_verification_validates_attached_inventory_schema_in_same_snapshot(

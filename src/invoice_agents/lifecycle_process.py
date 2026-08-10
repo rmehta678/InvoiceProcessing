@@ -4,21 +4,21 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
-import tempfile
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
 from invoice_agents.config import Settings
-from invoice_agents.db.migration_process import _serialize_settings
 from invoice_agents.db.store import ExecutionClaim, validate_execution_claim
 from invoice_agents.isolated_process import (
     IsolatedProcessCleanupError,
     run_isolated_process,
-    sanitized_worker_environment,
 )
+from invoice_agents.wire_settings import decode_wire_settings, serialize_wire_settings
+from invoice_agents.worker_environment import sanitized_worker_environment
 
 LIFECYCLE_PROTOCOL_VERSION = 1
 LIFECYCLE_MAX_MESSAGE_BYTES = 2_097_152
@@ -47,6 +47,33 @@ def _lifecycle_worker_command() -> list[str]:
     return [sys.executable, "-m", "invoice_agents.lifecycle_worker"]
 
 
+def _private_credential_channel() -> tuple[socket.socket, socket.socket]:
+    """Create one anonymous, message-preserving local credential channel."""
+
+    reader, writer = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    buffer_bytes = 4 * (LIFECYCLE_MAX_CREDENTIAL_BYTES + 1)
+    try:
+        reader.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buffer_bytes)
+        writer.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, buffer_bytes)
+    except BaseException:
+        reader.close()
+        writer.close()
+        raise
+    return reader, writer
+
+
+def _send_private_credential(writer: socket.socket, credential: bytearray) -> None:
+    """Send exactly one bounded datagram without creating another secret buffer."""
+
+    view = memoryview(credential)
+    try:
+        sent = writer.send(view)
+    finally:
+        view.release()
+    if sent != len(credential):
+        raise OSError("private credential transport was incomplete")
+
+
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     payload: dict[str, object] = {}
     for key, value in pairs:
@@ -61,8 +88,8 @@ def _reject_constant(_value: str) -> object:
 
 
 def _redacted_settings(settings: Settings) -> dict[str, object]:
-    payload = _serialize_settings(settings)
-    if type(payload) is not dict or payload.get("xai_api_key") is not None:
+    payload = serialize_wire_settings(settings)
+    if payload.get("xai_api_key") is not None:
         raise ValueError("lifecycle settings serialization is not redacted")
     payload = dict(payload)
     payload["inventory_db"] = os.fspath(settings.inventory_db.resolve())
@@ -167,7 +194,7 @@ def decode_lifecycle_request(
         or raw_settings.get("xai_api_key") is not None
         or type(raw_started_at) is not str
         or type(credential_fd) is not int
-        or credential_fd < 0
+        or credential_fd < 3
     ):
         raise ValueError("invalid lifecycle request values")
     expires_at = datetime.fromisoformat(raw_claim["expires_at"])
@@ -187,7 +214,7 @@ def decode_lifecycle_request(
         or started_at.isoformat() != raw_started_at
     ):
         raise ValueError("invalid lifecycle timestamp")
-    settings = Settings(**raw_settings)
+    settings = decode_wire_settings(raw_settings)
     if settings.xai_api_key is not None:
         raise ValueError("lifecycle JSON contains provider credentials")
     return mode, settings, claim, started_at, credential_fd
@@ -247,17 +274,21 @@ def run_lifecycle_process(
     """Run provider/team work and prove all local descendants stopped before return."""
 
     credential = bytearray()
-    with tempfile.TemporaryFile() as credential_stream:
+    credential_reader, credential_writer = _private_credential_channel()
+    with credential_reader, credential_writer:
         try:
             request, credential = _encode_request(
                 mode=mode,
                 settings=settings,
                 claim=claim,
                 started_at=started_at,
-                credential_fd=credential_stream.fileno(),
+                credential_fd=credential_reader.fileno(),
             )
-            credential_stream.write(credential)
-            credential_stream.seek(0)
+            _send_private_credential(credential_writer, credential)
+            credential_writer.close()
+            for index in range(len(credential)):
+                credential[index] = 0
+            credential_fd = credential_reader.detach()
             try:
                 outcome = run_isolated_process(
                     command=_lifecycle_worker_command(),
@@ -265,7 +296,7 @@ def run_lifecycle_process(
                     timeout_seconds=timeout_seconds,
                     max_response_bytes=LIFECYCLE_MAX_MESSAGE_BYTES,
                     cancel_requested=cancel_requested,
-                    pass_fds=(credential_stream.fileno(),),
+                    pass_fds=(credential_fd,),
                     env=sanitized_worker_environment(),
                 )
             except IsolatedProcessCleanupError:

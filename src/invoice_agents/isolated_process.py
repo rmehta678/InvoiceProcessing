@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import os
-import re
 import selectors
 import subprocess
 import tempfile
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
 
@@ -18,21 +18,23 @@ from invoice_agents.db.migration_process import (
     _stop_worker,
     _uncertain_worker_session,
 )
+from invoice_agents.worker_environment import (
+    sanitized_worker_environment as _sanitized_worker_environment,
+)
 
 _POLL_SECONDS = 0.02
-_SENSITIVE_ENVIRONMENT_NAME = re.compile(
-    r"(?i)(?:api[_-]?key|authorization|credential|secret|token|cookie)"
-)
 
 
 def sanitized_worker_environment() -> dict[str, str]:
-    """Copy only non-credential ambient variables into a case worker."""
+    """Compatibility export for worker callers using the shared controller."""
 
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if _SENSITIVE_ENVIRONMENT_NAME.search(key) is None
-    }
+    return _sanitized_worker_environment()
+
+
+def _close_descriptors(descriptors: set[int]) -> None:
+    for descriptor in descriptors:
+        with suppress(OSError):
+            os.close(descriptor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,8 +109,18 @@ def run_isolated_process(
     pass_fds: tuple[int, ...] = (),
     env: dict[str, str] | None = None,
 ) -> IsolatedProcessResult:
-    """Spawn one fresh session, then stop/reap all members before returning."""
+    """Spawn one fresh session, then stop/reap all members before returning.
 
+    Every descriptor in ``pass_fds`` transfers to this controller.  The parent
+    copy is closed immediately after the spawn attempt on every path.
+    """
+
+    owned_descriptors = {
+        descriptor for descriptor in pass_fds if type(descriptor) is int and descriptor >= 3
+    }
+    descriptors_are_valid = all(
+        type(descriptor) is int and descriptor >= 3 for descriptor in pass_fds
+    ) and len(set(pass_fds)) == len(pass_fds)
     if (
         type(timeout_seconds) is not float
         or timeout_seconds <= 0
@@ -118,11 +130,16 @@ def run_isolated_process(
         or type(command) is not list
         or not command
         or any(type(argument) is not str or not argument for argument in command)
-        or any(type(descriptor) is not int or descriptor < 0 for descriptor in pass_fds)
+        or not descriptors_are_valid
     ):
+        _close_descriptors(owned_descriptors)
         raise ValueError("invalid isolated worker controller input")
-    if not _retry_quarantined_workers():
-        raise IsolatedProcessCleanupError from None
+    try:
+        if not _retry_quarantined_workers():
+            raise IsolatedProcessCleanupError from None
+    except BaseException:
+        _close_descriptors(owned_descriptors)
+        raise
     process: subprocess.Popen[bytes] | None = None
     worker: object | None = None
     start_failed = False
@@ -140,11 +157,16 @@ def run_isolated_process(
                 pass_fds=pass_fds,
                 env=env,
             )
+        _close_descriptors(owned_descriptors)
+        owned_descriptors.clear()
         worker = _capture_worker_session(process)
     except Exception:
         start_failed = True
         if process is not None:
             worker = _uncertain_worker_session(process)
+    finally:
+        _close_descriptors(owned_descriptors)
+        owned_descriptors.clear()
     if worker is None:
         raise IsolatedProcessCleanupError from None
     start_failed = (

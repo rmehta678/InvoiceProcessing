@@ -355,11 +355,11 @@ def test_parent_descriptor_close_cannot_release_spawned_worker_transaction_lock(
     migration_thread.join(timeout=20)
     assert not migration_thread.is_alive()
     assert failures == []
-    assert applied == [[3]]
+    assert applied == [[3, 4]]
     assert first_writer.startswith("LOCKED:database is locked")
     assert _rival_create_table(target) == "COMMITTED"
     with sqlite3.connect(target) as connection:
-        assert connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 3
+        assert connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 4
         assert (
             connection.execute(
                 "SELECT COUNT(*) FROM sqlite_master "

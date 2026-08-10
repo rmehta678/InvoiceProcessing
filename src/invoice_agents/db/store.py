@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Never, TypeVar, cast
 from uuid import uuid4
 
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 from invoice_agents.config import Settings
 from invoice_agents.db.core import connect_database
@@ -46,6 +46,7 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 
 REQUIRED_JOURNAL_MODE = "delete"
 _DATETIME_WIRE_TYPE = datetime
+_DATETIME_ADAPTER = TypeAdapter(datetime)
 _REQUESTED_EXECUTION_TOKEN = re.compile(r"^exec_[0-9a-f]{32}$")
 
 
@@ -116,6 +117,62 @@ def parse_canonical_utc(value: object) -> datetime | None:
     return parsed if parsed.isoformat() == value else None
 
 
+def _runtime_utc_datetime(value: object) -> datetime | None:
+    """Accept exact datetime values at semantic UTC without tzinfo identity assumptions."""
+
+    if type(value) is not _DATETIME_WIRE_TYPE:
+        return None
+    offset = value.utcoffset()
+    return value if value.tzinfo is not None and offset == timedelta(0) else None
+
+
+def _canonical_pydantic_datetime_wire(value: datetime) -> str | None:
+    """Return Pydantic's one canonical JSON UTC scalar (the ``Z`` form)."""
+
+    if _runtime_utc_datetime(value) is None:
+        return None
+    try:
+        encoded = _DATETIME_ADAPTER.dump_json(value)
+        wire = json.loads(encoded)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return wire if type(wire) is str and wire.endswith("Z") else None
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError("duplicate persisted result key")
+        payload[key] = value
+    return payload
+
+
+def _reject_json_constant(_value: str) -> object:
+    raise ValueError("non-finite persisted result number")
+
+
+def _decode_terminal_result_json(raw: object) -> CaseResult:
+    """Decode a strict terminal aggregate and require canonical datetime wire scalars."""
+
+    if type(raw) is not str or not raw:
+        raise ValueError("terminal result JSON is missing")
+    payload = json.loads(
+        raw,
+        object_pairs_hook=_strict_json_object,
+        parse_constant=_reject_json_constant,
+    )
+    if type(payload) is not dict:
+        raise ValueError("terminal result JSON is not an object")
+    result = CaseResult.model_validate_json(raw, strict=True)
+    for field in ("started_at", "finished_at"):
+        wire = payload.get(field)
+        value = getattr(result, field)
+        if type(wire) is not str or wire != _canonical_pydantic_datetime_wire(value):
+            raise ValueError(f"terminal result {field} is not canonical UTC")
+    return result
+
+
 def execution_claim_expiry_iso(claim: ExecutionClaim) -> str | None:
     """Return the claim's canonical UTC lease text or reject its runtime shape."""
 
@@ -127,8 +184,7 @@ def execution_claim_expiry_iso(claim: ExecutionClaim) -> str | None:
         or not claim.case_id.strip()
         or claim.case_id != claim.case_id.strip()
         or type(claim.token) is not str
-        or not claim.token.strip()
-        or claim.token != claim.token.strip()
+        or _REQUESTED_EXECUTION_TOKEN.fullmatch(claim.token) is None
         or type(claim.generation) is not int
         or claim.generation <= 0
         or type(expires_at) is not _DATETIME_WIRE_TYPE
@@ -1037,6 +1093,144 @@ class WorkflowStore:
             ) from None
         return started_at
 
+    @staticmethod
+    def _require_terminal_chronology(
+        result: CaseResult,
+        authoritative_started_at: object,
+        *,
+        stored_finished_at: object | None = None,
+    ) -> None:
+        """Require one exact authoritative, monotonic, canonical UTC terminal clock."""
+
+        authoritative = parse_canonical_utc(authoritative_started_at)
+        started_at = _runtime_utc_datetime(result.started_at)
+        finished_at = _runtime_utc_datetime(result.finished_at)
+        stored_finish = (
+            parse_canonical_utc(stored_finished_at) if stored_finished_at is not None else None
+        )
+        valid = (
+            authoritative is not None
+            and started_at is not None
+            and finished_at is not None
+            and started_at == authoritative
+            and finished_at >= started_at
+            and _canonical_pydantic_datetime_wire(started_at) is not None
+            and _canonical_pydantic_datetime_wire(finished_at) is not None
+        )
+        if stored_finished_at is not None:
+            valid = valid and stored_finish is not None and finished_at == stored_finish
+        if not valid:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "terminal result chronology does not match its authoritative case",
+                case_id=result.case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from None
+
+    @classmethod
+    def _decode_terminal_result_row(cls, row: sqlite3.Row) -> CaseResult:
+        """Decode and bind one stored aggregate to the same relational row snapshot."""
+
+        try:
+            result = _decode_terminal_result_json(row["result_json"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "case has an invalid persisted result",
+                case_id=str(row["case_id"]),
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from exc
+        if (
+            result.case_id != row["case_id"]
+            or result.source_id != row["source_id"]
+            or str(result.status) != row["status"]
+            or result.stop_reason != row["stop_reason"]
+        ):
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "case result does not match its relational authority row",
+                case_id=str(row["case_id"]),
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from None
+        cls._require_terminal_chronology(
+            result,
+            row["started_at"],
+            stored_finished_at=row["finished_at"],
+        )
+        return result
+
+    @classmethod
+    def _decode_recovery_predecessor_row(cls, row: sqlite3.Row) -> CaseResult:
+        """Decode an older terminal aggregate retained by a resumed authority.
+
+        A resumed/expired row may already have moved its relational status back
+        to ``INCOMPLETE`` while retaining the predecessor aggregate.  Recovery
+        validates that predecessor's immutable identity and chronology without
+        pretending its old status is the current row status.
+        """
+
+        try:
+            result = _decode_terminal_result_json(row["result_json"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "case has an invalid persisted predecessor result",
+                case_id=str(row["case_id"]),
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from exc
+        if result.case_id != row["case_id"] or result.source_id != row["source_id"]:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "case predecessor result does not match its relational identity",
+                case_id=str(row["case_id"]),
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from None
+        cls._require_terminal_chronology(
+            result,
+            row["started_at"],
+            stored_finished_at=row["finished_at"],
+        )
+        return result
+
+    @classmethod
+    def _encode_terminal_result(
+        cls,
+        connection: sqlite3.Connection,
+        result: CaseResult,
+    ) -> str:
+        """Validate terminal identity/chronology in the write transaction and encode once."""
+
+        row = connection.execute(
+            "SELECT started_at FROM cases WHERE case_id = ?",
+            (result.case_id,),
+        ).fetchone()
+        if row is None:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                f"case does not exist: {result.case_id}",
+                case_id=result.case_id,
+                stop_reason="CASE_NOT_FOUND",
+            ) from None
+        cls._require_terminal_chronology(result, row["started_at"])
+        encoded = result.model_dump_json()
+        try:
+            decoded = _decode_terminal_result_json(encoded)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "terminal result cannot be encoded canonically",
+                case_id=result.case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from exc
+        if decoded != result:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "terminal result changes during canonical encoding",
+                case_id=result.case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from None
+        return encoded
+
     def load_recovery_case_source_id(self, claim: ExecutionClaim) -> str:
         """Load source authority for this exact running or finished generation."""
 
@@ -1123,6 +1317,17 @@ class WorkflowStore:
                 raise
 
     def create_case(self, case_id: str, source: SourceArtifact, started_at: datetime) -> None:
+        encoded_start = started_at.isoformat() if type(started_at) is datetime else ""
+        if (
+            _runtime_utc_datetime(started_at) is None
+            or parse_canonical_utc(encoded_start) != started_at
+        ):
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "case start timestamp must be canonical UTC",
+                case_id=case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from None
         with connect_database(self.path) as connection:
             connection.execute(
                 "INSERT INTO cases(case_id, source_id, status, stop_reason, started_at, updated_at) "
@@ -1132,7 +1337,7 @@ class WorkflowStore:
                     source.source_id,
                     CaseStatus.INCOMPLETE,
                     "CASE_CREATED",
-                    started_at.isoformat(),
+                    encoded_start,
                     now_iso(),
                 ),
             )
@@ -1386,6 +1591,7 @@ class WorkflowStore:
         with connect_database(self.path, read_only=True) as connection:
             row = connection.execute(
                 "SELECT case_id, source_id, status, stop_reason, result_json, started_at, "
+                "finished_at, "
                 "execution_token, execution_generation, execution_state, lease_expires_at "
                 "FROM cases WHERE case_id = ?",
                 (case_id,),
@@ -1410,27 +1616,14 @@ class WorkflowStore:
             )
         result: CaseResult | None = None
         if row["result_json"] is not None:
-            try:
-                result = CaseResult.model_validate_json(row["result_json"], strict=True)
-            except ValueError as exc:
-                raise InvoiceAgentsError(
-                    ErrorCategory.DATABASE,
-                    "case has an invalid persisted result",
-                    case_id=case_id,
-                    stop_reason="PERSISTED_RESULT_INVALID",
-                ) from exc
-            if (
-                result.case_id != row["case_id"]
-                or result.source_id != row["source_id"]
-                or str(result.status) != row["status"]
-                or result.stop_reason != row["stop_reason"]
-            ):
-                raise InvoiceAgentsError(
-                    ErrorCategory.DATABASE,
-                    "case result does not match its relational authority row",
-                    case_id=case_id,
-                    stop_reason="PERSISTED_RESULT_INVALID",
-                )
+            result = self._decode_terminal_result_row(row)
+        elif row["finished_at"] is not None:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "case has a terminal timestamp without a persisted result",
+                case_id=case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from None
         lease = parse_canonical_utc(row["lease_expires_at"])
         execution_state = str(row["execution_state"])
         return CaseExecutionSnapshot(
@@ -1472,6 +1665,7 @@ class WorkflowStore:
                 connection.execute("BEGIN IMMEDIATE")
                 sql = (
                     "SELECT case_id, source_id, status, stop_reason, result_json, started_at, "
+                    "finished_at, "
                     "execution_token, execution_generation, execution_state, lease_expires_at "
                     "FROM cases WHERE execution_state IN ('IDLE', 'RUNNING') "
                     "AND status IN ('INCOMPLETE', 'NEEDS_HUMAN')"
@@ -1503,29 +1697,19 @@ class WorkflowStore:
                             case_id=str(row["case_id"]),
                             stop_reason="PERSISTED_RESULT_INVALID",
                         )
+                    predecessor_finished_at = parse_canonical_utc(row["finished_at"])
+                    if row["finished_at"] is not None and (
+                        predecessor_finished_at is None or predecessor_finished_at < started_at
+                    ):
+                        raise InvoiceAgentsError(
+                            ErrorCategory.DATABASE,
+                            "case has an invalid predecessor terminal timestamp",
+                            case_id=str(row["case_id"]),
+                            stop_reason="PERSISTED_RESULT_INVALID",
+                        ) from None
                     previous: CaseResult | None = None
                     if row["result_json"] is not None:
-                        try:
-                            previous = CaseResult.model_validate_json(
-                                row["result_json"], strict=True
-                            )
-                        except ValueError as exc:
-                            raise InvoiceAgentsError(
-                                ErrorCategory.DATABASE,
-                                "case has an invalid persisted result",
-                                case_id=str(row["case_id"]),
-                                stop_reason="PERSISTED_RESULT_INVALID",
-                            ) from exc
-                        if (
-                            previous.case_id != row["case_id"]
-                            or previous.source_id != row["source_id"]
-                        ):
-                            raise InvoiceAgentsError(
-                                ErrorCategory.DATABASE,
-                                "case result identity does not match its relational row",
-                                case_id=str(row["case_id"]),
-                                stop_reason="PERSISTED_RESULT_INVALID",
-                            )
+                        previous = self._decode_recovery_predecessor_row(row)
                     (
                         recovered_final,
                         recovered_review,
@@ -1578,8 +1762,20 @@ class WorkflowStore:
                             },
                             deep=True,
                         )
+                    self._require_terminal_chronology(result, row["started_at"])
+                    encoded_result = result.model_dump_json()
+                    try:
+                        if _decode_terminal_result_json(encoded_result) != result:
+                            raise ValueError("recovery result changed during encoding")
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise InvoiceAgentsError(
+                            ErrorCategory.DATABASE,
+                            "recovery result chronology is not canonical",
+                            case_id=str(row["case_id"]),
+                            stop_reason="PERSISTED_RESULT_INVALID",
+                        ) from exc
                     recovery_generation = int(row["execution_generation"]) + 1
-                    recovery_token = f"recovery_{uuid4().hex}"
+                    recovery_token = f"exec_{uuid4().hex}"
                     updated = connection.execute(
                         "UPDATE cases SET status = ?, stop_reason = ?, result_json = ?, "
                         "updated_at = ?, finished_at = ?, execution_token = ?, "
@@ -1590,7 +1786,7 @@ class WorkflowStore:
                         (
                             result.status,
                             result.stop_reason,
-                            result.model_dump_json(),
+                            encoded_result,
                             recovered_at.isoformat(),
                             result.finished_at.isoformat(),
                             recovery_token,
@@ -1877,7 +2073,7 @@ class WorkflowStore:
 
         with connect_database(self.path, read_only=True) as connection:
             case_row = connection.execute(
-                "SELECT source_id FROM cases WHERE case_id = ?",
+                "SELECT source_id, started_at FROM cases WHERE case_id = ?",
                 (result.case_id,),
             ).fetchone()
             if case_row is None:
@@ -1895,6 +2091,7 @@ class WorkflowStore:
                     case_id=result.case_id,
                     stop_reason="PERSISTED_RESULT_INVALID",
                 )
+            self._require_terminal_chronology(result, case_row["started_at"])
             final, review, payment = self._load_relational_recovery_evidence(
                 connection,
                 result.case_id,
@@ -1926,7 +2123,7 @@ class WorkflowStore:
         if not isinstance(state, str) or not isinstance(raw_generation, int):
             return False
         generation = raw_generation
-        valid_token = isinstance(token, str) and bool(token)
+        valid_token = type(token) is str and _REQUESTED_EXECUTION_TOKEN.fullmatch(token) is not None
         valid_lease = parse_canonical_utc(lease) is not None
         return (
             (state == "IDLE" and token is None and lease is None and generation >= 0)
@@ -2914,6 +3111,7 @@ class WorkflowStore:
             written_at = datetime.now(UTC).isoformat()
             self._require_current_claim(connection, claim, datetime.fromisoformat(written_at))
             self._require_terminal_result_identity(connection, result)
+            encoded_result = self._encode_terminal_result(connection, result)
             updated = connection.execute(
                 "UPDATE cases SET status = ?, stop_reason = ?, result_json = ?, updated_at = ?, "
                 "finished_at = ?, execution_state = 'FINISHED', lease_expires_at = NULL "
@@ -2922,7 +3120,7 @@ class WorkflowStore:
                 (
                     result.status,
                     result.stop_reason,
-                    result.model_dump_json(),
+                    encoded_result,
                     written_at,
                     result.finished_at.isoformat(),
                     result.case_id,
@@ -2944,6 +3142,7 @@ class WorkflowStore:
             connection.execute("BEGIN IMMEDIATE")
             written_at = datetime.now(UTC).isoformat()
             self._require_terminal_result_identity(connection, result)
+            encoded_result = self._encode_terminal_result(connection, result)
             updated = connection.execute(
                 "UPDATE cases SET status = ?, stop_reason = ?, result_json = ?, "
                 "updated_at = ?, finished_at = ? WHERE case_id = ? "
@@ -2952,7 +3151,7 @@ class WorkflowStore:
                 (
                     result.status,
                     result.stop_reason,
-                    result.model_dump_json(),
+                    encoded_result,
                     written_at,
                     result.finished_at.isoformat(),
                     result.case_id,
@@ -3006,7 +3205,9 @@ class WorkflowStore:
     def load_result(self, case_id: str) -> CaseResult | None:
         with connect_database(self.path, read_only=True) as connection:
             row = connection.execute(
-                "SELECT result_json FROM cases WHERE case_id = ?", (case_id,)
+                "SELECT case_id, source_id, status, stop_reason, result_json, "
+                "started_at, finished_at FROM cases WHERE case_id = ?",
+                (case_id,),
             ).fetchone()
         if row is None:
             raise InvoiceAgentsError(
@@ -3015,7 +3216,16 @@ class WorkflowStore:
                 case_id=case_id,
                 stop_reason="CASE_NOT_FOUND",
             )
-        return CaseResult.model_validate_json(row["result_json"]) if row["result_json"] else None
+        if row["result_json"] is not None:
+            return self._decode_terminal_result_row(row)
+        if row["finished_at"] is not None:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "case has a terminal timestamp without a persisted result",
+                case_id=case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from None
+        return None
 
     def count_events(self, case_id: str, event_type: str) -> int:
         """Count persisted audit events of one type; retries use 'provider.retry'."""

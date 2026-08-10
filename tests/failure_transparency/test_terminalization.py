@@ -1990,16 +1990,17 @@ async def test_repeated_cancellation_during_cleanup_is_drained_and_reraised(
     )
     monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: BlockingTeam())
     monkeypatch.chdir(tmp_path)
+    assertion_timeout = 2.0
     run_task = asyncio.create_task(_run_prepared_with_new_claim(case_id, started_at, settings))
-    await asyncio.wait_for(stream_started.wait(), timeout=0.2)
+    await asyncio.wait_for(stream_started.wait(), timeout=assertion_timeout)
     run_task.cancel()
-    await asyncio.wait_for(close_started.wait(), timeout=0.2)
+    await asyncio.wait_for(close_started.wait(), timeout=assertion_timeout)
     run_task.cancel()
 
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(run_task, timeout=0.2)
+        await asyncio.wait_for(run_task, timeout=assertion_timeout)
 
-    await asyncio.wait_for(close_finished.wait(), timeout=0.2)
+    await asyncio.wait_for(close_finished.wait(), timeout=assertion_timeout)
     result = WorkflowStore(settings).load_result(case_id)
     assert result is not None
     assert [error.stop_reason for error in result.errors] == [

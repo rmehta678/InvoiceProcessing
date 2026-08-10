@@ -1160,6 +1160,7 @@ def duplicate_terminal_fixture(
     assert duplicate.status is PaymentStatus.DUPLICATE
     final = store.load_current_final_decision(duplicate_claim)
     assert final is not None
+    started_at = store.load_authoritative_case_started_at(duplicate_claim)
     attempted = CaseResult(
         case_id="case_duplicate_attempt",
         source_id=pdf.source.source_id,
@@ -1167,8 +1168,8 @@ def duplicate_terminal_fixture(
         stop_reason="APPROVED_PAYMENT_RECORDED",
         final_decision=final,
         payment=duplicate,
-        started_at=datetime.now(UTC),
-        finished_at=datetime.now(UTC),
+        started_at=started_at,
+        finished_at=max(datetime.now(UTC), started_at),
     )
     return store, attempted, paid, duplicate
 

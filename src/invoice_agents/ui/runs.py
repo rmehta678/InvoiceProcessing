@@ -20,7 +20,7 @@ from uuid import uuid4
 
 from invoice_agents.config import Settings
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
-from invoice_agents.errors import InvoiceAgentsError
+from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import CaseResult
 from invoice_agents.orchestration import (
     _DURABILITY_PRECEDENCE_STOPS,
@@ -48,7 +48,6 @@ class RunHandle:
     state: str  # "queued" | "running" | "done" | "unresolved"
     started_at: datetime
     task: asyncio.Task[CaseResult] | None = None
-    claim: ExecutionClaim | None = None
     error: str | None = None
 
 
@@ -59,7 +58,6 @@ class BatchEntry:
     path: Path
     case_id: str
     prepared_started_at: datetime | None
-    claim: ExecutionClaim | None = None
     result: CaseResult | None = None
 
     @property
@@ -78,6 +76,14 @@ class BatchState:
     @property
     def running(self) -> bool:
         return self.task is not None and not self.task.done()
+
+
+@dataclass(slots=True, repr=False)
+class _LifecycleOwner:
+    """Private execution authority retained only while durability is unresolved."""
+
+    claim: ExecutionClaim = field(repr=False)
+    started_at: datetime
 
 
 def _now() -> datetime:
@@ -109,6 +115,28 @@ class RunRegistry:
         self._runs: dict[str, RunHandle] = {}
         self._sources: dict[str, str] = {}
         self._batches: dict[str, BatchState] = {}
+        self._lifecycle_owners: dict[str, _LifecycleOwner] = {}
+
+    def _install_lifecycle_owner(
+        self,
+        case_id: str,
+        started_at: datetime,
+        claim: ExecutionClaim,
+    ) -> _LifecycleOwner:
+        if case_id in self._lifecycle_owners:
+            raise InvoiceAgentsError(
+                category=ErrorCategory.ORCHESTRATION,
+                message="case already has a private lifecycle owner",
+                case_id=case_id,
+                stop_reason="CASE_ALREADY_CLAIMED",
+            )
+        owner = _LifecycleOwner(claim=claim, started_at=started_at)
+        self._lifecycle_owners[case_id] = owner
+        return owner
+
+    def _drop_lifecycle_owner(self, case_id: str, owner: _LifecycleOwner) -> None:
+        if self._lifecycle_owners.get(case_id) is owner:
+            del self._lifecycle_owners[case_id]
 
     def handle(self, case_id: str) -> RunHandle | None:
         return self._runs.get(case_id)
@@ -223,8 +251,8 @@ class RunRegistry:
             kind=kind,
             state="running",
             started_at=_now(),
-            claim=claim,
         )
+        owner = self._install_lifecycle_owner(case_id, claimed_started_at, claim)
         source_key = str(source_path.resolve()) if source_path is not None else None
         if source_key is not None:
             self._sources[source_key] = case_id
@@ -242,13 +270,14 @@ class RunRegistry:
                 )
                 result = await asyncio.shield(child)
                 durability = await _inspect_claim_durability(
-                    [(case_id, claimed_started_at, claim)],
+                    [(case_id, owner.started_at, owner.claim)],
                     settings,
                 )
                 durability_failure = durability[case_id]
                 if durability_failure is not None:
                     raise durability_failure
                 handle.state = "done"
+                self._drop_lifecycle_owner(case_id, owner)
                 return result
             except BaseException as primary_failure:
                 outcomes: list[object] = []
@@ -266,25 +295,27 @@ class RunRegistry:
                         outcomes.append(drain_failure)
 
                 durability = await _inspect_claim_durability(
-                    [(case_id, claimed_started_at, claim)],
+                    [(case_id, owner.started_at, owner.claim)],
                     settings,
                 )
                 if durability[case_id] is not None:
                     try:
                         await _durably_cancel_unstarted_claim(
                             case_id,
-                            claimed_started_at,
+                            owner.started_at,
                             settings,
-                            claim,
+                            owner.claim,
                         )
                     except BaseException as terminal_failure:
                         outcomes.append(terminal_failure)
                     durability = await _inspect_claim_durability(
-                        [(case_id, claimed_started_at, claim)],
+                        [(case_id, owner.started_at, owner.claim)],
                         settings,
                     )
 
                 handle.state = "done" if durability[case_id] is None else "unresolved"
+                if handle.state == "done":
+                    self._drop_lifecycle_owner(case_id, owner)
                 selected_failure = _select_drained_failure(
                     primary_failure,
                     outcomes,
@@ -354,11 +385,15 @@ class RunRegistry:
                         result=prepared,
                     )
                 else:
+                    owner = self._install_lifecycle_owner(
+                        prepared[0],
+                        prepared[1],
+                        prepared[2],
+                    )
                     entry = BatchEntry(
                         path=path,
                         case_id=prepared[0],
                         prepared_started_at=prepared[1],
-                        claim=prepared[2],
                     )
                     prepared_entries.append(entry)
                     self._runs[entry.case_id] = RunHandle(
@@ -366,14 +401,14 @@ class RunRegistry:
                         kind="batch",
                         state="queued",
                         started_at=_now(),
-                        claim=entry.claim,
                     )
+                    assert self._lifecycle_owners[entry.case_id] is owner
                 batch.entries.append(entry)
         except BaseException as primary_failure:
             handed_off_claims: list[tuple[str, datetime, ExecutionClaim]] = []
             for entry in prepared_entries:
-                assert entry.prepared_started_at is not None and entry.claim is not None
-                handed_off_claims.append((entry.case_id, entry.prepared_started_at, entry.claim))
+                owner = self._lifecycle_owners[entry.case_id]
+                handed_off_claims.append((entry.case_id, owner.started_at, owner.claim))
             outcomes = await _durably_cancel_unstarted_claims(handed_off_claims, settings)
             durability = await _inspect_claim_durability(handed_off_claims, settings)
             selected_failure = _select_drained_failure(
@@ -389,12 +424,15 @@ class RunRegistry:
                 and outcome.case_id is not None
             }
             for entry in prepared_entries:
+                owner = self._lifecycle_owners[entry.case_id]
                 self._runs[entry.case_id].state = (
                     "done"
                     if durability.get(entry.case_id) is None
                     and entry.case_id not in indeterminate_case_ids
                     else "unresolved"
                 )
+                if self._runs[entry.case_id].state == "done":
+                    self._drop_lifecycle_owner(entry.case_id, owner)
             selected_failure.__cause__ = None
             selected_failure.__context__ = None
             raise selected_failure from None
@@ -421,13 +459,19 @@ class RunRegistry:
             else:
                 await asyncio.gather(batch.task, return_exceptions=True)
                 claims = [
-                    (entry.case_id, entry.prepared_started_at, entry.claim)
+                    (
+                        entry.case_id,
+                        self._lifecycle_owners[entry.case_id].started_at,
+                        self._lifecycle_owners[entry.case_id].claim,
+                    )
                     for entry in prepared_entries
-                    if entry.prepared_started_at is not None and entry.claim is not None
                 ]
                 outcomes = await _durably_cancel_unstarted_claims(claims, settings)
                 for entry, outcome in zip(prepared_entries, outcomes, strict=True):
                     self._runs[entry.case_id].state = "done" if outcome is None else "unresolved"
+                    if outcome is None:
+                        owner = self._lifecycle_owners[entry.case_id]
+                        self._drop_lifecycle_owner(entry.case_id, owner)
                 for outcome in outcomes:
                     if isinstance(outcome, BaseException) and not isinstance(
                         outcome, asyncio.CancelledError
@@ -448,10 +492,7 @@ class RunRegistry:
 
         async def bounded(entry: BatchEntry, ready: asyncio.Event) -> None:
             handle = self._runs[entry.case_id]
-            started_at = entry.prepared_started_at
-            assert started_at is not None  # only prepared entries reach here
-            claim = entry.claim
-            assert claim is not None  # retained preparation authority is mandatory
+            owner = self._lifecycle_owners[entry.case_id]
             ready.set()
             try:
                 await launch.wait()
@@ -459,23 +500,30 @@ class RunRegistry:
                     handle.state = "running"
                     await run_prepared_case(
                         entry.case_id,
-                        started_at,
+                        owner.started_at,
                         settings,
-                        claim=claim,
+                        claim=owner.claim,
                     )
+                durability = await _inspect_claim_durability(
+                    [(entry.case_id, owner.started_at, owner.claim)],
+                    settings,
+                )
+                durability_failure = durability[entry.case_id]
+                if durability_failure is not None:
+                    raise durability_failure
                 handle.state = "done"
             except asyncio.CancelledError:
 
                 async def ensure_durability() -> None:
                     durability = await _inspect_claim_durability(
-                        [(entry.case_id, started_at, claim)], settings
+                        [(entry.case_id, owner.started_at, owner.claim)], settings
                     )
                     if durability[entry.case_id] is not None:
                         await _durably_cancel_unstarted_claim(
                             entry.case_id,
-                            started_at,
+                            owner.started_at,
                             settings,
-                            claim,
+                            owner.claim,
                         )
 
                 durability_task = asyncio.create_task(
@@ -534,9 +582,12 @@ class RunRegistry:
                 ),
             )
             claims = [
-                (entry.case_id, entry.prepared_started_at, entry.claim)
+                (
+                    entry.case_id,
+                    self._lifecycle_owners[entry.case_id].started_at,
+                    self._lifecycle_owners[entry.case_id].claim,
+                )
                 for entry in entries
-                if entry.prepared_started_at is not None and entry.claim is not None
             ]
             durability = await _inspect_claim_durability(claims, settings)
             indeterminate_case_ids = {
@@ -548,12 +599,15 @@ class RunRegistry:
             }
             for entry in entries:
                 handle = self._runs[entry.case_id]
+                owner = self._lifecycle_owners[entry.case_id]
                 handle.state = (
                     "done"
                     if durability.get(entry.case_id) is None
                     and entry.case_id not in indeterminate_case_ids
                     else "unresolved"
                 )
+                if handle.state == "done":
+                    self._drop_lifecycle_owner(entry.case_id, owner)
             selected_failure = _select_drained_failure(
                 primary_failure,
                 list(outcomes),
@@ -563,3 +617,6 @@ class RunRegistry:
             selected_failure.__cause__ = None
             selected_failure.__context__ = None
             raise selected_failure from None
+        for entry in entries:
+            owner = self._lifecycle_owners[entry.case_id]
+            self._drop_lifecycle_owner(entry.case_id, owner)

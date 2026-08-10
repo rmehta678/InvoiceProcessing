@@ -17,13 +17,14 @@ from invoice_agents.config import Settings
 from invoice_agents.db.migration_process import (
     _capture_worker_session,
     _retry_quarantined_workers,
-    _serialize_settings,
     _stop_worker,
     _uncertain_worker_session,
 )
 from invoice_agents.db.store import ExecutionClaim, validate_execution_claim
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import CaseResult
+from invoice_agents.wire_settings import decode_wire_settings, serialize_wire_settings
+from invoice_agents.worker_environment import sanitized_worker_environment
 
 TERMINAL_WORKER_PROTOCOL_VERSION = 1
 TERMINAL_WORKER_MAX_MESSAGE_BYTES = 2_097_152
@@ -97,7 +98,7 @@ def _encode_request(
     payload = {
         "protocol_version": TERMINAL_WORKER_PROTOCOL_VERSION,
         "mode": mode,
-        "settings": _serialize_settings(settings),
+        "settings": serialize_wire_settings(settings),
         "claim": _claim_payload(exact),
         "started_at": started_at.astimezone(UTC).isoformat() if started_at is not None else None,
         "result": result.model_dump(mode="json") if result is not None else None,
@@ -147,7 +148,7 @@ def decode_terminal_request(
     settings_payload = payload["settings"]
     if type(settings_payload) is not dict:
         raise ValueError("invalid terminal worker settings")
-    settings = Settings(**settings_payload)
+    settings = decode_wire_settings(settings_payload)
     raw_claim = payload["claim"]
     if type(raw_claim) is not dict or set(raw_claim) != {
         "case_id",
@@ -312,6 +313,7 @@ def run_terminal_process(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
+                env=sanitized_worker_environment(),
             )
         worker = _capture_worker_session(process)
     except Exception:

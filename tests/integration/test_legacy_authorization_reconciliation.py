@@ -815,14 +815,14 @@ def test_reconciled_database_upgrades_without_fabricating_generation_provenance(
         source_archive_dir=tmp_path / "sources",
     )
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4]
     assert (
         verify_database(
             path,
             DatabaseKind.WORKFLOW,
             settings=settings,
         )["schema_version"]
-        == 3
+        == 4
     )
     assert _reconcile(path) == receipt
     with pytest.raises(DatabaseVerificationError) as replay_error:
@@ -907,10 +907,10 @@ def test_preflight_detects_reconciliation_metadata_tampering(tmp_path: Path) -> 
     assert excinfo.value.details["invalid_quarantine_count"] == 1
 
 
-def test_explicit_migrate_retrofits_version_neutral_archive_schema_on_existing_v3(
+def test_explicit_migrate_retrofits_version_neutral_archive_schema_on_current_workflow(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "existing-workflow-v3.db"
+    path = tmp_path / "existing-current-workflow.db"
     inventory = tmp_path / "inventory.db"
     migrate_database(path, DatabaseKind.WORKFLOW)
     migrate_database(inventory, DatabaseKind.INVENTORY)
@@ -922,7 +922,7 @@ def test_explicit_migrate_retrofits_version_neutral_archive_schema_on_existing_v
         connection.commit()
 
     assert migrate_database(path, DatabaseKind.WORKFLOW, settings=settings) == []
-    assert verify_database(path, DatabaseKind.WORKFLOW, settings=settings)["schema_version"] == 3
+    assert verify_database(path, DatabaseKind.WORKFLOW, settings=settings)["schema_version"] == 4
 
 
 def test_populated_row_only_archive_cannot_be_retrofitted_without_original_database_image(

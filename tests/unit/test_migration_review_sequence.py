@@ -279,9 +279,9 @@ def test_v1_database_requires_explicit_legacy_authorization_reconciliation(
         confirmed=True,
     )
     assert receipt.record_count == 2
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4]
     report = verify_database(path, DatabaseKind.WORKFLOW, settings=settings)
-    assert report["schema_version"] == 3
+    assert report["schema_version"] == 4
     with connect_database(path, read_only=True) as connection:
         assert connection.execute("SELECT COUNT(*) FROM review_requests").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM human_decisions").fetchone()[0] == 0
@@ -365,7 +365,7 @@ def test_missing_required_indexes_fail_verification(workflow_db: Path, inventory
         ([3], True),
         ([1, 3], True),
         ([1, 1], False),
-        ([1, 2, 3, 4], False),
+        ([1, 2, 3, 4, 5], False),
     ],
     ids=["missing-prefix", "sparse", "duplicate", "unknown"],
 )
@@ -452,6 +452,43 @@ def _remove_durable_history(path: Path) -> None:
         connection.commit()
 
 
+def _build_legitimate_v3_workflow(path: Path) -> None:
+    """Construct the exact pre-004 workflow schema for retrofit behavior tests."""
+
+    resources = _migration_resources(DatabaseKind.WORKFLOW)
+    applied_at = "2026-08-09T12:00:00+00:00"
+    with connect_database(path) as connection:
+        connection.executescript(resources[0].read_text(encoding="utf-8"))
+        connection.execute(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO schema_version(version, applied_at) VALUES (1, ?)",
+            (applied_at,),
+        )
+        connection.commit()
+        connection.executescript(resources[1].read_text(encoding="utf-8"))
+        connection.execute(
+            "INSERT INTO schema_version(version, applied_at) VALUES (2, ?)",
+            (applied_at,),
+        )
+        connection.commit()
+        core_module._install_legacy_archive_schema(connection)
+        connection.commit()
+        connection.executescript(resources[2].read_text(encoding="utf-8"))
+        connection.execute(
+            "INSERT INTO schema_version(version, applied_at) VALUES (3, ?)",
+            (applied_at,),
+        )
+        hashes = _packaged_workflow_hashes()
+        connection.executemany(
+            "INSERT INTO schema_migration_history("
+            "ordinal, version, migration_sha256, applied_at) VALUES (?, ?, ?, ?)",
+            [(version, version, hashes[version], applied_at) for version in (1, 2, 3)],
+        )
+        connection.commit()
+
+
 def _retrofit_settings(tmp_path: Path, workflow_db: Path) -> Settings:
     inventory_db = tmp_path / "retrofit-inventory.db"
     migrate_database(inventory_db, DatabaseKind.INVENTORY)
@@ -505,12 +542,12 @@ def test_migration_003_backfills_digest_bound_immutable_durable_history(
 ) -> None:
     path = tmp_path / "durable-history.db"
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [1, 2, 3]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [1, 2, 3, 4]
 
     rows = _durable_history_rows(path)
     hashes = _packaged_workflow_hashes()
     assert [(ordinal, version, digest) for ordinal, version, digest, _at in rows] == [
-        (version, version, hashes[version]) for version in (1, 2, 3)
+        (version, version, hashes[version]) for version in (1, 2, 3, 4)
     ]
     for _ordinal, _version, _digest, applied_at in rows:
         parsed = datetime.fromisoformat(applied_at)
@@ -528,20 +565,20 @@ def test_migration_003_backfills_digest_bound_immutable_durable_history(
             connection.execute("DELETE FROM schema_migration_history WHERE version = 1")
 
 
-def test_existing_legitimate_v3_history_is_retrofitted_without_version_004(
+def test_existing_legitimate_v3_history_is_retrofitted_before_version_004(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "existing-v3-history.db"
-    migrate_database(path, DatabaseKind.WORKFLOW)
+    _build_legitimate_v3_workflow(path)
     _remove_durable_history(path)
     settings = _retrofit_settings(tmp_path, path)
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW, settings=settings) == []
+    assert migrate_database(path, DatabaseKind.WORKFLOW, settings=settings) == [4]
     assert [row[:3] for row in _durable_history_rows(path)] == [
-        (version, version, _packaged_workflow_hashes()[version]) for version in (1, 2, 3)
+        (version, version, _packaged_workflow_hashes()[version]) for version in (1, 2, 3, 4)
     ]
-    assert verify_database(path, DatabaseKind.WORKFLOW, settings=settings)["schema_version"] == 3
-    assert not any(
+    assert verify_database(path, DatabaseKind.WORKFLOW, settings=settings)["schema_version"] == 4
+    assert any(
         resource.name.startswith("004_") for resource in _migration_resources(DatabaseKind.WORKFLOW)
     )
 
@@ -550,7 +587,7 @@ def test_legacy_v3_retrofit_rejects_main_file_wal_header_without_artifacts_or_mu
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "legacy-v3-main-only-wal.db"
-    migrate_database(path, DatabaseKind.WORKFLOW)
+    _build_legitimate_v3_workflow(path)
     _remove_durable_history(path)
     settings = _retrofit_settings(tmp_path, path)
     with connect_database(path) as connection:
@@ -571,7 +608,7 @@ def test_legacy_v3_retrofit_rejects_wal_without_touching_existing_sidecars(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "legacy-v3-existing-wal-sidecars.db"
-    migrate_database(path, DatabaseKind.WORKFLOW)
+    _build_legitimate_v3_workflow(path)
     _remove_durable_history(path)
     settings = _retrofit_settings(tmp_path, path)
     keeper = sqlite3.connect(path)
@@ -601,7 +638,7 @@ def test_legacy_v3_retrofit_holds_cross_process_sqlite_lock_before_begin_immedia
     operation: str,
 ) -> None:
     path = tmp_path / f"legacy-v3-cross-process-{operation}.db"
-    migrate_database(path, DatabaseKind.WORKFLOW)
+    _build_legitimate_v3_workflow(path)
     _remove_durable_history(path)
     settings = _retrofit_settings(tmp_path, path)
     real_connect = core_module.connect_database
@@ -629,11 +666,11 @@ def test_legacy_v3_retrofit_holds_cross_process_sqlite_lock_before_begin_immedia
 
     monkeypatch.setattr(core_module, "connect_database", observed_connect)
 
-    assert _migrate_database_in_process(path, DatabaseKind.WORKFLOW, settings=settings) == []
+    assert _migrate_database_in_process(path, DatabaseKind.WORKFLOW, settings=settings) == [4]
     assert len(rival_results) == 1
     assert rival_results[0].startswith("LOCKED:database is locked")
     assert [row[:3] for row in _durable_history_rows(path)] == [
-        (version, version, _packaged_workflow_hashes()[version]) for version in (1, 2, 3)
+        (version, version, _packaged_workflow_hashes()[version]) for version in (1, 2, 3, 4)
     ]
 
 
@@ -642,7 +679,7 @@ def test_legacy_v3_retrofit_aborts_when_same_process_raw_sqlite_switches_to_wal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "legacy-v3-same-process-wal-race.db"
-    migrate_database(path, DatabaseKind.WORKFLOW)
+    _build_legitimate_v3_workflow(path)
     _remove_durable_history(path)
     settings = _retrofit_settings(tmp_path, path)
     real_connect = core_module.connect_database
@@ -690,7 +727,7 @@ def test_legacy_v3_retrofit_rejects_application_id_change_after_begin_before_wri
     mutated_role: str,
 ) -> None:
     path = tmp_path / f"legacy-v3-post-begin-{mutated_role}.db"
-    migrate_database(path, DatabaseKind.WORKFLOW)
+    _build_legitimate_v3_workflow(path)
     _remove_durable_history(path)
     settings = _retrofit_settings(tmp_path, path)
     target = path if mutated_role == "workflow" else settings.inventory_db
@@ -746,7 +783,7 @@ def test_legacy_v3_retrofit_rejects_missing_required_trigger_without_mutation(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "false-v3-missing-trigger.db"
-    migrate_database(path, DatabaseKind.WORKFLOW)
+    _build_legitimate_v3_workflow(path)
     _remove_durable_history(path)
     settings = _retrofit_settings(tmp_path, path)
     with connect_database(path) as connection:
@@ -765,7 +802,7 @@ def test_legacy_v3_retrofit_requires_explicit_authorization_context_without_muta
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "legacy-v3-context-required.db"
-    migrate_database(path, DatabaseKind.WORKFLOW)
+    _build_legitimate_v3_workflow(path)
     _remove_durable_history(path)
     before = path.read_bytes()
 
@@ -780,7 +817,7 @@ def test_legacy_v3_retrofit_rejects_invalid_authorization_before_history_install
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "legacy-v3-invalid-authorization.db"
-    migrate_database(path, DatabaseKind.WORKFLOW)
+    _build_legitimate_v3_workflow(path)
     _remove_durable_history(path)
     settings = _retrofit_settings(tmp_path, path)
     at = "2026-08-09T12:00:00+00:00"
@@ -819,7 +856,7 @@ def test_legacy_v3_retrofit_revalidates_contract_after_write_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "legacy-v3-retrofit-race.db"
-    migrate_database(path, DatabaseKind.WORKFLOW)
+    _build_legitimate_v3_workflow(path)
     _remove_durable_history(path)
     settings = _retrofit_settings(tmp_path, path)
     real_preflight = core_module._preflight_existing_migration_history
@@ -979,6 +1016,7 @@ def test_malformed_durable_history_fails_before_any_write(
         (1, 1, hashes[1], valid_at),
         (2, 2, hashes[2], valid_at),
         (3, 3, hashes[3], valid_at),
+        (4, 4, hashes[4], valid_at),
     ]
     if corruption == "ordinal-gap":
         rows[1] = (4, 2, hashes[2], valid_at)
@@ -1027,7 +1065,7 @@ def test_future_synthetic_migration_appends_one_digest_bound_history_row(
     synthetic_sql = "CREATE TABLE synthetic_migration_probe(value INTEGER);\n"
 
     class SyntheticMigration:
-        name = "004_synthetic_history_probe.sql"
+        name = "005_synthetic_history_probe.sql"
 
         def read_text(self, encoding: str = "utf-8") -> str:
             assert encoding == "utf-8"
@@ -1045,14 +1083,14 @@ def test_future_synthetic_migration_appends_one_digest_bound_history_row(
 
     monkeypatch.setattr(core_module, "_migration_resources", resources)
 
-    assert _migrate_database_in_process(path, DatabaseKind.WORKFLOW) == [4]
+    assert _migrate_database_in_process(path, DatabaseKind.WORKFLOW) == [5]
     rows = _durable_history_rows(path)
     assert rows[-1][:3] == (
-        4,
-        4,
+        5,
+        5,
         hashlib.sha256(synthetic_sql.encode("utf-8")).hexdigest(),
     )
-    assert len(rows) == 4
+    assert len(rows) == 5
     with connect_database(path) as connection:
         for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'trigger' "

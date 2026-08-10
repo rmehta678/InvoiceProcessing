@@ -11,7 +11,7 @@ import threading
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from time import monotonic
@@ -2250,6 +2250,31 @@ async def run_prepared_case(
     claim = validate_execution_claim(claim, expected_case_id=case_id)
     store = WorkflowStore(settings)
     store.require_current_execution_claim(claim)
+    try:
+        authoritative_started_at = store.load_authoritative_case_started_at(claim)
+    except BaseException as exc:
+        raise _unresolved_durability_error(case_id, exc) from None
+    supplied_offset = started_at.utcoffset() if type(started_at) is datetime else None
+    if (
+        type(started_at) is not datetime
+        or started_at.tzinfo is None
+        or supplied_offset != timedelta(0)
+        or started_at != authoritative_started_at
+    ):
+        failure = InvoiceAgentsError(
+            ErrorCategory.DATABASE,
+            "prepared case start does not match its authoritative row",
+            case_id=case_id,
+            stop_reason="PERSISTED_RESULT_INVALID",
+        )
+        return await _terminalize_lifecycle_boundary_failure(
+            store=store,
+            claim=claim,
+            started_at=authoritative_started_at,
+            failure=failure,
+            load_previous=False,
+        )
+    started_at = authoritative_started_at
     try:
         settings.provider_key()
     except BaseException as failure:

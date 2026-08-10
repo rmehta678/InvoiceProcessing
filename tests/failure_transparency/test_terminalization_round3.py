@@ -300,12 +300,6 @@ async def test_round3_registry_never_stores_raw_exception_text() -> None:
         state="running",
         started_at=datetime.now(UTC),
         task=task,
-        claim=ExecutionClaim(
-            "case_registry_canary",
-            "exec_registry_canary",
-            1,
-            datetime.now(UTC) + timedelta(minutes=1),
-        ),
     )
     with pytest.raises(RuntimeError, match="xai-secret-canary"):
         await task

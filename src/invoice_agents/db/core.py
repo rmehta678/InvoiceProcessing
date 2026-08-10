@@ -186,7 +186,7 @@ class WorkflowVersionNeutralState:
 # direction, so an unmigrated or future database never silently processes cases.
 SCHEMA_VERSIONS: dict[DatabaseKind, int] = {
     DatabaseKind.INVENTORY: 1,
-    DatabaseKind.WORKFLOW: 3,
+    DatabaseKind.WORKFLOW: 4,
 }
 
 # Named indexes created by the migrations; verification fails when one is missing.

@@ -13,4 +13,5 @@ def test_each_database_kind_has_packaged_migrations() -> None:
         "001_initial.sql",
         "002_review_sequence.sql",
         "003_execution_fencing.sql",
+        "004_execution_token_grammar.sql",
     ]
