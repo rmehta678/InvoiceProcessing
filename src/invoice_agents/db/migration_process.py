@@ -191,11 +191,18 @@ _PARENT_WORKER_ERROR_CONTRACTS: dict[str, _WorkerErrorContract] = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkerProcessBinding:
+    """Immutable process identity accepted by one exit watcher."""
+
+    process_id: int
+
+
 class _WorkerExitWatcher:
     """Observe a child exit without reaping its identity before group cleanup."""
 
     def __init__(self, process_id: int) -> None:
-        self._process_id = process_id
+        self._binding = _WorkerProcessBinding(process_id)
         self._exited = False
         self._kqueue: Any | None = None
         self._pidfd: int | None = None
@@ -226,7 +233,24 @@ class _WorkerExitWatcher:
             return True
         bounded_timeout = max(0.0, timeout)
         if self._kqueue is not None:
-            self._exited = bool(self._kqueue.control(None, 1, bounded_timeout))
+            events = self._kqueue.control(None, 1, bounded_timeout)
+            if not events:
+                return False
+            if type(events) is not list or len(events) != 1:
+                raise OSError("invalid worker exit event")
+            event = events[0]
+            try:
+                invalid = (
+                    event.ident != self._binding.process_id
+                    or event.filter != select.KQ_FILTER_PROC
+                    or event.fflags != select.KQ_NOTE_EXIT
+                    or event.flags & select.KQ_EV_ERROR
+                )
+            except (AttributeError, TypeError):
+                raise OSError("invalid worker exit event") from None
+            if invalid:
+                raise OSError("invalid worker exit event")
+            self._exited = True
         elif self._pidfd is not None:
             readable, _, _ = select.select([self._pidfd], [], [], bounded_timeout)
             self._exited = bool(readable)

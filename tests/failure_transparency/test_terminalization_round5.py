@@ -633,12 +633,14 @@ def _round5_protocol_request(
         )
         return encoded, preparation_process.decode_preparation_request
     if protocol == "lifecycle":
-        encoded, credential = lifecycle_process._encode_request(
+        credential = bytearray()
+        encoded = lifecycle_process._encode_request(
             mode="process",
             settings=settings,
             claim=claim,
             started_at=started_at,
             credential_fd=99,
+            credential=credential,
         )
         for index in range(len(credential)):
             credential[index] = 0

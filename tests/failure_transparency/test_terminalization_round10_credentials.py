@@ -214,8 +214,9 @@ def test_round10_every_parent_read_alias_is_closed_before_credential_write(
     )
 
     assert outcome.error_code is None
-    assert len(captured_inputs) == len(captured_aliases) == 1
-    assert write_observations == [(True, (True,)), (True, (True,))]
+    assert len(captured_inputs) == 1
+    assert captured_aliases == []
+    assert write_observations == [(True, ()), (True, ())]
     assert receipt.read_bytes()[4:] == canary.encode()
 
 
@@ -260,17 +261,18 @@ def test_round10_metadata_faults_happen_before_credential_materialization(
             claim=claim,
             started_at=started_at,
             credential_fd=7,
+            credential=real_bytearray(),
         )
 
     assert tracked == []
 
 
 @pytest.mark.parametrize("endpoint_kind", ["reader", "writer"])
-def test_round10_close_before_action_retains_exact_endpoint_ownership(
+def test_round10_close_before_action_forgets_unsafe_raw_descriptor_ownership(
     monkeypatch: pytest.MonkeyPatch,
     endpoint_kind: str,
 ) -> None:
-    """A pre-action close fault must not discard the still-open pipe identity."""
+    """A pre-action close fault is visible but never authorizes a raw-fd retry."""
 
     reader, writer = isolated_process.private_pipe_channel()
     endpoint = reader if endpoint_kind == "reader" else writer
@@ -289,7 +291,7 @@ def test_round10_close_before_action_retains_exact_endpoint_ownership(
         with pytest.raises(OSError, match="before kernel action"):
             endpoint.close()
 
-        assert endpoint.fileno() == descriptor
+        assert endpoint.closed
         observed = os.fstat(descriptor)
         assert (observed.st_dev, observed.st_ino, observed.st_mode) == (
             expected.st_dev,
@@ -298,16 +300,16 @@ def test_round10_close_before_action_retains_exact_endpoint_ownership(
         )
     finally:
         monkeypatch.setattr(isolated_process.os, "close", real_close)
-        endpoint.close()
+        real_close(descriptor)
         other.close()
 
 
 @pytest.mark.parametrize("endpoint_kind", ["reader", "writer"])
-def test_round10_uncertain_endpoint_blocks_new_channels_until_reconciled(
+def test_round10_uncertain_endpoint_creates_no_retry_registry(
     monkeypatch: pytest.MonkeyPatch,
     endpoint_kind: str,
 ) -> None:
-    """A retained endpoint is durably quarantined and fail-closes later admission."""
+    """A failed raw close cannot create a registry that later acts on that number."""
 
     reader, writer = isolated_process.private_pipe_channel()
     endpoint = reader if endpoint_kind == "reader" else writer
@@ -325,29 +327,15 @@ def test_round10_uncertain_endpoint_blocks_new_channels_until_reconciled(
         endpoint.close()
     other.close()
 
-    unexpectedly_admitted: (
-        tuple[
-            isolated_process.PrivatePipeEndpoint,
-            isolated_process.PrivatePipeEndpoint,
-        ]
-        | None
-    ) = None
     try:
-        with pytest.raises(isolated_process.IsolatedProcessCleanupError):
-            unexpectedly_admitted = isolated_process.private_pipe_channel()
+        admitted_reader, admitted_writer = isolated_process.private_pipe_channel()
+        admitted_reader.close()
+        admitted_writer.close()
+        assert endpoint.closed
+        assert os.fstat(descriptor)
     finally:
         monkeypatch.setattr(isolated_process.os, "close", real_close)
-        if unexpectedly_admitted is not None:
-            unexpectedly_admitted[0].close()
-            unexpectedly_admitted[1].close()
-
-    recovered_reader, recovered_writer = isolated_process.private_pipe_channel()
-    recovered_reader.close()
-    recovered_writer.close()
-    assert endpoint.closed
-    with pytest.raises(OSError) as excinfo:
-        os.fstat(descriptor)
-    assert excinfo.value.errno == errno.EBADF
+        real_close(descriptor)
 
 
 @pytest.mark.parametrize("endpoint_kind", ["reader", "writer"])

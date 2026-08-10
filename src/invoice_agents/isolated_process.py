@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
-import errno
 import os
 import selectors
-import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, BinaryIO, Literal, cast
+from typing import BinaryIO, Literal, cast
 
 from invoice_agents.db.migration_process import (
     _QUARANTINED_WORKERS,
@@ -41,7 +40,6 @@ class IsolatedProcessCleanupError(Exception):
 
 
 _PRIVATE_PIPE_STATE_LOCK = threading.Lock()
-_QUARANTINED_PRIVATE_ENDPOINTS: list[PrivatePipeEndpoint] = []
 _ACTIVE_PRIVATE_PIPE_ENDPOINTS = 0
 
 
@@ -80,24 +78,20 @@ def sanitized_worker_environment() -> dict[str, str]:
 class PrivatePipeEndpoint:
     """Own exactly one directional anonymous-pipe descriptor.
 
-    A failed ``close(2)`` retains the exact pre-close kernel identity.  If the
-    raw number now identifies something else, ownership is released without
-    acting on that replacement; otherwise the endpoint is quarantined.
+    Ownership is retired before ``close(2)`` is attempted.  A failed close is
+    visible to the caller, but the raw number is never probed or retried after
+    another thread could have reused it.
     """
 
     _descriptor: int | None
     readable: bool
     writable: bool
-    _identity: tuple[int, int, int, int] = field(init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _managed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        descriptor = self._descriptor
-        if descriptor is None:
+        if self._descriptor is None:
             raise ValueError("private pipe endpoint requires an open descriptor")
-        status = os.fstat(descriptor)
-        self._identity = (status.st_dev, status.st_ino, status.st_mode, status.st_rdev)
 
     def fileno(self) -> int:
         descriptor = self._descriptor
@@ -114,31 +108,9 @@ class PrivatePipeEndpoint:
             descriptor = self._descriptor
             if descriptor is None:
                 return
-            try:
-                os.close(descriptor)
-            except BaseException:
-                try:
-                    status = os.fstat(descriptor)
-                except OSError as probe_error:
-                    if probe_error.errno == errno.EBADF:
-                        self._descriptor = None
-                else:
-                    current_identity = (
-                        status.st_dev,
-                        status.st_ino,
-                        status.st_mode,
-                        status.st_rdev,
-                    )
-                    if current_identity != self._identity:
-                        self._descriptor = None
-                if self._descriptor is None:
-                    _release_private_endpoint(self)
-                else:
-                    _quarantine_private_endpoint(self)
-                raise
-            else:
-                self._descriptor = None
-                _release_private_endpoint(self)
+            self._descriptor = None
+            _release_private_endpoint(self)
+            os.close(descriptor)
 
     def detach(self) -> int:
         """Transfer ownership for focused child-reader tests."""
@@ -202,9 +174,13 @@ class _SpawnedProcess:
     stdout: BinaryIO | None
     returncode: int | None = None
     args: tuple[str, ...] = ("isolated-worker",)
+    _native_handle: subprocess.Popen[bytes] | None = field(default=None, repr=False)
 
     def poll(self) -> int | None:
         if self.returncode is not None:
+            return self.returncode
+        if self._native_handle is not None:
+            self.returncode = self._native_handle.poll()
             return self.returncode
         try:
             observed_id, status = os.waitpid(self.pid, os.WNOHANG)
@@ -218,6 +194,9 @@ class _SpawnedProcess:
         return self.returncode
 
     def wait(self, timeout: float | None = None) -> int:
+        if self._native_handle is not None:
+            self.returncode = self._native_handle.wait(timeout=timeout)
+            return self.returncode
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             result = self.poll()
@@ -249,14 +228,262 @@ def _after_worker_spawn(_process: _SpawnedProcess) -> None:
     """Fault-injection seam reached only after PID ownership is published."""
 
 
+def _supervisor_command(publication_descriptor: int, command: list[str]) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "invoice_agents.spawn_supervisor",
+        str(publication_descriptor),
+        *command,
+    ]
+
+
+def _launch_supervisor(
+    owner: _StartupOwner,
+    *,
+    command: list[str],
+    request_stream: BinaryIO,
+    response_writer: PrivatePipeEndpoint,
+    publication_writer: PrivatePipeEndpoint,
+    pass_fds: tuple[int, ...],
+    env: dict[str, str] | None,
+) -> None:
+    """Launch through the close-all supervisor and publish its native handle immediately."""
+
+    publication_descriptor = publication_writer.fileno()
+    inherited = (*pass_fds, publication_descriptor)
+    process = subprocess.Popen(
+        _supervisor_command(publication_descriptor, command),
+        stdin=request_stream,
+        stdout=response_writer.fileno(),
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        pass_fds=inherited,
+        env=env,
+    )
+    owner.publish_native_handle(process, command)
+
+
+def _read_spawn_publication(
+    reader: PrivatePipeEndpoint,
+    *,
+    deadline: float,
+) -> int:
+    """Read the supervisor's exact PID publication through one bounded pipe."""
+
+    descriptor = reader.fileno()
+    os.set_blocking(descriptor, False)
+    published = bytearray()
+    with selectors.DefaultSelector() as selector:
+        selector.register(descriptor, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            wait_seconds = 0.0 if remaining <= 0 else min(remaining, _POLL_SECONDS)
+            if not selector.select(wait_seconds):
+                if remaining <= 0:
+                    raise TimeoutError("isolated supervisor did not publish its process identity")
+                continue
+            chunk = os.read(descriptor, 32 - len(published))
+            if not chunk:
+                break
+            published.extend(chunk)
+            if len(published) >= 32:
+                raise ValueError("invalid isolated supervisor process publication")
+    try:
+        encoded = bytes(published)
+        if not encoded.endswith(b"\n") or not encoded[:-1].isascii() or not encoded[:-1].isdigit():
+            raise ValueError("invalid isolated supervisor process publication")
+        process_id = int(encoded[:-1])
+    finally:
+        _zero_buffer(published)
+    if process_id <= 0 or str(process_id).encode("ascii") != encoded[:-1]:
+        raise ValueError("invalid isolated supervisor process publication")
+    return process_id
+
+
 @dataclass(slots=True)
 class _StartupOwner:
-    """Own spawn resources before any post-spawn Python callback can run."""
+    """Independently publish and capture a spawn before caller control resumes."""
 
     process: _SpawnedProcess | None = None
-    reader: PrivatePipeEndpoint | None = None
-    writer: PrivatePipeEndpoint | None = None
-    inherited_aliases: list[PrivatePipeEndpoint] = field(default_factory=list)
+    worker: _WorkerSession | None = None
+    response_reader: PrivatePipeEndpoint | None = None
+    response_writer: PrivatePipeEndpoint | None = None
+    publication_reader: PrivatePipeEndpoint | None = None
+    publication_writer: PrivatePipeEndpoint | None = None
+    start_failed: bool = False
+    response_failure: Literal["cancelled", "timeout"] | None = None
+    primary_error: BaseException | None = None
+    finished: threading.Event = field(default_factory=threading.Event)
+
+    def publish_native_handle(
+        self,
+        process: subprocess.Popen[bytes],
+        command: list[str],
+    ) -> None:
+        """Publish the PID and handle before a wrapping caller regains control."""
+
+        if self.process is not None or self.response_reader is None:
+            raise RuntimeError("isolated supervisor process was published more than once")
+        self.process = _SpawnedProcess(
+            process.pid,
+            cast(BinaryIO, _EndpointReader(self.response_reader)),
+            args=tuple(command),
+            _native_handle=process,
+        )
+
+    def _record_error(self, error: BaseException) -> None:
+        if isinstance(error, Exception):
+            self.start_failed = True
+        elif self.primary_error is None:
+            self.primary_error = error
+
+    def _adopt_transport_control(self, transport: _TransportOutcome) -> None:
+        """Make a captured startup control primary before any secret delivery."""
+
+        if self.primary_error is None and transport.control_error is not None:
+            self.primary_error = transport.control_error
+
+    def _run(
+        self,
+        *,
+        command: list[str],
+        request_stream: BinaryIO,
+        pass_fds: tuple[int, ...],
+        private_input: PrivatePipeInput | None,
+        cancel_requested: ProcessCancellation | None,
+        env: dict[str, str] | None,
+        deadline: float,
+        transport: _TransportOutcome,
+    ) -> None:
+        try:
+            if cancel_requested is not None and cancel_requested.is_set():
+                self.response_failure = "cancelled"
+            self.response_reader, self.response_writer = _owned_pipe_channel(
+                nonblocking_writer=False
+            )
+            self.publication_reader, self.publication_writer = _owned_pipe_channel(
+                nonblocking_writer=False
+            )
+            try:
+                _launch_supervisor(
+                    self,
+                    command=command,
+                    request_stream=request_stream,
+                    response_writer=self.response_writer,
+                    publication_writer=self.publication_writer,
+                    pass_fds=pass_fds,
+                    env=env,
+                )
+            except BaseException as exc:
+                self._record_error(exc)
+            finally:
+                _close_endpoint(self.response_writer, transport)
+                _close_endpoint(self.publication_writer, transport)
+                self._adopt_transport_control(transport)
+
+            try:
+                published_id = _read_spawn_publication(
+                    self.publication_reader,
+                    deadline=deadline,
+                )
+            except TimeoutError:
+                if self.process is None:
+                    self.start_failed = True
+                elif self.response_failure is None:
+                    self.response_failure = "timeout"
+            except BaseException as exc:
+                self._record_error(exc)
+            else:
+                if self.process is None:
+                    self.process = _SpawnedProcess(
+                        published_id,
+                        cast(BinaryIO, _EndpointReader(self.response_reader)),
+                        args=tuple(command),
+                    )
+                elif self.process.pid != published_id:
+                    self.start_failed = True
+
+            if self.process is not None:
+                self.worker = _fallback_worker_session(self.process)
+                if self.primary_error is None and not self.start_failed and not transport.failed:
+                    try:
+                        self.worker = _capture_worker_session(
+                            cast("subprocess.Popen[bytes]", self.process)
+                        )
+                    except BaseException as exc:
+                        self._record_error(exc)
+                if self.worker is not None:
+                    self.start_failed = (
+                        self.start_failed
+                        or not self.worker.watcher_initialized
+                        or not self.worker.identity_verified
+                    )
+                if (
+                    self.primary_error is None
+                    and not self.start_failed
+                    and not transport.failed
+                    and self.response_failure is None
+                ):
+                    try:
+                        _after_worker_spawn(self.process)
+                    except BaseException as exc:
+                        self._record_error(exc)
+
+            if private_input is not None:
+                try:
+                    _release_parent_reader(private_input.reader)
+                except BaseException as exc:
+                    if isinstance(exc, Exception):
+                        transport.failed = True
+                    elif self.primary_error is None:
+                        self.primary_error = exc
+
+                if (
+                    self.process is not None
+                    and self.primary_error is None
+                    and not self.start_failed
+                    and not transport.failed
+                ):
+                    if cancel_requested is not None and cancel_requested.is_set():
+                        self.response_failure = "cancelled"
+                    elif time.monotonic() >= deadline:
+                        self.response_failure = "timeout"
+                    else:
+                        try:
+                            delivered = send_private_frame(
+                                private_input.writer,
+                                private_input.payload,
+                                max_payload_bytes=private_input.max_payload_bytes,
+                                deadline=deadline,
+                                cancel_requested=cancel_requested,
+                            )
+                            if not delivered:
+                                self.response_failure = "cancelled"
+                        except BaseException as exc:
+                            if isinstance(exc, Exception):
+                                transport.failed = True
+                            elif self.primary_error is None:
+                                self.primary_error = exc
+                _zero_buffer(private_input.payload)
+                try:
+                    _release_parent_writer(private_input.writer)
+                except BaseException as exc:
+                    if isinstance(exc, Exception):
+                        transport.failed = True
+                    elif self.primary_error is None:
+                        self.primary_error = exc
+        except BaseException as exc:
+            self._record_error(exc)
+        finally:
+            if self.response_writer is not None:
+                _close_endpoint(self.response_writer, transport)
+            if self.publication_writer is not None:
+                _close_endpoint(self.publication_writer, transport)
+            if self.publication_reader is not None:
+                _close_endpoint(self.publication_reader, transport)
+            self.finished.set()
 
     def spawn(
         self,
@@ -264,58 +491,51 @@ class _StartupOwner:
         command: list[str],
         request_stream: BinaryIO,
         pass_fds: tuple[int, ...],
+        private_input: PrivatePipeInput | None,
+        cancel_requested: ProcessCancellation | None,
         env: dict[str, str] | None,
+        deadline: float,
         transport: _TransportOutcome,
-    ) -> _SpawnedProcess:
-        self.reader, self.writer = private_pipe_channel()
-        reader_descriptor = self.reader.fileno()
-        writer_descriptor = self.writer.fileno()
-        for descriptor in pass_fds:
-            self.inherited_aliases.append(
-                _private_pipe_duplicate(descriptor, readable=True, writable=False)
-            )
-        with open(os.devnull, "wb", buffering=0) as error_stream:
-            file_actions: list[tuple[Any, ...]] = [
-                (os.POSIX_SPAWN_DUP2, request_stream.fileno(), 0),
-                (os.POSIX_SPAWN_DUP2, writer_descriptor, 1),
-                (os.POSIX_SPAWN_DUP2, error_stream.fileno(), 2),
-                (os.POSIX_SPAWN_CLOSE, reader_descriptor),
-            ]
-            for descriptor, alias in zip(pass_fds, self.inherited_aliases, strict=True):
-                file_actions.extend(
-                    (
-                        (os.POSIX_SPAWN_DUP2, alias.fileno(), descriptor),
-                        (os.POSIX_SPAWN_CLOSE, alias.fileno()),
-                    )
+    ) -> _SpawnedProcess | None:
+        owner_thread = threading.Thread(
+            target=self._run,
+            kwargs={
+                "command": command,
+                "request_stream": request_stream,
+                "pass_fds": pass_fds,
+                "private_input": private_input,
+                "cancel_requested": cancel_requested,
+                "env": env,
+                "deadline": deadline,
+                "transport": transport,
+            },
+            name="isolated-spawn-owner",
+            daemon=True,
+        )
+        caller_control: BaseException | None = None
+        try:
+            owner_thread.start()
+        except BaseException as exc:
+            caller_control = exc
+            if owner_thread.ident is None:
+                self._run(
+                    command=command,
+                    request_stream=request_stream,
+                    pass_fds=pass_fds,
+                    private_input=private_input,
+                    cancel_requested=cancel_requested,
+                    env=env,
+                    deadline=deadline,
+                    transport=transport,
                 )
-            for descriptor in {
-                request_stream.fileno(),
-                writer_descriptor,
-                error_stream.fileno(),
-            } - {0, 1, 2, *pass_fds}:
-                file_actions.append((os.POSIX_SPAWN_CLOSE, descriptor))
-            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+        while not self.finished.is_set():
             try:
-                process_id = os.posix_spawnp(
-                    command[0],
-                    command,
-                    dict(os.environ) if env is None else env,
-                    file_actions=file_actions,
-                    setsid=True,
-                )
-                self.process = _SpawnedProcess(
-                    process_id,
-                    cast(BinaryIO, _EndpointReader(self.reader)),
-                    args=tuple(command),
-                )
-            finally:
-                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-        for alias in self.inherited_aliases:
-            _close_endpoint(alias, transport)
-        _close_endpoint(self.writer, transport)
-        if transport.control_error is not None:
-            raise transport.control_error
-        _after_worker_spawn(self.process)
+                self.finished.wait(_POLL_SECONDS)
+            except BaseException as exc:
+                if caller_control is None:
+                    caller_control = exc
+        if self.primary_error is None:
+            self.primary_error = caller_control
         return self.process
 
 
@@ -342,43 +562,15 @@ def _release_private_endpoint(endpoint: PrivatePipeEndpoint) -> None:
         if not endpoint._managed:
             return
         endpoint._managed = False
-        _QUARANTINED_PRIVATE_ENDPOINTS[:] = [
-            retained for retained in _QUARANTINED_PRIVATE_ENDPOINTS if retained is not endpoint
-        ]
         _ACTIVE_PRIVATE_PIPE_ENDPOINTS -= 1
 
 
-def _quarantine_private_endpoint(endpoint: PrivatePipeEndpoint) -> None:
-    with _PRIVATE_PIPE_STATE_LOCK:
-        if endpoint._managed and all(
-            retained is not endpoint for retained in _QUARANTINED_PRIVATE_ENDPOINTS
-        ):
-            _QUARANTINED_PRIVATE_ENDPOINTS.append(endpoint)
+def _owned_pipe_channel(
+    *,
+    nonblocking_writer: bool,
+) -> tuple[PrivatePipeEndpoint, PrivatePipeEndpoint]:
+    """Create one managed directional pipe without retaining failed raw numbers."""
 
-
-def _retry_quarantined_private_endpoints() -> bool:
-    with _PRIVATE_PIPE_STATE_LOCK:
-        retained = tuple(_QUARANTINED_PRIVATE_ENDPOINTS)
-    control_error: BaseException | None = None
-    for endpoint in retained:
-        try:
-            endpoint.close()
-        except Exception:
-            continue
-        except BaseException as exc:
-            if control_error is None:
-                control_error = exc
-    if control_error is not None:
-        raise control_error
-    with _PRIVATE_PIPE_STATE_LOCK:
-        return not _QUARANTINED_PRIVATE_ENDPOINTS
-
-
-def private_pipe_channel() -> tuple[PrivatePipeEndpoint, PrivatePipeEndpoint]:
-    """Create one anonymous read-only/write-only pipe pair."""
-
-    if not _retry_quarantined_private_endpoints():
-        raise IsolatedProcessCleanupError from None
     _reserve_private_endpoint_capacity(2)
     reader_descriptor = -1
     writer_descriptor = -1
@@ -398,7 +590,7 @@ def private_pipe_channel() -> tuple[PrivatePipeEndpoint, PrivatePipeEndpoint]:
     reader._managed = True
     writer._managed = True
     try:
-        os.set_blocking(writer_descriptor, False)
+        os.set_blocking(writer_descriptor, not nonblocking_writer)
     except BaseException:
         with suppress(BaseException):
             reader.close()
@@ -406,6 +598,12 @@ def private_pipe_channel() -> tuple[PrivatePipeEndpoint, PrivatePipeEndpoint]:
             writer.close()
         raise
     return reader, writer
+
+
+def private_pipe_channel() -> tuple[PrivatePipeEndpoint, PrivatePipeEndpoint]:
+    """Create one anonymous read-only/write-only credential pipe pair."""
+
+    return _owned_pipe_channel(nonblocking_writer=True)
 
 
 def _private_pipe_duplicate(
@@ -818,85 +1016,30 @@ def run_isolated_process(
                     command=command,
                     request_stream=request_stream,
                     pass_fds=pass_fds,
+                    private_input=private_input,
+                    cancel_requested=cast("ProcessCancellation | None", cancel_requested),
                     env=env,
+                    deadline=deadline,
                     transport=transport,
                 )
         except Exception:
             start_failed = True
         except BaseException as exc:
             primary_error = exc
-
         if process is None:
             process = startup_owner.process
+        worker = startup_owner.worker
+        start_failed = start_failed or startup_owner.start_failed
+        if primary_error is None:
+            primary_error = startup_owner.primary_error
+        response_failure = startup_owner.response_failure
 
-        if time.monotonic() >= deadline and process is not None:
+        if response_failure is None and time.monotonic() >= deadline and process is not None:
             response_failure = "timeout"
 
         if process is not None:
             if worker is None:
                 worker = _fallback_worker_session(process)
-
-            if private_input is not None:
-                try:
-                    _release_parent_reader(private_input.reader)
-                except Exception:
-                    transport.failed = True
-                except BaseException as exc:
-                    primary_error = exc
-
-            if primary_error is None and not start_failed and not transport.failed:
-                try:
-                    worker = _capture_worker_session(
-                        cast("subprocess.Popen[bytes]", process),
-                    )
-                except Exception:
-                    start_failed = True
-                except BaseException as exc:
-                    primary_error = exc
-
-            if worker is not None:
-                start_failed = (
-                    start_failed or not worker.watcher_initialized or not worker.identity_verified
-                )
-
-            if (
-                primary_error is None
-                and not start_failed
-                and not transport.failed
-                and response_failure is None
-                and private_input is not None
-            ):
-                if cancel_requested is not None and cancel_requested.is_set():
-                    response_failure = "cancelled"
-                elif time.monotonic() >= deadline:
-                    response_failure = "timeout"
-                else:
-                    try:
-                        delivered = send_private_frame(
-                            private_input.writer,
-                            private_input.payload,
-                            max_payload_bytes=private_input.max_payload_bytes,
-                            deadline=deadline,
-                            cancel_requested=cast(
-                                "ProcessCancellation | None",
-                                cancel_requested,
-                            ),
-                        )
-                        if not delivered:
-                            response_failure = "cancelled"
-                    except Exception:
-                        transport.failed = True
-                    except BaseException as exc:
-                        primary_error = exc
-                    finally:
-                        _zero_buffer(private_input.payload)
-                        try:
-                            _release_parent_writer(private_input.writer)
-                        except Exception:
-                            transport.failed = True
-                        except BaseException as exc:
-                            if primary_error is None:
-                                primary_error = exc
 
             if (
                 primary_error is None
@@ -922,12 +1065,14 @@ def run_isolated_process(
             worker_cleanup.contained = process is None
             worker_cleanup.reaped = process is None
             worker_cleanup.failed = process is not None
-        if startup_owner.reader is not None:
-            _close_endpoint(startup_owner.reader, transport)
-        if startup_owner.writer is not None:
-            _close_endpoint(startup_owner.writer, transport)
-        for alias in startup_owner.inherited_aliases:
-            _close_endpoint(alias, transport)
+        if startup_owner.response_reader is not None:
+            _close_endpoint(startup_owner.response_reader, transport)
+        if startup_owner.response_writer is not None:
+            _close_endpoint(startup_owner.response_writer, transport)
+        if startup_owner.publication_reader is not None:
+            _close_endpoint(startup_owner.publication_reader, transport)
+        if startup_owner.publication_writer is not None:
+            _close_endpoint(startup_owner.publication_writer, transport)
         _retire_private_input(private_input, transport)
 
     if transport.failed or worker_cleanup.failed or not worker_cleanup.contained:
@@ -942,10 +1087,10 @@ def run_isolated_process(
         if start_failed:
             return IsolatedProcessResult(None, "start")
         raise IsolatedProcessCleanupError from None
-    if start_failed:
-        return IsolatedProcessResult(None, "start")
     if response_failure is not None:
         return IsolatedProcessResult(None, response_failure)
+    if start_failed:
+        return IsolatedProcessResult(None, "start")
     if process is None or process.returncode != 0:
         return IsolatedProcessResult(None, "crash")
     return IsolatedProcessResult(response, None)

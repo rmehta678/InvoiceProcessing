@@ -117,13 +117,16 @@ def _capture_spawned_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> list[isolated_process._SpawnedProcess]:
     spawned: list[isolated_process._SpawnedProcess] = []
-    real_after_spawn = isolated_process._after_worker_spawn
+    real_launch = isolated_process._launch_supervisor
 
-    def observed_spawn(process: isolated_process._SpawnedProcess) -> None:
+    def observed_launch(*args: Any, **kwargs: Any) -> None:
+        owner = args[0]
+        real_launch(*args, **kwargs)
+        process = owner.process
+        assert process is not None
         spawned.append(process)
-        real_after_spawn(process)
 
-    monkeypatch.setattr(isolated_process, "_after_worker_spawn", observed_spawn)
+    monkeypatch.setattr(isolated_process, "_launch_supervisor", observed_launch)
     return spawned
 
 
@@ -977,17 +980,11 @@ def test_round9_stop_control_is_reraised_only_after_real_child_reap(
         lambda: _terminal_worker_command("timeout"),
     )
     captured_workers: list[object] = []
-    real_capture = isolated_process._capture_worker_session
 
-    def observed_capture(process: isolated_process._SpawnedProcess) -> object:
-        worker = real_capture(process)
+    def interrupt_stop(worker: object) -> object:
         captured_workers.append(worker)
-        return worker
-
-    def interrupt_stop(_worker: object) -> object:
         raise control_type("round9 stop control")
 
-    monkeypatch.setattr(isolated_process, "_capture_worker_session", observed_capture)
     monkeypatch.setattr(isolated_process, "_stop_worker", interrupt_stop)
 
     with pytest.raises(control_type):
@@ -1024,21 +1021,15 @@ def test_round9_stop_control_with_reap_failure_leaves_durable_quarantine(
         lambda: _terminal_worker_command("timeout"),
     )
     captured_workers: list[object] = []
-    real_capture = isolated_process._capture_worker_session
     real_stop = isolated_process._stop_worker
 
-    def observed_capture(process: isolated_process._SpawnedProcess) -> object:
-        worker = real_capture(process)
+    def interrupt_stop(worker: object) -> object:
         captured_workers.append(worker)
-        return worker
-
-    def interrupt_stop(_worker: object) -> object:
         raise control_type("round9 persistent stop control")
 
     def fail_independent_reap(_worker: object) -> None:
         raise OSError(errno.EIO, "round9 persistent independent reap failure")
 
-    monkeypatch.setattr(isolated_process, "_capture_worker_session", observed_capture)
     monkeypatch.setattr(isolated_process, "_stop_worker", interrupt_stop)
     monkeypatch.setattr(isolated_process, "_cleanup_worker_session", fail_independent_reap)
 
@@ -1072,21 +1063,15 @@ def test_round9_stop_and_reap_failure_returns_cleanup_error_with_quarantine(
         lambda: _terminal_worker_command("timeout"),
     )
     captured_workers: list[object] = []
-    real_capture = isolated_process._capture_worker_session
     real_stop = isolated_process._stop_worker
 
-    def observed_capture(process: isolated_process._SpawnedProcess) -> object:
-        worker = real_capture(process)
+    def failed_stop(worker: object) -> object:
         captured_workers.append(worker)
-        return worker
-
-    def failed_stop(_worker: object) -> object:
         return object()
 
     def failed_reap(_worker: object) -> None:
         raise OSError(errno.EIO, "round9 independent reap failed")
 
-    monkeypatch.setattr(isolated_process, "_capture_worker_session", observed_capture)
     monkeypatch.setattr(isolated_process, "_stop_worker", failed_stop)
     monkeypatch.setattr(isolated_process, "_cleanup_worker_session", failed_reap)
 

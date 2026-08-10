@@ -382,12 +382,14 @@ def test_round4_lifecycle_worker_uses_private_credential_fd_and_kills_descendant
     command = [sys.executable, "-c", child_code]
     monkeypatch.setattr(lifecycle_process, "_lifecycle_worker_command", lambda: command)
     selected = settings.model_copy(update={"xai_api_key": SecretStr(canary)})
-    encoded, _secret = lifecycle_process._encode_request(
+    _secret = bytearray()
+    encoded = lifecycle_process._encode_request(
         mode="process",
         settings=selected,
         claim=claim,
         started_at=started_at,
         credential_fd=99,
+        credential=_secret,
     )
     assert canary.encode() not in encoded
     _secret[:] = bytes(len(_secret))

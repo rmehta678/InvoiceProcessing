@@ -114,6 +114,25 @@ def _canonical_start(value: datetime) -> str:
     return encoded
 
 
+def _zero_credential(credential: bytearray) -> None:
+    for index in range(len(credential)):
+        credential[index] = 0
+
+
+def _materialize_provider_credential(
+    settings: Settings,
+    credential: bytearray,
+) -> None:
+    """Fill the caller-owned secret buffer only after metadata is complete."""
+
+    if type(credential) is not bytearray or credential:
+        raise ValueError("lifecycle credential buffer must be empty")
+    credential.extend(settings.provider_key().encode("utf-8"))
+    if not credential or len(credential) > LIFECYCLE_MAX_CREDENTIAL_BYTES:
+        _zero_credential(credential)
+        raise ValueError("provider credential exceeds its private transport bound")
+
+
 def _encode_request(
     *,
     mode: Literal["process", "resume"],
@@ -121,7 +140,8 @@ def _encode_request(
     claim: ExecutionClaim,
     started_at: datetime,
     credential_fd: int,
-) -> tuple[bytes, bytearray]:
+    credential: bytearray,
+) -> bytes:
     claim = validate_execution_claim(claim)
     if type(mode) is not str or mode not in {"process", "resume"}:
         raise ValueError("invalid lifecycle mode")
@@ -143,12 +163,8 @@ def _encode_request(
     ).encode("utf-8")
     if not encoded or len(encoded) > LIFECYCLE_MAX_MESSAGE_BYTES:
         raise ValueError("lifecycle request exceeds its bound")
-    credential = bytearray(settings.provider_key().encode("utf-8"))
-    if not credential or len(credential) > LIFECYCLE_MAX_CREDENTIAL_BYTES:
-        for index in range(len(credential)):
-            credential[index] = 0
-        raise ValueError("provider credential exceeds its private transport bound")
-    return encoded, credential
+    _materialize_provider_credential(settings, credential)
+    return encoded
 
 
 def decode_lifecycle_request(
@@ -269,37 +285,40 @@ def run_lifecycle_process(
     """Run provider/team work and prove all local descendants stopped before return."""
 
     credential = bytearray()
-    credential_reader, credential_writer = _private_credential_channel()
-    with credential_reader, credential_writer:
-        try:
-            request, credential = _encode_request(
-                mode=mode,
-                settings=settings,
-                claim=claim,
-                started_at=started_at,
-                credential_fd=credential_reader.fileno(),
-            )
+    try:
+        credential_reader, credential_writer = _private_credential_channel()
+        with credential_reader, credential_writer:
             try:
-                outcome = run_isolated_process(
-                    command=_lifecycle_worker_command(),
-                    request=request,
-                    timeout_seconds=timeout_seconds,
-                    max_response_bytes=LIFECYCLE_MAX_MESSAGE_BYTES,
-                    cancel_requested=cancel_requested,
-                    pass_fds=(credential_reader.fileno(),),
-                    private_input=PrivatePipeInput(
-                        reader=credential_reader,
-                        writer=credential_writer,
-                        payload=credential,
-                        max_payload_bytes=LIFECYCLE_MAX_CREDENTIAL_BYTES,
-                    ),
-                    env=sanitized_worker_environment(),
+                request = _encode_request(
+                    mode=mode,
+                    settings=settings,
+                    claim=claim,
+                    started_at=started_at,
+                    credential_fd=credential_reader.fileno(),
+                    credential=credential,
                 )
-            except IsolatedProcessCleanupError:
-                return LifecycleProcessOutcome(False, "LIFECYCLE_WORKER_CLEANUP_FAILED")
-        finally:
-            for index in range(len(credential)):
-                credential[index] = 0
+                try:
+                    outcome = run_isolated_process(
+                        command=_lifecycle_worker_command(),
+                        request=request,
+                        timeout_seconds=timeout_seconds,
+                        max_response_bytes=LIFECYCLE_MAX_MESSAGE_BYTES,
+                        cancel_requested=cancel_requested,
+                        pass_fds=(credential_reader.fileno(),),
+                        private_input=PrivatePipeInput(
+                            reader=credential_reader,
+                            writer=credential_writer,
+                            payload=credential,
+                            max_payload_bytes=LIFECYCLE_MAX_CREDENTIAL_BYTES,
+                        ),
+                        env=sanitized_worker_environment(),
+                    )
+                except IsolatedProcessCleanupError:
+                    return LifecycleProcessOutcome(False, "LIFECYCLE_WORKER_CLEANUP_FAILED")
+            finally:
+                _zero_credential(credential)
+    finally:
+        _zero_credential(credential)
     if outcome.failure == "cancelled":
         return LifecycleProcessOutcome(False, "LIFECYCLE_WORKER_CANCELLED")
     if outcome.failure == "timeout":
