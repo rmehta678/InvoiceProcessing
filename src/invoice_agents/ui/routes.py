@@ -55,6 +55,10 @@ SUPPORTED_SUFFIXES = {".txt", ".json", ".csv", ".xml", ".pdf"}
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 RESULT_ARTIFACT_MAX_BYTES = 1_048_576
 RESULT_ARTIFACT_MAX_DEPTH = 64
+_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
+_STAT_SUPPORTS_DIR_FD = os.stat in os.supports_dir_fd
+_STAT_SUPPORTS_NOFOLLOW = os.stat in os.supports_follow_symlinks
+
 
 # One-line consequence per HumanDecisionKind, matching decision_rules exactly:
 # an authorizing decision permits APPROVE (or HOLD when blocking evidence remains),
@@ -138,15 +142,47 @@ def _artifact_binding_durability_conflict(case_id: str) -> JSONResponse:
     )
 
 
+def _required_open_flag(name: str) -> int:
+    value = getattr(os, name, None)
+    if type(value) is not int:
+        raise ValueError(f"required artifact open flag is unavailable: {name}")
+    return value
+
+
+def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _validate_result_parent_relationships(
+    relationships: list[tuple[int, str, os.stat_result]],
+) -> None:
+    for relationship_parent, component, opened in relationships:
+        linked_parent = os.stat(
+            component,
+            dir_fd=relationship_parent,
+            follow_symlinks=False,
+        )
+        if not _same_inode(opened, linked_parent) or not stat.S_ISDIR(linked_parent.st_mode):
+            raise ValueError("result artifact parent changed during its bounded read")
+
+
 def _read_exact_bound_result_artifact(
     case_id: str,
     binding: ResultArtifactBinding,
 ) -> bytes | None:
     """Read only the exact no-follow file identity authorized by ``binding``."""
 
-    directory_descriptor: int | None = None
-    validation_directory_descriptor: int | None = None
-    artifact_descriptor: int | None = None
+    if not (_OPEN_SUPPORTS_DIR_FD and _STAT_SUPPORTS_DIR_FD and _STAT_SUPPORTS_NOFOLLOW):
+        raise ValueError("descriptor-relative artifact validation is unavailable")
+    read_only = _required_open_flag("O_RDONLY")
+    close_exec = _required_open_flag("O_CLOEXEC")
+    no_follow = _required_open_flag("O_NOFOLLOW")
+    nonblocking = _required_open_flag("O_NONBLOCK")
+    directory = _required_open_flag("O_DIRECTORY")
+    directory_flags = read_only | close_exec | no_follow | nonblocking | directory
+    file_flags = read_only | close_exec | no_follow | nonblocking
+    descriptors: list[int] = []
+    relationships: list[tuple[int, str, os.stat_result]] = []
     payload: bytes | None = None
     cleanup_failed = False
     target_name = f"{case_id}.json"
@@ -159,41 +195,44 @@ def _read_exact_bound_result_artifact(
     if not 0 < binding.artifact_size_bytes <= RESULT_ARTIFACT_MAX_BYTES:
         return None
     try:
-        directory_path = Path.cwd() / "artifacts" / "results"
-        classified_directory = os.lstat(directory_path)
-        if not stat.S_ISDIR(classified_directory.st_mode):
-            return None
-        expected_directory_identity = (
-            classified_directory.st_dev,
-            classified_directory.st_ino,
+        root_descriptor = os.open(".", directory_flags)
+        descriptors.append(root_descriptor)
+        parent_descriptor = root_descriptor
+        for component in ("artifacts", "results"):
+            directory_descriptor = os.open(
+                component,
+                directory_flags,
+                dir_fd=parent_descriptor,
+            )
+            descriptors.append(directory_descriptor)
+            opened_directory = os.fstat(directory_descriptor)
+            if not stat.S_ISDIR(opened_directory.st_mode):
+                return None
+            relationships.append((parent_descriptor, component, opened_directory))
+            parent_descriptor = directory_descriptor
+        namespace_identity = os.stat(
+            target_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
         )
-        directory_descriptor = os.open(
-            directory_path,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
-        )
-        opened_directory = os.fstat(directory_descriptor)
-        if (
-            not stat.S_ISDIR(opened_directory.st_mode)
-            or (opened_directory.st_dev, opened_directory.st_ino)
-            != expected_directory_identity
-        ):
-            return None
-        namespace_identity = os.lstat(target_name, dir_fd=directory_descriptor)
         observed_namespace = (
             namespace_identity.st_dev,
             namespace_identity.st_ino,
             stat.S_IFMT(namespace_identity.st_mode),
             namespace_identity.st_size,
         )
-        if observed_namespace != expected_identity or not stat.S_ISREG(
-            namespace_identity.st_mode
+        if (
+            observed_namespace != expected_identity
+            or not stat.S_ISREG(namespace_identity.st_mode)
+            or namespace_identity.st_nlink != 1
         ):
             return None
         artifact_descriptor = os.open(
             target_name,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
-            dir_fd=directory_descriptor,
+            file_flags,
+            dir_fd=parent_descriptor,
         )
+        descriptors.append(artifact_descriptor)
         opened_identity = os.fstat(artifact_descriptor)
         observed_opened = (
             opened_identity.st_dev,
@@ -201,7 +240,11 @@ def _read_exact_bound_result_artifact(
             stat.S_IFMT(opened_identity.st_mode),
             opened_identity.st_size,
         )
-        if observed_opened != expected_identity or not stat.S_ISREG(opened_identity.st_mode):
+        if (
+            observed_opened != expected_identity
+            or not stat.S_ISREG(opened_identity.st_mode)
+            or opened_identity.st_nlink != 1
+        ):
             return None
         digest = hashlib.sha256()
         chunks: list[bytes] = []
@@ -216,7 +259,11 @@ def _read_exact_bound_result_artifact(
             digest.update(chunk)
             chunks.append(chunk)
         final_opened_identity = os.fstat(artifact_descriptor)
-        final_namespace_identity = os.lstat(target_name, dir_fd=directory_descriptor)
+        final_namespace_identity = os.stat(
+            target_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
         final_opened = (
             final_opened_identity.st_dev,
             final_opened_identity.st_ino,
@@ -234,36 +281,18 @@ def _read_exact_bound_result_artifact(
             or digest.hexdigest() != binding.artifact_sha256
             or final_opened != expected_identity
             or final_namespace != expected_identity
+            or final_opened_identity.st_nlink != 1
+            or final_namespace_identity.st_nlink != 1
         ):
             return None
-        validation_directory_descriptor = os.open(
-            directory_path,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
-        )
-        validation_directory = os.fstat(validation_directory_descriptor)
-        if (
-            not stat.S_ISDIR(validation_directory.st_mode)
-            or (validation_directory.st_dev, validation_directory.st_ino)
-            != expected_directory_identity
-        ):
-            return None
+        _validate_result_parent_relationships(relationships)
         payload = b"".join(chunks)
     except OSError:
         payload = None
     finally:
-        if artifact_descriptor is not None:
+        for descriptor in reversed(descriptors):
             try:
-                os.close(artifact_descriptor)
-            except OSError:
-                cleanup_failed = True
-        if validation_directory_descriptor is not None:
-            try:
-                os.close(validation_directory_descriptor)
-            except OSError:
-                cleanup_failed = True
-        if directory_descriptor is not None:
-            try:
-                os.close(directory_descriptor)
+                os.close(descriptor)
             except OSError:
                 cleanup_failed = True
     return None if cleanup_failed else payload
@@ -469,7 +498,7 @@ async def case_detail(request: Request, case_id: str) -> Response:
 
 
 @router.get("/cases/{case_id}/result.json")
-async def case_result_json(request: Request, case_id: str) -> Response:
+def case_result_json(request: Request, case_id: str) -> Response:
     if SAFE_ID.fullmatch(case_id) is None:
         return _not_found(request, f"case does not exist: {case_id}", "CASE_NOT_FOUND")
     try:
@@ -497,17 +526,24 @@ async def case_result_json(request: Request, case_id: str) -> Response:
         )
     if binding is None or binding.execution_generation != generation:
         return _artifact_binding_conflict(result)
-    payload = _read_exact_bound_result_artifact(case_id, binding)
-    if payload is None:
-        return _artifact_binding_conflict(result)
     try:
+        payload = _read_exact_bound_result_artifact(case_id, binding)
+        if payload is None:
+            return _artifact_binding_conflict(result)
         artifact = _decode_canonical_result_artifact(payload)
-    except (RecursionError, TypeError, ValueError):
+    except (OSError, RecursionError, TypeError, ValueError):
         return _invalid_result_artifact(request, case_id)
     authoritative = sanitize_case_result(result)
     if artifact.case_id != case_id or artifact != authoritative:
         return _invalid_result_artifact(request, case_id)
-    return Response(content=artifact.model_dump_json(), media_type="application/json")
+    return Response(
+        content=artifact.model_dump_json(),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{case_id}.json"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.get("/cases/{case_id}/live")

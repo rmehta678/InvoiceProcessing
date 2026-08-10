@@ -61,6 +61,7 @@ from invoice_agents.observability.audit import (
     normalize_autogen_event_payload,
     redact,
     safe_provider_request_id,
+    safe_tool_call_id,
     sanitize_case_result,
     sanitize_text,
 )
@@ -1933,12 +1934,7 @@ def _validated_tool_call_ids(values: list[object], case_id: str) -> list[str]:
                 case_id=case_id,
                 stop_reason="TOOL_CALL_ID_MISSING",
             ) from None
-        if (
-            len(value) > 256
-            or value != value.strip()
-            or not value.isprintable()
-            or sanitize_text(value) != value
-        ):
+        if safe_tool_call_id(value) is None:
             raise InvoiceAgentsError(
                 ErrorCategory.SCHEMA,
                 "AutoGen tool event returned an invalid correlation ID",

@@ -85,10 +85,15 @@ ANSI_ESCAPE = re.compile(
 )
 SAFE_PROVIDER_REQUEST_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 SANITIZED_TEXT_MAX_CHARS = 4096
+SANITIZED_TEXT_INPUT_MAX_CHARS = 16_384
 TRUNCATION_MARKER = "…[TRUNCATED]"
 JSON_TEXT_MAX_CHARS = 65_536
 JSON_MAX_DEPTH = 20
 JSON_MAX_NODES = 1_000
+JSON_MAX_INTEGER_BITS = 512
+JSON_MAX_NUMERIC_DIGITS = 128
+JSON_MAX_TOTAL_NUMERIC_BITS = 8_192
+JSON_MAX_TOTAL_NUMERIC_DIGITS = 2_048
 JSON_PAYLOAD_REJECTED = "JSON_PAYLOAD_REJECTED"
 EVENT_PAYLOAD_REJECTED = "EVENT_PAYLOAD_REJECTED"
 VALUE_REJECTED = "[VALUE_REJECTED]"
@@ -99,6 +104,19 @@ _CURRENT_AUDIT: ContextVar[AuditRecorder | None] = ContextVar(
 _DETECTION_JOINER = "\ufff0"
 _DETECTION_JOINER_PATTERN = rf"[\t\r\n{_DETECTION_JOINER}]"
 _DETECTION_GAP = rf"(?:[ ]|{_DETECTION_JOINER_PATTERN})*"
+_ASCII_WHITESPACE = frozenset(" \t\r\n\f\v")
+_CONFUSABLE_ASCII = {
+    "\u0430": "a",
+    "\u0435": "e",
+    "\u0456": "i",
+    "\u043a": "k",
+    "\u043e": "o",
+    "\u0440": "p",
+    "\u0441": "c",
+    "\u0455": "s",
+    "\u0445": "x",
+}
+_JSON_NUMBER_TOKEN = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
 
 
 def _flexible_identifier(value: str) -> str:
@@ -132,7 +150,7 @@ FLEXIBLE_SINGLE_QUOTED_CREDENTIAL = re.compile(
 FLEXIBLE_UNQUOTED_CREDENTIAL = re.compile(
     rf"(?i)(?P<prefix>(?<![A-Za-z0-9-]){_FLEXIBLE_CREDENTIAL_KEY}"
     rf"[\"']?{_DETECTION_GAP}[:=]{_DETECTION_GAP})(?![\"'])"
-    r"(?P<value>[^\r\n,}\]]+)"
+    r"(?P<value>\[REDACTED\]|[^\s,;}\]]+)"
 )
 FLEXIBLE_AUTHORIZATION_HEADER = re.compile(
     rf"(?i)(?P<prefix>(?<![A-Za-z0-9-]){_FLEXIBLE_AUTHORIZATION_KEY}"
@@ -165,14 +183,181 @@ def _credential_detection_projection(value: str) -> tuple[str, list[int]]:
     projected: list[str] = []
     source_indexes: list[int] = []
     for source_index, character in enumerate(value):
-        if unicodedata.category(character) in {"Mn", "Mc", "Me"}:
-            normalized = _DETECTION_JOINER
-        else:
-            normalized = unicodedata.normalize("NFKC", character).casefold()
+        normalized = unicodedata.normalize("NFKD", character).casefold()
         for normalized_character in normalized:
-            projected.append(normalized_character)
+            if unicodedata.category(normalized_character) in {"Mn", "Mc", "Me"}:
+                continue
+            projected.append(_CONFUSABLE_ASCII.get(normalized_character, normalized_character))
             source_indexes.append(source_index)
     return "".join(projected), source_indexes
+
+
+def _skip_detection_whitespace(value: str, position: int) -> int:
+    while position < len(value) and value[position] in _ASCII_WHITESPACE:
+        position += 1
+    return position
+
+
+def _match_detection_identifier(value: str, position: int, identifier: str) -> int | None:
+    for offset, expected in enumerate(identifier):
+        if offset:
+            position = _skip_detection_whitespace(value, position)
+        if position >= len(value):
+            return None
+        actual = value[position]
+        if expected == "_":
+            if actual not in {"_", "-"}:
+                return None
+        elif actual != expected:
+            return None
+        position += 1
+    return position
+
+
+def _quoted_value_end(value: str, start: int, quote: str) -> int:
+    escaped = False
+    for position in range(start, len(value)):
+        character = value[position]
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == quote:
+            return position
+    return len(value)
+
+
+def _assignment_credential_spans(
+    value: str,
+    projected: str,
+    source_indexes: list[int],
+) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    sensitive_keys = sorted(SENSITIVE_KEYS, key=len, reverse=True)
+    for position in range(len(projected)):
+        if position and projected[position - 1] in "abcdefghijklmnopqrstuvwxyz0123456789-":
+            continue
+        for sensitive_key in sensitive_keys:
+            identifier_end = _match_detection_identifier(projected, position, sensitive_key)
+            if identifier_end is None:
+                continue
+            syntax_position = _skip_detection_whitespace(projected, identifier_end)
+            if syntax_position < len(projected) and projected[syntax_position] in {'"', "'"}:
+                syntax_position = _skip_detection_whitespace(projected, syntax_position + 1)
+            if syntax_position >= len(projected) or projected[syntax_position] not in {":", "="}:
+                continue
+            value_position = _skip_detection_whitespace(projected, syntax_position + 1)
+            if value_position >= len(projected):
+                break
+            source_start = source_indexes[value_position]
+            opening = projected[value_position]
+            if opening in {'"', "'"}:
+                source_start += 1
+                source_end = _quoted_value_end(value, source_start, opening)
+            elif sensitive_key in {
+                "authorization",
+                "proxy_authorization",
+                "cookie",
+                "set_cookie",
+            }:
+                source_end = source_start
+                while source_end < len(value) and value[source_end] not in {"\r", "\n"}:
+                    source_end += 1
+            else:
+                source_end = source_start
+                while (
+                    source_end < len(value)
+                    and value[source_end] not in _ASCII_WHITESPACE
+                    and value[source_end] not in {",", ";", "}", "]"}
+                ):
+                    source_end += 1
+            if source_end > source_start:
+                spans.append((source_start, source_end))
+            break
+    return spans
+
+
+def _provider_token_end(projected: str, position: int) -> tuple[int, int] | None:
+    token_characters = 0
+    last_token_position = position
+    ordinary_space_used = False
+    has_separator = False
+    while position < len(projected):
+        character = projected[position]
+        if character in "abcdefghijklmnopqrstuvwxyz0123456789_-":
+            token_characters += 1
+            has_separator = has_separator or character in "_-"
+            last_token_position = position + 1
+            position += 1
+            continue
+        if character in {"\t", "\r", "\n", "\f", "\v"}:
+            position += 1
+            continue
+        if character == " " and not ordinary_space_used:
+            continuation_start = _skip_detection_whitespace(projected, position)
+            continuation_end = continuation_start
+            while (
+                continuation_end < len(projected)
+                and projected[continuation_end] in "abcdefghijklmnopqrstuvwxyz0123456789_-"
+            ):
+                continuation_end += 1
+            continuation = projected[continuation_start:continuation_end]
+            if len(continuation) < 8 or not any(item in continuation for item in "_-"):
+                break
+            ordinary_space_used = True
+            position = continuation_start
+            continue
+        break
+    if token_characters < 8 or (ordinary_space_used and not has_separator):
+        return None
+    return last_token_position, token_characters
+
+
+def _provider_credential_spans(
+    projected: str,
+    source_indexes: list[int],
+) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for position in range(len(projected)):
+        if position and projected[position - 1] in "abcdefghijklmnopqrstuvwxyz0123456789-":
+            continue
+        prefix_end = _match_detection_identifier(projected, position, "sk")
+        if prefix_end is None:
+            prefix_end = _match_detection_identifier(projected, position, "xai")
+        if prefix_end is None:
+            continue
+        hyphen_position = _skip_detection_whitespace(projected, prefix_end)
+        if hyphen_position >= len(projected) or projected[hyphen_position] != "-":
+            continue
+        token_position = _skip_detection_whitespace(projected, hyphen_position + 1)
+        project_end = _match_detection_identifier(projected, token_position, "proj")
+        if project_end is not None:
+            second_hyphen = _skip_detection_whitespace(projected, project_end)
+            if second_hyphen < len(projected) and projected[second_hyphen] == "-":
+                token_position = _skip_detection_whitespace(projected, second_hyphen + 1)
+        token_result = _provider_token_end(projected, token_position)
+        if token_result is None:
+            continue
+        token_end, _token_characters = token_result
+        spans.append((source_indexes[position], source_indexes[token_end - 1] + 1))
+    return spans
+
+
+def _redact_lexical_credentials(value: str) -> str:
+    projected, source_indexes = _credential_detection_projection(value)
+    if not source_indexes:
+        return value
+    spans = _assignment_credential_spans(value, projected, source_indexes)
+    spans.extend(_provider_credential_spans(projected, source_indexes))
+    merged: list[list[int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    for start, end in reversed(merged):
+        value = f"{value[:start]}[REDACTED]{value[end:]}"
+    return value
 
 
 def _redact_projected_spans(
@@ -199,7 +384,7 @@ def _redact_projected_spans(
 
 
 def _redact_text_patterns(value: str) -> str:
-    span_safe = value
+    span_safe = _redact_lexical_credentials(value)
     for pattern in (
         FLEXIBLE_DOUBLE_QUOTED_CREDENTIAL,
         FLEXIBLE_SINGLE_QUOTED_CREDENTIAL,
@@ -278,8 +463,10 @@ def _normalize_lines(value: str) -> str:
 def sanitize_text(value: str) -> str:
     """Redact credential-like free text and apply one deterministic size ceiling."""
 
-    sanitized = _normalize_lines(_redact_text_patterns(_strip_unsafe_controls(value)))
-    if len(sanitized) <= SANITIZED_TEXT_MAX_CHARS:
+    input_truncated = len(value) > SANITIZED_TEXT_INPUT_MAX_CHARS
+    bounded = value[:SANITIZED_TEXT_INPUT_MAX_CHARS]
+    sanitized = _normalize_lines(_redact_text_patterns(_strip_unsafe_controls(bounded)))
+    if not input_truncated and len(sanitized) <= SANITIZED_TEXT_MAX_CHARS:
         return sanitized
     visible_chars = SANITIZED_TEXT_MAX_CHARS - len(TRUNCATION_MARKER)
     return f"{sanitized[:visible_chars]}{TRUNCATION_MARKER}"
@@ -297,13 +484,25 @@ def safe_provider_request_id(value: object) -> str | None:
 
 def _normalized_key(value: str) -> str:
     safe = _normalize_lines(_strip_unsafe_controls(value))
-    detection_key = "".join(
-        character
-        for character in safe
-        if unicodedata.category(character) not in {"Mn", "Mc", "Me"}
-        and character not in {"\t", "\n", "\r"}
-    )
-    return unicodedata.normalize("NFKC", detection_key).casefold().replace("-", "_")
+    projected, _source_indexes = _credential_detection_projection(safe)
+    return "".join(
+        character for character in projected if character not in _ASCII_WHITESPACE
+    ).replace("-", "_")
+
+
+def safe_tool_call_id(value: object) -> str | None:
+    """Return one unchanged, bounded, non-credential tool correlation ID."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 256
+        or value != value.strip()
+        or not value.isprintable()
+        or sanitize_text(value) != value
+    ):
+        return None
+    return value
 
 
 def _is_sensitive_key(value: str) -> bool:
@@ -341,7 +540,16 @@ def _redact(value: Any, *, depth: int, budget: list[int]) -> Any:
 def redact(value: Any) -> Any:
     """Redact exact secret keys and sanitize every serializable text boundary."""
 
-    return _redact(value, depth=0, budget=[0])
+    if not _json_value_within_limits(value, allow_nonfinite=True):
+        return VALUE_REJECTED
+    try:
+        cleaned = _redact(value, depth=0, budget=[0])
+        if not _json_value_within_limits(cleaned):
+            return VALUE_REJECTED
+        json.dumps(cleaned, allow_nan=False, ensure_ascii=False)
+    except (OverflowError, RuntimeError, TypeError, ValueError):
+        return VALUE_REJECTED
+    return cleaned
 
 
 def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -371,18 +579,48 @@ def _canonical_json_float(value: str) -> float:
     return parsed
 
 
-def _reject_excessive_json_nesting(value: str) -> None:
+def _validate_json_lexemes(value: str) -> None:
     depth = 0
     in_string = False
-    escaped = False
-    for character in value:
+    total_numeric_digits = 0
+    position = 0
+    while position < len(value):
+        character = value[position]
         if in_string:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == '"':
+            codepoint = ord(character)
+            if 0xD800 <= codepoint <= 0xDFFF:
+                raise ValueError("JSON string contains an unpaired surrogate")
+            if character == "\\":
+                if position + 1 >= len(value):
+                    raise ValueError("JSON string ends in an escape")
+                if value[position + 1] == "u":
+                    escape = value[position + 2 : position + 6]
+                    if len(escape) != 4 or any(
+                        item not in "0123456789abcdefABCDEF" for item in escape
+                    ):
+                        raise ValueError("JSON string contains an invalid Unicode escape")
+                    escaped_codepoint = int(escape, 16)
+                    if 0xD800 <= escaped_codepoint <= 0xDBFF:
+                        low_prefix = value[position + 6 : position + 8]
+                        low_escape = value[position + 8 : position + 12]
+                        if low_prefix != "\\u" or len(low_escape) != 4:
+                            raise ValueError("JSON string contains an unpaired high surrogate")
+                        low_codepoint = int(low_escape, 16)
+                        if not 0xDC00 <= low_codepoint <= 0xDFFF:
+                            raise ValueError("JSON string contains an unpaired high surrogate")
+                        position += 12
+                        continue
+                    if 0xDC00 <= escaped_codepoint <= 0xDFFF:
+                        raise ValueError("JSON string contains an unpaired low surrogate")
+                    position += 6
+                    continue
+                position += 2
+                continue
+            if character == '"':
                 in_string = False
+            elif ord(character) < 0x20:
+                raise ValueError("JSON string contains an unescaped control")
+            position += 1
             continue
         if character == '"':
             in_string = True
@@ -392,12 +630,26 @@ def _reject_excessive_json_nesting(value: str) -> None:
                 raise ValueError("JSON nesting exceeds the audit boundary")
         elif character in "}]":
             depth -= 1
+        elif character == "-" or character.isdigit():
+            number = _JSON_NUMBER_TOKEN.match(value, position)
+            if number is not None:
+                numeric_lexeme = number.group(0)
+                numeric_digits = sum(item.isdigit() for item in numeric_lexeme)
+                total_numeric_digits += numeric_digits
+                if (
+                    numeric_digits > JSON_MAX_NUMERIC_DIGITS
+                    or total_numeric_digits > JSON_MAX_TOTAL_NUMERIC_DIGITS
+                ):
+                    raise ValueError("JSON numeric budget exceeded")
+                position = number.end()
+                continue
+        position += 1
 
 
 def _bounded_json_mapping(value: str) -> dict[str, object]:
     if len(value) > JSON_TEXT_MAX_CHARS or value != value.strip():
         raise ValueError("JSON text exceeds the audit boundary")
-    _reject_excessive_json_nesting(value)
+    _validate_json_lexemes(value)
     try:
         parsed = json.loads(
             value,
@@ -415,36 +667,90 @@ def _bounded_json_mapping(value: str) -> dict[str, object]:
     return parsed
 
 
-def _json_value_within_limits(value: object) -> bool:
-    node_budget = [0]
-    character_budget = [0]
+def _contains_surrogate(value: str) -> bool:
+    return any(0xD800 <= ord(character) <= 0xDFFF for character in value)
 
-    def visit(item: object, depth: int) -> bool:
-        node_budget[0] += 1
-        if depth > JSON_MAX_DEPTH or node_budget[0] > JSON_MAX_NODES:
-            return False
-        if isinstance(item, Mapping):
-            safe_keys: set[str] = set()
-            for key, nested in item.items():
-                raw_key = str(key)
-                character_budget[0] += len(raw_key)
-                safe_key = sanitize_text(raw_key)
-                if safe_key in safe_keys or not visit(nested, depth + 1):
+
+def _json_value_within_limits(value: object, *, allow_nonfinite: bool = False) -> bool:
+    node_budget = 0
+    character_budget = 0
+    numeric_bit_budget = 0
+    active_containers: set[int] = set()
+    stack: list[tuple[bool, object, int]] = [(False, value, 0)]
+    try:
+        while stack:
+            exiting, item, depth = stack.pop()
+            if exiting:
+                active_containers.remove(id(item))
+                continue
+            node_budget += 1
+            if depth > JSON_MAX_DEPTH or node_budget > JSON_MAX_NODES:
+                return False
+            if isinstance(item, Mapping):
+                identity = id(item)
+                if identity in active_containers or len(item) > JSON_MAX_NODES:
                     return False
-                safe_keys.add(safe_key)
-            return character_budget[0] <= JSON_TEXT_MAX_CHARS
-        if isinstance(item, list):
-            return all(visit(nested, depth + 1) for nested in item)
-        if isinstance(item, str):
-            character_budget[0] += len(item)
-            return character_budget[0] <= JSON_TEXT_MAX_CHARS
-        return (
-            item is None
-            or type(item) in {str, bool, int}
-            or (type(item) is float and math.isfinite(item))
-        )
-
-    return visit(value, 0)
+                active_containers.add(identity)
+                stack.append((True, item, depth))
+                safe_keys: set[str] = set()
+                children: list[object] = []
+                for key, nested in item.items():
+                    raw_key = str(key)
+                    character_budget += len(raw_key)
+                    safe_key = sanitize_text(raw_key)
+                    if (
+                        _contains_surrogate(raw_key)
+                        or safe_key in safe_keys
+                        or character_budget > JSON_TEXT_MAX_CHARS
+                    ):
+                        return False
+                    safe_keys.add(safe_key)
+                    children.append(nested)
+                stack.extend((False, child, depth + 1) for child in reversed(children))
+                continue
+            if isinstance(item, str):
+                character_budget += len(item)
+                if _contains_surrogate(item) or character_budget > JSON_TEXT_MAX_CHARS:
+                    return False
+                continue
+            if isinstance(item, (bytes, bytearray, memoryview)):
+                character_budget += len(item)
+                if character_budget > JSON_TEXT_MAX_CHARS:
+                    return False
+                continue
+            if isinstance(item, Sequence):
+                identity = id(item)
+                if identity in active_containers or len(item) > JSON_MAX_NODES:
+                    return False
+                active_containers.add(identity)
+                stack.append((True, item, depth))
+                stack.extend((False, child, depth + 1) for child in reversed(item))
+                continue
+            if item is None or type(item) is bool:
+                continue
+            if type(item) is int:
+                integer_bits = abs(item).bit_length()
+                numeric_bit_budget += integer_bits
+                if (
+                    integer_bits > JSON_MAX_INTEGER_BITS
+                    or numeric_bit_budget > JSON_MAX_TOTAL_NUMERIC_BITS
+                ):
+                    return False
+                continue
+            if type(item) is float:
+                numeric_bit_budget += 64
+                if (
+                    not allow_nonfinite and not math.isfinite(item)
+                ) or numeric_bit_budget > JSON_MAX_TOTAL_NUMERIC_BITS:
+                    return False
+                continue
+            text = str(item)
+            character_budget += len(text)
+            if _contains_surrogate(text) or character_budget > JSON_TEXT_MAX_CHARS:
+                return False
+    except (OverflowError, RuntimeError, TypeError, ValueError):
+        return False
+    return True
 
 
 def _rejected_json_payload() -> str:
@@ -470,13 +776,19 @@ def sanitize_json_text(value: str) -> str:
         parsed = _bounded_json_mapping(value)
     except (TypeError, ValueError):
         return _rejected_json_payload()
-    return json.dumps(
-        redact(parsed),
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
+    cleaned = redact(parsed)
+    if not isinstance(cleaned, Mapping):
+        return _rejected_json_payload()
+    try:
+        return json.dumps(
+            cleaned,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (OverflowError, RuntimeError, TypeError, ValueError):
+        return _rejected_json_payload()
 
 
 def _safe_usage(value: object) -> dict[str, int] | None:
@@ -564,13 +876,21 @@ def sanitize_stored_event_payload(event_type: str, value: str) -> str:
             if event_type.startswith("autogen.")
             else redact(parsed)
         )
-    return json.dumps(
-        safe_payload,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
+    try:
+        return json.dumps(
+            safe_payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (OverflowError, RuntimeError, TypeError, ValueError):
+        return json.dumps(
+            _rejected_event_payload(event_type),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
 
 
 def sanitize_case_result(result: CaseResult) -> CaseResult:
@@ -681,7 +1001,11 @@ class AuditRecorder:
     ) -> str:
         """Persist one event and mirror its timing/correlation in a local span."""
 
+        sanitized_tool_call_id = safe_tool_call_id(tool_call_id)
+        if tool_call_id is not None and sanitized_tool_call_id is None:
+            raise ValueError("invalid tool call correlation ID")
         event_id = f"evt_{uuid4().hex}"
+        safe_payload: Any
         if event_type.startswith("autogen."):
             safe_payload = (
                 normalize_autogen_event_payload(event_type, payload)
@@ -690,13 +1014,20 @@ class AuditRecorder:
             )
         else:
             safe_payload = redact(payload)
-        encoded = json.dumps(
-            safe_payload,
-            allow_nan=False,
-            default=str,
-            ensure_ascii=False,
-            sort_keys=True,
-        )
+        try:
+            encoded = json.dumps(
+                safe_payload,
+                allow_nan=False,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        except (OverflowError, RuntimeError, TypeError, ValueError):
+            safe_payload = (
+                _rejected_event_payload(event_type)
+                if event_type.startswith("autogen.")
+                else VALUE_REJECTED
+            )
+            encoded = json.dumps(safe_payload, ensure_ascii=False, sort_keys=True)
         sanitized_provider_request_id = safe_provider_request_id(provider_request_id)
         created_at = datetime.now(UTC).isoformat()
         with self.tracer.start_as_current_span(event_type) as span:
@@ -716,7 +1047,7 @@ class AuditRecorder:
                         source_id,
                         event_type,
                         agent_name,
-                        tool_call_id,
+                        sanitized_tool_call_id,
                         db_evidence_id,
                         review_id,
                         payment_id,

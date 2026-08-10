@@ -274,6 +274,9 @@ def test_case_result_json_requires_a_durable_artifact_binding(
     }
     artifact_dir = ui_workdir / "artifacts" / "results"
     artifact_dir.mkdir(parents=True)
+    still_unbound = client.get(f"/cases/{case_id}/result.json")
+    assert still_unbound.status_code == 409
+    assert still_unbound.json() == missing.json()
     store = WorkflowStore(settings.workflow_db)
     result = store.load_result(case_id)
     assert result is not None

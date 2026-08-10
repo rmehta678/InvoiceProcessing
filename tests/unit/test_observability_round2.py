@@ -38,6 +38,12 @@ DEFAULT_IGNORABLES = (
 )
 REJECTED_JSON = '{"error":"JSON_PAYLOAD_REJECTED","original":"[REDACTED]"}'
 REJECTED_EVENT = "EVENT_PAYLOAD_REJECTED"
+REJECTED_VALUE = "[VALUE_REJECTED]"
+
+
+class _ExplodingRepresentation:
+    def __str__(self) -> str:
+        raise RuntimeError("round4 representation canary")
 
 
 @pytest.mark.parametrize("invisible", DEFAULT_IGNORABLES)
@@ -303,3 +309,146 @@ def test_nonfinite_python_values_never_serialize_as_json_constants(workflow_db: 
         "type": "ToolCallRequestEvent",
     }
     assert "Infinity" not in row["payload_json"]
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        "ápi_key=round4-nfc-key-canary",
+        "provider rejected sk-abcd efgh_12345678",
+        "provider rejected sk-abcd\u0435fgh_12345678",
+    ],
+)
+def test_normalized_whitespace_and_confusable_credentials_are_redacted(
+    credential: str,
+) -> None:
+    cleaned = sanitize_text(credential)
+
+    assert cleaned.count("[REDACTED]") == 1
+    assert "round4" not in cleaned
+    assert "abcd" not in cleaned
+
+
+def test_nfc_equivalent_sensitive_mapping_key_redacts_without_changing_the_key() -> None:
+    assert redact({"ápi_key": "round4-nfc-map-canary", "prompt_tokens": 47}) == {
+        "ápi_key": "[REDACTED]",
+        "prompt_tokens": 47,
+    }
+
+
+@pytest.mark.parametrize(
+    "tool_call_id",
+    [
+        "call_sk-abcd efgh_12345678",
+        "call_sk-abcd\u0435fgh_12345678",
+    ],
+)
+def test_split_and_confusable_credential_tool_ids_are_rejected_everywhere(
+    workflow_db: object,
+    tool_call_id: str,
+) -> None:
+    with pytest.raises(InvoiceAgentsError) as failure:
+        orchestration._validated_tool_call_ids([tool_call_id], "case_round4")
+    assert failure.value.stop_reason == "TOOL_CALL_ID_INVALID"
+
+    recorder = AuditRecorder(workflow_db, "case_round4_raw_tool_id")
+    with pytest.raises(ValueError, match="tool call"):
+        recorder.record("test.raw-tool-id", {"safe": True}, tool_call_id=tool_call_id)
+    with connect_database(workflow_db, read_only=True) as connection:
+        rows = connection.execute(
+            "SELECT tool_call_id FROM events WHERE case_id = ?",
+            ("case_round4_raw_tool_id",),
+        ).fetchall()
+    assert rows == []
+
+
+def test_quoted_credentials_span_lines_and_escapes_without_deleting_evidence() -> None:
+    marker_a = "round4-multiline-a"
+    marker_b = "round4-multiline-b"
+    cleaned = sanitize_text(
+        f'api_key="{marker_a}\ncontinued \\"quoted\\" {marker_b}" prompt_tokens=47 token_count=59'
+    )
+
+    assert cleaned == 'api_key="[REDACTED]" prompt_tokens=47 token_count=59'
+    assert marker_a not in cleaned
+    assert marker_b not in cleaned
+
+
+def test_unquoted_credential_stops_at_lexical_whitespace_and_preserves_evidence() -> None:
+    cleaned = sanitize_text("api_key=round4-unquoted-canary prompt_tokens=47 token_count=59")
+
+    assert cleaned == "api_key=[REDACTED] prompt_tokens=47 token_count=59"
+
+
+def test_sanitizer_bounds_input_work_without_leaking_a_boundary_spanning_secret() -> None:
+    prefix = "invoice context " * 245
+    value = prefix + ' api_key="round4-boundary-' + ("secret" * 20_000) + '" trailing'
+
+    cleaned = sanitize_text(value)
+
+    assert len(cleaned) <= 4_096
+    assert cleaned.endswith("…[TRUNCATED]")
+    assert "round4-boundary" not in cleaned
+    assert cleaned == sanitize_text(value)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"bad":"\\ud800"}',
+        '{"bad":"\\udc00"}',
+        '{"bad":"\ud800"}',
+    ],
+)
+def test_unpaired_json_surrogates_are_rejected_opaquely(raw: str) -> None:
+    assert sanitize_json_text(raw) == REJECTED_JSON
+
+
+def test_paired_json_surrogates_remain_valid_unicode() -> None:
+    assert json.loads(sanitize_json_text('{"emoji":"\\ud83d\\ude00"}')) == {"emoji": "😀"}
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"huge":' + ("9" * 4_000) + "}",
+        '{"huge":1e' + ("9" * 1_000) + "}",
+    ],
+)
+def test_long_numeric_lexemes_are_rejected_before_integer_or_float_conversion(raw: str) -> None:
+    assert sanitize_json_text(raw) == REJECTED_JSON
+
+
+def test_python_object_budget_rejects_huge_integers_cycles_and_serialization_failures(
+    workflow_db: object,
+) -> None:
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+    huge_integer = 10**5_000
+    recorder = AuditRecorder(workflow_db, "case_round4_object_budget")
+
+    assert redact({"huge": huge_integer}) == REJECTED_VALUE
+    assert redact(cyclic) == REJECTED_VALUE
+    assert redact({"opaque": _ExplodingRepresentation()}) == REJECTED_VALUE
+    for payload in ({"huge": huge_integer}, cyclic, {"opaque": _ExplodingRepresentation()}):
+        recorder.record("test.invalid-python-payload", payload)
+
+    with connect_database(workflow_db, read_only=True) as connection:
+        rows = connection.execute(
+            "SELECT payload_json FROM events WHERE case_id = ? ORDER BY rowid",
+            ("case_round4_object_budget",),
+        ).fetchall()
+    assert [json.loads(row["payload_json"]) for row in rows] == [
+        REJECTED_VALUE,
+        REJECTED_VALUE,
+        REJECTED_VALUE,
+    ]
+
+
+def test_python_object_budget_allows_shared_acyclic_references() -> None:
+    shared = {"invoice_number": "INV-42", "prompt_tokens": 47}
+
+    assert redact({"first": shared, "second": shared}) == {
+        "first": {"invoice_number": "INV-42", "prompt_tokens": 47},
+        "second": {"invoice_number": "INV-42", "prompt_tokens": 47},
+    }
