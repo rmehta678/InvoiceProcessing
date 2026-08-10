@@ -24,6 +24,13 @@ from invoice_agents.ui.runs import RunRegistry
 
 POLL_SECONDS = 1.0
 HEARTBEAT_SECONDS = 15.0
+_VISIBLE_RECOVERY_STOPS = frozenset(
+    {
+        "PERSISTED_RESULT_INVALID",
+        "EXECUTION_AUTHORITY_CORRUPT",
+        "EVIDENCE_AUTHORITY_MISSING",
+    }
+)
 
 
 def _tool_names(content: Any) -> list[dict[str, Any]]:
@@ -87,7 +94,7 @@ def terminal_payload(
         return _recovery_failure_payload(
             case_id,
             exc.stop_reason
-            if exc.stop_reason in {"PERSISTED_RESULT_INVALID", "EXECUTION_AUTHORITY_CORRUPT"}
+            if exc.stop_reason in _VISIBLE_RECOVERY_STOPS
             else "EXECUTION_RECOVERY_FAILED",
         )
     except Exception:
@@ -99,7 +106,18 @@ def terminal_payload(
     if snapshot.execution_state == "FINISHED":
         if snapshot.result is None:
             return _recovery_failure_payload(case_id, "PERSISTED_RESULT_INVALID")
-        return _stored_terminal_payload(case_id, snapshot.result, registry)
+        try:
+            result = store.merge_relational_case_evidence(snapshot.result)
+        except InvoiceAgentsError as exc:
+            return _recovery_failure_payload(
+                case_id,
+                exc.stop_reason
+                if exc.stop_reason in _VISIBLE_RECOVERY_STOPS
+                else "EXECUTION_RECOVERY_FAILED",
+            )
+        except Exception:
+            return _recovery_failure_payload(case_id, "EXECUTION_RECOVERY_FAILED")
+        return _stored_terminal_payload(case_id, result, registry)
     try:
         store.recover_expired_executions(case_id=case_id)
         snapshot = store.load_case_execution_snapshot(case_id)
@@ -107,7 +125,7 @@ def terminal_payload(
         return _recovery_failure_payload(
             case_id,
             exc.stop_reason
-            if exc.stop_reason in {"PERSISTED_RESULT_INVALID", "EXECUTION_AUTHORITY_CORRUPT"}
+            if exc.stop_reason in _VISIBLE_RECOVERY_STOPS
             else "EXECUTION_RECOVERY_FAILED",
         )
     except Exception:
@@ -118,7 +136,18 @@ def terminal_payload(
         return None
     if snapshot.execution_state != "FINISHED" or snapshot.result is None:
         return _recovery_failure_payload(case_id, "EXECUTION_RECOVERY_FAILED")
-    return _stored_terminal_payload(case_id, snapshot.result, registry)
+    try:
+        result = store.merge_relational_case_evidence(snapshot.result)
+    except InvoiceAgentsError as exc:
+        return _recovery_failure_payload(
+            case_id,
+            exc.stop_reason
+            if exc.stop_reason in _VISIBLE_RECOVERY_STOPS
+            else "EXECUTION_RECOVERY_FAILED",
+        )
+    except Exception:
+        return _recovery_failure_payload(case_id, "EXECUTION_RECOVERY_FAILED")
+    return _stored_terminal_payload(case_id, result, registry)
 
 
 def _stored_terminal_payload(

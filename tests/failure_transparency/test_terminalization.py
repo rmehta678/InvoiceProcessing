@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Event
+from threading import Event, Timer
 from types import SimpleNamespace
 
 import pytest
@@ -649,13 +649,21 @@ async def test_ui_batch_retains_each_claim_while_entries_are_queued(
     batch.task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await batch.task
-    for claim in captured:
-        if claim is not None:
-            WorkflowStore(settings).release_case_execution(claim)
+    terminal_snapshots = [
+        WorkflowStore(settings).load_case_execution_snapshot(case_id)
+        for case_id in prepared_case_ids
+    ]
 
     assert durable_before_schedule == [True, True]
     assert len(captured) == 2
     assert all(claim is not None for claim in captured)
+    assert all(
+        snapshot is not None
+        and snapshot.execution_state == "FINISHED"
+        and snapshot.result is not None
+        and snapshot.result.stop_reason == "CANCELLED"
+        for snapshot in terminal_snapshots
+    )
 
 
 @pytest.mark.asyncio
@@ -1553,6 +1561,7 @@ async def test_heartbeat_process_control_failure_reaches_outer_terminalizer(
         *,
         renew: Callable[[ExecutionClaim, int], ExecutionClaim],
         claim: ExecutionClaim,
+        replace_claim: Callable[[ExecutionClaim], None],
         lease_seconds: int,
         renewal_interval_seconds: float,
     ) -> CaseResult:
@@ -1561,6 +1570,7 @@ async def test_heartbeat_process_control_failure_reaches_outer_terminalizer(
             operation,
             renew=exit_renewal,
             claim=claim,
+            replace_claim=replace_claim,
             lease_seconds=lease_seconds,
             renewal_interval_seconds=0.001,
         )
@@ -2655,7 +2665,7 @@ async def test_ui_batch_cancel_surfaces_active_terminal_recovery_failure(
     assert excinfo.value.__cause__ is None
     assert excinfo.value.__context__ is None
     handle = registry.handle(batch.entries[0].case_id)
-    assert handle is not None and handle.state == "done"
+    assert handle is not None and handle.state == "unresolved"
 
 
 @pytest.mark.asyncio
@@ -2749,3 +2759,545 @@ async def test_one_terminal_db_failure_publishes_recovery_exactly_once(
     assert recovery.is_file()
     assert not (recovery.parent / f"{case_id}.json").exists()
     assert list(recovery.parent.glob(f"{case_id}*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_core_batch_preserves_recovery_only_preparation_publication(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recovery-only preparation outcome must never gain a normal result file."""
+
+    monkeypatch.setattr(
+        orchestration,
+        "extract_invoice_evidence",
+        lambda _source: (_ for _ in ()).throw(RuntimeError("preparation sentinel")),
+    )
+    monkeypatch.setattr(
+        WorkflowStore,
+        "finish_case",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("terminal write sentinel")
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    results = await orchestration.process_batch(
+        [invoice_dir / "invoice_1001.txt"], settings, concurrency=1
+    )
+
+    assert len(results) == 1
+    case_id = results[0].case_id
+    output = tmp_path / "artifacts" / "results"
+    assert (output / f"{case_id}.recovery.json").is_file()
+    assert not (output / f"{case_id}.json").exists()
+    assert list(output.glob(f"{case_id}*.tmp")) == []
+
+
+@pytest.mark.parametrize(
+    ("fault_type", "expected_control"),
+    [
+        (RuntimeError, None),
+        (asyncio.CancelledError, asyncio.CancelledError),
+        (SystemExit, SystemExit),
+        (KeyboardInterrupt, KeyboardInterrupt),
+    ],
+)
+@pytest.mark.asyncio
+async def test_core_batch_post_claim_preparation_failure_has_one_recovery_owner(
+    fault_type: type[BaseException],
+    expected_control: type[BaseException] | None,
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every post-claim control path keeps recovery-only publication exclusive."""
+
+    monkeypatch.setattr(
+        orchestration,
+        "extract_invoice_evidence",
+        lambda _source: (_ for _ in ()).throw(fault_type("preparation sentinel")),
+    )
+    monkeypatch.setattr(
+        WorkflowStore,
+        "finish_case",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("terminal write sentinel")
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    if expected_control is None:
+        results = await orchestration.process_batch(
+            [invoice_dir / "invoice_1001.txt"], settings, concurrency=1
+        )
+        assert len(results) == 1
+    else:
+        with pytest.raises(expected_control):
+            await orchestration.process_batch(
+                [invoice_dir / "invoice_1001.txt"], settings, concurrency=1
+            )
+
+    output = tmp_path / "artifacts" / "results"
+    recoveries = list(output.glob("case_*.recovery.json"))
+    assert len(recoveries) == 1
+    case_id = recoveries[0].name.removesuffix(".recovery.json")
+    assert not (output / f"{case_id}.json").exists()
+    assert list(output.glob(f"{case_id}*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_ui_batch_same_tick_cancellation_has_installed_drain_ownership(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A returned batch task is not cancellable before every claim has an owner."""
+
+    monkeypatch.chdir(tmp_path)
+    registry = RunRegistry()
+    batch = await registry.start_batch(
+        [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
+        settings,
+        concurrency=1,
+    )
+    assert batch.task is not None
+
+    batch.task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await batch.task
+
+    store = WorkflowStore(settings)
+    for entry in batch.entries:
+        result = store.load_result(entry.case_id)
+        assert result is not None
+        assert result.stop_reason == "CANCELLED"
+        handle = registry.handle(entry.case_id)
+        assert handle is not None and handle.state == "done"
+
+
+@pytest.mark.asyncio
+async def test_core_batch_first_await_cancellation_terminalizes_unstarted_tasks(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation queued before child first turns still has a direct owner."""
+
+    real_prepare = orchestration.prepare_claimed_case
+    prepared: list[tuple[str, datetime, ExecutionClaim]] = []
+
+    def cancel_after_second_prepare(path: Path, selected_settings: Settings) -> object:
+        outcome = real_prepare(path, selected_settings)
+        assert isinstance(outcome, tuple)
+        prepared.append(outcome)
+        if len(prepared) == 2:
+            task = asyncio.current_task()
+            assert task is not None
+            asyncio.get_running_loop().call_soon(task.cancel)
+        return outcome
+
+    monkeypatch.setattr(orchestration, "prepare_claimed_case", cancel_after_second_prepare)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(asyncio.CancelledError):
+        await orchestration.process_batch(
+            [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
+            settings,
+            concurrency=1,
+        )
+
+    assert len(prepared) == 2
+    store = WorkflowStore(settings)
+    for case_id, _started_at, _claim in prepared:
+        result = store.load_result(case_id)
+        assert result is not None
+        assert result.stop_reason == "CANCELLED"
+
+
+@pytest.mark.asyncio
+async def test_ui_start_batch_cancellation_during_startup_handshake_accounts_all_claims(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation before child ownership is acknowledged uses the direct owner."""
+
+    handshake_entered = asyncio.Event()
+    captured_batches: list[ui_runs.BatchState] = []
+
+    async def delayed_run_batch(
+        self: RunRegistry,
+        batch: ui_runs.BatchState,
+        entries: list[ui_runs.BatchEntry],
+        selected_settings: Settings,
+        ownership_installed: asyncio.Event,
+    ) -> None:
+        del self, entries, selected_settings, ownership_installed
+        captured_batches.append(batch)
+        handshake_entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(RunRegistry, "_run_batch", delayed_run_batch)
+    monkeypatch.chdir(tmp_path)
+    registry = RunRegistry()
+    startup = asyncio.create_task(
+        registry.start_batch(
+            [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
+            settings,
+            concurrency=1,
+        )
+    )
+    await asyncio.wait_for(handshake_entered.wait(), timeout=1)
+
+    startup.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(startup, timeout=1)
+
+    assert len(captured_batches) == 1
+    store = WorkflowStore(settings)
+    for entry in captured_batches[0].entries:
+        result = store.load_result(entry.case_id)
+        assert result is not None
+        assert result.stop_reason == "CANCELLED"
+        handle = registry.handle(entry.case_id)
+        assert handle is not None and handle.state == "done"
+
+
+@pytest.mark.asyncio
+async def test_ui_batch_recovery_failure_precedes_ordinary_child_failure(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every drained failure is inspected even when the first child fails ordinarily."""
+
+    calls = 0
+
+    async def fail_first_runner(*_args: object, **_kwargs: object) -> CaseResult:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("ordinary child sentinel")
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(ui_runs, "run_prepared_case", fail_first_runner)
+    monkeypatch.setattr(
+        WorkflowStore,
+        "finish_case",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("terminal persistence sentinel")
+        ),
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_write_recovery_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("recovery publication sentinel")),
+    )
+    drained: list[object] = []
+    original_select = orchestration._select_drained_failure
+
+    def capture_selection(
+        primary: BaseException,
+        outcomes: list[object],
+        durability: dict[str, BaseException | None],
+    ) -> BaseException:
+        drained.extend(outcomes)
+        return original_select(primary, outcomes, durability)
+
+    monkeypatch.setattr(ui_runs, "_select_drained_failure", capture_selection)
+    monkeypatch.chdir(tmp_path)
+    registry = RunRegistry()
+    batch = await registry.start_batch(
+        [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
+        settings,
+        concurrency=1,
+    )
+    assert batch.task is not None
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        await batch.task
+
+    assert any(
+        isinstance(outcome, InvoiceAgentsError)
+        and outcome.stop_reason == "TERMINAL_RECOVERY_ARTIFACT_FAILED"
+        for outcome in drained
+    ), [(type(outcome).__name__, getattr(outcome, "stop_reason", None)) for outcome in drained]
+    assert excinfo.value.stop_reason == "TERMINAL_RECOVERY_ARTIFACT_FAILED"
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+    assert any(
+        (handle := registry.handle(entry.case_id)) is not None and handle.state != "done"
+        for entry in batch.entries
+    )
+
+
+@pytest.mark.asyncio
+async def test_core_batch_recovery_failure_precedes_later_ordinary_child_failure(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Core selection is independent of the opposite drained-outcome ordering."""
+
+    calls = 0
+
+    async def block_then_fail(*_args: object, **_kwargs: object) -> CaseResult:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("later ordinary child sentinel")
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(orchestration, "run_prepared_case", block_then_fail)
+    monkeypatch.setattr(
+        WorkflowStore,
+        "finish_case",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("terminal persistence sentinel")
+        ),
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_write_recovery_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("recovery publication sentinel")),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        await orchestration.process_batch(
+            [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
+            settings,
+            concurrency=2,
+        )
+
+    assert excinfo.value.stop_reason == "TERMINAL_RECOVERY_ARTIFACT_FAILED"
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_durability_wait_has_a_monotonic_deadline() -> None:
+    """A stuck durability task must fail explicitly instead of draining forever."""
+
+    stuck = asyncio.create_task(asyncio.Event().wait(), name="task9-stuck-durability")
+    try:
+        with pytest.raises(InvoiceAgentsError) as excinfo:
+            await orchestration._await_task_despite_cancellation(
+                stuck,
+                deadline=orchestration.monotonic() - 0.001,
+            )
+        assert excinfo.value.stop_reason == "TERMINAL_DURABILITY_TIMEOUT"
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__context__ is None
+    finally:
+        stuck.cancel()
+        await asyncio.gather(stuck, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_blocking_terminal_write_times_out_without_blocking_event_loop(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stuck synchronous finish has one bounded timeout recovery owner."""
+
+    prepared = orchestration.prepare_claimed_invoice(invoice_dir / "invoice_1001.txt", settings)
+    assert isinstance(prepared, tuple)
+    case_id, started_at, claim = prepared
+    original_finish = WorkflowStore.finish_case
+    release = Event()
+    completed = Event()
+
+    def blocking_finish(
+        store: WorkflowStore, result: CaseResult, exact_claim: ExecutionClaim
+    ) -> None:
+        try:
+            assert release.wait(timeout=1)
+            original_finish(store, result, exact_claim)
+        finally:
+            completed.set()
+
+    publications: list[str] = []
+    original_publish = orchestration._write_recovery_artifact
+
+    def count_publish(result: CaseResult, error: ErrorRecord) -> Path:
+        publications.append(result.case_id)
+        return original_publish(result, error)
+
+    monkeypatch.setattr(WorkflowStore, "finish_case", blocking_finish)
+    monkeypatch.setattr(orchestration, "_write_recovery_artifact", count_publish)
+    monkeypatch.setattr(orchestration, "DURABILITY_DEADLINE_SECONDS", 0.03)
+    monkeypatch.chdir(tmp_path)
+    release_timer = Timer(0.2, release.set)
+    release_timer.start()
+    before = asyncio.get_running_loop().time()
+    try:
+        with pytest.raises(InvoiceAgentsError) as excinfo:
+            await orchestration._durably_cancel_unstarted_claim(
+                case_id, started_at, settings, claim
+            )
+        elapsed = asyncio.get_running_loop().time() - before
+        assert excinfo.value.stop_reason == "TERMINAL_DURABILITY_TIMEOUT"
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__context__ is None
+        assert elapsed < 0.15
+        recovery = tmp_path / "artifacts" / "results" / f"{case_id}.recovery.json"
+        payload = json.loads(recovery.read_text(encoding="utf-8"))
+        assert payload["terminal_persistence_error"]["stop_reason"] == (
+            "TERMINAL_DURABILITY_TIMEOUT"
+        )
+        assert publications == [case_id]
+    finally:
+        release.set()
+        release_timer.cancel()
+        assert await asyncio.to_thread(completed.wait, 1)
+
+
+@pytest.mark.asyncio
+async def test_ui_batch_timeout_publishes_once_and_leaves_handle_unresolved(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timeout artifact does not pretend an indeterminate worker is complete."""
+
+    runner_started = asyncio.Event()
+
+    async def blocking_runner(*_args: object, **_kwargs: object) -> CaseResult:
+        runner_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    original_finish = WorkflowStore.finish_case
+    release = Event()
+    completed = Event()
+
+    def blocking_finish(
+        store: WorkflowStore, result: CaseResult, exact_claim: ExecutionClaim
+    ) -> None:
+        try:
+            assert release.wait(timeout=1)
+            original_finish(store, result, exact_claim)
+        finally:
+            completed.set()
+
+    publications: list[str] = []
+    original_publish = orchestration._write_recovery_artifact
+
+    def count_publish(result: CaseResult, error: ErrorRecord) -> Path:
+        publications.append(result.case_id)
+        return original_publish(result, error)
+
+    monkeypatch.setattr(ui_runs, "run_prepared_case", blocking_runner)
+    monkeypatch.setattr(WorkflowStore, "finish_case", blocking_finish)
+    monkeypatch.setattr(orchestration, "_write_recovery_artifact", count_publish)
+    monkeypatch.setattr(orchestration, "DURABILITY_DEADLINE_SECONDS", 0.03)
+    monkeypatch.setattr(ui_runs, "DURABILITY_DEADLINE_SECONDS", 0.03)
+    monkeypatch.chdir(tmp_path)
+    registry = RunRegistry()
+    batch = await registry.start_batch([invoice_dir / "invoice_1001.txt"], settings, concurrency=1)
+    assert batch.task is not None
+    await asyncio.wait_for(runner_started.wait(), timeout=1)
+    release_timer = Timer(0.2, release.set)
+    release_timer.start()
+    before = asyncio.get_running_loop().time()
+    try:
+        batch.task.cancel()
+        with pytest.raises(InvoiceAgentsError) as excinfo:
+            await asyncio.wait_for(batch.task, timeout=0.5)
+        elapsed = asyncio.get_running_loop().time() - before
+        assert excinfo.value.stop_reason == "TERMINAL_DURABILITY_TIMEOUT"
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__context__ is None
+        assert elapsed < 0.15
+        recovery = tmp_path / "artifacts" / "results" / f"{batch.entries[0].case_id}.recovery.json"
+        assert recovery.is_file()
+        assert publications == [batch.entries[0].case_id]
+        handle = registry.handle(batch.entries[0].case_id)
+        assert handle is not None and handle.state == "unresolved"
+    finally:
+        release.set()
+        release_timer.cancel()
+        assert await asyncio.to_thread(completed.wait, 1)
+
+
+@pytest.mark.asyncio
+async def test_batch_preflight_process_control_is_not_a_business_result(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SystemExit before any claim stops the batch and publishes no result artifact."""
+
+    publications: list[str] = []
+    monkeypatch.setattr(
+        orchestration,
+        "preflight",
+        lambda _settings: (_ for _ in ()).throw(SystemExit("preflight sentinel")),
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_write_result",
+        lambda result: publications.append(result.case_id),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SystemExit):
+        await orchestration.process_batch(
+            [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
+            settings,
+            concurrency=1,
+        )
+
+    assert publications == []
+    assert not (tmp_path / "artifacts").exists()
+
+
+@pytest.mark.parametrize("control_type", [asyncio.CancelledError, SystemExit, KeyboardInterrupt])
+@pytest.mark.asyncio
+async def test_preflight_control_exceptions_escape_single_and_batch_without_artifacts(
+    control_type: type[BaseException],
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-claim process control is never converted into application data."""
+
+    publications: list[str] = []
+
+    def stop_preflight(_settings: Settings) -> None:
+        raise control_type("preflight process-control sentinel")
+
+    monkeypatch.setattr(orchestration, "preflight", stop_preflight)
+    monkeypatch.setattr(
+        orchestration,
+        "_write_result",
+        lambda result: publications.append(result.case_id),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(control_type):
+        orchestration.prepare_claimed_invoice(invoice_dir / "invoice_1001.txt", settings)
+    with pytest.raises(control_type):
+        await orchestration.process_batch(
+            [invoice_dir / "invoice_1001.txt"], settings, concurrency=1
+        )
+
+    assert publications == []
+    assert not (tmp_path / "artifacts").exists()

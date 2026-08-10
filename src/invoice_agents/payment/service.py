@@ -19,6 +19,7 @@ from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import (
     ExecutionClaim,
     WorkflowStore,
+    execution_claim_expiry_iso,
     load_authoritative_review_authorization,
     load_authorization_evidence_snapshot,
     parse_canonical_utc,
@@ -301,12 +302,16 @@ def mock_payment(
             lease = (
                 parse_canonical_utc(case_row["lease_expires_at"]) if case_row is not None else None
             )
+            claim_lease = execution_claim_expiry_iso(claim)
             current_claim = (
                 case_row is not None
+                and claim_lease is not None
                 and str(case_row["execution_token"]) == claim.token
                 and int(case_row["execution_generation"]) == claim.generation
                 and str(case_row["execution_state"]) == "RUNNING"
                 and lease is not None
+                and case_row["lease_expires_at"] == claim_lease
+                and claim.expires_at > authorization_time
                 and lease > authorization_time
             )
             if not current_claim:

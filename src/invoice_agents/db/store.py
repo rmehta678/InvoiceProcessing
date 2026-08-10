@@ -103,6 +103,17 @@ def parse_canonical_utc(value: object) -> datetime | None:
     return parsed if parsed.isoformat() == value else None
 
 
+def execution_claim_expiry_iso(claim: ExecutionClaim) -> str | None:
+    """Return the claim's canonical UTC lease text or reject its runtime shape."""
+
+    expires_at = claim.expires_at
+    if type(expires_at) is not datetime or expires_at.tzinfo is not UTC:
+        return None
+    encoded = expires_at.isoformat()
+    parsed = parse_canonical_utc(encoded)
+    return encoded if parsed == expires_at else None
+
+
 def _authoritative_source_for_case(connection: sqlite3.Connection, case_id: str) -> SourceArtifact:
     row = connection.execute(
         "SELECT c.source_id AS case_source_id, s.source_id, s.canonical_path, "
@@ -1631,7 +1642,11 @@ class WorkflowStore:
                 and aggregate.processed_at == datetime.fromisoformat(original.created_at)
                 and aggregate.error == original.error
             )
-        except (InvoiceAgentsError, _AuthorizationSnapshotError, ValueError, TypeError):
+        except InvoiceAgentsError as exc:
+            if exc.stop_reason == "EVIDENCE_AUTHORITY_MISSING":
+                raise exc from None
+            self._raise_invalid_duplicate(case_id)
+        except (_AuthorizationSnapshotError, ValueError, TypeError):
             self._raise_invalid_duplicate(case_id)
         if not current_columns_are_exact:
             self._raise_invalid_duplicate(case_id)
@@ -1758,13 +1773,17 @@ class WorkflowStore:
                 case_id=claim.case_id,
                 stop_reason="EXECUTION_AUTHORITY_CORRUPT",
             )
+        claim_lease = execution_claim_expiry_iso(claim)
         lease = parse_canonical_utc(row["lease_expires_at"]) if row is not None else None
         if (
             row is None
+            or claim_lease is None
             or row["execution_token"] != claim.token
             or int(row["execution_generation"]) != claim.generation
             or row["execution_state"] != "RUNNING"
             or lease is None
+            or row["lease_expires_at"] != claim_lease
+            or claim.expires_at <= checked_at
             or lease <= checked_at
         ):
             self._raise_stale_execution_claim(claim)

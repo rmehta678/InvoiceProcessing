@@ -9,20 +9,27 @@ acquired by the orchestration entrypoint used by both CLI and UI callers.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic
 from typing import Any
 from uuid import uuid4
 
 from invoice_agents.config import Settings
 from invoice_agents.db.store import ExecutionClaim
+from invoice_agents.errors import InvoiceAgentsError
 from invoice_agents.models import CaseResult
 from invoice_agents.orchestration import (
+    _DURABILITY_PRECEDENCE_STOPS,
+    DURABILITY_DEADLINE_SECONDS,
     _await_task_despite_cancellation,
     _durably_cancel_unstarted_claim,
     _durably_cancel_unstarted_claims,
+    _inspect_claim_durability,
+    _select_drained_failure,
     claim_resumable_case,
     prepare_claimed_invoice,
     resume_case,
@@ -36,7 +43,7 @@ class RunHandle:
 
     case_id: str
     kind: str  # "process" | "resume" | "batch"
-    state: str  # "queued" | "running" | "done"
+    state: str  # "queued" | "running" | "done" | "unresolved"
     started_at: datetime
     task: asyncio.Task[CaseResult] | None = None
     claim: ExecutionClaim | None = None
@@ -87,7 +94,10 @@ async def _prepare_claimed_for_launch(
     try:
         return await asyncio.shield(preparation)
     except asyncio.CancelledError as cancellation:
-        outcome = await _await_task_despite_cancellation(preparation)
+        outcome = await _await_task_despite_cancellation(
+            preparation,
+            deadline=monotonic() + DURABILITY_DEADLINE_SECONDS,
+        )
         if isinstance(outcome, tuple):
             await _durably_cancel_unstarted_claim(
                 outcome[0],
@@ -111,7 +121,7 @@ class RunRegistry:
 
     def is_running(self, case_id: str) -> bool:
         handle = self._runs.get(case_id)
-        return handle is not None and handle.state != "done"
+        return handle is not None and handle.state in {"queued", "running"}
 
     def run_state(self, case_id: str) -> str | None:
         handle = self._runs.get(case_id)
@@ -246,61 +256,134 @@ class RunRegistry:
                 assert entry.prepared_started_at is not None and entry.claim is not None
                 handed_off_claims.append((entry.case_id, entry.prepared_started_at, entry.claim))
             outcomes = await _durably_cancel_unstarted_claims(handed_off_claims, settings)
+            durability = await _inspect_claim_durability(handed_off_claims, settings)
+            selected_failure = _select_drained_failure(
+                primary_failure,
+                list(outcomes),
+                durability,
+            )
+            indeterminate_case_ids = {
+                outcome.case_id
+                for outcome in outcomes
+                if isinstance(outcome, InvoiceAgentsError)
+                and outcome.stop_reason in _DURABILITY_PRECEDENCE_STOPS
+                and outcome.case_id is not None
+            }
             for entry in prepared_entries:
-                self._runs[entry.case_id].state = "done"
-            for outcome in outcomes:
-                if isinstance(outcome, BaseException) and not isinstance(
-                    outcome, asyncio.CancelledError
-                ):
-                    raise outcome from None
-            raise primary_failure
+                self._runs[entry.case_id].state = (
+                    "done"
+                    if durability.get(entry.case_id) is None
+                    and entry.case_id not in indeterminate_case_ids
+                    else "unresolved"
+                )
+            selected_failure.__cause__ = None
+            selected_failure.__context__ = None
+            raise selected_failure from None
+        ownership_installed = asyncio.Event()
         batch.task = asyncio.create_task(
-            self._run_batch(batch, prepared_entries, settings),
+            self._run_batch(batch, prepared_entries, settings, ownership_installed),
             name=f"invoice-ui-{batch.batch_id}",
         )
+        try:
+            await asyncio.shield(ownership_installed.wait())
+        except asyncio.CancelledError as cancellation:
+            batch.task.cancel()
+            if ownership_installed.is_set():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await _await_task_despite_cancellation(
+                        batch.task,
+                        deadline=monotonic() + (3 * DURABILITY_DEADLINE_SECONDS),
+                    )
+            else:
+                await asyncio.gather(batch.task, return_exceptions=True)
+                claims = [
+                    (entry.case_id, entry.prepared_started_at, entry.claim)
+                    for entry in prepared_entries
+                    if entry.prepared_started_at is not None and entry.claim is not None
+                ]
+                outcomes = await _durably_cancel_unstarted_claims(claims, settings)
+                for entry, outcome in zip(prepared_entries, outcomes, strict=True):
+                    self._runs[entry.case_id].state = "done" if outcome is None else "unresolved"
+                for outcome in outcomes:
+                    if isinstance(outcome, BaseException) and not isinstance(
+                        outcome, asyncio.CancelledError
+                    ):
+                        raise outcome from None
+            raise cancellation
         return batch
 
     async def _run_batch(
-        self, batch: BatchState, entries: list[BatchEntry], settings: Settings
+        self,
+        batch: BatchState,
+        entries: list[BatchEntry],
+        settings: Settings,
+        ownership_installed: asyncio.Event,
     ) -> None:
         semaphore = asyncio.Semaphore(batch.concurrency)
+        launch = asyncio.Event()
 
-        async def bounded(entry: BatchEntry) -> None:
+        async def bounded(entry: BatchEntry, ready: asyncio.Event) -> None:
             handle = self._runs[entry.case_id]
             started_at = entry.prepared_started_at
             assert started_at is not None  # only prepared entries reach here
             claim = entry.claim
             assert claim is not None  # retained preparation authority is mandatory
-            runner_started = False
+            ready.set()
             try:
+                await launch.wait()
                 async with semaphore:
                     handle.state = "running"
-                    runner_started = True
                     await run_prepared_case(
                         entry.case_id,
                         started_at,
                         settings,
                         claim=claim,
                     )
+                handle.state = "done"
             except asyncio.CancelledError:
-                if not runner_started:
-                    await _durably_cancel_unstarted_claim(
-                        entry.case_id,
-                        started_at,
-                        settings,
-                        claim,
+
+                async def ensure_durability() -> None:
+                    durability = await _inspect_claim_durability(
+                        [(entry.case_id, started_at, claim)], settings
                     )
+                    if durability[entry.case_id] is not None:
+                        await _durably_cancel_unstarted_claim(
+                            entry.case_id,
+                            started_at,
+                            settings,
+                            claim,
+                        )
+
+                durability_task = asyncio.create_task(
+                    ensure_durability(),
+                    name=f"invoice-ui-batch-durability-{entry.case_id}",
+                )
+                await _await_task_despite_cancellation(
+                    durability_task,
+                    deadline=monotonic() + (2 * DURABILITY_DEADLINE_SECONDS),
+                    case_id=entry.case_id,
+                )
                 raise
-            except Exception as exc:
+            except BaseException as exc:
                 handle.error = type(exc).__name__
                 raise
-            finally:
-                handle.state = "done"
 
+        ready_events = [asyncio.Event() for _entry in entries]
         tasks = [
-            asyncio.create_task(bounded(entry), name=f"invoice-ui-batch-{entry.case_id}")
-            for entry in entries
+            asyncio.create_task(bounded(entry, ready), name=f"invoice-ui-batch-{entry.case_id}")
+            for entry, ready in zip(entries, ready_events, strict=True)
         ]
+        try:
+            await asyncio.gather(*(ready.wait() for ready in ready_events))
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            ownership_installed.set()
+            raise
+        ownership_installed.set()
+        launch.set()
+        selected_failure: BaseException | None = None
         try:
             await asyncio.gather(*tasks)
         except BaseException as primary_failure:
@@ -314,11 +397,37 @@ class RunRegistry:
             drain_task = asyncio.create_task(
                 drain(), name=f"invoice-ui-{batch.batch_id}-cancellation-drain"
             )
-            outcomes = await _await_task_despite_cancellation(drain_task)
-            if isinstance(primary_failure, asyncio.CancelledError):
-                for outcome in outcomes:
-                    if isinstance(outcome, BaseException) and not isinstance(
-                        outcome, asyncio.CancelledError
-                    ):
-                        raise outcome from None
-            raise primary_failure
+            outcomes = await _await_task_despite_cancellation(
+                drain_task,
+                deadline=monotonic() + (3 * DURABILITY_DEADLINE_SECONDS),
+            )
+            claims = [
+                (entry.case_id, entry.prepared_started_at, entry.claim)
+                for entry in entries
+                if entry.prepared_started_at is not None and entry.claim is not None
+            ]
+            durability = await _inspect_claim_durability(claims, settings)
+            indeterminate_case_ids = {
+                outcome.case_id
+                for outcome in outcomes
+                if isinstance(outcome, InvoiceAgentsError)
+                and outcome.stop_reason in _DURABILITY_PRECEDENCE_STOPS
+                and outcome.case_id is not None
+            }
+            for entry in entries:
+                handle = self._runs[entry.case_id]
+                handle.state = (
+                    "done"
+                    if durability.get(entry.case_id) is None
+                    and entry.case_id not in indeterminate_case_ids
+                    else "unresolved"
+                )
+            selected_failure = _select_drained_failure(
+                primary_failure,
+                list(outcomes),
+                durability,
+            )
+        if selected_failure is not None:
+            selected_failure.__cause__ = None
+            selected_failure.__context__ = None
+            raise selected_failure from None

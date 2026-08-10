@@ -10,7 +10,7 @@ import threading
 from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -493,6 +493,176 @@ def test_only_current_unexpired_claim_can_renew(settings: Settings) -> None:
     with pytest.raises(InvoiceAgentsError) as excinfo:
         store.renew_case_execution(renewed, lease_seconds=120)
     assert excinfo.value.stop_reason == "STALE_EXECUTION_CLAIM"
+
+
+def test_execution_claim_expiry_is_part_of_exact_authority(settings: Settings) -> None:
+    """A cloned token/generation cannot substitute a different lease expiry."""
+
+    store = _persist_case(settings, "case_exact_lease_authority")
+    issued = store.claim_case_execution(
+        "case_exact_lease_authority",
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+    forged = ExecutionClaim(
+        case_id=issued.case_id,
+        token=issued.token,
+        generation=issued.generation,
+        expires_at=issued.expires_at - timedelta(days=3650),
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.require_current_execution_claim(forged)
+
+    assert excinfo.value.stop_reason == "STALE_EXECUTION_CLAIM"
+
+
+@pytest.mark.parametrize("mutation", ["past", "future", "naive", "named-zero-offset"])
+def test_execution_claim_requires_exact_canonical_utc_expiry_shape(
+    settings: Settings, mutation: str
+) -> None:
+    store = _persist_case(settings, f"case_exact_claim_{mutation}")
+    issued = store.claim_case_execution(
+        f"case_exact_claim_{mutation}",
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+    if mutation == "past":
+        replacement = issued.expires_at - timedelta(days=3650)
+    elif mutation == "future":
+        replacement = issued.expires_at + timedelta(seconds=1)
+    elif mutation == "naive":
+        replacement = issued.expires_at.replace(tzinfo=None)
+    else:
+        replacement = issued.expires_at.astimezone(timezone(timedelta(0), name="named-zero-offset"))
+    forged = ExecutionClaim(
+        case_id=issued.case_id,
+        token=issued.token,
+        generation=issued.generation,
+        expires_at=replacement,
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.require_current_execution_claim(forged)
+
+    assert excinfo.value.stop_reason == "STALE_EXECUTION_CLAIM"
+
+
+def test_renewal_replaces_expiry_authority_atomically(settings: Settings) -> None:
+    store = _persist_case(settings, "case_exact_claim_renewed")
+    issued = store.claim_case_execution(
+        "case_exact_claim_renewed",
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+
+    renewed = store.renew_case_execution(issued, lease_seconds=120)
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.require_current_execution_claim(issued)
+    assert excinfo.value.stop_reason == "STALE_EXECUTION_CLAIM"
+    store.require_current_execution_claim(renewed)
+
+
+@pytest.mark.asyncio
+async def test_forged_expiry_is_rejected_before_provider_construction(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepared = orchestration.prepare_claimed_invoice(
+        Path("data/invoices/invoice_1001.txt"), settings
+    )
+    assert isinstance(prepared, tuple)
+    case_id, started_at, issued = prepared
+    forged = ExecutionClaim(
+        case_id=issued.case_id,
+        token=issued.token,
+        generation=issued.generation,
+        expires_at=issued.expires_at + timedelta(seconds=1),
+    )
+    provider_constructions = 0
+
+    def forbidden_provider(_settings: Settings) -> _StubModelClient:
+        nonlocal provider_constructions
+        provider_constructions += 1
+        return _StubModelClient()
+
+    monkeypatch.setattr(orchestration, "create_model_client", forbidden_provider)
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        await orchestration.run_prepared_case(case_id, started_at, settings, claim=forged)
+
+    assert excinfo.value.stop_reason == "STALE_EXECUTION_CLAIM"
+    assert provider_constructions == 0
+
+
+def test_payment_rejects_forged_expiry_before_ledger_mutation(settings: Settings) -> None:
+    case_id = "case_payment_exact_expiry"
+    store = _persist_case(settings, case_id)
+    issued = store.claim_case_execution(
+        case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
+    )
+    _approve(store, case_id, issued)
+    invoice = store.load_current_extraction(issued)
+    forged = ExecutionClaim(
+        case_id=issued.case_id,
+        token=issued.token,
+        generation=issued.generation,
+        expires_at=issued.expires_at + timedelta(seconds=1),
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        mock_payment(case_id, invoice, store, settings.workflow_db, forged)
+
+    assert excinfo.value.stop_reason == "STALE_EXECUTION_CLAIM"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_threads_renewed_claim_through_context_and_finish(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepared = orchestration.prepare_claimed_invoice(
+        Path("data/invoices/invoice_1001.txt"), settings
+    )
+    assert isinstance(prepared, tuple)
+    case_id, started_at, issued = prepared
+    observed: list[ExecutionClaim] = []
+
+    class RenewalObservingTeam:
+        def __init__(self, context: Any) -> None:
+            self.context = context
+
+        async def run_stream(self, task: object) -> AsyncIterator[object]:
+            del task
+            async with asyncio.timeout(1):
+                while self.context.claim.expires_at == issued.expires_at:
+                    await asyncio.sleep(0)
+            WorkflowStore(settings).require_current_execution_claim(self.context.claim)
+            observed.append(self.context.claim)
+            yield TaskResult(messages=[], stop_reason="maximum number of messages")
+
+        async def save_state(self) -> dict[str, object]:
+            WorkflowStore(settings).require_current_execution_claim(self.context.claim)
+            return {"renewed": True}
+
+    monkeypatch.setattr(orchestration, "EXECUTION_RENEWAL_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: _StubModelClient())
+    monkeypatch.setattr(
+        orchestration,
+        "build_team",
+        lambda context, _client: RenewalObservingTeam(context),
+    )
+
+    result = await orchestration.run_prepared_case(case_id, started_at, settings, claim=issued)
+
+    assert result.stop_reason == "MAX_MESSAGES_EXHAUSTED"
+    assert len(observed) == 1
+    assert observed[0].expires_at > issued.expires_at
+    snapshot = WorkflowStore(settings).load_case_execution_snapshot(case_id)
+    assert snapshot is not None
+    assert snapshot.execution_state == "FINISHED"
+    assert snapshot.result == result
 
 
 class _ConnectionProxy:
@@ -3878,6 +4048,7 @@ async def test_lease_heartbeat_propagates_renewal_failure_without_masking() -> N
             operation(),
             renew=fail_renewal,
             claim=claim,
+            replace_claim=lambda _renewed: None,
             lease_seconds=60,
             renewal_interval_seconds=0.001,
         )

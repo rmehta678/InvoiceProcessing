@@ -1173,6 +1173,21 @@ def duplicate_terminal_fixture(
     return store, attempted, paid, duplicate
 
 
+def persist_finished_terminal_envelope(settings: Settings, result: CaseResult) -> None:
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "UPDATE cases SET status = ?, stop_reason = ?, result_json = ?, "
+            "execution_state = 'FINISHED', lease_expires_at = NULL WHERE case_id = ?",
+            (
+                str(result.status),
+                result.stop_reason,
+                result.model_dump_json(),
+                result.case_id,
+            ),
+        )
+        connection.commit()
+
+
 def test_terminal_merge_reconstructs_cross_case_duplicate_from_paid_ledger(
     invoice_dir: Path, settings: Settings
 ) -> None:
@@ -1190,6 +1205,95 @@ def test_terminal_merge_reconstructs_cross_case_duplicate_from_paid_ledger(
     assert merged.payment.duplicate_of == paid.payment_id
     with connect_database(settings.workflow_db, read_only=True) as connection:
         assert connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 1
+
+
+def test_duplicate_reconstruction_propagates_missing_evidence_authority(
+    invoice_dir: Path, settings: Settings
+) -> None:
+    """Missing Settings is not evidence corruption and must retain its exact stop reason."""
+
+    _store, attempted, _paid, _duplicate = duplicate_terminal_fixture(invoice_dir, settings)
+    path_only_store = WorkflowStore(settings.workflow_db)
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        path_only_store.merge_relational_case_evidence(attempted)
+
+    assert excinfo.value.stop_reason == "EVIDENCE_AUTHORITY_MISSING"
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+
+
+def test_finished_duplicate_sse_requires_settings_without_mutating_persisted_state(
+    invoice_dir: Path, settings: Settings
+) -> None:
+    store, attempted, _paid, _duplicate = duplicate_terminal_fixture(invoice_dir, settings)
+    persist_finished_terminal_envelope(settings, attempted)
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        before = tuple(
+            connection.execute(
+                "SELECT status, stop_reason, result_json, execution_state, lease_expires_at "
+                "FROM cases WHERE case_id = ?",
+                (attempted.case_id,),
+            ).fetchone()
+        )
+
+    missing_authority = terminal_payload(
+        settings.workflow_db,
+        attempted.case_id,
+        RunRegistry(),
+    )
+    trusted = terminal_payload(
+        settings.workflow_db,
+        attempted.case_id,
+        RunRegistry(),
+        settings,
+    )
+
+    assert missing_authority is not None
+    assert missing_authority["stop_reason"] == "EVIDENCE_AUTHORITY_MISSING"
+    assert trusted is not None
+    assert trusted["status"] == "SUCCEEDED"
+    assert trusted["stop_reason"] == "APPROVED_PAYMENT_RECORDED"
+    assert store.load_result(attempted.case_id) == attempted
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        after = tuple(
+            connection.execute(
+                "SELECT status, stop_reason, result_json, execution_state, lease_expires_at "
+                "FROM cases WHERE case_id = ?",
+                (attempted.case_id,),
+            ).fetchone()
+        )
+    assert after == before
+
+
+def test_finished_duplicate_sse_keeps_persisted_contradiction_classification(
+    invoice_dir: Path, settings: Settings
+) -> None:
+    _store, attempted, _paid, duplicate = duplicate_terminal_fixture(invoice_dir, settings)
+    contradictory = attempted.model_copy(
+        update={"payment": duplicate.model_copy(update={"idempotency_key": "0" * 64})},
+        deep=True,
+    )
+    persist_finished_terminal_envelope(settings, contradictory)
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        before = connection.execute(
+            "SELECT result_json FROM cases WHERE case_id = ?", (attempted.case_id,)
+        ).fetchone()[0]
+
+    payload = terminal_payload(
+        settings.workflow_db,
+        attempted.case_id,
+        RunRegistry(),
+        settings,
+    )
+
+    assert payload is not None
+    assert payload["stop_reason"] == "PERSISTED_RESULT_INVALID"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        after = connection.execute(
+            "SELECT result_json FROM cases WHERE case_id = ?", (attempted.case_id,)
+        ).fetchone()[0]
+    assert after == before
 
 
 def test_terminal_sse_recovery_validates_cross_case_duplicate_with_request_settings(
@@ -1218,6 +1322,33 @@ def test_terminal_sse_recovery_validates_cross_case_duplicate_with_request_setti
             ),
         )
         connection.commit()
+
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        before = tuple(
+            connection.execute(
+                "SELECT status, stop_reason, result_json, execution_state, lease_expires_at "
+                "FROM cases WHERE case_id = ?",
+                (attempted.case_id,),
+            ).fetchone()
+        )
+
+    missing_authority = terminal_payload(
+        settings.workflow_db,
+        attempted.case_id,
+        RunRegistry(),
+    )
+
+    assert missing_authority is not None
+    assert missing_authority["stop_reason"] == "EVIDENCE_AUTHORITY_MISSING"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        after_missing_authority = tuple(
+            connection.execute(
+                "SELECT status, stop_reason, result_json, execution_state, lease_expires_at "
+                "FROM cases WHERE case_id = ?",
+                (attempted.case_id,),
+            ).fetchone()
+        )
+    assert after_missing_authority == before
 
     payload = terminal_payload(
         settings.workflow_db,

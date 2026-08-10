@@ -28,7 +28,11 @@ from pydantic import ValidationError
 from invoice_agents.agents.team import AgentCaseContext, build_team, create_model_client
 from invoice_agents.config import XAI_BASE_URL, XAI_MODEL, Settings
 from invoice_agents.db.core import DatabaseKind, verify_database
-from invoice_agents.db.store import ExecutionClaim, WorkflowStore
+from invoice_agents.db.store import (
+    ExecutionClaim,
+    WorkflowStore,
+    execution_claim_expiry_iso,
+)
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import (
     CaseResult,
@@ -59,6 +63,7 @@ MAX_MESSAGES_STOP_PHRASE = "maximum number of messages"
 EXECUTION_LEASE_SECONDS = 21_600
 EXECUTION_RENEWAL_INTERVAL_SECONDS = 30.0
 CLIENT_CLOSE_TIMEOUT_SECONDS = 5.0
+DURABILITY_DEADLINE_SECONDS = 5.0
 
 
 def is_max_messages_stop(stop_reason: str) -> bool:
@@ -76,6 +81,7 @@ async def _run_with_lease_heartbeat[ResultT](
     *,
     renew: Callable[[ExecutionClaim, int], ExecutionClaim],
     claim: ExecutionClaim,
+    replace_claim: Callable[[ExecutionClaim], None],
     lease_seconds: int,
     renewal_interval_seconds: float,
 ) -> ResultT:
@@ -84,15 +90,32 @@ async def _run_with_lease_heartbeat[ResultT](
     if renewal_interval_seconds <= 0:
         raise ValueError("renewal_interval_seconds must be positive")
     stopped = asyncio.Event()
+    current_claim = claim
 
     async def capture_heartbeat() -> BaseException | None:
+        nonlocal current_claim
         try:
             while True:
                 try:
                     await asyncio.wait_for(stopped.wait(), timeout=renewal_interval_seconds)
                     return None
                 except TimeoutError:
-                    await asyncio.to_thread(renew, claim, lease_seconds)
+                    renewed = renew(current_claim, lease_seconds)
+                    if (
+                        renewed.case_id != current_claim.case_id
+                        or renewed.token != current_claim.token
+                        or renewed.generation != current_claim.generation
+                        or execution_claim_expiry_iso(renewed) is None
+                        or renewed.expires_at <= current_claim.expires_at
+                    ):
+                        raise InvoiceAgentsError(
+                            ErrorCategory.ORCHESTRATION,
+                            "execution lease renewal returned contradictory authority",
+                            case_id=current_claim.case_id,
+                            stop_reason="STALE_EXECUTION_CLAIM",
+                        ) from None
+                    replace_claim(renewed)
+                    current_claim = renewed
         except BaseException as exc:
             return exc
 
@@ -302,6 +325,7 @@ class _ClaimedExecution:
     source_id: str | None = None
     audit: AuditRecorder | None = None
     client: Any | None = None
+    context: AgentCaseContext | None = None
     usage: UsageSummary | None = None
     clock: float = 0.0
 
@@ -1040,12 +1064,12 @@ def prepare_case(path: Path, settings: Settings) -> tuple[str, datetime] | CaseR
 
 def prepare_claimed_case(
     path: Path, settings: Settings
-) -> tuple[str, datetime, ExecutionClaim] | CaseResult:
-    prepared = _prepare_case(path, settings, retain_execution_claim=True)
-    return (
-        prepared.result
-        if isinstance(prepared, _PreparationFailure)
-        else cast(tuple[str, datetime, ExecutionClaim], prepared)
+) -> tuple[str, datetime, ExecutionClaim] | _PreparationFailure:
+    """Prepare a batch case while retaining its exact publication disposition."""
+
+    return cast(
+        tuple[str, datetime, ExecutionClaim] | _PreparationFailure,
+        _prepare_case(path, settings, retain_execution_claim=True),
     )
 
 
@@ -1257,7 +1281,7 @@ async def run_prepared_case(
     store.require_current_execution_claim(claim)
 
     async def execute_lifecycle(execution: _ClaimedExecution) -> CaseResult:
-        invoice = store.promote_predecessor_extraction(claim)
+        invoice = store.promote_predecessor_extraction(execution.claim)
         execution.source_id = invoice.source.source_id
         audit = AuditRecorder(settings.workflow_db, case_id)
         execution.audit = audit
@@ -1282,8 +1306,9 @@ async def run_prepared_case(
             settings=settings,
             store=store,
             audit=audit,
-            claim=claim,
+            claim=execution.claim,
         )
+        execution.context = context
         usage = cast(UsageSummary, execution.usage)
         client = create_model_client(settings)
         execution.client = client
@@ -1301,15 +1326,21 @@ async def run_prepared_case(
             )
         # State is saved only after run_stream has yielded its TaskResult and stopped.
         state = await team.save_state()
-        store.save_team_state(case_id, dict(state), claim)
+        store.save_team_state(case_id, dict(state), execution.claim)
         usage.latency_ms = int((monotonic() - execution.clock) * 1000)
         return _result_from_stop(context, task_result, started_at, usage)
 
     async def heartbeat_lifecycle(execution: _ClaimedExecution) -> CaseResult:
+        def replace_claim(renewed: ExecutionClaim) -> None:
+            execution.claim = renewed
+            if execution.context is not None:
+                execution.context.claim = renewed
+
         return await _run_with_lease_heartbeat(
             execute_lifecycle(execution),
             renew=store.renew_case_execution,
-            claim=claim,
+            claim=execution.claim,
+            replace_claim=replace_claim,
             lease_seconds=EXECUTION_LEASE_SECONDS,
             renewal_interval_seconds=EXECUTION_RENEWAL_INTERVAL_SECONDS,
         )
@@ -1340,7 +1371,9 @@ def _prepare_invoice(
     started_at = _now()
     try:
         preflight(settings)
-    except BaseException as exc:
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
         # The printed artifacts/results path must exist for every terminal outcome,
         # including failures that happen before a case or model call exists.
         result = _failed_result(f"case_{uuid4().hex}", None, started_at, exc)
@@ -1388,15 +1421,163 @@ async def process_invoice(path: Path, settings: Settings) -> CaseResult:
     )
 
 
-async def _await_task_despite_cancellation[ResultT](task: asyncio.Task[ResultT]) -> ResultT:
-    """Drain a durability task even if its caller receives repeated cancellation."""
+async def _await_task_despite_cancellation[ResultT](
+    task: asyncio.Task[ResultT],
+    *,
+    deadline: float,
+    case_id: str | None = None,
+) -> ResultT:
+    """Drain through repeated cancellation, but never beyond one monotonic deadline."""
 
+    loop = asyncio.get_running_loop()
+    initial_remaining = max(0.0, deadline - monotonic())
+    loop_deadline = loop.time() + initial_remaining
     while not task.done():
+        remaining = min(deadline - monotonic(), loop_deadline - loop.time())
+        if remaining <= 0:
+            task.add_done_callback(_consume_task_result)
+            raise InvoiceAgentsError(
+                ErrorCategory.TIMEOUT,
+                "terminal durability work exceeded its monotonic deadline",
+                case_id=case_id,
+                stop_reason="TERMINAL_DURABILITY_TIMEOUT",
+            ) from None
         try:
-            await asyncio.shield(task)
+            done, _pending = await asyncio.wait(
+                {task},
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
         except asyncio.CancelledError:
             continue
+        if not done:
+            task.add_done_callback(_consume_task_result)
+            raise InvoiceAgentsError(
+                ErrorCategory.TIMEOUT,
+                "terminal durability work exceeded its monotonic deadline",
+                case_id=case_id,
+                stop_reason="TERMINAL_DURABILITY_TIMEOUT",
+            ) from None
     return task.result()
+
+
+def _recovery_artifact_is_valid(case_id: str) -> bool:
+    target = Path("artifacts/results").resolve() / f"{case_id}.recovery.json"
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        result = CaseResult.model_validate_json(json.dumps(payload["case_result"]), strict=True)
+        persistence_error = ErrorRecord.model_validate_json(
+            json.dumps(payload["terminal_persistence_error"]), strict=True
+        )
+    except (OSError, KeyError, TypeError, ValueError):
+        return False
+    return (
+        payload.get("recovery_format") == 1
+        and result.case_id == case_id
+        and persistence_error.case_id == case_id
+        and persistence_error.stop_reason
+        in {"TERMINAL_PERSISTENCE_FAILED", "TERMINAL_DURABILITY_TIMEOUT"}
+    )
+
+
+def _claim_has_durable_terminal_evidence(case_id: str, settings: Settings) -> bool:
+    store = WorkflowStore(settings)
+    snapshot = store.load_case_execution_snapshot(case_id)
+    if (
+        snapshot is not None
+        and snapshot.execution_state == "FINISHED"
+        and snapshot.result is not None
+    ):
+        store.merge_relational_case_evidence(snapshot.result)
+        return True
+    return _recovery_artifact_is_valid(case_id)
+
+
+def _unresolved_durability_error(
+    case_id: str, exc: BaseException | None = None
+) -> InvoiceAgentsError:
+    return InvoiceAgentsError(
+        ErrorCategory.ORCHESTRATION,
+        "no trustworthy terminal database result or recovery artifact exists",
+        case_id=case_id,
+        stop_reason="TERMINAL_DURABILITY_UNRESOLVED",
+        details={"inspection_exception_type": type(exc).__name__ if exc is not None else None},
+    )
+
+
+async def _inspect_claim_durability(
+    claims: list[tuple[str, datetime, ExecutionClaim]],
+    settings: Settings,
+) -> dict[str, BaseException | None]:
+    """Bound every read-only durability inspection and return one result per claim."""
+
+    async def inspect(case_id: str) -> tuple[str, BaseException | None]:
+        task = asyncio.create_task(
+            asyncio.to_thread(_claim_has_durable_terminal_evidence, case_id, settings),
+            name=f"invoice-durability-inspect-{case_id}",
+        )
+        try:
+            durable = await _await_task_despite_cancellation(
+                task,
+                deadline=monotonic() + DURABILITY_DEADLINE_SECONDS,
+                case_id=case_id,
+            )
+        except InvoiceAgentsError as exc:
+            return case_id, exc
+        except BaseException as exc:
+            return case_id, _unresolved_durability_error(case_id, exc)
+        return case_id, None if durable else _unresolved_durability_error(case_id)
+
+    inspection_tasks = [
+        asyncio.create_task(inspect(case_id), name=f"invoice-durability-{case_id}")
+        for case_id, _started, _claim in claims
+    ]
+
+    async def drain() -> list[tuple[str, BaseException | None]]:
+        return await asyncio.gather(*inspection_tasks)
+
+    drain_task = asyncio.create_task(drain(), name="invoice-durability-inspection-drain")
+    inspected = await _await_task_despite_cancellation(
+        drain_task,
+        deadline=monotonic() + (2 * DURABILITY_DEADLINE_SECONDS),
+    )
+    return dict(inspected)
+
+
+_DURABILITY_PRECEDENCE_STOPS = frozenset(
+    {
+        "TERMINAL_RECOVERY_ARTIFACT_FAILED",
+        "TERMINAL_DURABILITY_TIMEOUT",
+        "TERMINAL_DURABILITY_UNRESOLVED",
+    }
+)
+
+
+def _select_drained_failure(
+    primary: BaseException,
+    outcomes: list[object],
+    durability: dict[str, BaseException | None],
+) -> BaseException:
+    """Choose durability loss before ordinary/process cancellation, independent of order."""
+
+    failures = [item for item in outcomes if isinstance(item, BaseException)]
+    for failure in failures:
+        if (
+            isinstance(failure, InvoiceAgentsError)
+            and failure.stop_reason in _DURABILITY_PRECEDENCE_STOPS
+        ):
+            return failure
+    for durability_failure in durability.values():
+        if durability_failure is not None:
+            return durability_failure
+    for failure in failures:
+        if not isinstance(failure, (Exception, asyncio.CancelledError)):
+            return failure
+    if isinstance(primary, asyncio.CancelledError):
+        for failure in failures:
+            if not isinstance(failure, asyncio.CancelledError):
+                return failure
+    return primary
 
 
 async def _terminalize_unstarted_claim(
@@ -1405,25 +1586,100 @@ async def _terminalize_unstarted_claim(
     settings: Settings,
     claim: ExecutionClaim,
 ) -> None:
-    """Persist cancellation for an exact claim that never entered its runner."""
+    """Persist cancellation in a bounded worker with one recovery publisher."""
 
-    store = WorkflowStore(settings)
-    store.require_current_execution_claim(claim)
+    fallback = _cancelled_result(case_id, None, started_at)
 
-    async def cancelled_lifecycle(_execution: _ClaimedExecution) -> CaseResult:
-        raise asyncio.CancelledError
+    @dataclass(frozen=True, slots=True)
+    class PersistenceOutcome:
+        result: CaseResult
+        failure: BaseException | None = None
+        control_exception: BaseException | None = None
 
-    try:
-        await _execute_claimed_case(
-            case_id,
-            started_at,
-            store,
-            claim,
-            cancelled_lifecycle,
-            finished_event_type="case.cancelled_before_start",
+    def persist() -> PersistenceOutcome:
+        store = WorkflowStore(settings)
+        result = fallback
+        control_exception: BaseException | None = None
+        try:
+            store.require_current_execution_claim(claim)
+            source_id = store.load_case_source_id(case_id)
+            previous = store.load_result(case_id)
+            result = _cancelled_result(case_id, source_id, started_at, previous)
+            try:
+                result = store.merge_relational_case_evidence(result)
+            except BaseException as exc:
+                _append_error(
+                    result,
+                    _secondary_error(
+                        exc,
+                        case_id=case_id,
+                        category=ErrorCategory.DATABASE,
+                        stop_reason="TERMINAL_EVIDENCE_RECONCILIATION_FAILED",
+                        message="durable terminal evidence reconciliation failed",
+                    ),
+                )
+                if not isinstance(exc, Exception):
+                    control_exception = exc
+            store.finish_case(result, claim)
+        except BaseException as exc:
+            return PersistenceOutcome(
+                result=result,
+                failure=exc,
+                control_exception=control_exception,
+            )
+        return PersistenceOutcome(result=result, control_exception=control_exception)
+
+    async def publish_recovery(result: CaseResult, error: ErrorRecord) -> None:
+        publication = asyncio.create_task(
+            asyncio.to_thread(_recovery_artifact_or_raise, result, error),
+            name=f"invoice-cancel-recovery-{case_id}",
         )
-    except asyncio.CancelledError:
+        await _await_task_despite_cancellation(
+            publication,
+            deadline=monotonic() + DURABILITY_DEADLINE_SECONDS,
+            case_id=case_id,
+        )
+
+    worker = asyncio.create_task(
+        asyncio.to_thread(persist),
+        name=f"invoice-cancel-persistence-{case_id}",
+    )
+    try:
+        outcome = await _await_task_despite_cancellation(
+            worker,
+            deadline=monotonic() + DURABILITY_DEADLINE_SECONDS,
+            case_id=case_id,
+        )
+    except InvoiceAgentsError as exc:
+        if exc.stop_reason != "TERMINAL_DURABILITY_TIMEOUT":
+            raise
+        timeout_error = ErrorRecord(
+            category=ErrorCategory.TIMEOUT,
+            message="terminal cancellation persistence exceeded its monotonic deadline",
+            case_id=case_id,
+            stop_reason="TERMINAL_DURABILITY_TIMEOUT",
+        )
+        _append_error(fallback, timeout_error)
+        await publish_recovery(fallback, timeout_error)
+        raise exc from None
+
+    if outcome.failure is not None:
+        persistence_error = _secondary_error(
+            outcome.failure,
+            case_id=case_id,
+            category=ErrorCategory.DATABASE,
+            stop_reason="TERMINAL_PERSISTENCE_FAILED",
+            message="terminal database write failed",
+        )
+        _append_error(outcome.result, persistence_error)
+        await publish_recovery(outcome.result, persistence_error)
+        if not isinstance(outcome.failure, Exception):
+            raise outcome.failure
+        if outcome.control_exception is not None:
+            raise outcome.control_exception
         return
+    if outcome.control_exception is not None:
+        raise outcome.control_exception
 
 
 async def _durably_cancel_unstarted_claim(
@@ -1432,11 +1688,7 @@ async def _durably_cancel_unstarted_claim(
     settings: Settings,
     claim: ExecutionClaim,
 ) -> None:
-    task = asyncio.create_task(
-        _terminalize_unstarted_claim(case_id, started_at, settings, claim),
-        name=f"invoice-cancel-unstarted-{case_id}",
-    )
-    await _await_task_despite_cancellation(task)
+    await _terminalize_unstarted_claim(case_id, started_at, settings, claim)
 
 
 async def _durably_cancel_unstarted_claims(
@@ -1457,7 +1709,10 @@ async def _durably_cancel_unstarted_claims(
         return await asyncio.gather(*tasks, return_exceptions=True)
 
     drain_task = asyncio.create_task(drain(), name="invoice-unstarted-claims-drain")
-    return await _await_task_despite_cancellation(drain_task)
+    return await _await_task_despite_cancellation(
+        drain_task,
+        deadline=monotonic() + (3 * DURABILITY_DEADLINE_SECONDS),
+    )
 
 
 async def process_batch(
@@ -1468,45 +1723,64 @@ async def process_batch(
     started_at = _now()
     try:
         preflight(settings)
-    except BaseException as exc:
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
         failed = [_failed_result(f"case_{uuid4().hex}", None, started_at, exc) for _ in paths]
         for result in failed:
             _write_result(result)
         return failed
     prepared: list[tuple[str, datetime, ExecutionClaim]] = []
     results: list[CaseResult] = []
+    selected_failure: BaseException | None = None
     try:
         for path in paths:
             item = prepare_claimed_case(path, settings)
-            if isinstance(item, CaseResult):
-                _write_result(item)
-                results.append(item)
+            if isinstance(item, _PreparationFailure):
+                if not item.recovery_published:
+                    _write_result(item.result)
+                results.append(item.result)
             else:
                 prepared.append(item)
     except BaseException as primary_failure:
         preparation_outcomes = await _durably_cancel_unstarted_claims(prepared, settings)
-        for outcome in preparation_outcomes:
-            if isinstance(outcome, BaseException) and not isinstance(
-                outcome, asyncio.CancelledError
-            ):
-                raise outcome from None
-        raise primary_failure
+        durability = await _inspect_claim_durability(prepared, settings)
+        selected_failure = _select_drained_failure(
+            primary_failure,
+            list(preparation_outcomes),
+            durability,
+        )
+    if selected_failure is not None:
+        selected_failure.__cause__ = None
+        selected_failure.__context__ = None
+        raise selected_failure from None
     semaphore = asyncio.Semaphore(concurrency or settings.case_concurrency)
 
     async def bounded(item: tuple[str, datetime, ExecutionClaim]) -> CaseResult:
-        runner_started = False
         try:
             async with semaphore:
-                runner_started = True
                 return await run_prepared_case(item[0], item[1], settings, claim=item[2])
         except asyncio.CancelledError:
-            if not runner_started:
-                await _durably_cancel_unstarted_claim(item[0], item[1], settings, item[2])
+
+            async def ensure_durability() -> None:
+                durability = await _inspect_claim_durability([item], settings)
+                if durability[item[0]] is not None:
+                    await _durably_cancel_unstarted_claim(item[0], item[1], settings, item[2])
+
+            durability_task = asyncio.create_task(
+                ensure_durability(), name=f"invoice-batch-durability-{item[0]}"
+            )
+            await _await_task_despite_cancellation(
+                durability_task,
+                deadline=monotonic() + (2 * DURABILITY_DEADLINE_SECONDS),
+                case_id=item[0],
+            )
             raise
 
     tasks = [
         asyncio.create_task(bounded(item), name=f"invoice-batch-{item[0]}") for item in prepared
     ]
+    selected_failure = None
     try:
         results.extend(await asyncio.gather(*tasks))
     except BaseException as primary_failure:
@@ -1518,14 +1792,28 @@ async def process_batch(
             return await asyncio.gather(*tasks, return_exceptions=True)
 
         drain_task = asyncio.create_task(drain(), name="invoice-batch-cancellation-drain")
-        task_outcomes = await _await_task_despite_cancellation(drain_task)
-        if isinstance(primary_failure, asyncio.CancelledError):
-            for task_outcome in task_outcomes:
-                if isinstance(task_outcome, BaseException) and not isinstance(
-                    task_outcome, asyncio.CancelledError
-                ):
-                    raise task_outcome from None
-        raise primary_failure
+        task_outcomes = await _await_task_despite_cancellation(
+            drain_task,
+            deadline=monotonic() + (3 * DURABILITY_DEADLINE_SECONDS),
+        )
+        durability = await _inspect_claim_durability(prepared, settings)
+        unowned_cancelled_claims = [
+            item
+            for item, outcome in zip(prepared, task_outcomes, strict=True)
+            if isinstance(outcome, asyncio.CancelledError) and durability[item[0]] is not None
+        ]
+        direct_outcomes = await _durably_cancel_unstarted_claims(unowned_cancelled_claims, settings)
+        if unowned_cancelled_claims:
+            durability = await _inspect_claim_durability(prepared, settings)
+        selected_failure = _select_drained_failure(
+            primary_failure,
+            [*task_outcomes, *direct_outcomes],
+            durability,
+        )
+    if selected_failure is not None:
+        selected_failure.__cause__ = None
+        selected_failure.__context__ = None
+        raise selected_failure from None
     return results
 
 
@@ -1671,17 +1959,18 @@ async def resume_case(
                 case_id=case_id,
                 stop_reason="TEAM_STATE_MISSING",
             )
-        store.adopt_latest_evidence(claim)
-        invoice = store.load_current_extraction(claim)
+        store.adopt_latest_evidence(execution.claim)
+        invoice = store.load_current_extraction(execution.claim)
         execution.source_id = invoice.source.source_id
         audit = AuditRecorder(settings.workflow_db, case_id)
         execution.audit = audit
         human = review.human_decision
         if human.decision is HumanDecisionKind.ESTABLISH_MAPPING:
-            _recompute_after_mapping(case_id, human, settings, store, audit, claim)
-            invoice = store.load_current_extraction(claim)
+            _recompute_after_mapping(case_id, human, settings, store, audit, execution.claim)
+            invoice = store.load_current_extraction(execution.claim)
             execution.source_id = invoice.source.source_id
-        context = AgentCaseContext(case_id, settings, store, audit, claim)
+        context = AgentCaseContext(case_id, settings, store, audit, execution.claim)
+        execution.context = context
         client = create_model_client(settings)
         execution.client = client
         team = build_team(context, client)
@@ -1707,14 +1996,20 @@ async def resume_case(
             with bind_audit_recorder(audit):
                 task_result = await _stream_team(team, context, task=message, usage=usage)
             new_state = await team.save_state()
-            store.save_team_state(case_id, dict(new_state), claim)
+            store.save_team_state(case_id, dict(new_state), execution.claim)
             usage.latency_ms += int((monotonic() - execution.clock) * 1000)
             return _result_from_stop(context, task_result, previous.started_at, usage)
+
+        def replace_claim(renewed: ExecutionClaim) -> None:
+            execution.claim = renewed
+            if execution.context is not None:
+                execution.context.claim = renewed
 
         return await _run_with_lease_heartbeat(
             execute_resume_team(),
             renew=store.renew_case_execution,
-            claim=claim,
+            claim=execution.claim,
+            replace_claim=replace_claim,
             lease_seconds=EXECUTION_LEASE_SECONDS,
             renewal_interval_seconds=EXECUTION_RENEWAL_INTERVAL_SECONDS,
         )
