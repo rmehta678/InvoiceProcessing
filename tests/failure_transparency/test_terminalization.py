@@ -2191,6 +2191,8 @@ async def test_execution_failure_overlays_already_committed_payment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A fresh nonterminal generation retains only exact immutable payment evidence."""
+
     case_id = make_succeeded_case(settings)
     store = WorkflowStore(settings)
     committed = store.load_result(case_id)
@@ -2199,10 +2201,12 @@ async def test_execution_failure_overlays_already_committed_payment(
     with connect_database(settings.workflow_db) as connection:
         connection.execute(
             "UPDATE cases SET status = 'INCOMPLETE', stop_reason = 'TORN_EXECUTION', "
-            "result_json = NULL WHERE case_id = ?",
+            "result_json = NULL, finished_at = NULL, execution_token = NULL, "
+            "execution_state = 'IDLE', lease_expires_at = NULL WHERE case_id = ?",
             (case_id,),
         )
         connection.commit()
+    assert store.load_result(case_id) is None
     claim = store.claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )

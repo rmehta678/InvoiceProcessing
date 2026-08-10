@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import sqlite3
 import sys
@@ -19,7 +20,7 @@ from invoice_agents import lifecycle_process, orchestration, terminal_process
 from invoice_agents.agents.team import AgentCaseContext
 from invoice_agents.config import Settings
 from invoice_agents.db import store as store_module
-from invoice_agents.db.store import ExecutionClaim, WorkflowStore
+from invoice_agents.db.store import ExecutionClaim, WorkflowStore, validate_execution_claim
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import CaseResult, CaseStatus, ErrorRecord
 from invoice_agents.payment import service as payment_service
@@ -360,6 +361,19 @@ def _mutate_claim(claim: ExecutionClaim, mutation: str) -> ExecutionClaim:
     return replace(claim, **values)  # type: ignore[arg-type]
 
 
+def _assert_only_generation_changed(
+    issued: ExecutionClaim,
+    forged: ExecutionClaim,
+) -> None:
+    assert forged.case_id == issued.case_id
+    assert forged.token == issued.token
+    assert forged.expires_at == issued.expires_at
+    assert (type(forged.generation), forged.generation) != (
+        type(issued.generation),
+        issued.generation,
+    )
+
+
 @pytest.mark.parametrize("mutation", _CLAIM_MUTATIONS)
 def test_round3_invalid_claim_shape_precedes_any_database_access(
     invoice_dir: Path,
@@ -412,11 +426,13 @@ def test_round3_invalid_claim_is_rejected_at_tool_context_construction(
 ) -> None:
     issued = ExecutionClaim(
         "case_tool_claim",
-        "exec_tool_claim",
+        f"exec_{'1a' * 16}",
         1,
         datetime.now(UTC) + timedelta(minutes=1),
     )
+    assert validate_execution_claim(issued) is issued
     forged = _mutate_claim(issued, mutation)
+    _assert_only_generation_changed(issued, forged)
     with pytest.raises(InvoiceAgentsError) as excinfo:
         AgentCaseContext(
             case_id=issued.case_id,
@@ -468,17 +484,32 @@ async def test_round3_invalid_renewed_claim_never_replaces_live_authority(
 ) -> None:
     issued = ExecutionClaim(
         "case_heartbeat_claim",
-        "exec_heartbeat_claim",
+        f"exec_{'2b' * 16}",
         1,
         datetime.now(UTC) + timedelta(minutes=1),
     )
+    assert validate_execution_claim(issued) is issued
     replacement_calls = 0
+    renewal_calls = 0
+    operation_started = asyncio.Event()
+    operation_finalized = asyncio.Event()
 
     async def operation() -> None:
-        await asyncio.Event().wait()
+        operation_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            operation_finalized.set()
 
-    def renew(_claim: ExecutionClaim, _lease_seconds: int) -> ExecutionClaim:
-        return _mutate_claim(issued, mutation)
+    def renew(current: ExecutionClaim, lease_seconds: int) -> ExecutionClaim:
+        nonlocal renewal_calls
+        renewal_calls += 1
+        assert renewal_calls == 1
+        assert current is issued
+        assert lease_seconds == 60
+        renewed = _mutate_claim(issued, mutation)
+        _assert_only_generation_changed(issued, renewed)
+        return renewed
 
     def replace_claim(_claim: ExecutionClaim) -> None:
         nonlocal replacement_calls
@@ -494,6 +525,65 @@ async def test_round3_invalid_renewed_claim_never_replaces_live_authority(
             renewal_interval_seconds=0.001,
         )
     assert excinfo.value.stop_reason == "STALE_EXECUTION_CLAIM"
+    assert renewal_calls == 1
+    assert replacement_calls == 0
+    assert operation_started.is_set()
+    assert operation_finalized.is_set()
+
+
+@pytest.mark.asyncio
+async def test_round3_malformed_heartbeat_baseline_rejects_before_renewal_and_is_closed() -> None:
+    """Entry grammar, not renewal validation, owns a malformed starting claim."""
+
+    malformed = ExecutionClaim(
+        "case_heartbeat_negative_control",
+        "exec_heartbeat_claim",
+        1,
+        datetime.now(UTC) + timedelta(minutes=1),
+    )
+    with pytest.raises(InvoiceAgentsError) as baseline_error:
+        validate_execution_claim(malformed)
+    assert baseline_error.value.stop_reason == "STALE_EXECUTION_CLAIM"
+
+    operation_calls = 0
+    renewal_calls = 0
+    replacement_calls = 0
+
+    async def forbidden_operation() -> None:
+        nonlocal operation_calls
+        operation_calls += 1
+        raise AssertionError("malformed entry claim started the operation")
+
+    def forbidden_renew(_claim: ExecutionClaim, _lease_seconds: int) -> ExecutionClaim:
+        nonlocal renewal_calls
+        renewal_calls += 1
+        raise AssertionError("malformed entry claim reached renewal")
+
+    def forbidden_replace(_claim: ExecutionClaim) -> None:
+        nonlocal replacement_calls
+        replacement_calls += 1
+        raise AssertionError("malformed entry claim replaced authority")
+
+    operation = forbidden_operation()
+    assert inspect.getcoroutinestate(operation) == inspect.CORO_CREATED
+    try:
+        with pytest.raises(InvoiceAgentsError) as excinfo:
+            await orchestration._run_with_lease_heartbeat(
+                operation,
+                renew=forbidden_renew,
+                claim=malformed,
+                replace_claim=forbidden_replace,
+                lease_seconds=60,
+                renewal_interval_seconds=0.001,
+            )
+    finally:
+        if inspect.getcoroutinestate(operation) == inspect.CORO_CREATED:
+            operation.close()
+
+    assert excinfo.value.stop_reason == "STALE_EXECUTION_CLAIM"
+    assert inspect.getcoroutinestate(operation) == inspect.CORO_CLOSED
+    assert operation_calls == 0
+    assert renewal_calls == 0
     assert replacement_calls == 0
 
 

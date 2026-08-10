@@ -1178,11 +1178,13 @@ def persist_finished_terminal_envelope(settings: Settings, result: CaseResult) -
     with connect_database(settings.workflow_db) as connection:
         connection.execute(
             "UPDATE cases SET status = ?, stop_reason = ?, result_json = ?, "
-            "execution_state = 'FINISHED', lease_expires_at = NULL WHERE case_id = ?",
+            "finished_at = ?, execution_state = 'FINISHED', lease_expires_at = NULL "
+            "WHERE case_id = ?",
             (
                 str(result.status),
                 result.stop_reason,
                 result.model_dump_json(),
+                result.finished_at.isoformat(),
                 result.case_id,
             ),
         )
@@ -1313,11 +1315,12 @@ def test_terminal_sse_recovery_validates_cross_case_duplicate_with_request_setti
     with connect_database(settings.workflow_db) as connection:
         connection.execute(
             "UPDATE cases SET status = ?, stop_reason = ?, result_json = ?, "
-            "lease_expires_at = ? WHERE case_id = ?",
+            "finished_at = ?, lease_expires_at = ? WHERE case_id = ?",
             (
                 str(interrupted.status),
                 interrupted.stop_reason,
                 interrupted.model_dump_json(),
+                interrupted.finished_at.isoformat(),
                 "2000-01-01T00:00:00+00:00",
                 attempted.case_id,
             ),

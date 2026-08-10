@@ -48,6 +48,7 @@ REQUIRED_JOURNAL_MODE = "delete"
 _DATETIME_WIRE_TYPE = datetime
 _DATETIME_ADAPTER = TypeAdapter(datetime)
 _REQUESTED_EXECUTION_TOKEN = re.compile(r"^exec_[0-9a-f]{32}$")
+_STORED_FINISHED_AT_OMITTED = object()
 
 
 def _validated_requested_execution_token(token: object) -> str:
@@ -1098,15 +1099,16 @@ class WorkflowStore:
         result: CaseResult,
         authoritative_started_at: object,
         *,
-        stored_finished_at: object | None = None,
+        stored_finished_at: object = _STORED_FINISHED_AT_OMITTED,
     ) -> None:
         """Require one exact authoritative, monotonic, canonical UTC terminal clock."""
 
         authoritative = parse_canonical_utc(authoritative_started_at)
         started_at = _runtime_utc_datetime(result.started_at)
         finished_at = _runtime_utc_datetime(result.finished_at)
+        stored_finish_is_required = stored_finished_at is not _STORED_FINISHED_AT_OMITTED
         stored_finish = (
-            parse_canonical_utc(stored_finished_at) if stored_finished_at is not None else None
+            parse_canonical_utc(stored_finished_at) if stored_finish_is_required else None
         )
         valid = (
             authoritative is not None
@@ -1117,7 +1119,7 @@ class WorkflowStore:
             and _canonical_pydantic_datetime_wire(started_at) is not None
             and _canonical_pydantic_datetime_wire(finished_at) is not None
         )
-        if stored_finished_at is not None:
+        if stored_finish_is_required:
             valid = valid and stored_finish is not None and finished_at == stored_finish
         if not valid:
             raise InvoiceAgentsError(
@@ -1158,6 +1160,31 @@ class WorkflowStore:
             stored_finished_at=row["finished_at"],
         )
         return result
+
+    @classmethod
+    def _decode_optional_stored_result_row(
+        cls,
+        row: sqlite3.Row,
+        *,
+        predecessor: bool,
+        require_result: bool = False,
+    ) -> CaseResult | None:
+        """Validate any aggregate/finish pair before a row can authorize later work."""
+
+        if row["result_json"] is not None:
+            return (
+                cls._decode_recovery_predecessor_row(row)
+                if predecessor
+                else cls._decode_terminal_result_row(row)
+            )
+        if row["finished_at"] is not None or require_result:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "case has terminal authority without a valid persisted result",
+                case_id=str(row["case_id"]),
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from None
+        return None
 
     @classmethod
     def _decode_recovery_predecessor_row(cls, row: sqlite3.Row) -> CaseResult:
@@ -1369,8 +1396,9 @@ class WorkflowStore:
                 claimed_at = datetime.now(UTC)
                 expires_at = claimed_at + timedelta(seconds=lease_seconds)
                 row = connection.execute(
-                    "SELECT status, execution_token, execution_generation, "
-                    "execution_state, lease_expires_at FROM cases WHERE case_id = ?",
+                    "SELECT case_id, source_id, status, stop_reason, result_json, started_at, "
+                    "finished_at, execution_token, execution_generation, execution_state, "
+                    "lease_expires_at FROM cases WHERE case_id = ?",
                     (case_id,),
                 ).fetchone()
                 if row is None:
@@ -1411,6 +1439,11 @@ class WorkflowStore:
                         case_id=case_id,
                         stop_reason="CASE_ALREADY_CLAIMED",
                     )
+                self._decode_optional_stored_result_row(
+                    row,
+                    predecessor=previous_state != "FINISHED",
+                    require_result=previous_state == "FINISHED",
+                )
                 generation = previous_generation + 1
                 updated = connection.execute(
                     "UPDATE cases SET execution_token = ?, "
@@ -2073,7 +2106,8 @@ class WorkflowStore:
 
         with connect_database(self.path, read_only=True) as connection:
             case_row = connection.execute(
-                "SELECT source_id, started_at FROM cases WHERE case_id = ?",
+                "SELECT case_id, source_id, status, stop_reason, result_json, started_at, "
+                "finished_at, execution_state FROM cases WHERE case_id = ?",
                 (result.case_id,),
             ).fetchone()
             if case_row is None:
@@ -2083,6 +2117,11 @@ class WorkflowStore:
                     case_id=result.case_id,
                     stop_reason="CASE_NOT_FOUND",
                 )
+            self._decode_optional_stored_result_row(
+                case_row,
+                predecessor=case_row["execution_state"] != "FINISHED",
+                require_result=case_row["execution_state"] == "FINISHED",
+            )
             source_id = cast(str | None, case_row["source_id"])
             if result.source_id != source_id:
                 raise InvoiceAgentsError(
@@ -3141,6 +3180,32 @@ class WorkflowStore:
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             written_at = datetime.now(UTC).isoformat()
+            current = connection.execute(
+                "SELECT case_id, source_id, status, stop_reason, result_json, started_at, "
+                "finished_at, execution_token, execution_generation, execution_state, "
+                "lease_expires_at FROM cases WHERE case_id = ?",
+                (result.case_id,),
+            ).fetchone()
+            if current is not None and not self._authority_tuple_is_valid(current):
+                raise InvoiceAgentsError(
+                    ErrorCategory.DATABASE,
+                    f"case {result.case_id} has a contradictory execution authority tuple",
+                    case_id=result.case_id,
+                    stop_reason="EXECUTION_AUTHORITY_CORRUPT",
+                )
+            if (
+                current is None
+                or current["execution_token"] != claim.token
+                or int(current["execution_generation"]) != claim.generation
+                or current["execution_state"] != "FINISHED"
+                or current["lease_expires_at"] is not None
+            ):
+                self._raise_stale_execution_claim(claim)
+            self._decode_optional_stored_result_row(
+                current,
+                predecessor=False,
+                require_result=True,
+            )
             self._require_terminal_result_identity(connection, result)
             encoded_result = self._encode_terminal_result(connection, result)
             updated = connection.execute(

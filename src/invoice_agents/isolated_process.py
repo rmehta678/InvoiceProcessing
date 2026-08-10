@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import selectors
+import socket
+import stat
 import subprocess
 import tempfile
 import threading
 import time
-from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
 
@@ -31,10 +33,112 @@ def sanitized_worker_environment() -> dict[str, str]:
     return _sanitized_worker_environment()
 
 
-def _close_descriptors(descriptors: set[int]) -> None:
+@dataclass(frozen=True, slots=True)
+class _DescriptorIdentity:
+    """Stable-enough identity for refusing to close a reused descriptor number."""
+
+    device: int
+    inode: int
+    file_type: int
+    device_type: int
+
+
+def _descriptor_identity(descriptor: int) -> _DescriptorIdentity:
+    status = os.fstat(descriptor)
+    return _DescriptorIdentity(
+        device=status.st_dev,
+        inode=status.st_ino,
+        file_type=stat.S_IFMT(status.st_mode),
+        device_type=status.st_rdev,
+    )
+
+
+def _capture_owned_fds(descriptors: set[int]) -> dict[int, _DescriptorIdentity | None]:
+    """Capture transferred FD identities without treating an absent FD as owned."""
+
+    owned: dict[int, _DescriptorIdentity | None] = {}
     for descriptor in descriptors:
-        with suppress(OSError):
+        try:
+            owned[descriptor] = _descriptor_identity(descriptor)
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                # Identity inspection failed, so retain conservative ownership.
+                owned[descriptor] = None
+    return owned
+
+
+def _close_owned_fds(owned: dict[int, _DescriptorIdentity | None]) -> bool:
+    """Attempt each transferred close once and retain every unproven ownership.
+
+    A failed ``close(2)`` is never retried by descriptor number: EINTR and
+    deferred I/O errors can mean that the number was already released and
+    reused.  ``fstat`` proves either nonexistence or a changed identity before
+    ownership is discarded.  Confirmed EBADF/nonexistence is already clean;
+    every other close error remains a fail-closed lifecycle outcome.
+    """
+
+    close_failed = False
+    for descriptor, expected_identity in tuple(owned.items()):
+        try:
             os.close(descriptor)
+        except OSError as close_error:
+            current_identity: _DescriptorIdentity | None
+            try:
+                current_identity = _descriptor_identity(descriptor)
+            except OSError as inspect_error:
+                if inspect_error.errno == errno.EBADF:
+                    owned.pop(descriptor, None)
+                    current_identity = None
+                else:
+                    current_identity = expected_identity
+            else:
+                if expected_identity is not None and current_identity != expected_identity:
+                    # The original FD is gone and this number now belongs elsewhere.
+                    owned.pop(descriptor, None)
+            if close_error.errno != errno.EBADF or current_identity is not None:
+                close_failed = True
+        else:
+            owned.pop(descriptor, None)
+    return close_failed
+
+
+def _destroy_still_owned_fds(owned: dict[int, _DescriptorIdentity | None]) -> bool:
+    """Destroy retained descriptors after no child can consume their contents.
+
+    This is containment, not a successful retry: callers preserve the original
+    close-failure flag and report cleanup failure even when containment proves
+    the secret-bearing descriptor gone.  Socket FDs use the socket close
+    primitive so an injected or persistently failing ``os.close`` cannot leave
+    a queued credential recoverable.
+    """
+
+    for descriptor, expected_identity in tuple(owned.items()):
+        try:
+            current_identity = _descriptor_identity(descriptor)
+        except OSError as exc:
+            if exc.errno == errno.EBADF:
+                owned.pop(descriptor, None)
+            continue
+        if expected_identity is not None and current_identity != expected_identity:
+            # A failed close released the original before this number was reused.
+            owned.pop(descriptor, None)
+            continue
+        try:
+            if current_identity.file_type == stat.S_IFSOCK:
+                socket.close(descriptor)
+            else:
+                os.closerange(descriptor, descriptor + 1)
+        except OSError:
+            pass
+        try:
+            final_identity = _descriptor_identity(descriptor)
+        except OSError as exc:
+            if exc.errno == errno.EBADF:
+                owned.pop(descriptor, None)
+            continue
+        if expected_identity is not None and final_identity != expected_identity:
+            owned.pop(descriptor, None)
+    return bool(owned)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,9 +219,10 @@ def run_isolated_process(
     copy is closed immediately after the spawn attempt on every path.
     """
 
-    owned_descriptors = {
+    descriptor_numbers = {
         descriptor for descriptor in pass_fds if type(descriptor) is int and descriptor >= 3
     }
+    owned_descriptors = _capture_owned_fds(descriptor_numbers)
     descriptors_are_valid = all(
         type(descriptor) is int and descriptor >= 3 for descriptor in pass_fds
     ) and len(set(pass_fds)) == len(pass_fds)
@@ -132,17 +237,25 @@ def run_isolated_process(
         or any(type(argument) is not str or not argument for argument in command)
         or not descriptors_are_valid
     ):
-        _close_descriptors(owned_descriptors)
+        close_failed = _close_owned_fds(owned_descriptors)
+        containment_failed = _destroy_still_owned_fds(owned_descriptors)
+        if close_failed or containment_failed:
+            raise IsolatedProcessCleanupError from None
         raise ValueError("invalid isolated worker controller input")
     try:
         if not _retry_quarantined_workers():
             raise IsolatedProcessCleanupError from None
     except BaseException:
-        _close_descriptors(owned_descriptors)
+        close_failed = _close_owned_fds(owned_descriptors)
+        containment_failed = _destroy_still_owned_fds(owned_descriptors)
+        if close_failed or containment_failed:
+            raise IsolatedProcessCleanupError from None
         raise
     process: subprocess.Popen[bytes] | None = None
     worker: object | None = None
     start_failed = False
+    descriptor_close_attempted = False
+    descriptor_cleanup_failed = False
     try:
         with tempfile.TemporaryFile() as request_stream:
             request_stream.write(request)
@@ -157,17 +270,20 @@ def run_isolated_process(
                 pass_fds=pass_fds,
                 env=env,
             )
-        _close_descriptors(owned_descriptors)
-        owned_descriptors.clear()
+        descriptor_close_attempted = True
+        descriptor_cleanup_failed = _close_owned_fds(owned_descriptors)
         worker = _capture_worker_session(process)
     except Exception:
         start_failed = True
         if process is not None:
             worker = _uncertain_worker_session(process)
     finally:
-        _close_descriptors(owned_descriptors)
-        owned_descriptors.clear()
+        if not descriptor_close_attempted:
+            descriptor_cleanup_failed = _close_owned_fds(owned_descriptors)
     if worker is None:
+        containment_failed = _destroy_still_owned_fds(owned_descriptors)
+        if descriptor_cleanup_failed or containment_failed:
+            raise IsolatedProcessCleanupError from None
         raise IsolatedProcessCleanupError from None
     start_failed = (
         start_failed
@@ -184,7 +300,8 @@ def run_isolated_process(
             cancel_requested=cancel_requested,
         )
     cleanup_error = _stop_worker(worker)  # type: ignore[arg-type]
-    if cleanup_error is not None:
+    containment_failed = _destroy_still_owned_fds(owned_descriptors)
+    if cleanup_error is not None or descriptor_cleanup_failed or containment_failed:
         raise IsolatedProcessCleanupError from None
     if start_failed:
         return IsolatedProcessResult(None, "start")
