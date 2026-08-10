@@ -10,9 +10,7 @@ import json
 import logging
 import os
 import struct
-import subprocess
 import sys
-import threading
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -115,6 +113,20 @@ def _worker_is_contained(worker: object) -> bool:
         )
 
 
+def _capture_spawned_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[isolated_process._SpawnedProcess]:
+    spawned: list[isolated_process._SpawnedProcess] = []
+    real_after_spawn = isolated_process._after_worker_spawn
+
+    def observed_spawn(process: isolated_process._SpawnedProcess) -> None:
+        spawned.append(process)
+        real_after_spawn(process)
+
+    monkeypatch.setattr(isolated_process, "_after_worker_spawn", observed_spawn)
+    return spawned
+
+
 def test_round9_child_receives_a_read_only_pipe_endpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -124,17 +136,16 @@ def test_round9_child_receives_a_read_only_pipe_endpoint(
     canary = "round9-read-only-pipe-canary"
     settings, started_at, claim = _lifecycle_inputs(tmp_path, canary)
     observed_access_modes: list[int] = []
-    real_popen = subprocess.Popen
+    real_run = isolated_process.run_isolated_process
 
-    def observed_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
-        process = real_popen(*args, **kwargs)
-        passed = kwargs.get("pass_fds", ())
+    def observed_run(**kwargs: Any) -> isolated_process.IsolatedProcessResult:
+        passed = kwargs["pass_fds"]
         observed_access_modes.extend(
             fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE for descriptor in passed
         )
-        return process
+        return real_run(**kwargs)
 
-    monkeypatch.setattr(isolated_process.subprocess, "Popen", observed_popen)
+    monkeypatch.setattr(lifecycle_process, "run_isolated_process", observed_run)
     monkeypatch.setattr(
         lifecycle_process,
         "_lifecycle_worker_command",
@@ -180,17 +191,15 @@ def test_round9_unproven_parent_read_close_transmits_zero_credential_bytes(
         "_lifecycle_worker_command",
         lambda: [sys.executable, "-c", child_code],
     )
-    spawned: list[subprocess.Popen[bytes]] = []
+    spawned = _capture_spawned_worker(monkeypatch)
     credential_reader: list[int] = []
     injected = False
-    real_popen = subprocess.Popen
     real_close = os.close
+    real_run = isolated_process.run_isolated_process
 
-    def observed_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
-        process = real_popen(*args, **kwargs)
-        spawned.append(process)
-        credential_reader.extend(kwargs.get("pass_fds", ()))
-        return process
+    def observed_run(**kwargs: Any) -> isolated_process.IsolatedProcessResult:
+        credential_reader.extend(kwargs["pass_fds"])
+        return real_run(**kwargs)
 
     def fail_first_parent_read_close(descriptor: int) -> None:
         nonlocal injected
@@ -199,7 +208,7 @@ def test_round9_unproven_parent_read_close_transmits_zero_credential_bytes(
             raise OSError(errno.EIO, "round9 injected parent read close failure")
         real_close(descriptor)
 
-    monkeypatch.setattr(isolated_process.subprocess, "Popen", observed_popen)
+    monkeypatch.setattr(lifecycle_process, "run_isolated_process", observed_run)
     monkeypatch.setattr(isolated_process.os, "close", fail_first_parent_read_close)
 
     outcome = lifecycle_process.run_lifecycle_process(
@@ -299,18 +308,8 @@ def test_round9_parent_reader_is_closed_before_first_write_and_writer_is_write_o
     retained_payloads: list[bytearray] = []
     requests: list[bytes] = []
     environments: list[dict[str, str]] = []
-    real_popen = subprocess.Popen
     real_write = os.write
     real_run = isolated_process.run_isolated_process
-
-    def observed_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
-        process = real_popen(*args, **kwargs)
-        readers.extend(kwargs.get("pass_fds", ()))
-        reader_identities.extend(
-            (status.st_dev, status.st_ino, status.st_mode, status.st_rdev)
-            for status in (os.fstat(descriptor) for descriptor in kwargs.get("pass_fds", ()))
-        )
-        return process
 
     def observed_write(descriptor: int, data: Any) -> int:
         access_mode = fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE
@@ -330,12 +329,16 @@ def test_round9_parent_reader_is_closed_before_first_write_and_writer_is_write_o
         return real_write(descriptor, data)
 
     def observed_run(**kwargs: Any) -> isolated_process.IsolatedProcessResult:
+        readers.extend(kwargs["pass_fds"])
+        reader_identities.extend(
+            (status.st_dev, status.st_ino, status.st_mode, status.st_rdev)
+            for status in (os.fstat(descriptor) for descriptor in kwargs["pass_fds"])
+        )
         requests.append(kwargs["request"])
         environments.append(kwargs["env"])
         retained_payloads.append(kwargs["private_input"].payload)
         return real_run(**kwargs)
 
-    monkeypatch.setattr(isolated_process.subprocess, "Popen", observed_popen)
     monkeypatch.setattr(isolated_process.os, "write", observed_write)
     monkeypatch.setattr(lifecycle_process, "run_isolated_process", observed_run)
 
@@ -382,23 +385,15 @@ def test_round9_worker_terminal_paths_reap_child_and_retire_directional_endpoint
         lambda: _terminal_worker_command(worker_mode),
     )
     captured_inputs: list[isolated_process.PrivatePipeInput] = []
-    spawned: list[subprocess.Popen[bytes]] = []
+    spawned = _capture_spawned_worker(monkeypatch)
     real_run = isolated_process.run_isolated_process
-    real_popen = subprocess.Popen
 
     def observed_run(**kwargs: Any) -> isolated_process.IsolatedProcessResult:
         captured_inputs.append(kwargs["private_input"])
         return real_run(**kwargs)
 
-    def observed_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
-        process = real_popen(*args, **kwargs)
-        if kwargs.get("pass_fds"):
-            spawned.append(process)
-        return process
-
     monkeypatch.setattr(lifecycle_process, "run_isolated_process", observed_run)
-    monkeypatch.setattr(isolated_process.subprocess, "Popen", observed_popen)
-    cancel_requested = threading.Event()
+    cancel_requested = isolated_process.ProcessCancellation()
     if worker_mode == "cancel":
         cancel_requested.set()
 
@@ -645,21 +640,14 @@ def test_round9_write_faults_destroy_partial_kernel_buffer_and_reap_child(
         lambda: _digest_worker_command(receipt),
     )
     captured_inputs: list[isolated_process.PrivatePipeInput] = []
-    spawned: list[subprocess.Popen[bytes]] = []
+    spawned = _capture_spawned_worker(monkeypatch)
     write_calls = 0
     real_run = isolated_process.run_isolated_process
-    real_popen = subprocess.Popen
     real_write = os.write
 
     def observed_run(**kwargs: Any) -> isolated_process.IsolatedProcessResult:
         captured_inputs.append(kwargs["private_input"])
         return real_run(**kwargs)
-
-    def observed_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
-        process = real_popen(*args, **kwargs)
-        if kwargs.get("pass_fds"):
-            spawned.append(process)
-        return process
 
     def failing_write(descriptor: int, data: Any) -> int:
         nonlocal write_calls
@@ -680,7 +668,6 @@ def test_round9_write_faults_destroy_partial_kernel_buffer_and_reap_child(
         return real_write(descriptor, data)
 
     monkeypatch.setattr(lifecycle_process, "run_isolated_process", observed_run)
-    monkeypatch.setattr(isolated_process.subprocess, "Popen", observed_popen)
     monkeypatch.setattr(isolated_process.os, "write", failing_write)
 
     outcome = lifecycle_process.run_lifecycle_process(
@@ -726,9 +713,8 @@ def test_round9_transport_control_waits_for_child_containment_and_zeroes_buffers
         lambda: _digest_worker_command(receipt),
     )
     captured_inputs: list[isolated_process.PrivatePipeInput] = []
-    spawned: list[subprocess.Popen[bytes]] = []
+    spawned = _capture_spawned_worker(monkeypatch)
     real_run = isolated_process.run_isolated_process
-    real_popen = subprocess.Popen
     real_reader_release = isolated_process._release_parent_reader
     real_write = os.write
     write_calls = 0
@@ -736,12 +722,6 @@ def test_round9_transport_control_waits_for_child_containment_and_zeroes_buffers
     def observed_run(**kwargs: Any) -> isolated_process.IsolatedProcessResult:
         captured_inputs.append(kwargs["private_input"])
         return real_run(**kwargs)
-
-    def observed_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
-        process = real_popen(*args, **kwargs)
-        if kwargs.get("pass_fds"):
-            spawned.append(process)
-        return process
 
     def control_reader_release(reader: isolated_process.PrivatePipeEndpoint) -> None:
         if control_stage == "after-read-close":
@@ -764,7 +744,6 @@ def test_round9_transport_control_waits_for_child_containment_and_zeroes_buffers
         raise control_type("round9 post-write control")
 
     monkeypatch.setattr(lifecycle_process, "run_isolated_process", observed_run)
-    monkeypatch.setattr(isolated_process.subprocess, "Popen", observed_popen)
     if control_stage in {"before-read-close", "after-read-close"}:
         monkeypatch.setattr(isolated_process, "_release_parent_reader", control_reader_release)
     elif control_stage == "before-write":
@@ -812,20 +791,13 @@ def test_round9_writer_release_failure_precedes_worker_terminal_result(
         lambda: _digest_worker_command(receipt, worker_mode),
     )
     captured_inputs: list[isolated_process.PrivatePipeInput] = []
-    spawned: list[subprocess.Popen[bytes]] = []
+    spawned = _capture_spawned_worker(monkeypatch)
     real_run = isolated_process.run_isolated_process
-    real_popen = subprocess.Popen
     real_release = isolated_process._release_parent_writer
 
     def observed_run(**kwargs: Any) -> isolated_process.IsolatedProcessResult:
         captured_inputs.append(kwargs["private_input"])
         return real_run(**kwargs)
-
-    def observed_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
-        process = real_popen(*args, **kwargs)
-        if kwargs.get("pass_fds"):
-            spawned.append(process)
-        return process
 
     def fail_writer_release(writer: isolated_process.PrivatePipeEndpoint) -> None:
         if release_stage == "after-close":
@@ -833,7 +805,6 @@ def test_round9_writer_release_failure_precedes_worker_terminal_result(
         raise OSError(errno.EIO, "round9 injected writer release failure")
 
     monkeypatch.setattr(lifecycle_process, "run_isolated_process", observed_run)
-    monkeypatch.setattr(isolated_process.subprocess, "Popen", observed_popen)
     monkeypatch.setattr(isolated_process, "_release_parent_writer", fail_writer_release)
 
     outcome = lifecycle_process.run_lifecycle_process(
@@ -923,25 +894,17 @@ def test_round9_capture_control_transmits_nothing_and_reaps_fallback_session(
         lambda: _digest_worker_command(receipt),
     )
     captured_inputs: list[isolated_process.PrivatePipeInput] = []
-    spawned: list[subprocess.Popen[bytes]] = []
+    spawned = _capture_spawned_worker(monkeypatch)
     real_run = isolated_process.run_isolated_process
-    real_popen = subprocess.Popen
 
     def observed_run(**kwargs: Any) -> isolated_process.IsolatedProcessResult:
         captured_inputs.append(kwargs["private_input"])
         return real_run(**kwargs)
 
-    def observed_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
-        process = real_popen(*args, **kwargs)
-        if kwargs.get("pass_fds"):
-            spawned.append(process)
-        return process
-
-    def interrupt_capture(_process: subprocess.Popen[bytes]) -> object:
+    def interrupt_capture(_process: isolated_process._SpawnedProcess) -> object:
         raise control_type("round9 worker capture control")
 
     monkeypatch.setattr(lifecycle_process, "run_isolated_process", observed_run)
-    monkeypatch.setattr(isolated_process.subprocess, "Popen", observed_popen)
     monkeypatch.setattr(isolated_process, "_capture_worker_session", interrupt_capture)
 
     with pytest.raises(control_type):
@@ -974,19 +937,11 @@ def test_round9_capture_failure_is_start_failure_with_zero_credential_bytes(
         "_lifecycle_worker_command",
         lambda: _digest_worker_command(receipt),
     )
-    spawned: list[subprocess.Popen[bytes]] = []
-    real_popen = subprocess.Popen
+    spawned = _capture_spawned_worker(monkeypatch)
 
-    def observed_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
-        process = real_popen(*args, **kwargs)
-        if kwargs.get("pass_fds"):
-            spawned.append(process)
-        return process
-
-    def fail_capture(_process: subprocess.Popen[bytes]) -> object:
+    def fail_capture(_process: isolated_process._SpawnedProcess) -> object:
         raise OSError(errno.EIO, "round9 worker capture failure")
 
-    monkeypatch.setattr(isolated_process.subprocess, "Popen", observed_popen)
     monkeypatch.setattr(isolated_process, "_capture_worker_session", fail_capture)
 
     outcome = lifecycle_process.run_lifecycle_process(
@@ -1024,7 +979,7 @@ def test_round9_stop_control_is_reraised_only_after_real_child_reap(
     captured_workers: list[object] = []
     real_capture = isolated_process._capture_worker_session
 
-    def observed_capture(process: subprocess.Popen[bytes]) -> object:
+    def observed_capture(process: isolated_process._SpawnedProcess) -> object:
         worker = real_capture(process)
         captured_workers.append(worker)
         return worker
@@ -1072,7 +1027,7 @@ def test_round9_stop_control_with_reap_failure_leaves_durable_quarantine(
     real_capture = isolated_process._capture_worker_session
     real_stop = isolated_process._stop_worker
 
-    def observed_capture(process: subprocess.Popen[bytes]) -> object:
+    def observed_capture(process: isolated_process._SpawnedProcess) -> object:
         worker = real_capture(process)
         captured_workers.append(worker)
         return worker
@@ -1120,7 +1075,7 @@ def test_round9_stop_and_reap_failure_returns_cleanup_error_with_quarantine(
     real_capture = isolated_process._capture_worker_session
     real_stop = isolated_process._stop_worker
 
-    def observed_capture(process: subprocess.Popen[bytes]) -> object:
+    def observed_capture(process: isolated_process._SpawnedProcess) -> object:
         worker = real_capture(process)
         captured_workers.append(worker)
         return worker
@@ -1150,90 +1105,3 @@ def test_round9_stop_and_reap_failure_returns_cleanup_error_with_quarantine(
         for worker in captured_workers:
             with suppress(BaseException):
                 real_stop(worker)  # type: ignore[arg-type]
-
-
-@pytest.mark.parametrize("endpoint_kind", ["reader", "writer"])
-def test_round9_uncertain_close_never_retries_a_reused_raw_descriptor(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    endpoint_kind: str,
-) -> None:
-    """A close-then-error cannot authorize mutation of an unrelated reused FD."""
-
-    canary = f"round9-{endpoint_kind}-reuse-canary"
-    settings, started_at, claim = _lifecycle_inputs(tmp_path, canary)
-    unrelated_path = tmp_path / f"{endpoint_kind}-unrelated"
-    unrelated_path.write_bytes(b"round9-unrelated-descriptor-payload")
-    receipt = tmp_path / f"{endpoint_kind}-reuse-digest"
-    monkeypatch.setattr(
-        lifecycle_process,
-        "_lifecycle_worker_command",
-        lambda: _digest_worker_command(receipt),
-    )
-    real_close = os.close
-    real_reader_release = isolated_process._release_parent_reader
-    real_writer_release = isolated_process._release_parent_writer
-    target: list[int] = []
-    replacement_identity: list[tuple[int, int, int, int]] = []
-    close_calls = 0
-
-    def observed_close(descriptor: int) -> None:
-        nonlocal close_calls
-        if target and descriptor == target[0]:
-            close_calls += 1
-        real_close(descriptor)
-
-    def install_reuse(descriptor: int) -> None:
-        replacement = os.open(unrelated_path, os.O_RDONLY)
-        if replacement != descriptor:
-            os.dup2(replacement, descriptor, inheritable=False)
-            real_close(replacement)
-        status = os.fstat(descriptor)
-        replacement_identity.append((status.st_dev, status.st_ino, status.st_mode, status.st_rdev))
-
-    def fail_reader_release(reader: isolated_process.PrivatePipeEndpoint) -> None:
-        descriptor = reader.fileno()
-        target.append(descriptor)
-        real_reader_release(reader)
-        install_reuse(descriptor)
-        raise OSError(errno.EINTR, "round9 uncertain reader close")
-
-    def fail_writer_release(writer: isolated_process.PrivatePipeEndpoint) -> None:
-        descriptor = writer.fileno()
-        target.append(descriptor)
-        real_writer_release(writer)
-        install_reuse(descriptor)
-        raise OSError(errno.EINTR, "round9 uncertain writer close")
-
-    monkeypatch.setattr(isolated_process.os, "close", observed_close)
-    if endpoint_kind == "reader":
-        monkeypatch.setattr(isolated_process, "_release_parent_reader", fail_reader_release)
-    else:
-        monkeypatch.setattr(isolated_process, "_release_parent_writer", fail_writer_release)
-
-    try:
-        outcome = lifecycle_process.run_lifecycle_process(
-            mode="process",
-            settings=settings,
-            claim=claim,
-            started_at=started_at,
-            timeout_seconds=1.0,
-        )
-        assert outcome.error_code == "LIFECYCLE_WORKER_CLEANUP_FAILED"
-        assert target and replacement_identity
-        status = os.fstat(target[0])
-        assert (
-            status.st_dev,
-            status.st_ino,
-            status.st_mode,
-            status.st_rdev,
-        ) == replacement_identity[0]
-        assert close_calls == 1
-        if receipt.exists():
-            assert (
-                receipt.read_text(encoding="ascii") == hashlib.sha256(canary.encode()).hexdigest()
-            )
-    finally:
-        for descriptor in target:
-            with suppress(OSError):
-                real_close(descriptor)

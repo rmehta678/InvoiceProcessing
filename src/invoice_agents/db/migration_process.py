@@ -712,9 +712,10 @@ def _leader_exit_is_proven(
 ) -> bool:
     zombie = snapshot.leader_state.startswith("Z")
     observed = _watcher_observed_exit(worker)
-    if observed is not None and observed != zombie:
-        raise _WorkerCleanupFailure
-    return zombie
+    # NOTE_EXIT and a zombie process-table row are independent positive exit
+    # proofs. Their visibility is not atomic, so a negative observation from
+    # either source cannot invalidate a positive observation from the other.
+    return zombie or observed is True
 
 
 def _signal_worker_leader(

@@ -392,7 +392,7 @@ def test_round4_lifecycle_worker_uses_private_credential_fd_and_kills_descendant
     assert canary.encode() not in encoded
     _secret[:] = bytes(len(_secret))
     assert all(canary not in argument for argument in command)
-    cancel_requested = threading.Event()
+    cancel_requested = lifecycle_process.ProcessCancellation()
 
     def cancel_after_worker_started() -> None:
         deadline = time.monotonic() + 0.75

@@ -10,7 +10,6 @@ import os
 import sqlite3
 import struct
 import sys
-import threading
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -1246,7 +1245,7 @@ def test_round5_parent_credential_descriptor_closes_on_every_worker_path(
         return real_run(**kwargs)
 
     monkeypatch.setattr(lifecycle_process, "run_isolated_process", observed_run)
-    cancel_requested = threading.Event()
+    cancel_requested = isolated_process.ProcessCancellation()
     if worker_mode == "cancel":
         cancel_requested.set()
     outcome = lifecycle_process.run_lifecycle_process(

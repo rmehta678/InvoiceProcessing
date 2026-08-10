@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -17,6 +16,7 @@ from invoice_agents.isolated_process import (
     IsolatedProcessCleanupError,
     PrivatePipeEndpoint,
     PrivatePipeInput,
+    ProcessCancellation,
     private_pipe_channel,
     run_isolated_process,
     send_private_frame,
@@ -127,11 +127,6 @@ def _encode_request(
         raise ValueError("invalid lifecycle mode")
     if type(credential_fd) is not int or credential_fd < 0:
         raise ValueError("invalid lifecycle credential descriptor")
-    credential = bytearray(settings.provider_key().encode("utf-8"))
-    if not credential or len(credential) > LIFECYCLE_MAX_CREDENTIAL_BYTES:
-        for index in range(len(credential)):
-            credential[index] = 0
-        raise ValueError("provider credential exceeds its private transport bound")
     payload = {
         "claim": _claim_payload(claim),
         "credential_fd": credential_fd,
@@ -147,9 +142,12 @@ def _encode_request(
         sort_keys=True,
     ).encode("utf-8")
     if not encoded or len(encoded) > LIFECYCLE_MAX_MESSAGE_BYTES:
+        raise ValueError("lifecycle request exceeds its bound")
+    credential = bytearray(settings.provider_key().encode("utf-8"))
+    if not credential or len(credential) > LIFECYCLE_MAX_CREDENTIAL_BYTES:
         for index in range(len(credential)):
             credential[index] = 0
-        raise ValueError("lifecycle request exceeds its bound")
+        raise ValueError("provider credential exceeds its private transport bound")
     return encoded, credential
 
 
@@ -266,7 +264,7 @@ def run_lifecycle_process(
     claim: ExecutionClaim,
     started_at: datetime,
     timeout_seconds: float,
-    cancel_requested: threading.Event | None = None,
+    cancel_requested: ProcessCancellation | None = None,
 ) -> LifecycleProcessOutcome:
     """Run provider/team work and prove all local descendants stopped before return."""
 

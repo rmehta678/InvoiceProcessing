@@ -1921,7 +1921,9 @@ async def _invoke_lifecycle_boundary(
 ) -> tuple[_LifecycleBoundaryOutcome, asyncio.CancelledError | None]:
     """Drain a cancellation-aware process controller without retaining raw failures."""
 
-    cancel_requested = threading.Event()
+    from invoice_agents.isolated_process import ProcessCancellation
+
+    cancel_requested = ProcessCancellation()
 
     def invoke() -> _LifecycleBoundaryOutcome:
         try:
