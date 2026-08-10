@@ -347,6 +347,31 @@ def infer_kind(path: Path) -> DatabaseKind:
     return DatabaseKind.WORKFLOW if "workflow" in path.name.lower() else DatabaseKind.INVENTORY
 
 
+def _strict_case_result_json(value: object) -> int:
+    """Return one only for JSON accepted by the historical/current strict schema."""
+
+    if type(value) is not str:
+        return 0
+    from invoice_agents.models import CaseResult
+
+    try:
+        CaseResult.model_validate_json(value, strict=True)
+    except (TypeError, ValueError):
+        return 0
+    return 1
+
+
+def _register_workflow_migration_functions(connection: sqlite3.Connection) -> None:
+    """Install connection-local validators required by packaged workflow SQL."""
+
+    connection.create_function(
+        "strict_case_result_json",
+        1,
+        _strict_case_result_json,
+        deterministic=True,
+    )
+
+
 @contextmanager
 def connect_database(path: Path, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
     """Open SQLite with foreign keys enabled and row dictionaries."""
@@ -1458,6 +1483,7 @@ def _expected_workflow_schema_manifest(
     reference = sqlite3.connect(":memory:")
     reference.row_factory = sqlite3.Row
     try:
+        _register_workflow_migration_functions(reference)
         reference.execute(
             "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
@@ -2368,6 +2394,8 @@ def _migrate_database_in_process(
                         ):
                             _raise_source_changed(path)
                     connection.execute("BEGIN IMMEDIATE")
+                    if selected_kind is DatabaseKind.WORKFLOW and version == 4:
+                        _register_workflow_migration_functions(connection)
                     _assert_connection_rollback_mode(
                         connection,
                         schema="main",

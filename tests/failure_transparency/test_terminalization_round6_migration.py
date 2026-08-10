@@ -284,7 +284,7 @@ def _apply_contradiction(path: Path, contradiction: str) -> None:
             "UPDATE cases SET result_json = NULL WHERE case_id = ?",
             (_CASE_ID,),
         ),
-        "generation_one": (
+        "generation_one_without_predecessor_evidence": (
             "UPDATE cases SET execution_generation = 1 WHERE case_id = ?",
             (_CASE_ID,),
         ),
@@ -346,7 +346,7 @@ def test_round6_public_v3_migration_reconciles_exact_historical_recovery_token(
         "wrong_recovery_error",
         "wrong_recovery_generation_link",
         "extra_result_field",
-        "generation_one",
+        "generation_one_without_predecessor_evidence",
         "generation_real",
         "generation_text",
         "finished_with_lease",

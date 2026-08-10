@@ -1,7 +1,30 @@
 -- aa9e43b issued recovery_<uuid4.hex> only while atomically terminalizing an
--- expired RUNNING generation.  Record only rows whose complete terminal shape
--- proves that exact historical path; no other noncanonical authority is
--- eligible for automatic reconciliation.
+-- eligible IDLE or expired RUNNING generation.  Record only rows whose complete
+-- terminal shape proves that exact historical path; no other noncanonical
+-- authority is eligible for automatic reconciliation.
+CREATE TABLE execution_token_migration_guard (
+    valid INTEGER NOT NULL CHECK(valid = 1)
+);
+
+-- Preserve the original fail-fast boundary for authorities that are not even
+-- lexical recovery candidates.  Exact recovery tokens continue below to the
+-- mandatory strict payload validator before they can be reconciled.
+INSERT INTO execution_token_migration_guard(valid)
+SELECT 0
+FROM cases
+WHERE execution_state IN ('RUNNING', 'FINISHED')
+AND NOT (
+    typeof(execution_token) = 'text'
+    AND length(execution_token) = 37
+    AND execution_token GLOB 'exec_[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+)
+AND NOT (
+    typeof(execution_token) = 'text'
+    AND length(execution_token) = 41
+    AND execution_token GLOB 'recovery_[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+)
+LIMIT 1;
+
 CREATE TABLE execution_token_recovery_reconciliation (
     case_id TEXT PRIMARY KEY,
     original_token TEXT NOT NULL,
@@ -29,7 +52,7 @@ AND c.execution_token GLOB 'recovery_[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-
 AND c.status = 'INCOMPLETE'
 AND c.stop_reason = 'ORPHANED_EXECUTION'
 AND typeof(c.execution_generation) = 'integer'
-AND c.execution_generation >= 2
+AND c.execution_generation >= 1
 AND c.lease_expires_at IS NULL
 AND typeof(c.started_at) = 'text'
 AND typeof(c.updated_at) = 'text'
@@ -45,10 +68,13 @@ AND (c.source_id IS NULL OR EXISTS (
     SELECT 1 FROM source_artifacts AS source
     WHERE source.source_id = c.source_id
 ))
+-- This deterministic connection-local UDF is mandatory.  An unregistered
+-- validator is a SQLite error, so migration cannot silently skip certification.
 AND CASE
     WHEN typeof(c.result_json) <> 'text' OR json_valid(c.result_json) <> 1 THEN 0
     ELSE (
-        json_type(c.result_json, '$') = 'object'
+        strict_case_result_json(c.result_json) = 1
+        AND json_type(c.result_json, '$') = 'object'
         AND (SELECT COUNT(*) FROM json_each(c.result_json)) = 11
         AND NOT EXISTS (
             SELECT 1
@@ -75,41 +101,12 @@ AND CASE
         AND json_extract(c.result_json, '$.status') = c.status
         AND json_type(c.result_json, '$.stop_reason') = 'text'
         AND json_extract(c.result_json, '$.stop_reason') = c.stop_reason
-        AND json_type(c.result_json, '$.final_decision') IN ('object', 'null')
-        AND json_type(c.result_json, '$.review_request') IN ('object', 'null')
-        AND json_type(c.result_json, '$.payment') IN ('object', 'null')
         AND json_type(c.result_json, '$.started_at') = 'text'
         AND json_extract(c.result_json, '$.started_at') =
             substr(c.started_at, 1, length(c.started_at) - 6) || 'Z'
         AND json_type(c.result_json, '$.finished_at') = 'text'
         AND json_extract(c.result_json, '$.finished_at') =
             substr(c.finished_at, 1, length(c.finished_at) - 6) || 'Z'
-        AND json_type(c.result_json, '$.usage') = 'object'
-        AND (SELECT COUNT(*) FROM json_each(c.result_json, '$.usage')) = 6
-        AND NOT EXISTS (
-            SELECT 1
-            FROM json_each(c.result_json, '$.usage') AS usage_field
-            WHERE usage_field.key NOT IN (
-                'prompt_tokens',
-                'completion_tokens',
-                'model_calls',
-                'tool_calls',
-                'retries',
-                'latency_ms'
-            )
-        )
-        AND json_type(c.result_json, '$.usage.prompt_tokens') = 'integer'
-        AND json_extract(c.result_json, '$.usage.prompt_tokens') >= 0
-        AND json_type(c.result_json, '$.usage.completion_tokens') = 'integer'
-        AND json_extract(c.result_json, '$.usage.completion_tokens') >= 0
-        AND json_type(c.result_json, '$.usage.model_calls') = 'integer'
-        AND json_extract(c.result_json, '$.usage.model_calls') >= 0
-        AND json_type(c.result_json, '$.usage.tool_calls') = 'integer'
-        AND json_extract(c.result_json, '$.usage.tool_calls') >= 0
-        AND json_type(c.result_json, '$.usage.retries') = 'integer'
-        AND json_extract(c.result_json, '$.usage.retries') >= 0
-        AND json_type(c.result_json, '$.usage.latency_ms') = 'integer'
-        AND json_extract(c.result_json, '$.usage.latency_ms') >= 0
         AND json_type(c.result_json, '$.errors') = 'array'
         AND json_array_length(c.result_json, '$.errors') >= 1
         AND json_type(c.result_json, '$.errors[#-1]') = 'object'
@@ -164,10 +161,6 @@ END;
 -- Reject every other pre-existing authority that cannot satisfy the canonical
 -- grammar.  Both transient tables are inside the migration transaction, so a
 -- rejection leaves v3 schema, history, and case data unchanged and retryable.
-CREATE TABLE execution_token_migration_guard (
-    valid INTEGER NOT NULL CHECK(valid = 1)
-);
-
 INSERT INTO execution_token_migration_guard(valid)
 SELECT 0
 FROM cases
