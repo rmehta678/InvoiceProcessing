@@ -1,11 +1,17 @@
 """Inventory aggregation, exact alias policy, arithmetic, identity, and risk tests."""
 
+import sqlite3
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from invoice_agents.config import Settings
+from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import WorkflowStore
+from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import (
     CaseStatus,
     ExtractedInvoice,
@@ -130,6 +136,161 @@ def test_identity_representation_and_revision(
         candidate.relationship is IdentityRelationship.POSSIBLE_REVISION
         for candidate in revision_candidates
     )
+
+
+def test_qualifying_prior_with_deleted_extraction_fails_loudly(
+    invoice_dir: Path, workflow_db: Path, tmp_path: Path
+) -> None:
+    store = WorkflowStore(workflow_db)
+    prior = invoice(invoice_dir, "invoice_1011.txt", tmp_path / "sources")
+    persist_extraction(store, "case_prior", prior)
+    current = invoice(invoice_dir, "invoice_1011.pdf", tmp_path / "sources")
+
+    identity_rows = store.identity_rows(
+        "case_current",
+        current.invoice_number.normalized_value,
+        current.vendor.normalized_value,
+    )
+    assert [str(row["case_id"]) for row in identity_rows] == ["case_prior"]
+    uncorrupted = find_prior_invoice_candidates("case_current", current, store)
+    assert [candidate.relationship for candidate in uncorrupted] == [
+        IdentityRelationship.DUPLICATE_REPRESENTATION
+    ]
+    with connect_database(workflow_db) as connection:
+        connection.execute("DELETE FROM extractions WHERE case_id = ?", ("case_prior",))
+        connection.commit()
+
+    with pytest.raises(InvoiceAgentsError) as direct_error:
+        store.load_extraction("case_prior")
+    assert direct_error.value.category is ErrorCategory.DATABASE
+    assert direct_error.value.stop_reason == "EXTRACTION_NOT_FOUND"
+    assert direct_error.value.case_id == "case_prior"
+
+    with pytest.raises(InvoiceAgentsError) as candidate_error:
+        find_prior_invoice_candidates("case_current", current, store)
+    assert candidate_error.value.category is ErrorCategory.DATABASE
+    assert candidate_error.value.stop_reason == "EXTRACTION_NOT_FOUND"
+    assert candidate_error.value.case_id == "case_prior"
+    assert candidate_error.value.message == direct_error.value.message
+
+
+def test_qualifying_prior_with_corrupt_extraction_preserves_validation_error(
+    invoice_dir: Path, workflow_db: Path, tmp_path: Path
+) -> None:
+    store = WorkflowStore(workflow_db)
+    prior = invoice(invoice_dir, "invoice_1011.txt", tmp_path / "sources")
+    persist_extraction(store, "case_prior", prior)
+    current = invoice(invoice_dir, "invoice_1011.pdf", tmp_path / "sources")
+
+    identity_rows = store.identity_rows(
+        "case_current",
+        current.invoice_number.normalized_value,
+        current.vendor.normalized_value,
+    )
+    assert [str(row["case_id"]) for row in identity_rows] == ["case_prior"]
+    uncorrupted = find_prior_invoice_candidates("case_current", current, store)
+    assert [candidate.relationship for candidate in uncorrupted] == [
+        IdentityRelationship.DUPLICATE_REPRESENTATION
+    ]
+    with connect_database(workflow_db) as connection:
+        connection.execute(
+            "UPDATE extractions SET payload_json = ? WHERE case_id = ?",
+            ("{}", "case_prior"),
+        )
+        connection.commit()
+
+    with pytest.raises(ValidationError) as direct_error:
+        store.load_extraction("case_prior")
+    with pytest.raises(ValidationError) as candidate_error:
+        find_prior_invoice_candidates("case_current", current, store)
+    assert type(candidate_error.value) is ValidationError
+    assert candidate_error.value.title == direct_error.value.title
+    assert candidate_error.value.errors(include_url=False) == direct_error.value.errors(
+        include_url=False
+    )
+
+
+def test_qualifying_prior_with_malformed_json_preserves_validation_error(
+    invoice_dir: Path, workflow_db: Path, tmp_path: Path
+) -> None:
+    store = WorkflowStore(workflow_db)
+    prior = invoice(invoice_dir, "invoice_1011.txt", tmp_path / "sources")
+    persist_extraction(store, "case_prior", prior)
+    current = invoice(invoice_dir, "invoice_1011.pdf", tmp_path / "sources")
+
+    identity_rows = store.identity_rows(
+        "case_current",
+        current.invoice_number.normalized_value,
+        current.vendor.normalized_value,
+    )
+    assert [str(row["case_id"]) for row in identity_rows] == ["case_prior"]
+    uncorrupted = find_prior_invoice_candidates("case_current", current, store)
+    assert [candidate.relationship for candidate in uncorrupted] == [
+        IdentityRelationship.DUPLICATE_REPRESENTATION
+    ]
+    with connect_database(workflow_db) as connection:
+        connection.execute(
+            "UPDATE extractions SET payload_json = ? WHERE case_id = ?",
+            ("{", "case_prior"),
+        )
+        connection.commit()
+
+    with pytest.raises(ValidationError) as direct_error:
+        store.load_extraction("case_prior")
+    with pytest.raises(ValidationError) as candidate_error:
+        find_prior_invoice_candidates("case_current", current, store)
+    assert type(candidate_error.value) is ValidationError
+    assert candidate_error.value.title == direct_error.value.title
+    assert candidate_error.value.errors(include_url=False) == direct_error.value.errors(
+        include_url=False
+    )
+
+
+def test_qualifying_prior_preserves_sqlite_load_failure(
+    invoice_dir: Path, workflow_db: Path, tmp_path: Path
+) -> None:
+    store = WorkflowStore(workflow_db)
+    prior = invoice(invoice_dir, "invoice_1011.txt", tmp_path / "sources")
+    persist_extraction(store, "case_prior", prior)
+    current = invoice(invoice_dir, "invoice_1011.pdf", tmp_path / "sources")
+
+    identity_rows = store.identity_rows(
+        "case_current",
+        current.invoice_number.normalized_value,
+        current.vendor.normalized_value,
+    )
+    assert [str(row["case_id"]) for row in identity_rows] == ["case_prior"]
+    uncorrupted = find_prior_invoice_candidates("case_current", current, store)
+    assert [candidate.relationship for candidate in uncorrupted] == [
+        IdentityRelationship.DUPLICATE_REPRESENTATION
+    ]
+    with connect_database(workflow_db) as connection:
+        connection.execute("ALTER TABLE extractions RENAME TO extractions_corrupt")
+        connection.commit()
+
+    with pytest.raises(sqlite3.OperationalError) as direct_error:
+        store.load_extraction("case_prior")
+    with pytest.raises(sqlite3.OperationalError) as candidate_error:
+        find_prior_invoice_candidates("case_current", current, store)
+    assert type(candidate_error.value) is sqlite3.OperationalError
+    assert candidate_error.value.args == direct_error.value.args
+
+
+def test_no_matching_prior_returns_no_identity_candidates(
+    invoice_dir: Path, workflow_db: Path, tmp_path: Path
+) -> None:
+    store = WorkflowStore(workflow_db)
+    unrelated = invoice(invoice_dir, "invoice_1014.xml", tmp_path / "sources")
+    persist_extraction(store, "case_unrelated", unrelated)
+    current = invoice(invoice_dir, "invoice_1004.json", tmp_path / "sources")
+
+    identity_rows = store.identity_rows(
+        "case_current",
+        current.invoice_number.normalized_value,
+        current.vendor.normalized_value,
+    )
+    assert identity_rows == []
+    assert find_prior_invoice_candidates("case_current", current, store) == []
 
 
 def test_policy_triggers_high_dollar_non_usd_and_clean(
