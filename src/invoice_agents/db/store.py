@@ -921,6 +921,12 @@ class WorkflowStore:
             )
         return self.settings
 
+    def require_current_execution_claim(self, claim: ExecutionClaim) -> None:
+        """Prove exact, unexpired execution authority without mutating storage."""
+
+        with connect_database(self.path, read_only=True) as connection:
+            self._begin_current_read(connection, claim)
+
     def register_source(self, source: SourceArtifact) -> None:
         with connect_database(self.path) as connection:
             try:
@@ -1338,6 +1344,7 @@ class WorkflowStore:
                         connection,
                         str(row["case_id"]),
                         cast(str | None, row["source_id"]),
+                        previous.payment if previous is not None else None,
                     )
                     if previous is not None:
                         self._require_relational_terminal_facts(
@@ -1443,16 +1450,19 @@ class WorkflowStore:
                 raise
         return recovered
 
-    @staticmethod
     def _load_relational_recovery_evidence(
+        self,
         connection: sqlite3.Connection,
         case_id: str,
         source_id: str | None,
+        aggregate_payment: PaymentResult | None = None,
     ) -> tuple[FinalDecision | None, ReviewRequest | None, PaymentResult | None]:
         """Strictly reconstruct durable evidence when the aggregate JSON is absent."""
 
         final_row = connection.execute(
-            "SELECT payload_json, decision_generation, source_id "
+            "SELECT payload_json, decision_generation, evidence_snapshot_digest, source_id, "
+            "invoice_number, vendor, authorized_amount, authorized_currency, "
+            "payment_idempotency_key, review_id "
             "FROM final_decisions WHERE case_id = ?",
             (case_id,),
         ).fetchone()
@@ -1527,7 +1537,124 @@ class WorkflowStore:
             if persisted_payment is not None
             else None
         )
+        if aggregate_payment is not None and aggregate_payment.status is PaymentStatus.DUPLICATE:
+            payment = self._reconstruct_duplicate_payment(
+                connection,
+                case_id,
+                source_id,
+                aggregate_payment,
+                final_row,
+                payment_rows,
+            )
         return final, review, payment
+
+    def _reconstruct_duplicate_payment(
+        self,
+        connection: sqlite3.Connection,
+        case_id: str,
+        source_id: str | None,
+        aggregate: PaymentResult,
+        final_row: sqlite3.Row | None,
+        case_payment_rows: list[sqlite3.Row],
+    ) -> PaymentResult:
+        """Derive a DUPLICATE attempt from exact current and original authorities."""
+
+        referenced_id = aggregate.duplicate_of
+        if (
+            aggregate.case_id != case_id
+            or aggregate.payment_id is None
+            or referenced_id is None
+            or aggregate.payment_id != referenced_id
+            or final_row is None
+        ):
+            self._raise_invalid_duplicate(case_id)
+        referenced_rows = connection.execute(
+            "SELECT payment_id, case_id, idempotency_key, vendor, amount, currency, "
+            "status, error, created_at, decision_generation, evidence_snapshot_digest, "
+            "source_id, invoice_number, review_id FROM payments WHERE payment_id = ?",
+            (referenced_id,),
+        ).fetchall()
+        if len(referenced_rows) != 1:
+            self._raise_invalid_duplicate(case_id)
+        referenced_row = referenced_rows[0]
+        try:
+            original = PersistedPaymentRow.model_validate(dict(referenced_row), strict=True)
+        except ValueError:
+            self._raise_invalid_duplicate(case_id)
+        if original.status != "PAID":
+            self._raise_invalid_duplicate(case_id)
+        if case_payment_rows and (
+            len(case_payment_rows) != 1
+            or case_payment_rows[0]["payment_id"] != original.payment_id
+            or original.case_id != case_id
+        ):
+            self._raise_invalid_duplicate(case_id)
+
+        try:
+            from invoice_agents.payment.identity import payment_identity_key
+            from invoice_agents.payment.service import (
+                _AuthorizationSnapshotError,
+                _load_authorization_snapshot,
+                _validate_paid_ledger_source,
+            )
+
+            snapshot_settings = self._snapshot_settings()
+            _validate_paid_ledger_source(connection, referenced_row, snapshot_settings)
+            current_generation = int(final_row["decision_generation"])
+            current = _load_authorization_snapshot(
+                connection,
+                case_id,
+                current_generation,
+                snapshot_settings,
+            )
+            invoice = current.invoice
+            expected_key = payment_identity_key(
+                invoice.vendor.normalized_value,
+                invoice.invoice_number.normalized_value,
+            )
+            expected_amount = invoice.declared_total
+            current_columns_are_exact = (
+                final_row["source_id"] == source_id == invoice.source.source_id
+                and final_row["invoice_number"] == invoice.invoice_number.normalized_value
+                and final_row["vendor"] == invoice.vendor.normalized_value
+                and final_row["authorized_amount"]
+                == (str(expected_amount) if expected_amount is not None else None)
+                and final_row["authorized_currency"] == invoice.currency.normalized_value
+                and final_row["payment_idempotency_key"] == expected_key
+                and final_row["evidence_snapshot_digest"] == current.evidence_snapshot_digest
+                and original.idempotency_key == expected_key == aggregate.idempotency_key
+                and original.vendor == invoice.vendor.normalized_value == aggregate.vendor
+                and expected_amount is not None
+                and Decimal(original.amount) == expected_amount
+                and aggregate.amount == Money(amount=expected_amount, currency=original.currency)
+                and original.currency == invoice.currency.normalized_value
+                and aggregate.processed_at == datetime.fromisoformat(original.created_at)
+                and aggregate.error == original.error
+            )
+        except (InvoiceAgentsError, _AuthorizationSnapshotError, ValueError, TypeError):
+            self._raise_invalid_duplicate(case_id)
+        if not current_columns_are_exact:
+            self._raise_invalid_duplicate(case_id)
+        return PaymentResult(
+            payment_id=original.payment_id,
+            case_id=case_id,
+            idempotency_key=original.idempotency_key,
+            status=PaymentStatus.DUPLICATE,
+            vendor=original.vendor,
+            amount=Money(amount=Decimal(original.amount), currency=original.currency),
+            processed_at=datetime.fromisoformat(original.created_at),
+            duplicate_of=original.payment_id,
+            error=original.error,
+        )
+
+    @staticmethod
+    def _raise_invalid_duplicate(case_id: str) -> Never:
+        raise InvoiceAgentsError(
+            ErrorCategory.DATABASE,
+            "duplicate payment evidence does not match immutable payment authority",
+            case_id=case_id,
+            stop_reason="PERSISTED_RESULT_INVALID",
+        ) from None
 
     @staticmethod
     def _require_relational_terminal_facts(
@@ -1578,6 +1705,7 @@ class WorkflowStore:
                 connection,
                 result.case_id,
                 source_id,
+                result.payment,
             )
             self._require_relational_terminal_facts(result, final, review, payment)
         return result.model_copy(

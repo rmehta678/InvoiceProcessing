@@ -24,7 +24,7 @@ from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.hitl.service import record_human_decision
-from invoice_agents.models import CaseResult, CaseStatus, HumanDecisionKind
+from invoice_agents.models import CaseResult, CaseStatus, ErrorRecord, HumanDecisionKind
 from invoice_agents.ui import runs as ui_runs
 from invoice_agents.ui import sse
 from invoice_agents.ui.runs import RunRegistry
@@ -64,6 +64,27 @@ def _prepared_case(invoice_dir: Path, settings: Settings) -> tuple[str, datetime
     return prepared
 
 
+async def _run_prepared_with_new_claim(
+    case_id: str, started_at: datetime, settings: Settings
+) -> CaseResult:
+    claim = WorkflowStore(settings).claim_case_execution(
+        case_id,
+        frozenset({CaseStatus.INCOMPLETE}),
+        orchestration.EXECUTION_LEASE_SECONDS,
+    )
+    return await orchestration.run_prepared_case(
+        case_id,
+        started_at,
+        settings,
+        claim=claim,
+    )
+
+
+async def _resume_with_new_claim(case_id: str, settings: Settings) -> CaseResult:
+    claim = orchestration.claim_resumable_case(case_id, settings)
+    return await orchestration.resume_case(case_id, settings, claim=claim)
+
+
 @pytest.mark.asyncio
 async def test_setup_failure_after_claim_is_durably_terminal(
     invoice_dir: Path,
@@ -87,7 +108,7 @@ async def test_setup_failure_after_claim_is_durably_terminal(
     monkeypatch.chdir(tmp_path)
 
     try:
-        result = await orchestration.run_prepared_case(case_id, started_at, settings)
+        result = await _run_prepared_with_new_claim(case_id, started_at, settings)
     except InvoiceAgentsError as exc:
         pytest.fail(f"post-claim setup failure escaped terminalization: {exc.stop_reason}")
 
@@ -119,7 +140,7 @@ async def test_cancellation_is_durable_and_reraised(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(asyncio.CancelledError):
-        await orchestration.run_prepared_case(case_id, started_at, settings)
+        await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     stored = WorkflowStore(settings.workflow_db).load_result(case_id)
     assert stored is not None
@@ -146,7 +167,7 @@ async def test_cancellation_during_evidence_reconciliation_remains_cancelled(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(asyncio.CancelledError):
-        await orchestration.run_prepared_case(case_id, started_at, settings)
+        await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     stored = WorkflowStore(settings).load_result(case_id)
     assert stored is not None
@@ -189,7 +210,7 @@ async def test_cancellation_during_terminal_evidence_refresh_is_recovery_durable
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(asyncio.CancelledError):
-        await orchestration.run_prepared_case(case_id, started_at, settings)
+        await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     recovery_path = tmp_path / "artifacts" / "results" / f"{case_id}.recovery.json"
     recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
@@ -236,7 +257,7 @@ async def test_process_control_during_terminal_evidence_refresh_is_reraised(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(SystemExit):
-        await orchestration.run_prepared_case(case_id, started_at, settings)
+        await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     recovery_path = tmp_path / "artifacts" / "results" / f"{case_id}.recovery.json"
     recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
@@ -696,6 +717,58 @@ async def test_core_process_entrypoints_retain_claims_until_each_run_starts(
     assert all(state == "RUNNING" for _case_id, state in queued_authorities)
 
 
+@pytest.mark.asyncio
+async def test_core_batch_preparation_abort_terminalizes_prior_handed_off_claims(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later preparation failure cannot abandon claims acquired earlier in the batch."""
+
+    real_prepare = orchestration.prepare_claimed_case
+    prepared: list[tuple[str, datetime, ExecutionClaim]] = []
+    calls = 0
+
+    def abort_second(path: Path, selected_settings: Settings) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise InvoiceAgentsError(
+                ErrorCategory.ORCHESTRATION,
+                "batch preparation could not establish terminal evidence",
+                stop_reason="TERMINAL_RECOVERY_ARTIFACT_FAILED",
+            ) from None
+        outcome = real_prepare(path, selected_settings)
+        assert isinstance(outcome, tuple)
+        prepared.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(orchestration, "prepare_claimed_case", abort_second)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        await orchestration.process_batch(
+            [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
+            settings,
+            concurrency=1,
+        )
+
+    assert excinfo.value.stop_reason == "TERMINAL_RECOVERY_ARTIFACT_FAILED"
+    assert len(prepared) == 1
+    case_id, _started_at, _claim = prepared[0]
+    result = WorkflowStore(settings).load_result(case_id)
+    assert result is not None
+    assert result.status is CaseStatus.INCOMPLETE
+    assert result.stop_reason == "CANCELLED"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        authority = connection.execute(
+            "SELECT execution_state, lease_expires_at FROM cases WHERE case_id = ?",
+            (case_id,),
+        ).fetchone()
+    assert tuple(authority) == ("FINISHED", None)
+
+
 def _nonterminal_authority_rows(settings: Settings) -> list[sqlite3.Row]:
     with connect_database(settings.workflow_db, read_only=True) as connection:
         return list(
@@ -737,12 +810,15 @@ async def test_delayed_runner_cannot_overwrite_recovered_orphan_with_stale_claim
     )
     monkeypatch.chdir(tmp_path)
 
-    await orchestration.run_prepared_case(
-        case_id,
-        started_at,
-        settings,
-        claim=stale_claim,
-    )
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        await orchestration.run_prepared_case(
+            case_id,
+            started_at,
+            settings,
+            claim=stale_claim,
+        )
+    assert excinfo.value.stop_reason == "STALE_EXECUTION_CLAIM"
+    assert excinfo.value.__cause__ is None
 
     with connect_database(settings.workflow_db, read_only=True) as connection:
         after = connection.execute(
@@ -1332,7 +1408,7 @@ async def test_setup_boundary_faults_are_sanitized_and_terminal(
         )
     monkeypatch.chdir(tmp_path)
 
-    result = await orchestration.run_prepared_case(case_id, started_at, settings)
+    result = await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     stored = WorkflowStore(settings).load_result(case_id)
     assert stored == result
@@ -1416,7 +1492,7 @@ async def test_cancellation_at_setup_boundaries_is_durable_and_reraised(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(asyncio.CancelledError):
-        await orchestration.run_prepared_case(case_id, started_at, settings)
+        await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     result = WorkflowStore(settings).load_result(case_id)
     assert result is not None
@@ -1443,7 +1519,7 @@ async def test_process_control_exception_is_terminalized_then_reraised(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(SystemExit):
-        await orchestration.run_prepared_case(case_id, started_at, settings)
+        await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     result = WorkflowStore(settings).load_result(case_id)
     assert result is not None
@@ -1494,7 +1570,7 @@ async def test_heartbeat_process_control_failure_reaches_outer_terminalizer(
     monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: BlockingTeam())
     monkeypatch.chdir(tmp_path)
     with pytest.raises(SystemExit):
-        await orchestration.run_prepared_case(case_id, started_at, settings)
+        await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     result = WorkflowStore(settings).load_result(case_id)
     assert result is not None
@@ -1521,7 +1597,7 @@ async def test_process_control_during_client_close_preserves_primary_result(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(SystemExit):
-        await orchestration.run_prepared_case(case_id, started_at, settings)
+        await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     result = WorkflowStore(settings).load_result(case_id)
     assert result is not None
@@ -1555,7 +1631,7 @@ async def test_primary_process_control_survives_secondary_cleanup_cancellation(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(SystemExit):
-        await orchestration.run_prepared_case(case_id, started_at, settings)
+        await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     result = WorkflowStore(settings).load_result(case_id)
     assert result is not None
@@ -1621,7 +1697,7 @@ async def test_multiple_secondary_failures_preserve_primary_and_order(
     monkeypatch.setattr(os, "replace", fail_result_replace)
     monkeypatch.chdir(tmp_path)
 
-    result = await orchestration.run_prepared_case(case_id, started_at, settings)
+    result = await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     assert result.status is CaseStatus.FAILED
     assert result.stop_reason == "UNEXPECTED_RUNTIME_ERROR"
@@ -1656,7 +1732,7 @@ async def test_terminal_db_failure_writes_atomic_recovery_artifact(
     monkeypatch.setattr(WorkflowStore, "finish_case", fail_terminal_write)
     monkeypatch.chdir(tmp_path)
 
-    result = await orchestration.run_prepared_case(case_id, started_at, settings)
+    result = await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     assert result.status is CaseStatus.INCOMPLETE
     assert result.stop_reason == "MAX_MESSAGES_EXHAUSTED"
@@ -1697,7 +1773,7 @@ async def test_terminal_db_and_recovery_artifact_failure_raise_explicitly(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(InvoiceAgentsError) as error:
-        await orchestration.run_prepared_case(case_id, started_at, settings)
+        await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     assert error.value.stop_reason == "TERMINAL_RECOVERY_ARTIFACT_FAILED"
     assert error.value.__cause__ is None
@@ -1710,7 +1786,7 @@ async def test_terminal_db_and_recovery_artifact_failure_raise_explicitly(
 
 
 @pytest.mark.asyncio
-async def test_recovery_artifact_process_control_is_not_converted(
+async def test_recovery_artifact_process_control_becomes_one_chainless_failure(
     invoice_dir: Path,
     settings: Settings,
     tmp_path: Path,
@@ -1742,9 +1818,12 @@ async def test_recovery_artifact_process_control_is_not_converted(
     )
     monkeypatch.chdir(tmp_path)
 
-    with pytest.raises(SystemExit):
-        await orchestration.run_prepared_case(case_id, started_at, settings)
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        await _run_prepared_with_new_claim(case_id, started_at, settings)
 
+    assert excinfo.value.stop_reason == "TERMINAL_RECOVERY_ARTIFACT_FAILED"
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
     assert closed
     assert WorkflowStore(settings).load_result(case_id) is None
 
@@ -1767,7 +1846,7 @@ async def test_cancellation_during_client_cleanup_is_durable_and_reraised(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(asyncio.CancelledError):
-        await orchestration.run_prepared_case(case_id, started_at, settings)
+        await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     result = WorkflowStore(settings).load_result(case_id)
     assert result is not None
@@ -1803,7 +1882,7 @@ async def test_cancelled_execution_bounds_hung_client_cleanup(
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(
-            orchestration.run_prepared_case(case_id, started_at, settings),
+            _run_prepared_with_new_claim(case_id, started_at, settings),
             timeout=0.2,
         )
 
@@ -1848,7 +1927,7 @@ async def test_repeated_cancellation_during_cleanup_is_drained_and_reraised(
     )
     monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: BlockingTeam())
     monkeypatch.chdir(tmp_path)
-    run_task = asyncio.create_task(orchestration.run_prepared_case(case_id, started_at, settings))
+    run_task = asyncio.create_task(_run_prepared_with_new_claim(case_id, started_at, settings))
     await asyncio.wait_for(stream_started.wait(), timeout=0.2)
     run_task.cancel()
     await asyncio.wait_for(close_started.wait(), timeout=0.2)
@@ -1890,7 +1969,7 @@ async def test_cancellation_during_terminal_write_retries_cancel_result_once(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(asyncio.CancelledError):
-        await orchestration.run_prepared_case(case_id, started_at, settings)
+        await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     assert calls == 2
     result = WorkflowStore(settings).load_result(case_id)
@@ -1923,7 +2002,7 @@ async def test_cancelled_execution_does_not_repeat_failed_terminal_write(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(asyncio.CancelledError):
-        await orchestration.run_prepared_case(case_id, started_at, settings)
+        await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     assert calls == 1
     recovery = tmp_path / "artifacts" / "results" / f"{case_id}.recovery.json"
@@ -1952,7 +2031,7 @@ async def test_cancelled_primary_survives_cleanup_failure(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(asyncio.CancelledError):
-        await orchestration.run_prepared_case(case_id, started_at, settings)
+        await _run_prepared_with_new_claim(case_id, started_at, settings)
 
     result = WorkflowStore(settings).load_result(case_id)
     assert result is not None
@@ -2001,7 +2080,7 @@ async def test_resume_state_load_failure_after_claim_is_terminal(
     monkeypatch.setattr(WorkflowStore, "load_team_state", fail_state_load)
     monkeypatch.chdir(tmp_path)
 
-    result = await orchestration.resume_case(case_id, settings)
+    result = await _resume_with_new_claim(case_id, settings)
 
     assert result.status is CaseStatus.FAILED
     assert result.stop_reason == "UNEXPECTED_RUNTIME_ERROR"
@@ -2031,7 +2110,7 @@ async def test_resume_failure_preserves_latest_resolved_review(
     monkeypatch.setattr(WorkflowStore, "load_team_state", fail_state_load)
     monkeypatch.chdir(tmp_path)
 
-    result = await orchestration.resume_case(case_id, settings)
+    result = await _resume_with_new_claim(case_id, settings)
 
     assert result.status is CaseStatus.FAILED
     assert result.review_request == resolved
@@ -2081,3 +2160,592 @@ async def test_execution_failure_overlays_already_committed_payment(
     assert result.payment == committed.payment
     assert "private sentinel" not in result.model_dump_json()
     assert store.load_result(case_id) == result
+
+
+@pytest.mark.asyncio
+async def test_missing_claim_cannot_reclaim_recovered_terminal_case(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delayed caller without exact authority cannot replace recovered truth."""
+
+    prepared = orchestration.prepare_claimed_invoice(invoice_dir / "invoice_1001.txt", settings)
+    assert isinstance(prepared, tuple)
+    case_id, started_at, _stale_claim = prepared
+    store = WorkflowStore(settings)
+    _expire_running_case(settings, case_id)
+    assert store.recover_expired_executions(now=datetime.now(UTC)) == [case_id]
+    recovered = store.load_result(case_id)
+    assert recovered is not None and recovered.stop_reason == "ORPHANED_EXECUTION"
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        before = tuple(
+            connection.execute(
+                "SELECT status, stop_reason, result_json, execution_token, "
+                "execution_generation, execution_state, lease_expires_at FROM cases "
+                "WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()
+        )
+    provider_calls = 0
+
+    def provider_sentinel(_settings: Settings) -> object:
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("missing authority reached provider construction")
+
+    monkeypatch.setattr(orchestration, "create_model_client", provider_sentinel)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        await orchestration.run_prepared_case(case_id, started_at, settings, claim=None)
+
+    assert excinfo.value.stop_reason == "EXECUTION_CLAIM_MISSING"
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        after = tuple(
+            connection.execute(
+                "SELECT status, stop_reason, result_json, execution_token, "
+                "execution_generation, execution_state, lease_expires_at FROM cases "
+                "WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()
+        )
+    assert after == before
+    assert store.load_result(case_id) == recovered
+    assert provider_calls == 0
+    assert not (tmp_path / "artifacts").exists()
+
+
+def test_prepare_setup_process_control_is_terminalized_then_reraised(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preparation must not convert process-control into an ordinary return."""
+
+    original_record = orchestration.AuditRecorder.record
+    captured_case_id: str | None = None
+
+    def exit_prepared_audit(
+        self: orchestration.AuditRecorder,
+        event_type: str,
+        *args: object,
+        **kwargs: object,
+    ) -> str:
+        nonlocal captured_case_id
+        if event_type == "case.prepared":
+            captured_case_id = self.case_id
+            raise SystemExit("prepare audit sk-proj-private-sentinel")
+        return original_record(self, event_type, *args, **kwargs)
+
+    monkeypatch.setattr(orchestration.AuditRecorder, "record", exit_prepared_audit)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SystemExit) as excinfo:
+        orchestration.prepare_claimed_invoice(invoice_dir / "invoice_1001.txt", settings)
+
+    assert excinfo.value.__cause__ is None
+    assert captured_case_id is not None
+    stored = WorkflowStore(settings).load_result(captured_case_id)
+    assert stored is not None
+    assert stored.status is CaseStatus.FAILED
+    assert stored.stop_reason == "UNEXPECTED_RUNTIME_ERROR"
+    assert "private-sentinel" not in stored.model_dump_json()
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        authority = connection.execute(
+            "SELECT execution_state, lease_expires_at FROM cases WHERE case_id = ?",
+            (captured_case_id,),
+        ).fetchone()
+    assert tuple(authority) == ("FINISHED", None)
+
+
+def test_prepare_setup_terminal_db_failure_publishes_only_recovery_artifact(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal-looking preparation return needs durable recovery evidence."""
+
+    def fail_extraction(_source: object) -> object:
+        raise RuntimeError("prepare extraction sk-proj-private-sentinel")
+
+    def fail_finish(_self: WorkflowStore, _result: CaseResult, _claim: ExecutionClaim) -> None:
+        raise sqlite3.OperationalError("prepare terminal write private sentinel")
+
+    monkeypatch.setattr(orchestration, "extract_invoice_evidence", fail_extraction)
+    monkeypatch.setattr(WorkflowStore, "finish_case", fail_finish)
+    monkeypatch.chdir(tmp_path)
+
+    result = orchestration.prepare_claimed_invoice(invoice_dir / "invoice_1001.txt", settings)
+
+    assert isinstance(result, CaseResult)
+    recovery = tmp_path / "artifacts" / "results" / f"{result.case_id}.recovery.json"
+    normal = tmp_path / "artifacts" / "results" / f"{result.case_id}.json"
+    assert recovery.is_file()
+    assert not normal.exists()
+    payload = json.loads(recovery.read_text(encoding="utf-8"))
+    assert payload["case_result"]["case_id"] == result.case_id
+    assert payload["terminal_persistence_error"]["stop_reason"] == ("TERMINAL_PERSISTENCE_FAILED")
+    assert "private sentinel" not in recovery.read_text(encoding="utf-8")
+    assert list(recovery.parent.glob(f"{result.case_id}*.tmp")) == []
+
+
+@pytest.mark.parametrize(
+    ("fault_type", "expected_control"),
+    [
+        (RuntimeError, None),
+        (asyncio.CancelledError, asyncio.CancelledError),
+        (SystemExit, SystemExit),
+        (KeyboardInterrupt, KeyboardInterrupt),
+    ],
+)
+@pytest.mark.parametrize("persistence_mode", ["success", "db_failure", "artifact_failure"])
+def test_prepare_post_claim_fault_matrix_is_durable_and_preserves_precedence(
+    fault_type: type[BaseException],
+    expected_control: type[BaseException] | None,
+    persistence_mode: str,
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every preparation control path has DB or one recovery authority."""
+
+    original_record = orchestration.AuditRecorder.record
+    case_ids: list[str] = []
+
+    def fail_prepared_audit(
+        self: orchestration.AuditRecorder,
+        event_type: str,
+        *args: object,
+        **kwargs: object,
+    ) -> str:
+        if event_type == "case.prepared":
+            case_ids.append(self.case_id)
+            raise fault_type(f"{fault_type.__name__} sk-proj-private-sentinel")
+        return original_record(self, event_type, *args, **kwargs)
+
+    monkeypatch.setattr(orchestration.AuditRecorder, "record", fail_prepared_audit)
+    if persistence_mode != "success":
+        monkeypatch.setattr(
+            WorkflowStore,
+            "finish_case",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                sqlite3.OperationalError("prepare terminal persistence private sentinel")
+            ),
+        )
+    if persistence_mode == "artifact_failure":
+        monkeypatch.setattr(
+            orchestration,
+            "_write_recovery_artifact",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OSError("prepare recovery publication private sentinel")
+            ),
+        )
+    monkeypatch.chdir(tmp_path)
+
+    if persistence_mode == "artifact_failure":
+        with pytest.raises(InvoiceAgentsError) as excinfo:
+            orchestration.prepare_claimed_invoice(invoice_dir / "invoice_1001.txt", settings)
+        assert excinfo.value.stop_reason == "TERMINAL_RECOVERY_ARTIFACT_FAILED"
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__context__ is None
+    elif expected_control is not None:
+        with pytest.raises(expected_control):
+            orchestration.prepare_claimed_invoice(invoice_dir / "invoice_1001.txt", settings)
+    else:
+        returned = orchestration.prepare_claimed_invoice(invoice_dir / "invoice_1001.txt", settings)
+        assert isinstance(returned, CaseResult)
+
+    assert len(case_ids) == 1
+    case_id = case_ids[0]
+    stored = WorkflowStore(settings).load_result(case_id)
+    recovery = tmp_path / "artifacts" / "results" / f"{case_id}.recovery.json"
+    normal = tmp_path / "artifacts" / "results" / f"{case_id}.json"
+    if persistence_mode == "success":
+        assert stored is not None
+        assert stored.status is (
+            CaseStatus.INCOMPLETE if fault_type is asyncio.CancelledError else CaseStatus.FAILED
+        )
+        assert not recovery.exists()
+    elif persistence_mode == "db_failure":
+        assert stored is None
+        assert recovery.is_file()
+        assert not normal.exists()
+    else:
+        assert stored is None
+        assert not recovery.exists()
+        assert not normal.exists()
+    artifacts = tmp_path / "artifacts" / "results"
+    if artifacts.exists():
+        assert list(artifacts.glob(f"{case_id}*.tmp")) == []
+        assert "private-sentinel" not in "".join(
+            path.read_text(encoding="utf-8") for path in artifacts.glob(f"{case_id}*.json")
+        )
+
+
+@pytest.mark.asyncio
+async def test_ui_batch_cancellation_terminalizes_queued_exact_claims_before_return(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling while one child owns the semaphore cannot strand queued leases."""
+
+    started = asyncio.Event()
+
+    class BlockingTeam:
+        async def run_stream(self, task: object) -> AsyncIterator[object]:
+            del task
+            started.set()
+            await asyncio.Event().wait()
+            yield  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: _ClosingClient())
+    monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: BlockingTeam())
+    monkeypatch.chdir(tmp_path)
+    registry = RunRegistry()
+    batch = await registry.start_batch(
+        [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
+        settings,
+        concurrency=1,
+    )
+    assert batch.task is not None
+    await asyncio.wait_for(started.wait(), timeout=0.5)
+
+    batch.task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(batch.task, timeout=1.0)
+
+    store = WorkflowStore(settings)
+    assert len(batch.entries) == 2
+    for entry in batch.entries:
+        result = store.load_result(entry.case_id)
+        assert result is not None
+        assert result.status is CaseStatus.INCOMPLETE
+        assert result.stop_reason == "CANCELLED"
+        handle = registry.handle(entry.case_id)
+        assert handle is not None and handle.state == "done"
+        with connect_database(settings.workflow_db, read_only=True) as connection:
+            authority = connection.execute(
+                "SELECT execution_state, lease_expires_at FROM cases WHERE case_id = ?",
+                (entry.case_id,),
+            ).fetchone()
+        assert tuple(authority) == ("FINISHED", None)
+
+
+@pytest.mark.asyncio
+async def test_ui_batch_cancel_during_preparation_accounts_for_completed_thread_claim(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation cannot abandon a claim returned by an in-flight prep thread."""
+
+    real_prepare = ui_runs.prepare_claimed_invoice
+    second_started = Event()
+    release_second = Event()
+    prepared: list[tuple[str, datetime, ExecutionClaim]] = []
+    calls = 0
+
+    def controlled_prepare(path: Path, selected_settings: Settings) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            second_started.set()
+            assert release_second.wait(timeout=2)
+        outcome = real_prepare(path, selected_settings)
+        if isinstance(outcome, tuple):
+            prepared.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(ui_runs, "prepare_claimed_invoice", controlled_prepare)
+    monkeypatch.chdir(tmp_path)
+    registry = RunRegistry()
+    start_task = asyncio.create_task(
+        registry.start_batch(
+            [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
+            settings,
+            concurrency=1,
+        )
+    )
+    assert await asyncio.to_thread(second_started.wait, 1)
+
+    start_task.cancel()
+    release_second.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(start_task, timeout=2)
+    deadline = asyncio.get_running_loop().time() + 2
+    while len(prepared) < 2 and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+
+    assert len(prepared) == 2
+    store = WorkflowStore(settings)
+    for case_id, _started_at, _claim in prepared:
+        result = store.load_result(case_id)
+        assert result is not None
+        assert result.status is CaseStatus.INCOMPLETE
+        assert result.stop_reason == "CANCELLED"
+        with connect_database(settings.workflow_db, read_only=True) as connection:
+            authority = connection.execute(
+                "SELECT execution_state, lease_expires_at FROM cases WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()
+        assert tuple(authority) == ("FINISHED", None)
+
+
+@pytest.mark.asyncio
+async def test_ui_batch_repeated_cancellation_drains_active_and_queued_claims(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated caller cancellation cannot interrupt terminal durability work."""
+
+    started = asyncio.Event()
+
+    class BlockingTeam:
+        async def run_stream(self, task: object) -> AsyncIterator[object]:
+            del task
+            started.set()
+            await asyncio.Event().wait()
+            yield  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: _ClosingClient())
+    monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: BlockingTeam())
+    monkeypatch.chdir(tmp_path)
+    registry = RunRegistry()
+    batch = await registry.start_batch(
+        [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
+        settings,
+        concurrency=1,
+    )
+    assert batch.task is not None
+    await asyncio.wait_for(started.wait(), timeout=0.5)
+
+    batch.task.cancel()
+    await asyncio.sleep(0)
+    batch.task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(batch.task, timeout=1.0)
+
+    store = WorkflowStore(settings)
+    for entry in batch.entries:
+        result = store.load_result(entry.case_id)
+        assert result is not None
+        assert result.status is CaseStatus.INCOMPLETE
+        assert result.stop_reason == "CANCELLED"
+        handle = registry.handle(entry.case_id)
+        assert handle is not None and handle.state == "done"
+
+
+@pytest.mark.asyncio
+async def test_ui_batch_cancellation_racing_child_completion_is_terminal(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Completion and cancellation may race, but the exact claim always finishes."""
+
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    class CompletingTeam(_MaxMessagesTeam):
+        async def run_stream(self, task: object) -> AsyncIterator[object]:
+            del task
+            started.set()
+            await release.wait()
+            yield TaskResult(messages=[], stop_reason="maximum number of messages")
+
+    monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: _ClosingClient())
+    monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: CompletingTeam())
+    monkeypatch.chdir(tmp_path)
+    registry = RunRegistry()
+    batch = await registry.start_batch(
+        [invoice_dir / "invoice_1001.txt"],
+        settings,
+        concurrency=1,
+    )
+    assert batch.task is not None
+    await asyncio.wait_for(started.wait(), timeout=0.5)
+
+    release.set()
+    await asyncio.sleep(0)
+    cancellation_accepted = batch.task.cancel()
+    if cancellation_accepted:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(batch.task, timeout=1.0)
+    else:
+        await asyncio.wait_for(batch.task, timeout=1.0)
+
+    entry = batch.entries[0]
+    result = WorkflowStore(settings).load_result(entry.case_id)
+    assert result is not None
+    assert result.status is CaseStatus.INCOMPLETE
+    assert result.stop_reason in {"CANCELLED", "MAX_MESSAGES_EXHAUSTED"}
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        authority = connection.execute(
+            "SELECT execution_state, lease_expires_at FROM cases WHERE case_id = ?",
+            (entry.case_id,),
+        ).fetchone()
+    assert tuple(authority) == ("FINISHED", None)
+    handle = registry.handle(entry.case_id)
+    assert handle is not None and handle.state == "done"
+
+
+@pytest.mark.asyncio
+async def test_ui_batch_cancel_surfaces_active_terminal_recovery_failure(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing both terminal stores supersedes cancellation with one stable failure."""
+
+    started = asyncio.Event()
+
+    class BlockingTeam:
+        async def run_stream(self, task: object) -> AsyncIterator[object]:
+            del task
+            started.set()
+            await asyncio.Event().wait()
+            yield  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: _ClosingClient())
+    monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: BlockingTeam())
+    monkeypatch.chdir(tmp_path)
+    registry = RunRegistry()
+    batch = await registry.start_batch(
+        [invoice_dir / "invoice_1001.txt"],
+        settings,
+        concurrency=1,
+    )
+    assert batch.task is not None
+    await asyncio.wait_for(started.wait(), timeout=0.5)
+
+    monkeypatch.setattr(
+        WorkflowStore,
+        "finish_case",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("batch terminal persistence private sentinel")
+        ),
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_write_recovery_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("batch recovery publication private sentinel")
+        ),
+    )
+
+    batch.task.cancel()
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        await asyncio.wait_for(batch.task, timeout=1.0)
+
+    assert excinfo.value.stop_reason == "TERMINAL_RECOVERY_ARTIFACT_FAILED"
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+    handle = registry.handle(batch.entries[0].case_id)
+    assert handle is not None and handle.state == "done"
+
+
+@pytest.mark.asyncio
+async def test_ui_batch_cancel_publishes_recovery_for_active_and_queued_claims(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DB terminal-write failure still accounts for every batch claim by artifact."""
+
+    started = asyncio.Event()
+
+    class BlockingTeam:
+        async def run_stream(self, task: object) -> AsyncIterator[object]:
+            del task
+            started.set()
+            await asyncio.Event().wait()
+            yield  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: _ClosingClient())
+    monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: BlockingTeam())
+    monkeypatch.chdir(tmp_path)
+    registry = RunRegistry()
+    batch = await registry.start_batch(
+        [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
+        settings,
+        concurrency=1,
+    )
+    assert batch.task is not None
+    await asyncio.wait_for(started.wait(), timeout=0.5)
+    monkeypatch.setattr(
+        WorkflowStore,
+        "finish_case",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("batch terminal persistence private sentinel")
+        ),
+    )
+
+    batch.task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(batch.task, timeout=1.0)
+
+    for entry in batch.entries:
+        recovery = tmp_path / "artifacts" / "results" / f"{entry.case_id}.recovery.json"
+        payload = json.loads(recovery.read_text(encoding="utf-8"))
+        assert payload["case_result"]["status"] == "INCOMPLETE"
+        assert payload["case_result"]["stop_reason"] == "CANCELLED"
+        assert payload["terminal_persistence_error"]["stop_reason"] == (
+            "TERMINAL_PERSISTENCE_FAILED"
+        )
+        assert not recovery.with_name(f"{entry.case_id}.json").exists()
+        handle = registry.handle(entry.case_id)
+        assert handle is not None and handle.state == "done"
+
+
+@pytest.mark.asyncio
+async def test_one_terminal_db_failure_publishes_recovery_exactly_once(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No later audit or artifact branch may republish recovery evidence."""
+
+    prepared = orchestration.prepare_claimed_invoice(invoice_dir / "invoice_1001.txt", settings)
+    assert isinstance(prepared, tuple)
+    case_id, started_at, claim = prepared
+    monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: _ClosingClient())
+    monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: _MaxMessagesTeam())
+
+    def fail_finish(_self: WorkflowStore, _result: CaseResult, _claim: ExecutionClaim) -> None:
+        raise sqlite3.OperationalError("single terminal persistence failure")
+
+    publications: list[str] = []
+    original_publish = orchestration._write_recovery_artifact
+
+    def count_publish(result: CaseResult, error: ErrorRecord) -> Path:
+        publications.append(result.case_id)
+        return original_publish(result, error)
+
+    monkeypatch.setattr(WorkflowStore, "finish_case", fail_finish)
+    monkeypatch.setattr(orchestration, "_write_recovery_artifact", count_publish)
+    monkeypatch.chdir(tmp_path)
+
+    result = await orchestration.run_prepared_case(case_id, started_at, settings, claim=claim)
+
+    assert result.errors[-1].stop_reason == "TERMINAL_PERSISTENCE_FAILED"
+    assert publications == [case_id]
+    recovery = tmp_path / "artifacts" / "results" / f"{case_id}.recovery.json"
+    assert recovery.is_file()
+    assert not (recovery.parent / f"{case_id}.json").exists()
+    assert list(recovery.parent.glob(f"{case_id}*.tmp")) == []

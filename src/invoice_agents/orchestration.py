@@ -371,32 +371,33 @@ def _write_recovery_artifact(result: CaseResult, terminal_persistence_error: Err
 
 def _recovery_artifact_or_raise(
     result: CaseResult, terminal_persistence_error: ErrorRecord
-) -> BaseException | None:
-    """Publish recovery evidence or return a process-control signal for outer rethrow."""
+) -> None:
+    """Publish recovery evidence once or raise one stable, chainless failure."""
 
+    artifact_exc: BaseException | None = None
     try:
         _write_recovery_artifact(result, terminal_persistence_error)
-    except BaseException as artifact_exc:
-        if not isinstance(artifact_exc, Exception):
-            return artifact_exc
-        artifact_error = _secondary_error(
-            artifact_exc,
-            case_id=result.case_id,
-            category=ErrorCategory.ORCHESTRATION,
-            stop_reason="TERMINAL_RECOVERY_ARTIFACT_FAILED",
-            message="atomic terminal recovery artifact publication failed",
-        )
-        raise InvoiceAgentsError(
-            ErrorCategory.ORCHESTRATION,
-            artifact_error.message,
-            case_id=result.case_id,
-            stop_reason=artifact_error.stop_reason,
-            details={
-                "terminal_persistence_stop_reason": terminal_persistence_error.stop_reason,
-                "artifact_exception_type": type(artifact_exc).__name__,
-            },
-        ) from None
-    return None
+    except BaseException as exc:
+        artifact_exc = exc
+    if artifact_exc is None:
+        return
+    artifact_error = _secondary_error(
+        artifact_exc,
+        case_id=result.case_id,
+        category=ErrorCategory.ORCHESTRATION,
+        stop_reason="TERMINAL_RECOVERY_ARTIFACT_FAILED",
+        message="atomic terminal recovery artifact publication failed",
+    )
+    raise InvoiceAgentsError(
+        ErrorCategory.ORCHESTRATION,
+        artifact_error.message,
+        case_id=result.case_id,
+        stop_reason=artifact_error.stop_reason,
+        details={
+            "terminal_persistence_stop_reason": terminal_persistence_error.stop_reason,
+            "artifact_exception_type": type(artifact_exc).__name__,
+        },
+    ) from None
 
 
 def _consume_task_result(task: asyncio.Future[Any]) -> None:
@@ -522,12 +523,11 @@ def _persist_terminal_result(
             message="terminal database write failed",
         )
         _append_error(terminal_result, persistence_error)
-        artifact_control = _recovery_artifact_or_raise(terminal_result, persistence_error)
         return _PersistenceOutcome(
             terminal_result,
             False,
             persistence_error,
-            control_exception or exc or artifact_control,
+            control_exception or exc,
         )
     except BaseException as exc:
         persistence_error = _secondary_error(
@@ -538,16 +538,11 @@ def _persist_terminal_result(
             message="terminal database write failed",
         )
         _append_error(result, persistence_error)
-        artifact_control = _recovery_artifact_or_raise(result, persistence_error)
         return _PersistenceOutcome(
             result,
             False,
             persistence_error,
-            (
-                control_exception or artifact_control
-                if isinstance(exc, Exception)
-                else control_exception or exc or artifact_control
-            ),
+            (control_exception if isinstance(exc, Exception) else control_exception or exc),
         )
 
 
@@ -561,12 +556,11 @@ def _refresh_terminal_evidence(
 ) -> _PersistenceOutcome:
     if not persisted:
         assert persistence_error is not None
-        artifact_control = _recovery_artifact_or_raise(result, persistence_error)
         return _PersistenceOutcome(
             result,
             False,
             persistence_error,
-            control_exception or artifact_control,
+            control_exception,
         )
     try:
         execution.store.update_finished_case_result(result, execution.claim)
@@ -590,12 +584,11 @@ def _refresh_terminal_evidence(
             stop_reason="TERMINAL_RESULT_UPDATE_CANCELLED",
         )
         _append_error(terminal_result, update_error)
-        artifact_control = _recovery_artifact_or_raise(terminal_result, update_error)
         return _PersistenceOutcome(
             terminal_result,
             False,
             update_error,
-            control_exception or exc or artifact_control,
+            control_exception or exc,
         )
     except BaseException as exc:
         update_error = _secondary_error(
@@ -606,16 +599,11 @@ def _refresh_terminal_evidence(
             message="terminal database result update failed",
         )
         _append_error(result, update_error)
-        artifact_control = _recovery_artifact_or_raise(result, update_error)
         return _PersistenceOutcome(
             result,
             False,
             update_error,
-            (
-                control_exception or artifact_control
-                if isinstance(exc, Exception)
-                else control_exception or exc or artifact_control
-            ),
+            (control_exception if isinstance(exc, Exception) else control_exception or exc),
         )
 
 
@@ -798,10 +786,6 @@ async def _execute_claimed_case(
         persisted = persistence.persisted
         persistence_error = persistence.persistence_error
         control_exception = persistence.control_exception
-    else:
-        assert persistence_error is not None
-        artifact_control = _recovery_artifact_or_raise(result, persistence_error)
-        control_exception = control_exception or artifact_control
 
     if execution.audit is not None:
         try:
@@ -918,14 +902,53 @@ async def _execute_claimed_case(
             persisted = refresh.persisted
             persistence_error = refresh.persistence_error
             control_exception = refresh.control_exception
-    else:
+    if not persisted:
         assert persistence_error is not None
-        artifact_control = _recovery_artifact_or_raise(result, persistence_error)
-        control_exception = control_exception or artifact_control
+        _recovery_artifact_or_raise(result, persistence_error)
 
     if control_exception is not None:
         raise control_exception
     return result
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparationFailure:
+    result: CaseResult
+    recovery_published: bool
+
+
+def _terminalize_preparation_failure(
+    *,
+    store: WorkflowStore,
+    claim: ExecutionClaim,
+    case_id: str,
+    source_id: str | None,
+    started_at: datetime,
+    failure: BaseException,
+) -> _PreparationFailure:
+    control_exception = failure if not isinstance(failure, Exception) else None
+    result = (
+        _cancelled_result(case_id, source_id, started_at)
+        if isinstance(failure, asyncio.CancelledError)
+        else _failed_result(case_id, source_id, started_at, failure)
+    )
+    execution = _ClaimedExecution(
+        store=store,
+        claim=claim,
+        case_id=case_id,
+        started_at=started_at,
+        source_id=source_id,
+        usage=UsageSummary(),
+        clock=monotonic(),
+    )
+    persistence = _persist_terminal_result(execution, result, control_exception)
+    result = persistence.result
+    if not persistence.persisted:
+        assert persistence.persistence_error is not None
+        _recovery_artifact_or_raise(result, persistence.persistence_error)
+    if persistence.control_exception is not None:
+        raise persistence.control_exception
+    return _PreparationFailure(result=result, recovery_published=not persistence.persisted)
 
 
 def _prepare_case(
@@ -933,7 +956,7 @@ def _prepare_case(
     settings: Settings,
     *,
     retain_execution_claim: bool,
-) -> tuple[str, datetime] | tuple[str, datetime, ExecutionClaim] | CaseResult:
+) -> tuple[str, datetime] | tuple[str, datetime, ExecutionClaim] | _PreparationFailure:
     """Create immutable source/case evidence before any model request.
 
     Batch preparation is sequential so every later identity agent can see all submitted
@@ -945,6 +968,8 @@ def _prepare_case(
     source_id: str | None = None
     case_created = False
     claim: ExecutionClaim | None = None
+    store: WorkflowStore | None = None
+    failure: BaseException | None = None
     try:
         source = snapshot_source(path, settings.source_archive_dir, settings.source_max_bytes)
         source_id = source.source_id
@@ -974,37 +999,53 @@ def _prepare_case(
         store.release_case_execution(claim)
         return case_id, started_at
     except BaseException as exc:
-        result = _failed_result(case_id, source_id, started_at, exc)
-        if source_id is not None and case_created:
-            try:
-                failed_store = WorkflowStore(settings)
-                if claim is None:
-                    claim = failed_store.claim_case_execution(
-                        case_id,
-                        frozenset({CaseStatus.INCOMPLETE}),
-                        EXECUTION_LEASE_SECONDS,
-                    )
-                failed_store.finish_case(result, claim)
-            except BaseException as persistence_exc:
-                # Preserve both the original case failure and the secondary audit-write
-                # failure; neither may disappear behind the other.
-                result.errors.append(_error_record(persistence_exc, case_id))
-        return result
+        failure = exc
+    assert failure is not None
+    if case_created and store is not None and claim is not None:
+        return _terminalize_preparation_failure(
+            store=store,
+            claim=claim,
+            case_id=case_id,
+            source_id=source_id,
+            started_at=started_at,
+            failure=failure,
+        )
+    result = _failed_result(case_id, source_id, started_at, failure)
+    if case_created:
+        persistence_error = _secondary_error(
+            failure,
+            case_id=case_id,
+            category=ErrorCategory.DATABASE,
+            stop_reason="TERMINAL_PERSISTENCE_FAILED",
+            message="preparation failed before execution authority was acquired",
+        )
+        _append_error(result, persistence_error)
+        _recovery_artifact_or_raise(result, persistence_error)
+        if not isinstance(failure, Exception):
+            raise failure
+        return _PreparationFailure(result=result, recovery_published=True)
+    if not isinstance(failure, Exception):
+        raise failure
+    return _PreparationFailure(result=result, recovery_published=False)
 
 
 def prepare_case(path: Path, settings: Settings) -> tuple[str, datetime] | CaseResult:
-    return cast(
-        tuple[str, datetime] | CaseResult,
-        _prepare_case(path, settings, retain_execution_claim=False),
+    prepared = _prepare_case(path, settings, retain_execution_claim=False)
+    return (
+        prepared.result
+        if isinstance(prepared, _PreparationFailure)
+        else cast(tuple[str, datetime], prepared)
     )
 
 
 def prepare_claimed_case(
     path: Path, settings: Settings
 ) -> tuple[str, datetime, ExecutionClaim] | CaseResult:
-    return cast(
-        tuple[str, datetime, ExecutionClaim] | CaseResult,
-        _prepare_case(path, settings, retain_execution_claim=True),
+    prepared = _prepare_case(path, settings, retain_execution_claim=True)
+    return (
+        prepared.result
+        if isinstance(prepared, _PreparationFailure)
+        else cast(tuple[str, datetime, ExecutionClaim], prepared)
     )
 
 
@@ -1198,20 +1239,22 @@ async def run_prepared_case(
 ) -> CaseResult:
     """Run one fresh Swarm and convert every terminal path to an explicit case status."""
 
-    store = WorkflowStore(settings)
     if claim is None:
-        claim = store.claim_case_execution(
-            case_id,
-            frozenset({CaseStatus.INCOMPLETE}),
-            EXECUTION_LEASE_SECONDS,
-        )
-    elif claim.case_id != case_id:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "an exact execution claim is required to run a prepared case",
+            case_id=case_id,
+            stop_reason="EXECUTION_CLAIM_MISSING",
+        ) from None
+    if claim.case_id != case_id:
         raise InvoiceAgentsError(
             ErrorCategory.ORCHESTRATION,
             "supplied execution claim belongs to a different case",
             case_id=case_id,
             stop_reason="STALE_EXECUTION_CLAIM",
-        )
+        ) from None
+    store = WorkflowStore(settings)
+    store.require_current_execution_claim(claim)
 
     async def execute_lifecycle(execution: _ClaimedExecution) -> CaseResult:
         invoice = store.promote_predecessor_extraction(claim)
@@ -1308,9 +1351,10 @@ def _prepare_invoice(
         settings,
         retain_execution_claim=retain_execution_claim,
     )
-    if isinstance(prepared, CaseResult):
-        _write_result(prepared)
-        return prepared
+    if isinstance(prepared, _PreparationFailure):
+        if not prepared.recovery_published:
+            _write_result(prepared.result)
+        return prepared.result
     return prepared
 
 
@@ -1344,6 +1388,78 @@ async def process_invoice(path: Path, settings: Settings) -> CaseResult:
     )
 
 
+async def _await_task_despite_cancellation[ResultT](task: asyncio.Task[ResultT]) -> ResultT:
+    """Drain a durability task even if its caller receives repeated cancellation."""
+
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
+
+
+async def _terminalize_unstarted_claim(
+    case_id: str,
+    started_at: datetime,
+    settings: Settings,
+    claim: ExecutionClaim,
+) -> None:
+    """Persist cancellation for an exact claim that never entered its runner."""
+
+    store = WorkflowStore(settings)
+    store.require_current_execution_claim(claim)
+
+    async def cancelled_lifecycle(_execution: _ClaimedExecution) -> CaseResult:
+        raise asyncio.CancelledError
+
+    try:
+        await _execute_claimed_case(
+            case_id,
+            started_at,
+            store,
+            claim,
+            cancelled_lifecycle,
+            finished_event_type="case.cancelled_before_start",
+        )
+    except asyncio.CancelledError:
+        return
+
+
+async def _durably_cancel_unstarted_claim(
+    case_id: str,
+    started_at: datetime,
+    settings: Settings,
+    claim: ExecutionClaim,
+) -> None:
+    task = asyncio.create_task(
+        _terminalize_unstarted_claim(case_id, started_at, settings, claim),
+        name=f"invoice-cancel-unstarted-{case_id}",
+    )
+    await _await_task_despite_cancellation(task)
+
+
+async def _durably_cancel_unstarted_claims(
+    claims: list[tuple[str, datetime, ExecutionClaim]],
+    settings: Settings,
+) -> list[BaseException | None]:
+    """Attempt terminal cancellation for every handed-off claim before returning."""
+
+    tasks = [
+        asyncio.create_task(
+            _terminalize_unstarted_claim(case_id, started_at, settings, claim),
+            name=f"invoice-cancel-unstarted-{case_id}",
+        )
+        for case_id, started_at, claim in claims
+    ]
+
+    async def drain() -> list[BaseException | None]:
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+    drain_task = asyncio.create_task(drain(), name="invoice-unstarted-claims-drain")
+    return await _await_task_despite_cancellation(drain_task)
+
+
 async def process_batch(
     paths: list[Path], settings: Settings, concurrency: int | None = None
 ) -> list[CaseResult]:
@@ -1359,20 +1475,57 @@ async def process_batch(
         return failed
     prepared: list[tuple[str, datetime, ExecutionClaim]] = []
     results: list[CaseResult] = []
-    for path in paths:
-        item = prepare_claimed_case(path, settings)
-        if isinstance(item, CaseResult):
-            _write_result(item)
-            results.append(item)
-        else:
-            prepared.append(item)
+    try:
+        for path in paths:
+            item = prepare_claimed_case(path, settings)
+            if isinstance(item, CaseResult):
+                _write_result(item)
+                results.append(item)
+            else:
+                prepared.append(item)
+    except BaseException as primary_failure:
+        preparation_outcomes = await _durably_cancel_unstarted_claims(prepared, settings)
+        for outcome in preparation_outcomes:
+            if isinstance(outcome, BaseException) and not isinstance(
+                outcome, asyncio.CancelledError
+            ):
+                raise outcome from None
+        raise primary_failure
     semaphore = asyncio.Semaphore(concurrency or settings.case_concurrency)
 
     async def bounded(item: tuple[str, datetime, ExecutionClaim]) -> CaseResult:
-        async with semaphore:
-            return await run_prepared_case(item[0], item[1], settings, claim=item[2])
+        runner_started = False
+        try:
+            async with semaphore:
+                runner_started = True
+                return await run_prepared_case(item[0], item[1], settings, claim=item[2])
+        except asyncio.CancelledError:
+            if not runner_started:
+                await _durably_cancel_unstarted_claim(item[0], item[1], settings, item[2])
+            raise
 
-    results.extend(await asyncio.gather(*(bounded(item) for item in prepared)))
+    tasks = [
+        asyncio.create_task(bounded(item), name=f"invoice-batch-{item[0]}") for item in prepared
+    ]
+    try:
+        results.extend(await asyncio.gather(*tasks))
+    except BaseException as primary_failure:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+        async def drain() -> list[CaseResult | BaseException]:
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+        drain_task = asyncio.create_task(drain(), name="invoice-batch-cancellation-drain")
+        task_outcomes = await _await_task_despite_cancellation(drain_task)
+        if isinstance(primary_failure, asyncio.CancelledError):
+            for task_outcome in task_outcomes:
+                if isinstance(task_outcome, BaseException) and not isinstance(
+                    task_outcome, asyncio.CancelledError
+                ):
+                    raise task_outcome from None
+        raise primary_failure
     return results
 
 
@@ -1438,6 +1591,26 @@ def _recompute_after_mapping(
     )
 
 
+def claim_resumable_case(case_id: str, settings: Settings) -> ExecutionClaim:
+    """Acquire the exact resume authority that callers must pass unchanged."""
+
+    try:
+        return WorkflowStore(settings).claim_case_execution(
+            case_id,
+            frozenset({CaseStatus.NEEDS_HUMAN}),
+            EXECUTION_LEASE_SECONDS,
+        )
+    except InvoiceAgentsError as exc:
+        if exc.stop_reason == "CASE_STATUS_NOT_CLAIMABLE":
+            raise InvoiceAgentsError(
+                ErrorCategory.ORCHESTRATION,
+                f"case {case_id} is not waiting for human review",
+                case_id=case_id,
+                stop_reason="CASE_NOT_RESUMABLE",
+            ) from None
+        raise
+
+
 async def resume_case(
     case_id: str,
     settings: Settings,
@@ -1446,30 +1619,22 @@ async def resume_case(
 ) -> CaseResult:
     """Load a stopped Swarm only after an attributable human decision and resume it."""
 
-    store = WorkflowStore(settings)
     if claim is None:
-        try:
-            claim = store.claim_case_execution(
-                case_id,
-                frozenset({CaseStatus.NEEDS_HUMAN}),
-                EXECUTION_LEASE_SECONDS,
-            )
-        except InvoiceAgentsError as exc:
-            if exc.stop_reason == "CASE_STATUS_NOT_CLAIMABLE":
-                raise InvoiceAgentsError(
-                    ErrorCategory.ORCHESTRATION,
-                    f"case {case_id} is not waiting for human review",
-                    case_id=case_id,
-                    stop_reason="CASE_NOT_RESUMABLE",
-                ) from None
-            raise
-    elif claim.case_id != case_id:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "an exact execution claim is required to resume a case",
+            case_id=case_id,
+            stop_reason="EXECUTION_CLAIM_MISSING",
+        ) from None
+    if claim.case_id != case_id:
         raise InvoiceAgentsError(
             ErrorCategory.ORCHESTRATION,
             "supplied execution claim belongs to a different case",
             case_id=case_id,
             stop_reason="STALE_EXECUTION_CLAIM",
-        )
+        ) from None
+    store = WorkflowStore(settings)
+    store.require_current_execution_claim(claim)
 
     async def resume_lifecycle(execution: _ClaimedExecution) -> CaseResult:
         preflight(settings)

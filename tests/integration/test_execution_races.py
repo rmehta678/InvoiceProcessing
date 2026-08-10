@@ -58,7 +58,7 @@ from invoice_agents.models import (
     RiskAssessment,
 )
 from invoice_agents.observability.audit import AuditRecorder
-from invoice_agents.orchestration import resume_case
+from invoice_agents.orchestration import claim_resumable_case, resume_case
 from invoice_agents.payment.service import mock_payment
 from invoice_agents.source_store import snapshot_source
 from invoice_agents.tools.comparison import (
@@ -409,7 +409,11 @@ async def test_two_orchestration_resume_attempts_have_one_database_owner(
     monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: _StubModelClient())
     monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: team)
 
-    attempts = [asyncio.create_task(resume_case(case_id, settings)) for _ in range(2)]
+    async def claim_and_resume() -> CaseResult:
+        claim = claim_resumable_case(case_id, settings)
+        return await resume_case(case_id, settings, claim=claim)
+
+    attempts = [asyncio.create_task(claim_and_resume()) for _ in range(2)]
     await asyncio.wait_for(team.entered.wait(), timeout=5)
     await asyncio.sleep(0)
     loser = next((attempt for attempt in attempts if attempt.done()), None)

@@ -28,6 +28,7 @@ from invoice_agents.errors import (
 )
 from invoice_agents.hitl.service import create_review_request, record_human_decision
 from invoice_agents.models import (
+    CaseResult,
     CaseStatus,
     Critique,
     DecisionKind,
@@ -107,6 +108,17 @@ def _prepare(
     prepared = prepare_case(invoice_dir / name, settings)
     assert isinstance(prepared, tuple), "case preparation must succeed before the team runs"
     return prepared
+
+
+async def _run_prepared_with_new_claim(
+    case_id: str, started_at: datetime, settings: Settings
+) -> CaseResult:
+    claim = WorkflowStore(settings).claim_case_execution(
+        case_id,
+        frozenset({CaseStatus.INCOMPLETE}),
+        orchestration.EXECUTION_LEASE_SECONDS,
+    )
+    return await run_prepared_case(case_id, started_at, settings, claim=claim)
 
 
 def _zero_financial() -> FinancialComparison:
@@ -328,7 +340,7 @@ async def test_max_messages_maps_to_incomplete(
         lambda _context, _client: FakeTeam(TaskResult(messages=[], stop_reason=pinned_phrase)),
     )
     monkeypatch.chdir(tmp_path)
-    result = await run_prepared_case(case_id, started_at, settings)
+    result = await _run_prepared_with_new_claim(case_id, started_at, settings)
     assert result.status is CaseStatus.INCOMPLETE
     assert result.stop_reason == "MAX_MESSAGES_EXHAUSTED"
     assert result.final_decision is None
@@ -455,7 +467,7 @@ async def test_malformed_provider_response_categorized(
         orchestration, "build_team", lambda _context, _client: FakeTeam(error=validation_error)
     )
     monkeypatch.chdir(tmp_path)
-    result = await run_prepared_case(case_id, started_at, settings)
+    result = await _run_prepared_with_new_claim(case_id, started_at, settings)
     assert result.status is CaseStatus.FAILED
     assert result.errors[0].category == "PROVIDER"
     assert result.errors[0].stop_reason == "PROVIDER_RESPONSE_INVALID"
@@ -562,7 +574,7 @@ async def test_retry_events_count_into_usage(
         lambda _context, _client: FakeTeam(TaskResult(messages=[], stop_reason=pinned_phrase)),
     )
     monkeypatch.chdir(tmp_path)
-    result = await run_prepared_case(case_id, started_at, settings)
+    result = await _run_prepared_with_new_claim(case_id, started_at, settings)
     assert result.usage.retries == 2
     assert WorkflowStore(settings.workflow_db).count_events(case_id, "provider.retry") == 2
 

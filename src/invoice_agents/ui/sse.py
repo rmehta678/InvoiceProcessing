@@ -15,6 +15,7 @@ from typing import Any
 
 from sse_starlette import ServerSentEvent
 
+from invoice_agents.config import Settings
 from invoice_agents.db.store import WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import CaseResult, ErrorRecord
@@ -70,11 +71,16 @@ def summarize_event(row: EventRow) -> dict[str, Any]:
 
 
 def terminal_payload(
-    workflow_db: Path, case_id: str, registry: RunRegistry
+    workflow_db: Path,
+    case_id: str,
+    registry: RunRegistry,
+    settings: Settings | None = None,
 ) -> dict[str, Any] | None:
     """Return storage-derived terminal state or None for one valid active lease."""
 
-    store = WorkflowStore(workflow_db)
+    if settings is not None and settings.workflow_db.resolve() != workflow_db.resolve():
+        return _recovery_failure_payload(case_id, "EXECUTION_RECOVERY_FAILED")
+    store = WorkflowStore(settings if settings is not None else workflow_db)
     try:
         snapshot = store.load_case_execution_snapshot(case_id)
     except InvoiceAgentsError as exc:
@@ -153,6 +159,8 @@ async def case_event_stream(
     case_id: str,
     registry: RunRegistry,
     after_seq: int = 0,
+    *,
+    settings: Settings | None = None,
 ) -> AsyncIterator[ServerSentEvent]:
     """Yield stored events as they appear, then one terminal event, then stop."""
 
@@ -168,7 +176,13 @@ async def case_event_stream(
                 id=str(row.seq),
                 data=json.dumps(summarize_event(row), ensure_ascii=False, default=str),
             )
-        terminal = await asyncio.to_thread(terminal_payload, workflow_db, case_id, registry)
+        terminal = await asyncio.to_thread(
+            terminal_payload,
+            workflow_db,
+            case_id,
+            registry,
+            settings,
+        )
         if terminal is not None:
             yield ServerSentEvent(
                 event="terminal",

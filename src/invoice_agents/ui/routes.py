@@ -252,7 +252,13 @@ async def case_live(request: Request, case_id: str) -> Response:
 async def case_events(request: Request, case_id: str, after: int = 0) -> EventSourceResponse:
     settings = _settings(request)
     return EventSourceResponse(
-        case_event_stream(settings.workflow_db, case_id, _registry(request), after)
+        case_event_stream(
+            settings.workflow_db,
+            case_id,
+            _registry(request),
+            after,
+            settings=settings,
+        )
     )
 
 

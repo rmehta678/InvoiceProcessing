@@ -24,7 +24,12 @@ from invoice_agents.models import (
     HumanDecisionKind,
 )
 from invoice_agents.observability.audit import configure_logging
-from invoice_agents.orchestration import process_batch, process_invoice, resume_case
+from invoice_agents.orchestration import (
+    claim_resumable_case,
+    process_batch,
+    process_invoice,
+    resume_case,
+)
 
 console = Console()
 app = typer.Typer(
@@ -237,7 +242,9 @@ def review_resume(case_id: str) -> None:
     """Resume a stopped team after a persisted human decision."""
 
     try:
-        result = asyncio.run(resume_case(case_id, _settings()))
+        settings = _settings()
+        claim = claim_resumable_case(case_id, settings)
+        result = asyncio.run(resume_case(case_id, settings, claim=claim))
     except InvoiceAgentsError as exc:
         console.print(str(exc), style="red")
         raise typer.Exit(1) from exc

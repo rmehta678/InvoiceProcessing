@@ -5,6 +5,7 @@ import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -24,12 +25,15 @@ from invoice_agents.errors import DatabaseVerificationError, InvoiceAgentsError
 from invoice_agents.hitl.service import create_review_request, record_human_decision
 from invoice_agents.models import (
     CanonicalMapping,
+    CaseResult,
     CaseStatus,
     Critique,
     DecisionKind,
     FinalDecision,
     HumanDecisionKind,
     IdentityCandidate,
+    Money,
+    PaymentResult,
     PaymentStatus,
     ReviewRequest,
 )
@@ -44,6 +48,8 @@ from invoice_agents.tools.comparison import (
     find_prior_invoice_candidates,
 )
 from invoice_agents.tools.evidence import extract_invoice_evidence
+from invoice_agents.ui.runs import RunRegistry
+from invoice_agents.ui.sse import terminal_payload
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures"
 
@@ -1125,6 +1131,202 @@ def test_mock_payment_pays_once_across_duplicate_representations(
     assert duplicate.duplicate_of == first.payment_id
     with connect_database(workflow_db, read_only=True) as connection:
         assert connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 1
+
+
+def duplicate_terminal_fixture(
+    invoice_dir: Path, settings: Settings
+) -> tuple[WorkflowStore, CaseResult, PaymentResult, PaymentResult]:
+    store = WorkflowStore(settings)
+    text = load(invoice_dir, "invoice_1011.txt", settings.source_archive_dir)
+    pdf = load(invoice_dir, "invoice_1011.pdf", settings.source_archive_dir)
+    persist_case(store, "case_original_payment", text)
+    original_claim = record_payment_evidence(store, "case_original_payment", text, settings)
+    text = store.load_current_extraction(original_claim)
+    approve_final(store, "case_original_payment", original_claim)
+    paid = mock_payment("case_original_payment", text, store, settings.workflow_db, original_claim)
+    persist_case(store, "case_duplicate_attempt", pdf)
+    duplicate_claim = record_payment_evidence(
+        store,
+        "case_duplicate_attempt",
+        pdf,
+        settings,
+        authorize_review=True,
+    )
+    pdf = store.load_current_extraction(duplicate_claim)
+    approve_final(store, "case_duplicate_attempt", duplicate_claim)
+    duplicate = mock_payment(
+        "case_duplicate_attempt", pdf, store, settings.workflow_db, duplicate_claim
+    )
+    assert duplicate.status is PaymentStatus.DUPLICATE
+    final = store.load_current_final_decision(duplicate_claim)
+    assert final is not None
+    attempted = CaseResult(
+        case_id="case_duplicate_attempt",
+        source_id=pdf.source.source_id,
+        status=CaseStatus.SUCCEEDED,
+        stop_reason="APPROVED_PAYMENT_RECORDED",
+        final_decision=final,
+        payment=duplicate,
+        started_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+    )
+    return store, attempted, paid, duplicate
+
+
+def test_terminal_merge_reconstructs_cross_case_duplicate_from_paid_ledger(
+    invoice_dir: Path, settings: Settings
+) -> None:
+    """A valid duplicate result derives from the one immutable original PAID row."""
+
+    store, attempted, paid, duplicate = duplicate_terminal_fixture(invoice_dir, settings)
+
+    merged = store.merge_relational_case_evidence(attempted)
+
+    assert merged.payment == duplicate
+    assert merged.payment is not None
+    assert merged.payment.case_id == "case_duplicate_attempt"
+    assert merged.payment.status is PaymentStatus.DUPLICATE
+    assert merged.payment.payment_id == paid.payment_id
+    assert merged.payment.duplicate_of == paid.payment_id
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 1
+
+
+def test_terminal_sse_recovery_validates_cross_case_duplicate_with_request_settings(
+    invoice_dir: Path, settings: Settings
+) -> None:
+    """Post-startup lease recovery retains a validated cross-case duplicate."""
+
+    store, attempted, _paid, duplicate = duplicate_terminal_fixture(invoice_dir, settings)
+    interrupted = attempted.model_copy(
+        update={
+            "status": CaseStatus.INCOMPLETE,
+            "stop_reason": "INTERRUPTED_AFTER_DUPLICATE",
+        },
+        deep=True,
+    )
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "UPDATE cases SET status = ?, stop_reason = ?, result_json = ?, "
+            "lease_expires_at = ? WHERE case_id = ?",
+            (
+                str(interrupted.status),
+                interrupted.stop_reason,
+                interrupted.model_dump_json(),
+                "2000-01-01T00:00:00+00:00",
+                attempted.case_id,
+            ),
+        )
+        connection.commit()
+
+    payload = terminal_payload(
+        settings.workflow_db,
+        attempted.case_id,
+        RunRegistry(),
+        settings,
+    )
+
+    assert payload is not None
+    assert payload["status"] == "INCOMPLETE"
+    assert payload["stop_reason"] == "ORPHANED_EXECUTION"
+    recovered = store.load_result(attempted.case_id)
+    assert recovered is not None
+    assert recovered.payment == duplicate
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing_original",
+        "wrong_payment_reference",
+        "wrong_idempotency_key",
+        "wrong_amount",
+        "wrong_currency",
+        "original_source",
+        "original_generation",
+        "original_status",
+        "missing_ledger",
+        "multiple_case_ledger_rows",
+    ],
+)
+def test_terminal_merge_rejects_contradictory_duplicate_authority(
+    corruption: str,
+    invoice_dir: Path,
+    settings: Settings,
+) -> None:
+    store, attempted, paid, duplicate = duplicate_terminal_fixture(invoice_dir, settings)
+    assert paid.payment_id is not None
+    assert duplicate.amount is not None
+    if corruption == "missing_original":
+        attempted.payment = duplicate.model_copy(
+            update={"payment_id": "pay_missing", "duplicate_of": "pay_missing"}
+        )
+    elif corruption == "wrong_payment_reference":
+        attempted.payment = duplicate.model_copy(update={"payment_id": "pay_wrong"})
+    elif corruption == "wrong_idempotency_key":
+        attempted.payment = duplicate.model_copy(update={"idempotency_key": "0" * 64})
+    elif corruption == "wrong_amount":
+        attempted.payment = duplicate.model_copy(
+            update={
+                "amount": Money(
+                    amount=duplicate.amount.amount + Decimal("1"),
+                    currency=duplicate.amount.currency,
+                )
+            }
+        )
+    elif corruption == "wrong_currency":
+        attempted.payment = duplicate.model_copy(
+            update={"amount": Money(amount=duplicate.amount.amount, currency="EUR")}
+        )
+    else:
+        with connect_database(settings.workflow_db) as connection:
+            for trigger in (
+                "trg_payments_authorization_insert",
+                "trg_payments_snapshot_digest_insert",
+                "trg_payments_immutable_update",
+                "trg_payments_snapshot_digest_update",
+                "trg_paid_payments_immutable_update",
+                "trg_payments_immutable_delete",
+                "trg_paid_payments_immutable_delete",
+            ):
+                connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            if corruption == "original_source":
+                connection.execute(
+                    "UPDATE payments SET source_id = 'src_wrong' WHERE payment_id = ?",
+                    (paid.payment_id,),
+                )
+            elif corruption == "original_generation":
+                connection.execute(
+                    "UPDATE payments SET decision_generation = decision_generation + 1 "
+                    "WHERE payment_id = ?",
+                    (paid.payment_id,),
+                )
+            elif corruption == "original_status":
+                connection.execute(
+                    "UPDATE payments SET status = 'FAILED', error = 'forged failure' "
+                    "WHERE payment_id = ?",
+                    (paid.payment_id,),
+                )
+            elif corruption == "missing_ledger":
+                connection.execute("DELETE FROM payments WHERE payment_id = ?", (paid.payment_id,))
+            else:
+                for index, key in enumerate(("a" * 64, "b" * 64), start=1):
+                    connection.execute(
+                        "INSERT INTO payments(payment_id, case_id, idempotency_key, vendor, "
+                        "amount, currency, status, error, created_at, decision_generation, "
+                        "evidence_snapshot_digest, source_id, invoice_number, review_id) "
+                        "SELECT ?, 'case_duplicate_attempt', ?, vendor, amount, currency, "
+                        "status, error, created_at, decision_generation, "
+                        "evidence_snapshot_digest, source_id, invoice_number, review_id "
+                        "FROM payments WHERE payment_id = ?",
+                        (f"pay_extra_{index}", key, paid.payment_id),
+                    )
+            connection.commit()
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.merge_relational_case_evidence(attempted)
+
+    assert excinfo.value.stop_reason == "PERSISTED_RESULT_INVALID"
 
 
 def test_rejected_and_injected_failure_never_report_payment_success(

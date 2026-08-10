@@ -17,10 +17,13 @@ from typing import Any
 from uuid import uuid4
 
 from invoice_agents.config import Settings
-from invoice_agents.db.store import ExecutionClaim, WorkflowStore
-from invoice_agents.models import CaseResult, CaseStatus
+from invoice_agents.db.store import ExecutionClaim
+from invoice_agents.models import CaseResult
 from invoice_agents.orchestration import (
-    EXECUTION_LEASE_SECONDS,
+    _await_task_despite_cancellation,
+    _durably_cancel_unstarted_claim,
+    _durably_cancel_unstarted_claims,
+    claim_resumable_case,
     prepare_claimed_invoice,
     resume_case,
     run_prepared_case,
@@ -72,6 +75,29 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+async def _prepare_claimed_for_launch(
+    path: Path, settings: Settings
+) -> tuple[str, datetime, ExecutionClaim] | CaseResult:
+    """Drain a prep thread and account for any claim if its caller is cancelled."""
+
+    preparation = asyncio.create_task(
+        asyncio.to_thread(prepare_claimed_invoice, path, settings),
+        name=f"invoice-ui-prepare-{path.name}",
+    )
+    try:
+        return await asyncio.shield(preparation)
+    except asyncio.CancelledError as cancellation:
+        outcome = await _await_task_despite_cancellation(preparation)
+        if isinstance(outcome, tuple):
+            await _durably_cancel_unstarted_claim(
+                outcome[0],
+                outcome[1],
+                settings,
+                outcome[2],
+            )
+        raise cancellation
+
+
 class RunRegistry:
     """Track in-flight asyncio runs; storage remains the source of truth."""
 
@@ -119,7 +145,7 @@ class RunRegistry:
     async def start_process(self, path: Path, settings: Settings) -> str | CaseResult:
         """Prepare and launch one case; terminal prepare failures are returned as-is."""
 
-        prepared = await asyncio.to_thread(prepare_claimed_invoice, path, settings)
+        prepared = await _prepare_claimed_for_launch(path, settings)
         if isinstance(prepared, CaseResult):
             return prepared
         case_id, started_at, claim = prepared
@@ -138,11 +164,7 @@ class RunRegistry:
         existing = self._runs.get(case_id)
         if existing is not None and existing.state != "done":
             return existing
-        claim = WorkflowStore(settings).claim_case_execution(
-            case_id,
-            frozenset({CaseStatus.NEEDS_HUMAN}),
-            EXECUTION_LEASE_SECONDS,
-        )
+        claim = claim_resumable_case(case_id, settings)
         return self._launch(
             case_id,
             "resume",
@@ -192,31 +214,46 @@ class RunRegistry:
         )
         self._batches[batch.batch_id] = batch
         prepared_entries: list[BatchEntry] = []
-        for path in paths:
-            prepared = await asyncio.to_thread(prepare_claimed_invoice, path, settings)
-            if isinstance(prepared, CaseResult):
-                entry = BatchEntry(
-                    path=path,
-                    case_id=prepared.case_id,
-                    prepared_started_at=None,
-                    result=prepared,
-                )
-            else:
-                entry = BatchEntry(
-                    path=path,
-                    case_id=prepared[0],
-                    prepared_started_at=prepared[1],
-                    claim=prepared[2],
-                )
-                prepared_entries.append(entry)
-                self._runs[entry.case_id] = RunHandle(
-                    case_id=entry.case_id,
-                    kind="batch",
-                    state="queued",
-                    started_at=_now(),
-                    claim=entry.claim,
-                )
-            batch.entries.append(entry)
+        try:
+            for path in paths:
+                prepared = await _prepare_claimed_for_launch(path, settings)
+                if isinstance(prepared, CaseResult):
+                    entry = BatchEntry(
+                        path=path,
+                        case_id=prepared.case_id,
+                        prepared_started_at=None,
+                        result=prepared,
+                    )
+                else:
+                    entry = BatchEntry(
+                        path=path,
+                        case_id=prepared[0],
+                        prepared_started_at=prepared[1],
+                        claim=prepared[2],
+                    )
+                    prepared_entries.append(entry)
+                    self._runs[entry.case_id] = RunHandle(
+                        case_id=entry.case_id,
+                        kind="batch",
+                        state="queued",
+                        started_at=_now(),
+                        claim=entry.claim,
+                    )
+                batch.entries.append(entry)
+        except BaseException as primary_failure:
+            handed_off_claims: list[tuple[str, datetime, ExecutionClaim]] = []
+            for entry in prepared_entries:
+                assert entry.prepared_started_at is not None and entry.claim is not None
+                handed_off_claims.append((entry.case_id, entry.prepared_started_at, entry.claim))
+            outcomes = await _durably_cancel_unstarted_claims(handed_off_claims, settings)
+            for entry in prepared_entries:
+                self._runs[entry.case_id].state = "done"
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException) and not isinstance(
+                    outcome, asyncio.CancelledError
+                ):
+                    raise outcome from None
+            raise primary_failure
         batch.task = asyncio.create_task(
             self._run_batch(batch, prepared_entries, settings),
             name=f"invoice-ui-{batch.batch_id}",
@@ -230,24 +267,58 @@ class RunRegistry:
 
         async def bounded(entry: BatchEntry) -> None:
             handle = self._runs[entry.case_id]
-            async with semaphore:
-                handle.state = "running"
-                started_at = entry.prepared_started_at
-                assert started_at is not None  # only prepared entries reach here
-                claim = entry.claim
-                assert claim is not None  # retained preparation authority is mandatory
-                try:
+            started_at = entry.prepared_started_at
+            assert started_at is not None  # only prepared entries reach here
+            claim = entry.claim
+            assert claim is not None  # retained preparation authority is mandatory
+            runner_started = False
+            try:
+                async with semaphore:
+                    handle.state = "running"
+                    runner_started = True
                     await run_prepared_case(
                         entry.case_id,
                         started_at,
                         settings,
                         claim=claim,
                     )
-                except BaseException as exc:
-                    # Surfaced verbatim in the matrix; run_prepared_case already
-                    # persists its own terminal result for expected failures.
-                    handle.error = str(exc)
-                finally:
-                    handle.state = "done"
+            except asyncio.CancelledError:
+                if not runner_started:
+                    await _durably_cancel_unstarted_claim(
+                        entry.case_id,
+                        started_at,
+                        settings,
+                        claim,
+                    )
+                raise
+            except Exception as exc:
+                handle.error = type(exc).__name__
+                raise
+            finally:
+                handle.state = "done"
 
-        await asyncio.gather(*(bounded(entry) for entry in entries))
+        tasks = [
+            asyncio.create_task(bounded(entry), name=f"invoice-ui-batch-{entry.case_id}")
+            for entry in entries
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException as primary_failure:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+            async def drain() -> list[BaseException | None]:
+                return await asyncio.gather(*tasks, return_exceptions=True)
+
+            drain_task = asyncio.create_task(
+                drain(), name=f"invoice-ui-{batch.batch_id}-cancellation-drain"
+            )
+            outcomes = await _await_task_despite_cancellation(drain_task)
+            if isinstance(primary_failure, asyncio.CancelledError):
+                for outcome in outcomes:
+                    if isinstance(outcome, BaseException) and not isinstance(
+                        outcome, asyncio.CancelledError
+                    ):
+                        raise outcome from None
+            raise primary_failure
