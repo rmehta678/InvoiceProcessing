@@ -97,7 +97,7 @@
       <div class="form-note" role="status">Decision recorded.</div>
       {% endif %}
       {% if form_error %}
-      <div class="form-error" role="alert">{{ form_error }}</div>
+      <div class="form-error" role="alert">{{ form_error|sanitize_text }}</div>
       {% endif %}
 
       {% if review.status == 'RESOLVED' and review.human_decision %}
@@ -177,7 +177,7 @@
             {% if kind.value == 'ESTABLISH_MAPPING' %}
             <div class="subform" data-for="ESTABLISH_MAPPING">
               {% if inventory_error %}
-                <p class="text-fail small">Inventory database unavailable: {{ inventory_error }}</p>
+                <p class="text-fail small">Inventory database unavailable: {{ inventory_error|sanitize_text }}</p>
               {% elif unresolved_items %}
                 <table class="data small">
                   <caption class="small">Raw item &rarr; SKU (rows left unmapped are not submitted)</caption>

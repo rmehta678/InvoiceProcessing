@@ -7,11 +7,10 @@ import errno
 import hashlib
 import json
 import os
-import re
 import sqlite3
 import stat
 import threading
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -56,7 +55,13 @@ from invoice_agents.models import (
     ToolStatus,
     UsageSummary,
 )
-from invoice_agents.observability.audit import AuditRecorder, bind_audit_recorder
+from invoice_agents.observability.audit import (
+    AuditRecorder,
+    bind_audit_recorder,
+    redact,
+    safe_provider_request_id,
+    sanitize_text,
+)
 from invoice_agents.source_store import snapshot_source
 from invoice_agents.terminal_process import TerminalProcessOutcome, run_terminal_process
 from invoice_agents.tools.comparison import (
@@ -195,49 +200,19 @@ def preflight(settings: Settings) -> None:
     verify_database(settings.workflow_db, DatabaseKind.WORKFLOW, settings=settings)
 
 
-_EXTERNAL_SECRET = re.compile(
-    r"(?i)(?:bearer\s+[A-Za-z0-9._~+/=-]+|(?:sk(?:-proj)?|xai)-[A-Za-z0-9._~+/=-]+)"
-)
-_SENSITIVE_DETAIL_KEY = re.compile(r"(?i)(?:authorization|api[_-]?key|secret|token|cookie)")
-_SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
-
-
-def _sanitize_error_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            str(key): (
-                "[REDACTED]"
-                if _SENSITIVE_DETAIL_KEY.search(str(key))
-                else _sanitize_error_value(item)
-            )
-            for key, item in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        return [_sanitize_error_value(item) for item in value]
-    if isinstance(value, str):
-        return _EXTERNAL_SECRET.sub("[REDACTED]", value)
-    return value
-
-
 def _safe_provider_request_id(exc: BaseException) -> str | None:
-    value = getattr(exc, "request_id", None)
-    return value if isinstance(value, str) and _SAFE_REQUEST_ID.fullmatch(value) else None
+    return safe_provider_request_id(getattr(exc, "request_id", None))
 
 
 def _error_record(exc: BaseException, case_id: str | None = None) -> ErrorRecord:
     if isinstance(exc, InvoiceAgentsError):
         return ErrorRecord(
             category=exc.category,
-            message=str(_sanitize_error_value(exc.message)),
+            message=sanitize_text(str(exc.message)),
             case_id=exc.case_id or case_id,
-            stop_reason=exc.stop_reason,
-            provider_request_id=(
-                exc.provider_request_id
-                if isinstance(exc.provider_request_id, str)
-                and _SAFE_REQUEST_ID.fullmatch(exc.provider_request_id)
-                else None
-            ),
-            details=cast(dict[str, Any], _sanitize_error_value(exc.details or {})),
+            stop_reason=(sanitize_text(exc.stop_reason) if exc.stop_reason is not None else None),
+            provider_request_id=safe_provider_request_id(exc.provider_request_id),
+            details=cast(dict[str, Any], redact(exc.details or {})),
         )
     if isinstance(exc, openai.APIResponseValidationError):
         # The provider answered with a payload the SDK could not validate; this is a
@@ -1899,6 +1874,101 @@ def _event_payload(event: Any) -> dict[str, Any]:
     return {"type": type(event).__name__, "value": str(event)}
 
 
+def _validated_tool_call_ids(values: list[object], case_id: str) -> list[str]:
+    validated: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise InvoiceAgentsError(
+                ErrorCategory.SCHEMA,
+                "AutoGen tool event omitted its correlation ID",
+                case_id=case_id,
+                stop_reason="TOOL_CALL_ID_MISSING",
+            ) from None
+        if (
+            len(value) > 256
+            or value != value.strip()
+            or not value.isprintable()
+            or sanitize_text(value) != value
+        ):
+            raise InvoiceAgentsError(
+                ErrorCategory.SCHEMA,
+                "AutoGen tool event returned an invalid correlation ID",
+                case_id=case_id,
+                stop_reason="TOOL_CALL_ID_INVALID",
+            ) from None
+        validated.append(value)
+    return validated
+
+
+def _record_stream_event(
+    event: Any,
+    context: AgentCaseContext,
+    usage: UsageSummary,
+) -> None:
+    """Account for one AutoGen event and persist normalized per-call audit rows."""
+
+    event_payload = _event_payload(event)
+    model_usage = getattr(event, "models_usage", None)
+    if model_usage is not None:
+        usage.prompt_tokens += int(model_usage.prompt_tokens)
+        usage.completion_tokens += int(model_usage.completion_tokens)
+        usage.model_calls += 1
+    if isinstance(event, ToolCallRequestEvent):
+        usage.tool_calls += len(event.content)
+
+    tool_call_ids: list[str] | None = None
+    if isinstance(event, ToolCallRequestEvent):
+        tool_call_ids = _validated_tool_call_ids(
+            [getattr(call, "id", None) for call in event.content], context.case_id
+        )
+    elif isinstance(event, ToolCallExecutionEvent):
+        tool_call_ids = _validated_tool_call_ids(
+            [getattr(execution, "call_id", None) for execution in event.content],
+            context.case_id,
+        )
+
+    content_payloads: list[Any] | None = None
+    if tool_call_ids is not None:
+        raw_content = event_payload.get("content")
+        if not isinstance(raw_content, list) or len(raw_content) != len(tool_call_ids):
+            raise InvoiceAgentsError(
+                ErrorCategory.SCHEMA,
+                "AutoGen tool event payload did not match its correlation items",
+                case_id=context.case_id,
+                stop_reason="TOOL_EVENT_PAYLOAD_INVALID",
+            ) from None
+        content_payloads = raw_content
+
+    if isinstance(event, ToolCallExecutionEvent):
+        for execution in event.content:
+            if execution.is_error:
+                context.tool_failures.append(
+                    sanitize_text(f"{execution.name}({execution.call_id}): {execution.content}")
+                )
+
+    source_id = context.invoice().source.source_id
+    metadata = getattr(event, "metadata", {}) or {}
+    provider_request_id = metadata.get("request_id") if isinstance(metadata, Mapping) else None
+    record_kwargs = {
+        "source_id": source_id,
+        "agent_name": getattr(event, "source", None),
+        "provider_request_id": provider_request_id,
+    }
+    event_type = f"autogen.{type(event).__name__}"
+    if tool_call_ids is None:
+        context.audit.record(event_type, event_payload, **record_kwargs)
+        return
+
+    assert content_payloads is not None
+    for tool_call_id, content_payload in zip(tool_call_ids, content_payloads, strict=True):
+        context.audit.record(
+            event_type,
+            {**event_payload, "content": [content_payload]},
+            tool_call_id=tool_call_id,
+            **record_kwargs,
+        )
+
+
 async def _stream_team(
     team: Any,
     context: AgentCaseContext,
@@ -1911,26 +1981,7 @@ async def _stream_team(
         if isinstance(event, TaskResult):
             final_task_result = event
             continue
-        model_usage = getattr(event, "models_usage", None)
-        if model_usage is not None:
-            usage.prompt_tokens += int(model_usage.prompt_tokens)
-            usage.completion_tokens += int(model_usage.completion_tokens)
-            usage.model_calls += 1
-        if isinstance(event, ToolCallRequestEvent):
-            usage.tool_calls += len(event.content)
-        if isinstance(event, ToolCallExecutionEvent):
-            for execution in event.content:
-                if execution.is_error:
-                    context.tool_failures.append(
-                        f"{execution.name}({execution.call_id}): {execution.content}"
-                    )
-        context.audit.record(
-            f"autogen.{type(event).__name__}",
-            _event_payload(event),
-            source_id=context.invoice().source.source_id,
-            agent_name=getattr(event, "source", None),
-            provider_request_id=(getattr(event, "metadata", {}) or {}).get("request_id"),
-        )
+        _record_stream_event(event, context, usage)
     if final_task_result is None:
         raise InvoiceAgentsError(
             ErrorCategory.ORCHESTRATION,
@@ -1953,7 +2004,7 @@ def _result_from_stop(
     errors = [
         ErrorRecord(
             category=ErrorCategory.TOOL,
-            message=failure,
+            message=sanitize_text(failure),
             case_id=context.case_id,
             stop_reason="TOOL_EXECUTION_FAILED",
         )

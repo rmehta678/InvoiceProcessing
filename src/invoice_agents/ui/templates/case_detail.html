@@ -59,10 +59,10 @@
   <h2>Errors</h2>
   {% for error in result.errors %}
   <div class="entry">
-    <div><span class="badge tone-fail">{{ error.category }}</span>
-      {% if error.stop_reason %}<span class="mono small">{{ error.stop_reason }}</span>{% endif %}</div>
-    <p class="small">{{ error.message }}</p>
-    {% if error.provider_request_id %}<p class="small dim">provider request ID: <span class="mono">{{ error.provider_request_id }}</span></p>{% endif %}
+    <div><span class="badge tone-fail">{{ error.category|sanitize_text }}</span>
+      {% if error.stop_reason %}<span class="mono small">{{ error.stop_reason|sanitize_text }}</span>{% endif %}</div>
+    <p class="small">{{ error.message|sanitize_text }}</p>
+    {% if error.provider_request_id %}<p class="small dim">provider request ID: <span class="mono">{{ error.provider_request_id|sanitize_text }}</span></p>{% endif %}
   </div>
   {% endfor %}
 </section>
@@ -144,7 +144,7 @@
       {% if duplicate_case %}&mdash; prior transaction on <a class="mono" href="/cases/{{ duplicate_case }}">{{ duplicate_case|middle }}</a>{% endif %}
       <span class="dim small">the attempt returned the prior transaction; no second payment was made</span></dd>
     {% endif %}
-    {% if result.payment.error %}<dt>Error</dt><dd class="text-fail">{{ result.payment.error }}</dd>{% endif %}
+    {% if result.payment.error %}<dt>Error</dt><dd class="text-fail">{{ result.payment.error|sanitize_text }}</dd>{% endif %}
   </dl>
   {% else %}
   <p class="dim">No payment attempt is recorded for this case.</p>
@@ -175,11 +175,11 @@
             <td class="mono small">{{ event.event_type }}</td>
             <td>{% if event.agent_name %}{{ m.agent_chip(event.agent_name) }}{% else %}<span class="dim">-</span>{% endif %}</td>
             <td class="small">
-              {% if event.tool_call_id %}<span class="chip locator" title="tool call">{{ event.tool_call_id|middle }}</span>{% endif %}
+              {% if event.tool_call_id %}<span class="chip locator" title="tool call">{{ event.tool_call_id|sanitize_text|middle }}</span>{% endif %}
               {% if event.review_id %}<span class="chip locator" title="review">{{ event.review_id|middle }}</span>{% endif %}
               {% if event.payment_id %}<span class="chip locator" title="payment">{{ event.payment_id|middle }}</span>{% endif %}
               {% if event.db_evidence_id %}<span class="chip locator" title="evidence record">{{ event.db_evidence_id|middle }}</span>{% endif %}
-              {% if event.provider_request_id %}<span class="chip locator" title="provider request">{{ event.provider_request_id|middle }}</span>{% endif %}
+              {% if event.provider_request_id %}<span class="chip locator" title="provider request">{{ event.provider_request_id|sanitize_text|middle }}</span>{% endif %}
             </td>
             <td>{{ m.json_disclosure(event.payload_json) }}</td>
           </tr>

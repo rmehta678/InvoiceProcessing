@@ -23,6 +23,7 @@ from fastapi.templating import Jinja2Templates
 
 from invoice_agents.config import Settings
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
+from invoice_agents.observability.audit import redact, sanitize_text
 from invoice_agents.ui.recovery import RecoveryCoordinator, RecoveryHealthMiddleware
 from invoice_agents.ui.routes import router
 from invoice_agents.ui.runs import RunRegistry
@@ -190,6 +191,7 @@ def build_templates() -> Jinja2Templates:
     templates.env.filters["json_pretty"] = json_pretty
     templates.env.filters["middle"] = middle
     templates.env.filters["nonzero"] = is_nonzero
+    templates.env.filters["sanitize_text"] = sanitize_text
     templates.env.globals["tone"] = tone
     templates.env.globals["fmt_duration"] = fmt_duration
     return templates
@@ -262,18 +264,34 @@ def create_app(
     @app.exception_handler(InvoiceAgentsError)
     async def invoice_error(request: Request, exc: InvoiceAgentsError) -> Response:
         status_code = 404 if exc.stop_reason in NOT_FOUND_STOPS else 400
+        error = InvoiceAgentsError(
+            category=exc.category,
+            message=sanitize_text(str(exc.message)),
+            case_id=(sanitize_text(exc.case_id) if exc.case_id is not None else None),
+            stop_reason=(sanitize_text(exc.stop_reason) if exc.stop_reason is not None else None),
+            provider_request_id=(
+                sanitize_text(exc.provider_request_id)
+                if exc.provider_request_id is not None
+                else None
+            ),
+            details=redact(exc.details or {}),
+        )
         response: Response = app.state.templates.TemplateResponse(
             request,
             "error.html",
-            {"nav": None, "error": exc},
+            {"nav": None, "error": error},
             status_code=status_code,
         )
         return response
 
     @app.exception_handler(sqlite3.Error)
     async def sqlite_error(request: Request, exc: sqlite3.Error) -> Response:
-        # Verbatim database failure; the console never repairs or retries.
-        error = InvoiceAgentsError(ErrorCategory.DATABASE, str(exc), stop_reason="DATABASE_ERROR")
+        # The failure remains visible, but credential-like text is never rendered.
+        error = InvoiceAgentsError(
+            ErrorCategory.DATABASE,
+            sanitize_text(str(exc)),
+            stop_reason="DATABASE_ERROR",
+        )
         response: Response = app.state.templates.TemplateResponse(
             request,
             "error.html",

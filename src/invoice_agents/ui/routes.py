@@ -36,6 +36,7 @@ from invoice_agents.models import (
     HumanDecisionKind,
     ReviewRequest,
 )
+from invoice_agents.observability.audit import sanitize_text
 from invoice_agents.orchestration import validate_case_concurrency
 from invoice_agents.ui import queries
 from invoice_agents.ui.preflight import key_present, run_preflight
@@ -103,7 +104,11 @@ def _render(
 
 
 def _not_found(request: Request, message: str, stop_reason: str) -> Response:
-    error = InvoiceAgentsError(ErrorCategory.DATABASE, message, stop_reason=stop_reason)
+    error = InvoiceAgentsError(
+        ErrorCategory.DATABASE,
+        sanitize_text(message),
+        stop_reason=sanitize_text(stop_reason),
+    )
     return _render(request, "error.html", {"nav": None, "error": error}, status_code=404)
 
 
@@ -299,7 +304,7 @@ async def dashboard(
         counts = queries.status_counts(settings.workflow_db)
         pending_reviews = queries.pending_review_count(settings.workflow_db)
     except sqlite3.Error as exc:
-        db_error = str(exc)
+        db_error = sanitize_text(str(exc))
     table_context = {
         "rows": rows,
         "db_error": db_error,
@@ -505,7 +510,7 @@ def _review_context(request: Request, review: ReviewRequest) -> dict[str, Any]:
     try:
         inventory_rows = list(queries.list_inventory(settings.inventory_db))
     except Exception as exc:
-        inventory_error = str(exc)
+        inventory_error = sanitize_text(str(exc))
     invoice_number = None
     number_field = invoice.get("invoice_number")
     if isinstance(number_field, dict):
@@ -613,7 +618,7 @@ async def review_decide(
     def rerender(message: str) -> Response:
         context = _review_context(request, review)
         context["decided"] = False
-        context["form_error"] = message
+        context["form_error"] = sanitize_text(message)
         context["form_values"] = {
             "reviewer": reviewer or "",
             "decision": decision or "",
@@ -660,7 +665,7 @@ async def review_decide(
             addressed_blocker_ids=addressed_blocker_ids_by_decision.get(selected, []),
         )
     except InvoiceAgentsError as exc:
-        return rerender(str(exc))
+        return rerender(sanitize_text(str(exc)))
     response = RedirectResponse(f"/reviews/{review_id}?decided=1", status_code=303)
     if reviewer and reviewer.strip():
         # URL-encoded so addresses with @ survive the cookie layer unquoted.

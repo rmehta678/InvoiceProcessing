@@ -2,7 +2,7 @@
 <div id="case-table-region">
   {% if db_error %}
   <div class="empty">
-    The workflow database cannot be read: <span class="mono text-fail">{{ db_error }}</span>.
+    The workflow database cannot be read: <span class="mono text-fail">{{ db_error|sanitize_text }}</span>.
     The preflight strip above shows the exact stop reason and fix command.
   </div>
   {% elif rows %}

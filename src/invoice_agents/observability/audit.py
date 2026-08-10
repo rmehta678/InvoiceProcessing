@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import traceback
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -19,41 +20,101 @@ from opentelemetry.sdk.trace import TracerProvider
 from invoice_agents.db.core import connect_database
 
 SENSITIVE_KEY = re.compile(r"(authorization|api[_-]?key|secret|token|cookie)", re.IGNORECASE)
-BEARER_VALUE = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
+BEARER_VALUE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+AUTHORIZATION_SCHEME_VALUE = re.compile(
+    r"(?i)\bauthorization[\"']?\s*[:=]\s*[\"']?"
+    r"(?:bearer|basic|digest|token)\s+[A-Za-z0-9._~+/=-]+[\"']?"
+)
+CREDENTIAL_VALUE = re.compile(
+    r"(?i)\b(?:xai|sk)(?:-proj)?-[A-Za-z0-9_-]{8,}\b|"
+    r"\b(?:api[_-]?key|authorization|cookie)[\"']?\s*[:=]\s*"
+    r"[\"']?[^\s\"',}\]]+[\"']?"
+)
+CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028\u2029\u2060\ufeff]")
+SAFE_PROVIDER_REQUEST_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+SANITIZED_TEXT_MAX_CHARS = 4096
+TRUNCATION_MARKER = "…[TRUNCATED]"
 NUMERIC_USAGE_TOKEN_KEYS = frozenset({"prompt_tokens", "completion_tokens"})
 _CURRENT_AUDIT: ContextVar[AuditRecorder | None] = ContextVar(
     "invoice_agents_current_audit", default=None
 )
 
 
+def _redact_text_patterns(value: str) -> str:
+    return CREDENTIAL_VALUE.sub(
+        "[REDACTED]",
+        BEARER_VALUE.sub(
+            "Bearer [REDACTED]",
+            AUTHORIZATION_SCHEME_VALUE.sub("[REDACTED]", value),
+        ),
+    )
+
+
+def sanitize_text(value: str) -> str:
+    """Redact credential-like free text and apply one deterministic size ceiling."""
+
+    sanitized = _redact_text_patterns(value)
+    control_free = CONTROL_CHARACTER.sub("", value)
+    if control_free != value and _redact_text_patterns(control_free) != control_free:
+        # Controls can split a token across log lines or invisible characters. Use
+        # the canonical control-free text only when that canonicalization exposes a
+        # credential; ordinary multiline invoice text otherwise stays unchanged.
+        sanitized = _redact_text_patterns(control_free)
+    if len(sanitized) <= SANITIZED_TEXT_MAX_CHARS:
+        return sanitized
+    visible_chars = SANITIZED_TEXT_MAX_CHARS - len(TRUNCATION_MARKER)
+    return f"{sanitized[:visible_chars]}{TRUNCATION_MARKER}"
+
+
+def safe_provider_request_id(value: object) -> str | None:
+    if (
+        not isinstance(value, str)
+        or SAFE_PROVIDER_REQUEST_ID.fullmatch(value) is None
+        or sanitize_text(value) != value
+    ):
+        return None
+    return value
+
+
 def redact(value: Any) -> Any:
-    """Redact known secret keys and bearer values recursively."""
+    """Redact known secret keys and sanitize every serializable text boundary."""
 
     if isinstance(value, Mapping):
         cleaned: dict[str, Any] = {}
         for key, item in value.items():
-            normalized_key = str(key)
-            if normalized_key in NUMERIC_USAGE_TOKEN_KEYS and type(item) is int and item >= 0:
-                cleaned[normalized_key] = item
-            elif SENSITIVE_KEY.search(normalized_key):
-                cleaned[normalized_key] = "[REDACTED]"
+            raw_key = str(key)
+            safe_key = sanitize_text(raw_key)
+            if raw_key in NUMERIC_USAGE_TOKEN_KEYS and type(item) is int and item >= 0:
+                cleaned[safe_key] = item
+            elif SENSITIVE_KEY.search(raw_key):
+                cleaned[safe_key] = "[REDACTED]"
             else:
-                cleaned[normalized_key] = redact(item)
+                cleaned[safe_key] = redact(item)
         return cleaned
     if isinstance(value, str):
-        return BEARER_VALUE.sub("Bearer [REDACTED]", value)
-    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return sanitize_text(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return sanitize_text(bytes(value).decode("utf-8", errors="replace"))
+    if isinstance(value, Sequence):
         return [redact(item) for item in value]
-    return value
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return sanitize_text(str(value))
 
 
 class RedactingFilter(logging.Filter):
     """Prevent credentials from reaching console or local logging handlers."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = redact(record.msg)
-        if record.args:
-            record.args = tuple(redact(item) for item in record.args)
+        record.msg = sanitize_text(record.getMessage())
+        record.args = ()
+        if record.exc_info is not None:
+            record.exc_text = sanitize_text("".join(traceback.format_exception(*record.exc_info)))
+            record.exc_info = None
+        elif record.exc_text:
+            record.exc_text = sanitize_text(record.exc_text)
+        if record.stack_info:
+            record.stack_info = sanitize_text(record.stack_info)
         return True
 
 
@@ -61,7 +122,7 @@ class ProviderRetryAuditHandler(logging.Handler):
     """Persist OpenAI SDK retry attempts against the current async case context."""
 
     def emit(self, record: logging.LogRecord) -> None:
-        message = str(redact(record.getMessage()))
+        message = sanitize_text(record.getMessage())
         if "retry" not in message.casefold():
             return
         recorder = _CURRENT_AUDIT.get()
@@ -122,6 +183,7 @@ class AuditRecorder:
         event_id = f"evt_{uuid4().hex}"
         safe_payload = redact(payload)
         encoded = json.dumps(safe_payload, default=str, ensure_ascii=False, sort_keys=True)
+        sanitized_provider_request_id = safe_provider_request_id(provider_request_id)
         created_at = datetime.now(UTC).isoformat()
         with self.tracer.start_as_current_span(event_type) as span:
             if self.case_id:
@@ -144,7 +206,7 @@ class AuditRecorder:
                         db_evidence_id,
                         review_id,
                         payment_id,
-                        provider_request_id,
+                        sanitized_provider_request_id,
                         encoded,
                         created_at,
                     ),

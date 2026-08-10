@@ -31,6 +31,7 @@ from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import CaseResult, CaseStatus, RiskAssessment
+from invoice_agents.observability.audit import AuditRecorder
 from invoice_agents.ui import queries
 
 
@@ -204,6 +205,51 @@ def test_failed_case_shows_errors_at_top(client: TestClient, settings: Settings)
     assert text.index("provider request exceeded") < text.index("Extraction"), (
         "error records render before the evidence narrative"
     )
+
+
+def test_ui_exception_handler_sanitizes_embedded_credentials(client: TestClient) -> None:
+    secret = "plainUiCredential"
+
+    async def sensitive_error() -> None:
+        raise InvoiceAgentsError(
+            category="PROVIDER",
+            message=f"provider exception AUTHORIZATION: Bearer {secret}",
+            stop_reason="PROVIDER_REQUEST_FAILED",
+        )
+
+    client.app.add_api_route("/_task13-sensitive-error", sensitive_error)
+    response = client.get("/_task13-sensitive-error")
+
+    assert response.status_code == 400
+    assert "[REDACTED]" in response.text
+    assert secret not in response.text
+
+
+def test_case_detail_displays_matching_tool_call_rows_without_secrets(
+    client: TestClient, settings: Settings
+) -> None:
+    case_id = make_succeeded_case(settings)
+    secret = "plainUiEventCredential"
+    audit = AuditRecorder(settings.workflow_db, case_id)
+    audit.record(
+        "autogen.ToolCallRequestEvent",
+        {"content": [{"name": "lookup", "arguments": f"api_key={secret}"}]},
+        tool_call_id="call_shared_1",
+    )
+    audit.record(
+        "autogen.ToolCallExecutionEvent",
+        {"content": [{"name": "lookup", "content": "inventory matched"}]},
+        tool_call_id="call_shared_1",
+    )
+
+    response = client.get(f"/cases/{case_id}")
+
+    assert response.status_code == 200
+    assert response.text.count("call_shared_1") == 2
+    assert "ToolCallRequestEvent" in response.text
+    assert "ToolCallExecutionEvent" in response.text
+    assert "[REDACTED]" in response.text
+    assert secret not in response.text
 
 
 def test_needs_human_case_links_review(client: TestClient, settings: Settings) -> None:

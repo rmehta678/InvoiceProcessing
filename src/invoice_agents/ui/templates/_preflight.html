@@ -10,7 +10,7 @@
     {% else %}
       <span class="badge tone-fail">{{ item.stop_reason or 'FAILED' }}</span>
     {% endif %}
-    <span class="small {{ 'dim' if item.ok else 'text-fail' }}">{{ item.detail }}</span>
+    <span class="small {{ 'dim' if item.ok else 'text-fail' }}">{{ item.detail|sanitize_text }}</span>
   </div>
   {% endfor %}
   <a class="small preflight-system-link" href="/system">System</a>

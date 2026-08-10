@@ -21,8 +21,8 @@
     <dt>Indexes</dt><dd class="mono small">{{ check.info.indexes|join(', ') }}</dd>
   </dl>
   {% else %}
-  <p><span class="badge tone-fail">{{ check.error.stop_reason or 'FAILED' }}</span></p>
-  <p class="text-fail">{{ check.error.message }}</p>
+  <p><span class="badge tone-fail">{{ (check.error.stop_reason or 'FAILED')|sanitize_text }}</span></p>
+  <p class="text-fail">{{ check.error.message|sanitize_text }}</p>
   {% endif %}
 </section>
 {% endfor %}

@@ -4,10 +4,10 @@
 
 {% block content %}
 <section class="error-list error-page">
-  <h2><span class="badge tone-fail">{{ error.category }}</span>
-    {% if error.stop_reason %}<span class="mono">{{ error.stop_reason }}</span>{% endif %}</h2>
-  <p>{{ error.message }}</p>
-  {% if error.case_id %}<p class="small">case: <a class="mono" href="/cases/{{ error.case_id }}">{{ error.case_id }}</a></p>{% endif %}
+  <h2><span class="badge tone-fail">{{ error.category|sanitize_text }}</span>
+    {% if error.stop_reason %}<span class="mono">{{ error.stop_reason|sanitize_text }}</span>{% endif %}</h2>
+  <p>{{ error.message|sanitize_text }}</p>
+  {% if error.case_id %}<p class="small">case: <a class="mono" href="/cases/{{ error.case_id|sanitize_text }}">{{ error.case_id|sanitize_text }}</a></p>{% endif %}
 </section>
 <p><a class="btn" href="/">Back to dashboard</a></p>
 {% endblock %}

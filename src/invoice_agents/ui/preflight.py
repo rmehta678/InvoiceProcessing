@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from invoice_agents.config import Settings
 from invoice_agents.db.core import DatabaseKind, verify_database
 from invoice_agents.errors import InvoiceAgentsError
+from invoice_agents.observability.audit import sanitize_text
 
 
 @dataclass(slots=True)
@@ -73,8 +74,10 @@ def run_preflight(settings: Settings) -> PreflightReport:
                 PreflightItem(
                     name=name,
                     ok=False,
-                    detail=exc.message,
-                    stop_reason=exc.stop_reason,
+                    detail=sanitize_text(exc.message),
+                    stop_reason=(
+                        sanitize_text(exc.stop_reason) if exc.stop_reason is not None else None
+                    ),
                     fix_command=fix_command,
                 )
             )

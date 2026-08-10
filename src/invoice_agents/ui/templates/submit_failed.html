@@ -10,9 +10,9 @@
   <h2>{{ result.status }} &mdash; <span class="mono">{{ result.stop_reason }}</span></h2>
   {% for error in result.errors %}
   <div class="entry">
-    <div><span class="badge tone-fail">{{ error.category }}</span>
-      {% if error.stop_reason %}<span class="mono small">{{ error.stop_reason }}</span>{% endif %}</div>
-    <p class="small">{{ error.message }}</p>
+    <div><span class="badge tone-fail">{{ error.category|sanitize_text }}</span>
+      {% if error.stop_reason %}<span class="mono small">{{ error.stop_reason|sanitize_text }}</span>{% endif %}</div>
+    <p class="small">{{ error.message|sanitize_text }}</p>
   </div>
   {% endfor %}
 </section>
