@@ -1253,7 +1253,9 @@ def test_finished_duplicate_sse_requires_settings_without_mutating_persisted_sta
     )
 
     assert missing_authority is not None
+    assert missing_authority["status"] == "UNAVAILABLE"
     assert missing_authority["stop_reason"] == "EVIDENCE_AUTHORITY_MISSING"
+    assert missing_authority["recovery_verified"] is False
     assert trusted is not None
     assert trusted["status"] == "SUCCEEDED"
     assert trusted["stop_reason"] == "APPROVED_PAYMENT_RECORDED"
@@ -1291,7 +1293,9 @@ def test_finished_duplicate_sse_keeps_persisted_contradiction_classification(
     )
 
     assert payload is not None
+    assert payload["status"] == "UNAVAILABLE"
     assert payload["stop_reason"] == "PERSISTED_RESULT_INVALID"
+    assert payload["recovery_verified"] is False
     with connect_database(settings.workflow_db, read_only=True) as connection:
         after = connection.execute(
             "SELECT result_json FROM cases WHERE case_id = ?", (attempted.case_id,)
@@ -1299,10 +1303,10 @@ def test_finished_duplicate_sse_keeps_persisted_contradiction_classification(
     assert after == before
 
 
-def test_terminal_sse_recovery_validates_cross_case_duplicate_with_request_settings(
+def test_coordinator_recovery_validates_cross_case_duplicate_before_terminal_sse(
     invoice_dir: Path, settings: Settings
 ) -> None:
-    """Post-startup lease recovery retains a validated cross-case duplicate."""
+    """Observational reads wait for the recovery owner to validate a duplicate."""
 
     store, attempted, _paid, duplicate = duplicate_terminal_fixture(invoice_dir, settings)
     interrupted = attempted.model_copy(
@@ -1343,7 +1347,19 @@ def test_terminal_sse_recovery_validates_cross_case_duplicate_with_request_setti
     )
 
     assert missing_authority is not None
-    assert missing_authority["stop_reason"] == "EVIDENCE_AUTHORITY_MISSING"
+    assert missing_authority["status"] == "UNAVAILABLE"
+    assert missing_authority["stop_reason"] == "EXECUTION_RECOVERY_FAILED"
+    assert missing_authority["recovery_verified"] is False
+    awaiting_recovery = terminal_payload(
+        settings.workflow_db,
+        attempted.case_id,
+        RunRegistry(),
+        settings,
+    )
+    assert awaiting_recovery is not None
+    assert awaiting_recovery["status"] == "UNAVAILABLE"
+    assert awaiting_recovery["stop_reason"] == "EXECUTION_RECOVERY_FAILED"
+    assert awaiting_recovery["recovery_verified"] is False
     with connect_database(settings.workflow_db, read_only=True) as connection:
         after_missing_authority = tuple(
             connection.execute(
@@ -1353,6 +1369,8 @@ def test_terminal_sse_recovery_validates_cross_case_duplicate_with_request_setti
             ).fetchone()
         )
     assert after_missing_authority == before
+
+    assert store.recover_expired_executions(now=datetime.now(UTC)) == [attempted.case_id]
 
     payload = terminal_payload(
         settings.workflow_db,
@@ -1364,6 +1382,7 @@ def test_terminal_sse_recovery_validates_cross_case_duplicate_with_request_setti
     assert payload is not None
     assert payload["status"] == "INCOMPLETE"
     assert payload["stop_reason"] == "ORPHANED_EXECUTION"
+    assert payload["recovery_verified"] is True
     recovered = store.load_result(attempted.case_id)
     assert recovered is not None
     assert recovered.payment == duplicate

@@ -7,6 +7,7 @@ the browser flows, not the paid pipeline.
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import threading
@@ -172,3 +173,36 @@ def test_u2_submit_from_browser_reaches_terminal_banner(
     page.wait_for_url("**/live")
     page.wait_for_selector(".terminal-banner", timeout=15000)
     assert "STUB_RUN_RECORDED" in page.inner_text(".terminal-banner")
+
+
+def test_recovery_error_event_closes_eventsource_without_retry(
+    page: Any,
+    server_url: str,
+    settings: Settings,
+) -> None:
+    case_id = make_succeeded_case(settings)
+    event_requests = 0
+    payload = json.dumps(
+        {
+            "case_id": case_id,
+            "status": "UNAVAILABLE",
+            "stop_reason": "EXECUTION_RECOVERY_FAILED",
+            "recovery_verified": False,
+        }
+    )
+
+    def recovery_error(route: Any) -> None:
+        nonlocal event_requests
+        event_requests += 1
+        route.fulfill(
+            status=200,
+            content_type="text/event-stream",
+            body=f"retry: 10\nevent: recovery-error\ndata: {payload}\n\n",
+        )
+
+    page.route(f"**/cases/{case_id}/events", recovery_error)
+    page.goto(f"{server_url}/cases/{case_id}/live")
+    page.wait_for_selector(".terminal-banner", timeout=2_000)
+    assert "Execution recovery unavailable" in page.inner_text(".terminal-banner")
+    page.wait_for_timeout(250)
+    assert event_requests == 1

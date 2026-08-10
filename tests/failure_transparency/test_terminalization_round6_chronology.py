@@ -160,7 +160,7 @@ def test_round6_sse_never_publishes_success_from_corrupt_relational_finish(
     settings: Settings,
     mutation: RelationalFinishMutation,
 ) -> None:
-    """SSE exposes a fail-closed corruption terminal instead of stored success."""
+    """SSE exposes corruption as unavailable instead of a fabricated terminal result."""
 
     case_id, _claim, _store, result = _finish_legitimate_case(invoice_dir, settings)
     _tamper_relational_finish(settings, case_id, result, mutation)
@@ -173,8 +173,9 @@ def test_round6_sse_never_publishes_success_from_corrupt_relational_finish(
     )
 
     assert payload is not None
-    assert payload["status"] == "INCOMPLETE"
+    assert payload["status"] == "UNAVAILABLE"
     assert payload["stop_reason"] == "PERSISTED_RESULT_INVALID"
+    assert payload["recovery_verified"] is False
     assert payload["status"] != "SUCCEEDED"
 
 

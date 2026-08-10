@@ -1744,11 +1744,13 @@ class WorkflowStore:
         now: datetime | None = None,
         case_id: str | None = None,
     ) -> list[str]:
-        """Atomically terminalize abandoned nonterminal authorities in case-ID order.
+        """Atomically terminalize expired RUNNING authorities in case-ID order.
 
         Recovery advances the execution generation and replaces the abandoned token.
         A worker holding the prior claim therefore cannot overwrite the recovered result.
         The case update and recovery audit event commit in the same SQLite transaction.
+        IDLE is intentionally excluded: it has no lease and can be the committed gap
+        between case creation and claim acquisition or a deliberately released case.
         """
 
         recovered_at = now or datetime.now(UTC)
@@ -1767,7 +1769,7 @@ class WorkflowStore:
                     "SELECT case_id, source_id, status, stop_reason, result_json, started_at, "
                     "finished_at, "
                     "execution_token, execution_generation, execution_state, lease_expires_at "
-                    "FROM cases WHERE execution_state IN ('IDLE', 'RUNNING') "
+                    "FROM cases WHERE execution_state = 'RUNNING' "
                     "AND status IN ('INCOMPLETE', 'NEEDS_HUMAN')"
                 )
                 params: tuple[str, ...] = ()
@@ -1785,9 +1787,7 @@ class WorkflowStore:
                             stop_reason="EXECUTION_AUTHORITY_CORRUPT",
                         )
                     lease = parse_canonical_utc(row["lease_expires_at"])
-                    if row["execution_state"] == "RUNNING" and (
-                        lease is None or lease > recovered_at
-                    ):
+                    if lease is None or lease > recovered_at:
                         continue
                     started_at = parse_canonical_utc(row["started_at"])
                     if started_at is None:
@@ -1945,14 +1945,14 @@ class WorkflowStore:
         *,
         checked_at: datetime,
     ) -> list[str]:
-        """Read eligible authorities that a scan at ``checked_at`` should have finished."""
+        """Read expired RUNNING authorities a scan should have finished."""
 
         self._require_canonical_utc_clock(checked_at)
         with connect_database(self.path, read_only=True) as connection:
             rows = connection.execute(
                 "SELECT case_id, status, execution_token, execution_generation, "
                 "execution_state, lease_expires_at, updated_at FROM cases "
-                "WHERE execution_state IN ('IDLE', 'RUNNING') "
+                "WHERE execution_state = 'RUNNING' "
                 "AND status IN ('INCOMPLETE', 'NEEDS_HUMAN') ORDER BY case_id"
             ).fetchall()
         unrecovered: list[str] = []
@@ -1965,21 +1965,8 @@ class WorkflowStore:
                     case_id=case_id,
                     stop_reason="EXECUTION_AUTHORITY_CORRUPT",
                 )
-            state = str(row["execution_state"])
-            if state == "RUNNING":
-                lease = parse_canonical_utc(row["lease_expires_at"])
-                if lease is not None and lease <= checked_at:
-                    unrecovered.append(case_id)
-                continue
-            updated_at = parse_canonical_utc(row["updated_at"])
-            if updated_at is None:
-                raise InvoiceAgentsError(
-                    ErrorCategory.DATABASE,
-                    "case has a noncanonical persisted update timestamp",
-                    case_id=case_id,
-                    stop_reason="PERSISTED_RESULT_INVALID",
-                )
-            if updated_at <= checked_at:
+            lease = parse_canonical_utc(row["lease_expires_at"])
+            if lease is not None and lease <= checked_at:
                 unrecovered.append(case_id)
         return unrecovered
 

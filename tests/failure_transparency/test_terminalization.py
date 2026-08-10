@@ -5419,8 +5419,9 @@ def test_terminal_payload_reports_corrupt_persisted_result_explicitly(
     payload = terminal_payload(settings.workflow_db, case_id, RunRegistry())
 
     assert payload is not None
-    assert payload["status"] == "INCOMPLETE"
+    assert payload["status"] == "UNAVAILABLE"
     assert payload["stop_reason"] == "PERSISTED_RESULT_INVALID"
+    assert payload["recovery_verified"] is False
     assert payload["recovery_error"]["stop_reason"] == "PERSISTED_RESULT_INVALID"
     assert "corrupt-json" not in json.dumps(payload)
 

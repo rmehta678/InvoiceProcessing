@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from typing import Any, cast
 
 import pytest
@@ -18,7 +19,7 @@ from invoice_agents.config import Settings
 from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.errors import InvoiceAgentsError
-from invoice_agents.models import CaseStatus
+from invoice_agents.models import CaseResult, CaseStatus
 from invoice_agents.ui import server as ui_server
 from invoice_agents.ui import sse
 from invoice_agents.ui.recovery import RecoveryCoordinator
@@ -105,6 +106,150 @@ async def _get_once(app: FastAPI, path: str) -> list[dict[str, Any]]:
     return sent
 
 
+@pytest.mark.parametrize("invalid_timeout", [0.0, -1.0, math.inf, math.nan])
+def test_recovery_shutdown_deadline_must_be_finite_and_positive(
+    settings: Settings,
+    invalid_timeout: float,
+) -> None:
+    with pytest.raises(ValueError, match="shutdown timeout must be"):
+        RecoveryCoordinator(
+            settings,
+            scan_interval_seconds=1,
+            shutdown_timeout_seconds=invalid_timeout,
+        )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_coordinators_serialize_one_process_wide_scan_reservation(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = Event()
+    release = Event()
+    calls_lock = Lock()
+    calls = 0
+    active = 0
+    maximum_active = 0
+    scan_times: list[datetime] = []
+    first_scan_at = datetime(2026, 8, 10, 12, tzinfo=UTC)
+    second_clock_calls = 0
+    second_requested_at = Event()
+
+    def second_clock() -> datetime:
+        nonlocal second_clock_calls
+        second_clock_calls += 1
+        second_requested_at.set()
+        return first_scan_at + timedelta(seconds=second_clock_calls)
+
+    def blocking_recovery(_self: WorkflowStore, **kwargs: object) -> list[str]:
+        nonlocal active, calls, maximum_active
+        with calls_lock:
+            calls += 1
+            active += 1
+            maximum_active = max(maximum_active, active)
+            scan_times.append(cast(datetime, kwargs["now"]))
+        entered.set()
+        try:
+            assert release.wait(timeout=2)
+            return []
+        finally:
+            with calls_lock:
+                active -= 1
+
+    monkeypatch.setattr(WorkflowStore, "recover_expired_executions", blocking_recovery)
+    first = RecoveryCoordinator(
+        settings,
+        scan_interval_seconds=3_600,
+        clock=lambda: first_scan_at,
+    )
+    second = RecoveryCoordinator(
+        settings,
+        scan_interval_seconds=3_600,
+        clock=second_clock,
+    )
+    first_start = asyncio.create_task(first.start())
+    second_start: asyncio.Task[None] | None = None
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait), timeout=1)
+        second_start = asyncio.create_task(second.start())
+        assert await asyncio.wait_for(
+            asyncio.to_thread(second_requested_at.wait),
+            timeout=1,
+        )
+        release.set()
+        await asyncio.wait_for(asyncio.gather(first_start, second_start), timeout=1)
+
+        assert calls == 2
+        assert maximum_active == 1
+        assert scan_times == [first_scan_at, first_scan_at + timedelta(seconds=2)]
+        assert first.completed_scans == 1
+        assert second.completed_scans == 1
+    finally:
+        release.set()
+        for start_task in (first_start, second_start):
+            if start_task is None:
+                continue
+            if not start_task.done():
+                await start_task
+        await first.close()
+        await second.close()
+
+
+@pytest.mark.asyncio
+async def test_unresolved_scan_quarantine_blocks_new_coordinator_admission(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = Event()
+    release = Event()
+    calls_lock = Lock()
+    calls = 0
+    first = RecoveryCoordinator(
+        settings,
+        scan_interval_seconds=3_600,
+        shutdown_timeout_seconds=0.02,
+    )
+    await first.start()
+
+    def wedged_recovery(_self: WorkflowStore, **_kwargs: object) -> list[str]:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call = calls
+        if call == 1:
+            entered.set()
+            assert release.wait(timeout=2)
+        return []
+
+    monkeypatch.setattr(WorkflowStore, "recover_expired_executions", wedged_recovery)
+    first.request_scan()
+    assert await asyncio.wait_for(asyncio.to_thread(entered.wait), timeout=1)
+    with pytest.raises(InvoiceAgentsError) as close_error:
+        await first.close()
+    assert close_error.value.stop_reason == "EXECUTION_RECOVERY_DRAIN_TIMEOUT"
+    assert first.health().quarantined_scans == 1
+
+    blocked = RecoveryCoordinator(settings, scan_interval_seconds=3_600)
+    try:
+        with pytest.raises(InvoiceAgentsError) as admission_error:
+            await asyncio.wait_for(blocked.start(), timeout=0.2)
+        assert admission_error.value.stop_reason == "EXECUTION_RECOVERY_OWNERSHIP_UNRESOLVED"
+        assert blocked.state == "failed"
+        assert calls == 1
+    finally:
+        release.set()
+
+    async def quarantine_is_drained() -> None:
+        while first.health().quarantined_scans:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(quarantine_is_drained(), timeout=1)
+    successor = RecoveryCoordinator(settings, scan_interval_seconds=3_600)
+    await successor.start()
+    await successor.close()
+    assert calls == 2
+
+
 @pytest.mark.asyncio
 async def test_lifespan_coordinator_recovers_post_startup_expiry_and_sse_only_observes(
     invoice_dir: Path,
@@ -167,6 +312,97 @@ async def test_lifespan_coordinator_recovers_post_startup_expiry_and_sse_only_ob
 
     assert background_task is not None and background_task.done()
     assert coordinator.state == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_periodic_scan_never_terminalizes_preparation_at_idle_or_claim_barriers(
+    invoice_dir: Path,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only an expired RUNNING claim gives the periodic owner recovery authority."""
+
+    app = ui_server.create_app(settings)
+    coordinator = _coordinator(app)
+    original_create = WorkflowStore.create_case
+    original_claim = WorkflowStore.claim_case_execution
+    idle_committed = Event()
+    release_idle = Event()
+    claimed = Event()
+    release_claim = Event()
+    prepared_case_ids: list[str] = []
+
+    def create_at_barrier(
+        self: WorkflowStore,
+        case_id: str,
+        source: Any,
+        started_at: datetime,
+    ) -> None:
+        original_create(self, case_id, source, started_at)
+        prepared_case_ids.append(case_id)
+        idle_committed.set()
+        assert release_idle.wait(timeout=2)
+
+    def claim_at_barrier(
+        self: WorkflowStore,
+        case_id: str,
+        expected_statuses: frozenset[CaseStatus],
+        lease_seconds: int,
+        *,
+        requested_token: str | None = None,
+    ) -> ExecutionClaim:
+        claim = original_claim(
+            self,
+            case_id,
+            expected_statuses,
+            lease_seconds,
+            requested_token=requested_token,
+        )
+        claimed.set()
+        assert release_claim.wait(timeout=2)
+        return claim
+
+    async with app.router.lifespan_context(app):
+        monkeypatch.setattr(WorkflowStore, "create_case", create_at_barrier)
+        monkeypatch.setattr(WorkflowStore, "claim_case_execution", claim_at_barrier)
+        preparation = asyncio.create_task(
+            asyncio.to_thread(
+                orchestration.prepare_case,
+                invoice_dir / "invoice_1001.txt",
+                settings,
+            )
+        )
+        try:
+            assert await asyncio.wait_for(asyncio.to_thread(idle_committed.wait), timeout=1)
+            case_id = prepared_case_ids[0]
+            before_idle_scan = _authority_and_recovery_count(settings, case_id)
+            assert before_idle_scan[5:] == (0, "IDLE", None, 0)
+
+            completed_before = coordinator.completed_scans
+            coordinator.request_scan()
+            await asyncio.wait_for(coordinator.wait_for_scan(completed_before), timeout=1)
+
+            assert _authority_and_recovery_count(settings, case_id) == before_idle_scan
+            release_idle.set()
+            assert await asyncio.wait_for(asyncio.to_thread(claimed.wait), timeout=1)
+            claimed_state = _authority_and_recovery_count(settings, case_id)
+            assert claimed_state[5] == 1
+            assert claimed_state[6] == "RUNNING"
+            assert claimed_state[7] is not None
+
+            completed_before = coordinator.completed_scans
+            coordinator.request_scan()
+            await asyncio.wait_for(coordinator.wait_for_scan(completed_before), timeout=1)
+
+            assert _authority_and_recovery_count(settings, case_id) == claimed_state
+            release_claim.set()
+            prepared = await asyncio.wait_for(preparation, timeout=1)
+            assert isinstance(prepared, tuple)
+        finally:
+            release_idle.set()
+            release_claim.set()
+            if not preparation.done():
+                await preparation
 
 
 @pytest.mark.asyncio
@@ -323,7 +559,7 @@ async def test_runtime_recovery_failure_is_health_failing_and_never_fakes_termin
                 )
             unavailable_event = await asyncio.wait_for(stream_event, timeout=1)
             await stream.aclose()
-            assert b"event: error" in unavailable_event.encode()
+            assert b"event: recovery-error" in unavailable_event.encode()
             assert b"EXECUTION_RECOVERY_FAILED" in unavailable_event.encode()
 
             payload = sse.terminal_payload(
@@ -360,6 +596,216 @@ async def test_runtime_recovery_failure_is_health_failing_and_never_fakes_termin
 
     assert background_task is not None and background_task.done()
     assert coordinator.state == "failed"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_deadline_quarantines_wedged_scan_despite_repeated_cancellation(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = Event()
+    release = Event()
+    finished = Event()
+    coordinator = RecoveryCoordinator(
+        settings,
+        scan_interval_seconds=3_600,
+        shutdown_timeout_seconds=0.02,
+    )
+    await coordinator.start()
+
+    def never_released_during_close(
+        _self: WorkflowStore,
+        **_kwargs: object,
+    ) -> list[str]:
+        entered.set()
+        try:
+            assert release.wait(timeout=2)
+            return []
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(
+        WorkflowStore,
+        "recover_expired_executions",
+        never_released_during_close,
+    )
+    coordinator.request_scan()
+    assert await asyncio.wait_for(asyncio.to_thread(entered.wait), timeout=1)
+    health_version = coordinator.health().version
+    close_task = asyncio.create_task(coordinator.close())
+    try:
+        stopping = await coordinator.wait_for_change(health_version, timeout=1)
+        assert stopping.state == "stopping"
+        for _ in range(3):
+            close_task.cancel()
+            await asyncio.sleep(0)
+
+        with pytest.raises(InvoiceAgentsError) as error:
+            await asyncio.wait_for(asyncio.shield(close_task), timeout=0.5)
+
+        assert error.value.stop_reason == "EXECUTION_RECOVERY_DRAIN_TIMEOUT"
+        assert coordinator.health().state == "failed"
+        assert coordinator.health().quarantined_scans == 1
+        assert coordinator.background_task is not None
+        assert coordinator.background_task.done()
+    finally:
+        release.set()
+        assert await asyncio.wait_for(asyncio.to_thread(finished.wait), timeout=1)
+
+    async def quarantine_is_drained() -> None:
+        while coordinator.health().quarantined_scans:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(quarantine_is_drained(), timeout=1)
+    assert coordinator.health().state == "failed"
+    assert coordinator.health().quarantined_scans == 0
+
+
+@pytest.mark.asyncio
+async def test_recovery_failure_precedes_shutdown_cancellation_and_remains_failed(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = Event()
+    release = Event()
+    coordinator = RecoveryCoordinator(
+        settings,
+        scan_interval_seconds=3_600,
+        shutdown_timeout_seconds=1,
+    )
+    await coordinator.start()
+
+    def fail_after_release(_self: WorkflowStore, **_kwargs: object) -> list[str]:
+        entered.set()
+        assert release.wait(timeout=2)
+        raise RuntimeError("round4 recovery failure sentinel")
+
+    monkeypatch.setattr(WorkflowStore, "recover_expired_executions", fail_after_release)
+    coordinator.request_scan()
+    assert await asyncio.wait_for(asyncio.to_thread(entered.wait), timeout=1)
+    health_version = coordinator.health().version
+    close_task = asyncio.create_task(coordinator.close())
+    stopping = await coordinator.wait_for_change(health_version, timeout=1)
+    assert stopping.state == "stopping"
+    close_task.cancel()
+    release.set()
+
+    with pytest.raises(RuntimeError, match="round4 recovery failure sentinel"):
+        await asyncio.wait_for(close_task, timeout=1)
+
+    assert coordinator.health().state == "failed"
+
+
+@pytest.mark.asyncio
+async def test_terminal_snapshot_flushes_recovery_audit_before_terminal_event(
+    invoice_dir: Path,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case_id, _claim, _expired_at = _expire_claim(invoice_dir, settings)
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        after_seq = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(rowid), 0) FROM events WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()[0]
+        )
+    initial_read_complete = Event()
+    release_initial_read = Event()
+    original_events_after = sse.events_after
+    reads = 0
+
+    def events_at_barrier(
+        workflow_db: Path,
+        selected_case_id: str,
+        selected_after_seq: int,
+    ) -> list[Any]:
+        nonlocal reads
+        rows = original_events_after(workflow_db, selected_case_id, selected_after_seq)
+        reads += 1
+        if reads == 1:
+            initial_read_complete.set()
+            assert release_initial_read.wait(timeout=2)
+        return rows
+
+    monkeypatch.setattr(sse, "events_after", events_at_barrier)
+    stream = sse.case_event_stream(
+        settings.workflow_db,
+        case_id,
+        RunRegistry(),
+        after_seq=after_seq,
+        settings=settings,
+    )
+    first_event = asyncio.create_task(anext(stream))
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(initial_read_complete.wait), timeout=1)
+        assert WorkflowStore(settings).recover_expired_executions(now=datetime.now(UTC)) == [
+            case_id
+        ]
+        release_initial_read.set()
+
+        audit_event = await asyncio.wait_for(first_event, timeout=1)
+        terminal_event = await asyncio.wait_for(anext(stream), timeout=1)
+
+        assert b"event: case-event" in audit_event.encode()
+        assert b"case.execution_recovered" in audit_event.encode()
+        assert b"event: terminal" in terminal_event.encode()
+        assert reads == 2
+    finally:
+        release_initial_read.set()
+        await stream.aclose()
+
+
+def test_untrusted_terminal_snapshots_are_explicitly_nonterminal(
+    invoice_dir: Path,
+    settings: Settings,
+) -> None:
+    case_id, started_at = _prepared_case(invoice_dir, settings)
+    store = WorkflowStore(settings)
+    claim = store.claim_case_execution(
+        case_id,
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+    store.finish_case(
+        CaseResult(
+            case_id=case_id,
+            source_id=store.load_case_source_id(case_id),
+            status=CaseStatus.FAILED,
+            stop_reason="ROUND4_STORED_RESULT",
+            started_at=started_at,
+            finished_at=datetime.now(UTC),
+        ),
+        claim,
+    )
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "UPDATE cases SET result_json = NULL WHERE case_id = ?",
+            (case_id,),
+        )
+        connection.commit()
+
+    payload = sse.terminal_payload(
+        settings.workflow_db,
+        case_id,
+        RunRegistry(),
+        settings,
+    )
+
+    assert payload is not None
+    assert payload["status"] == "UNAVAILABLE"
+    assert payload["stop_reason"] == "PERSISTED_RESULT_INVALID"
+    assert payload["recovery_verified"] is False
+
+
+def test_recovery_error_javascript_contract_closes_the_stream() -> None:
+    script = (ui_server.PACKAGE_DIR / "static" / "app.js").read_text(encoding="utf-8")
+    listener = script.partition('source.addEventListener("recovery-error"')[2].partition("});")[0]
+
+    assert listener
+    assert "JSON.parse(event.data)" in listener
+    assert "source.close()" in listener
+    assert "showRecoveryError" in listener
 
 
 @pytest.mark.asyncio

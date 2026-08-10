@@ -222,6 +222,24 @@
     bannerHost.appendChild(banner);
   }
 
+  function showRecoveryError(data) {
+    if (note) {
+      note.textContent = "Execution recovery unavailable. Stored terminal state was not verified.";
+      note.classList.add("dropped");
+      note.classList.remove("pulsing");
+    }
+    var banner = el("div", "terminal-banner tone-fail");
+    banner.appendChild(el("div", null, "Execution recovery unavailable"));
+    banner.appendChild(
+      el("div", "small mono", data.stop_reason || "EXECUTION_RECOVERY_FAILED")
+    );
+    var link = el("a", null, "Open case detail (stored state)");
+    link.href = "/cases/" + encodeURIComponent(caseId);
+    banner.appendChild(link);
+    bannerHost.textContent = "";
+    bannerHost.appendChild(banner);
+  }
+
   var source = new EventSource("/cases/" + encodeURIComponent(caseId) + "/events");
   source.addEventListener("case-event", function (event) {
     appendRow(JSON.parse(event.data));
@@ -230,6 +248,16 @@
     showTerminal(JSON.parse(event.data));
     source.close();
     if (note) note.classList.remove("pulsing");
+  });
+  source.addEventListener("recovery-error", function (event) {
+    source.close();
+    var data;
+    try {
+      data = JSON.parse(event.data);
+    } catch (_error) {
+      data = { stop_reason: "EXECUTION_RECOVERY_FAILED" };
+    }
+    showRecoveryError(data);
   });
   source.onerror = function () {
     if (note) {

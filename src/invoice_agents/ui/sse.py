@@ -103,7 +103,7 @@ def terminal_payload(
     except Exception:
         return _recovery_failure_payload(case_id, "EXECUTION_RECOVERY_FAILED")
     if snapshot is None:
-        return {"case_id": case_id, "missing": True}
+        return _recovery_failure_payload(case_id, "CASE_NOT_FOUND", missing=True)
     if snapshot.has_valid_lease:
         return None
     if snapshot.execution_state == "FINISHED":
@@ -140,10 +140,16 @@ def _stored_terminal_payload(
             if registry.run_error(case_id) is not None
             else None
         ),
+        "recovery_verified": True,
     }
 
 
-def _recovery_failure_payload(case_id: str, stop_reason: str) -> dict[str, Any]:
+def _recovery_failure_payload(
+    case_id: str,
+    stop_reason: str,
+    *,
+    missing: bool = False,
+) -> dict[str, Any]:
     error = ErrorRecord(
         category=ErrorCategory.DATABASE,
         message="persisted execution state could not be trusted or recovered",
@@ -152,10 +158,12 @@ def _recovery_failure_payload(case_id: str, stop_reason: str) -> dict[str, Any]:
     )
     return {
         "case_id": case_id,
-        "status": "INCOMPLETE",
+        "status": "UNAVAILABLE",
         "stop_reason": stop_reason,
+        "recovery_verified": False,
         "run_error": None,
         "recovery_error": error.model_dump(mode="json"),
+        **({"missing": True} if missing else {}),
     }
 
 
@@ -211,8 +219,28 @@ async def case_event_stream(
             recovery_coordinator=recovery_coordinator,
         )
         if terminal is not None:
+            if terminal.get("recovery_verified") is True:
+                trailing_rows = await asyncio.to_thread(
+                    events_after,
+                    workflow_db,
+                    case_id,
+                    last_seq,
+                )
+                for row in trailing_rows:
+                    last_seq = row.seq
+                    yield ServerSentEvent(
+                        event="case-event",
+                        id=str(row.seq),
+                        data=json.dumps(
+                            summarize_event(row),
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                    )
             yield ServerSentEvent(
-                event=("error" if terminal.get("recovery_verified") is False else "terminal"),
+                event=(
+                    "terminal" if terminal.get("recovery_verified") is True else "recovery-error"
+                ),
                 data=json.dumps(terminal, ensure_ascii=False, default=str),
             )
             return
