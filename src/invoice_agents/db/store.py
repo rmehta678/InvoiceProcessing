@@ -42,6 +42,7 @@ from invoice_agents.models import (
     ReviewRequest,
     SourceArtifact,
 )
+from invoice_agents.observability.audit import sanitize_case_result, sanitize_text
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -220,7 +221,7 @@ def _decode_terminal_result_json(raw: object) -> CaseResult:
     )
     if type(payload) is not dict:
         raise ValueError("terminal result JSON is not an object")
-    result = CaseResult.model_validate_json(raw, strict=True)
+    result = sanitize_case_result(CaseResult.model_validate_json(raw, strict=True))
     for field in ("started_at", "finished_at"):
         wire = payload.get(field)
         value = getattr(result, field)
@@ -1282,6 +1283,7 @@ class WorkflowStore:
     ) -> str:
         """Validate terminal identity/chronology in the write transaction and encode once."""
 
+        result = sanitize_case_result(result)
         row = connection.execute(
             "SELECT started_at FROM cases WHERE case_id = ?",
             (result.case_id,),
@@ -1863,6 +1865,7 @@ class WorkflowStore:
                             deep=True,
                         )
                     self._require_terminal_chronology(result, row["started_at"])
+                    result = sanitize_case_result(result)
                     encoded_result = result.model_dump_json()
                     try:
                         if _decode_terminal_result_json(encoded_result) != result:
@@ -2052,7 +2055,11 @@ class WorkflowStore:
                     currency=persisted_payment.currency,
                 ),
                 processed_at=datetime.fromisoformat(persisted_payment.created_at),
-                error=persisted_payment.error,
+                error=(
+                    sanitize_text(persisted_payment.error)
+                    if persisted_payment.error is not None
+                    else None
+                ),
             )
             if persisted_payment is not None
             else None
@@ -2149,7 +2156,8 @@ class WorkflowStore:
                 and aggregate.amount == Money(amount=expected_amount, currency=original.currency)
                 and original.currency == invoice.currency.normalized_value
                 and aggregate.processed_at == datetime.fromisoformat(original.created_at)
-                and aggregate.error == original.error
+                and aggregate.error
+                == (sanitize_text(original.error) if original.error is not None else None)
             )
         except InvoiceAgentsError as exc:
             if exc.stop_reason == "EVIDENCE_AUTHORITY_MISSING":
@@ -2168,7 +2176,7 @@ class WorkflowStore:
             amount=Money(amount=Decimal(original.amount), currency=original.currency),
             processed_at=datetime.fromisoformat(original.created_at),
             duplicate_of=original.payment_id,
-            error=original.error,
+            error=sanitize_text(original.error) if original.error is not None else None,
         )
 
     @staticmethod

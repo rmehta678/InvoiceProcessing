@@ -14,6 +14,11 @@ from pydantic import BaseModel, ConfigDict
 
 from invoice_agents.db.core import connect_database
 from invoice_agents.models import InventoryRow
+from invoice_agents.observability.audit import (
+    safe_provider_request_id,
+    sanitize_stored_event_payload,
+    sanitize_text,
+)
 
 SOURCE_FORMATS = ("txt", "json", "csv", "xml", "pdf")
 
@@ -217,13 +222,19 @@ def events_after(workflow_db: Path, case_id: str, after_seq: int = 0) -> list[Ev
             seq=int(row["seq"]),
             event_id=str(row["event_id"]),
             event_type=str(row["event_type"]),
-            agent_name=row["agent_name"],
-            tool_call_id=row["tool_call_id"],
+            agent_name=(
+                sanitize_text(str(row["agent_name"])) if row["agent_name"] is not None else None
+            ),
+            tool_call_id=(
+                sanitize_text(str(row["tool_call_id"])) if row["tool_call_id"] is not None else None
+            ),
             db_evidence_id=row["db_evidence_id"],
             review_id=row["review_id"],
             payment_id=row["payment_id"],
-            provider_request_id=row["provider_request_id"],
-            payload_json=str(row["payload_json"]),
+            provider_request_id=safe_provider_request_id(row["provider_request_id"]),
+            payload_json=sanitize_stored_event_payload(
+                str(row["event_type"]), str(row["payload_json"])
+            ),
             created_at=str(row["created_at"]),
         )
         for row in rows

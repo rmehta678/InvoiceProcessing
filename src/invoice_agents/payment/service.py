@@ -42,6 +42,7 @@ from invoice_agents.models import (
     ReviewRequest,
     RiskAssessment,
 )
+from invoice_agents.observability.audit import sanitize_text
 from invoice_agents.payment.identity import payment_identity_key
 
 
@@ -248,7 +249,7 @@ def _from_row(
         amount=Money(amount=Decimal(payment.amount), currency=payment.currency),
         processed_at=datetime.fromisoformat(payment.created_at),
         duplicate_of=payment.payment_id if duplicate else None,
-        error=payment.error,
+        error=sanitize_text(payment.error) if payment.error is not None else None,
     )
 
 
@@ -282,7 +283,7 @@ def mock_payment(
             vendor=vendor,
             amount=None,
             processed_at=None,
-            error=error,
+            error=sanitize_text(error),
         )
 
     with connect_database(workflow_db) as connection:
@@ -375,7 +376,7 @@ def mock_payment(
             payment_id = f"pay_{uuid4().hex}"
             created_at = datetime.now(UTC)
             status = PaymentStatus.FAILED if inject_failure else PaymentStatus.PAID
-            error = "injected mock-payment failure" if inject_failure else None
+            error = sanitize_text("injected mock-payment failure") if inject_failure else None
             connection.execute(
                 "INSERT INTO payments("
                 "payment_id, case_id, idempotency_key, vendor, amount, currency, status, error, "

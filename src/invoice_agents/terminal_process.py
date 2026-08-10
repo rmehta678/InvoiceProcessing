@@ -27,6 +27,7 @@ from invoice_agents.db.migration_process import (
 from invoice_agents.db.store import ExecutionClaim, validate_execution_claim
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import CaseResult
+from invoice_agents.observability.audit import sanitize_case_result
 from invoice_agents.wire_settings import decode_wire_settings, serialize_wire_settings
 from invoice_agents.worker_environment import sanitized_worker_environment
 
@@ -401,6 +402,8 @@ def _encode_request(
         or worker_error_code is not None
     ):
         raise ValueError("finish worker requires one claim-bound case result")
+    if result is not None:
+        result = sanitize_case_result(result)
     payload = {
         "protocol_version": TERMINAL_WORKER_PROTOCOL_VERSION,
         "mode": mode,
@@ -527,9 +530,11 @@ def decode_terminal_request(
         # though they are their canonical wire representation.  Re-validate the
         # already shape-checked object through strict JSON mode so transport
         # scalars remain non-coercible while canonical model JSON is accepted.
-        result = CaseResult.model_validate_json(
-            json.dumps(raw_result, ensure_ascii=True, separators=(",", ":")),
-            strict=True,
+        result = sanitize_case_result(
+            CaseResult.model_validate_json(
+                json.dumps(raw_result, ensure_ascii=True, separators=(",", ":")),
+                strict=True,
+            )
         )
         if result.case_id != claim.case_id:
             raise ValueError("terminal worker result is not claim-bound")

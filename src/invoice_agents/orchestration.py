@@ -58,8 +58,10 @@ from invoice_agents.models import (
 from invoice_agents.observability.audit import (
     AuditRecorder,
     bind_audit_recorder,
+    normalize_autogen_event_payload,
     redact,
     safe_provider_request_id,
+    sanitize_case_result,
     sanitize_text,
 )
 from invoice_agents.source_store import snapshot_source
@@ -628,6 +630,7 @@ def _write_recovery_artifact(result: CaseResult, terminal_persistence_error: Err
     )
     result = _recovery_only_result(result, terminal_persistence_error)
     result = _recovery_result_bound_to_authority(result, authority)
+    result = sanitize_case_result(result)
     output_dir = Path("artifacts/results").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     target = output_dir / f"{result.case_id}.recovery.json"
@@ -929,6 +932,7 @@ def _persist_terminal_result(
 ) -> _PersistenceOutcome:
     """Persist once; a cancellation at this boundary gets one CANCELLED retry."""
 
+    result = sanitize_case_result(result)
     try:
         execution.store.finish_case(result, execution.claim)
         return _PersistenceOutcome(result, True, None, control_exception)
@@ -999,6 +1003,7 @@ async def _terminal_process_write(
 ) -> _TerminalWriteBoundaryOutcome:
     """Run one terminal write and return evidence from only reaped helper sessions."""
 
+    result = sanitize_case_result(result)
     settings = execution.store._snapshot_settings()
     if durability_deadline is None:
         durability_deadline = (
@@ -1868,10 +1873,54 @@ def prepare_claimed_case(
     )
 
 
+def _event_semantic_value(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, Mapping):
+        return {str(key): _event_semantic_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_event_semantic_value(item) for item in value]
+    return value
+
+
 def _event_payload(event: Any) -> dict[str, Any]:
-    if hasattr(event, "model_dump"):
-        return cast(dict[str, Any], event.model_dump(mode="json"))
-    return {"type": type(event).__name__, "value": str(event)}
+    """Build an allowlisted semantic event without retaining the raw model dump."""
+
+    event_type = f"autogen.{type(event).__name__}"
+    payload: dict[str, Any] = {
+        "type": type(event).__name__,
+        "source": getattr(event, "source", None),
+    }
+    model_usage = getattr(event, "models_usage", None)
+    if model_usage is not None:
+        payload["models_usage"] = {
+            "prompt_tokens": getattr(model_usage, "prompt_tokens", None),
+            "completion_tokens": getattr(model_usage, "completion_tokens", None),
+        }
+    if isinstance(event, ToolCallRequestEvent):
+        payload["content"] = [
+            {
+                "id": getattr(call, "id", None),
+                "name": getattr(call, "name", None),
+                "arguments": getattr(call, "arguments", None),
+            }
+            for call in event.content
+        ]
+    elif isinstance(event, ToolCallExecutionEvent):
+        payload["content"] = [
+            {
+                "call_id": getattr(execution, "call_id", None),
+                "name": getattr(execution, "name", None),
+                "content": getattr(execution, "content", None),
+                "is_error": getattr(execution, "is_error", None),
+            }
+            for execution in event.content
+        ]
+    elif hasattr(event, "content"):
+        payload["content"] = _event_semantic_value(event.content)
+    if isinstance(event, HandoffMessage):
+        payload["target"] = getattr(event, "target", None)
+    return normalize_autogen_event_payload(event_type, payload)
 
 
 def _validated_tool_call_ids(values: list[object], case_id: str) -> list[str]:
@@ -1940,10 +1989,14 @@ def _record_stream_event(
         content_payloads = raw_content
 
     if isinstance(event, ToolCallExecutionEvent):
-        for execution in event.content:
+        assert content_payloads is not None
+        for execution, content_payload in zip(event.content, content_payloads, strict=True):
             if execution.is_error:
+                safe_item = content_payload if isinstance(content_payload, Mapping) else {}
+                safe_name = safe_item.get("name", "unknown_tool")
+                safe_content = safe_item.get("content", "tool execution failed")
                 context.tool_failures.append(
-                    sanitize_text(f"{execution.name}({execution.call_id}): {execution.content}")
+                    sanitize_text(f"{safe_name}({execution.call_id}): {safe_content}")
                 )
 
     source_id = context.invoice().source.source_id
@@ -1951,7 +2004,7 @@ def _record_stream_event(
     provider_request_id = metadata.get("request_id") if isinstance(metadata, Mapping) else None
     record_kwargs = {
         "source_id": source_id,
-        "agent_name": getattr(event, "source", None),
+        "agent_name": event_payload.get("source"),
         "provider_request_id": provider_request_id,
     }
     event_type = f"autogen.{type(event).__name__}"
@@ -2055,7 +2108,7 @@ def _result_from_stop(
             errors.append(
                 ErrorRecord(
                     category=ErrorCategory.PAYMENT,
-                    message=payment.error or f"payment status is {payment.status}",
+                    message=sanitize_text(payment.error or f"payment status is {payment.status}"),
                     case_id=context.case_id,
                     stop_reason=normalized_stop,
                 )
@@ -2124,6 +2177,7 @@ def _result_artifact_target(result: CaseResult) -> Path:
 
 
 def _write_result(result: CaseResult) -> Path:
+    result = sanitize_case_result(result)
     target = _result_artifact_target(result)
     _atomic_publish(target, result.model_dump_json(indent=2).encode("utf-8"))
     return target
@@ -2134,6 +2188,7 @@ def _write_result_for_generation(
     result: CaseResult,
     execution_generation: int,
 ) -> Path:
+    result = sanitize_case_result(result)
     target = _result_artifact_target(result)
     payload = result.model_dump_json(indent=2).encode("utf-8")
 

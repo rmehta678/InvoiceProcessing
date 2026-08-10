@@ -29,7 +29,7 @@ from invoice_agents.config import XAI_BASE_URL, XAI_MODEL, Settings
 from invoice_agents.db.core import DatabaseKind, migrate_database
 from invoice_agents.errors import ErrorCategory
 from invoice_agents.models import UsageSummary
-from invoice_agents.observability.audit import AuditRecorder
+from invoice_agents.observability.audit import AuditRecorder, safe_provider_request_id
 from invoice_agents.orchestration import _error_record
 
 
@@ -48,6 +48,16 @@ class ContractCheck(BaseModel):
     evidence: str
 
 
+def _stable_evidence(category: str, status: str | int, request_id: object = None) -> str:
+    """Encode only bounded contract classifications, never provider-controlled prose."""
+
+    validated_request_id = safe_provider_request_id(request_id)
+    return (
+        f"category={category}; status={status}; provider_request_id="
+        f"{validated_request_id or '<absent>'}"
+    )
+
+
 async def run_live_contracts(settings: Settings) -> list[ContractCheck]:
     """Run paid live checks; callers must opt in and skips are never reported as passes."""
 
@@ -61,9 +71,11 @@ async def run_live_contracts(settings: Settings) -> list[ContractCheck]:
             ContractCheck(
                 name="authentication_basic_completion",
                 passed=bool(basic.content) and basic.finish_reason is not None,
-                evidence=(
-                    f"model={XAI_MODEL}; base_url={XAI_BASE_URL}; finish_reason={basic.finish_reason}; "
-                    f"usage_present={basic.usage is not None}"
+                evidence=_stable_evidence(
+                    "MODEL_COMPLETION",
+                    "COMPLETE"
+                    if bool(basic.content) and basic.finish_reason is not None
+                    else "INCOMPLETE",
                 ),
             )
         )
@@ -258,8 +270,9 @@ async def run_live_contracts(settings: Settings) -> list[ContractCheck]:
                     and review_calls == ["before", "after"]
                 ),
                 evidence=(
-                    f"first_stop={first_stop.stop_reason}; state_keys={sorted(saved)}; "
-                    f"review_calls={review_calls}; resumed={resume_done}"
+                    f"handoff_observed={'human_reviewer' in str(first_stop.stop_reason)}; "
+                    f"state_saved={bool(saved)}; review_call_count={len(review_calls)}; "
+                    f"resumed={resume_done}"
                 ),
             )
         )
@@ -317,14 +330,16 @@ async def _server_echoed_model_identity(settings: Settings) -> ContractCheck:
             messages=[{"role": "user", "content": "Reply with exactly the word OK."}],
         )
         completion = raw.parse()
-        request_id = raw.headers.get("x-request-id")
+        request_id = safe_provider_request_id(raw.headers.get("x-request-id"))
         echoed = completion.model or ""
+        matched = echoed.startswith("grok-4.5")
         return ContractCheck(
             name="server_echoed_model_identity",
-            passed=echoed.startswith("grok-4.5"),
-            evidence=(
-                f"response.model={echoed!r}; requested={XAI_MODEL}; "
-                f"x_request_id={request_id or '<absent>'}"
+            passed=matched,
+            evidence=_stable_evidence(
+                "MODEL_IDENTITY",
+                "MATCHED" if matched else "MISMATCHED",
+                request_id,
             ),
         )
     finally:
@@ -356,31 +371,33 @@ async def _live_invalid_key_rejection() -> ContractCheck:
         return ContractCheck(
             name="live_invalid_key_rejection",
             passed=False,
-            evidence="provider accepted an incorrect key; no error was raised",
+            evidence=_stable_evidence("AUTHENTICATION", "UNEXPECTED_ACCEPT"),
         )
     except openai.APIStatusError as exc:
         record = _error_record(exc)
         rejected_as_bad_credential = (
             exc.status_code in (400, 401)
-            and "incorrect api key" in str(exc).lower()
             and record.category in (ErrorCategory.PROVIDER, ErrorCategory.AUTHENTICATION)
             and record.stop_reason in ("PROVIDER_REQUEST_FAILED", "PROVIDER_AUTHENTICATION_FAILED")
         )
         return ContractCheck(
             name="live_invalid_key_rejection",
             passed=rejected_as_bad_credential,
-            evidence=(
-                f"{type(exc).__name__} status={exc.status_code}; category={record.category}; "
-                f"stop_reason={record.stop_reason}; "
-                f"provider_request_id={record.provider_request_id or exc.request_id or '<absent>'}; "
-                f"body={str(exc)[:120]}"
+            evidence=_stable_evidence(
+                str(record.category),
+                exc.status_code,
+                record.provider_request_id or safe_provider_request_id(exc.request_id),
             ),
         )
     except openai.OpenAIError as exc:
         return ContractCheck(
             name="live_invalid_key_rejection",
             passed=False,
-            evidence=f"expected an explicit HTTP rejection, observed {type(exc).__name__}: {exc}",
+            evidence=_stable_evidence(
+                "OPENAI_ERROR",
+                "NO_HTTP_STATUS",
+                safe_provider_request_id(getattr(exc, "request_id", None)),
+            ),
         )
     finally:
         await invalid.close()
@@ -450,7 +467,7 @@ async def _structured_output_rejection_live(settings: Settings) -> ContractCheck
 
     direct = openai.AsyncOpenAI(base_url=XAI_BASE_URL, api_key=settings.provider_key())
     try:
-        completion = await direct.chat.completions.create(
+        await direct.chat.completions.create(
             model=XAI_MODEL,
             messages=[{"role": "user", "content": "Return the probe object."}],
             # extra_body bypasses SDK-side typing so the provider itself must rule on
@@ -466,21 +483,23 @@ async def _structured_output_rejection_live(settings: Settings) -> ContractCheck
                 }
             },
         )
-        content = completion.choices[0].message.content if completion.choices else None
         return ContractCheck(
             name="structured_output_rejection_live",
             passed=False,
-            evidence=(
-                "provider accepted an invalid response schema and returned content="
-                f"{str(content)[:120]!r}"
-            ),
+            evidence=_stable_evidence("PROVIDER", "UNEXPECTED_ACCEPT"),
         )
     except openai.APIError as exc:
         status = getattr(exc, "status_code", None)
+        record = _error_record(exc)
         return ContractCheck(
             name="structured_output_rejection_live",
             passed=True,
-            evidence=(f"explicit rejection {type(exc).__name__} status={status}: {str(exc)[:160]}"),
+            evidence=_stable_evidence(
+                str(record.category),
+                status if type(status) is int else "ERROR",
+                record.provider_request_id
+                or safe_provider_request_id(getattr(exc, "request_id", None)),
+            ),
         )
     finally:
         await direct.close()

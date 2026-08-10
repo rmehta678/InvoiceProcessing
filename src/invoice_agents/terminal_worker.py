@@ -7,6 +7,7 @@ import sys
 from typing import Any
 
 from invoice_agents.errors import InvoiceAgentsError
+from invoice_agents.observability.audit import sanitize_case_result
 from invoice_agents.terminal_process import (
     TERMINAL_WORKER_MAX_MESSAGE_BYTES,
     _claim_payload,
@@ -50,16 +51,24 @@ def _response(
 ) -> dict[str, Any]:
     evidence_state = evidence.state
     evidence_result = evidence.result
+    safe_result = sanitize_case_result(result) if result is not None else None
+    safe_evidence_result = (
+        sanitize_case_result(evidence_result) if evidence_result is not None else None
+    )
     return {
         "ok": error_code is None,
         "claim": _claim_payload(claim),
         "result": (
-            result.model_dump(mode="json") if error_code is None and result is not None else None
+            safe_result.model_dump(mode="json")
+            if error_code is None and safe_result is not None
+            else None
         ),
         "error_code": error_code,
         "evidence_state": evidence_state.value,
         "evidence_result": (
-            evidence_result.model_dump(mode="json") if evidence_result is not None else None
+            safe_evidence_result.model_dump(mode="json")
+            if safe_evidence_result is not None
+            else None
         ),
     }
 

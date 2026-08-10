@@ -26,6 +26,7 @@ from invoice_agents.observability.audit import (
     bind_audit_recorder,
     redact,
 )
+from invoice_agents.ui import queries
 
 
 class _SecretRepresentation:
@@ -159,6 +160,42 @@ def test_sanitize_text_is_bounded_control_safe_and_preserves_ordinary_invoice_te
     assert len(bounded) <= 4096
     assert "plainCredentialValue" not in bounded
     assert "[REDACTED]" in bounded
+
+
+def test_round1_sanitizer_redacts_complete_cookie_headers_and_neutralizes_controls() -> None:
+    value = (
+        "Invoice 1042\r\n"
+        "\tOrdinary multiline description\r\n"
+        "  cOoKiE: session=round1-cookie-a; preference=round1-cookie-b\r\n"
+        "\tSeT-CoOkIe: first=round1-set-cookie-a; Path=/, "
+        "second=round1-set-cookie-b; Secure\r"
+        "ANSI \x1b[31mround1-color-marker\x1b[0m NUL\x00 ESC\x1b "
+        "C1\x85 zero\u200bwidth"
+    )
+
+    cleaned = _sanitize_text(value)
+
+    assert cleaned.startswith("Invoice 1042\n\tOrdinary multiline description\n")
+    assert "cOoKiE: [REDACTED]" in cleaned
+    assert "SeT-CoOkIe: [REDACTED]" in cleaned
+    for marker in (
+        "round1-cookie-a",
+        "round1-cookie-b",
+        "round1-set-cookie-a",
+        "round1-set-cookie-b",
+    ):
+        assert marker not in cleaned
+    for unsafe in ("\r", "\x00", "\x1b", "\x85", "\u200b", "[31m", "[0m"):
+        assert unsafe not in cleaned
+    assert "round1-color-marker" in cleaned
+    assert _sanitize_text("Line one\r\n\tLine two\nLine three") == (
+        "Line one\n\tLine two\nLine three"
+    )
+    assert redact({"prompt_tokens": 47, "invoice_text": "blue cookie cutters"}) == {
+        "prompt_tokens": 47,
+        "invoice_text": "blue cookie cutters",
+    }
+    assert redact({"api\u200b_key": "round1-control-key-marker"}) == {"api_key": "[REDACTED]"}
 
 
 def test_recursive_redaction_sanitizes_bytes_objects_and_not_usage_or_invoice_data() -> None:
@@ -350,6 +387,178 @@ def test_stream_tool_events_persist_one_safe_correlated_row_per_item(
     assert secret not in encoded
     assert "secondCredentialValue" not in encoded
     assert "INV-42" in encoded and "INV-43" in encoded
+
+
+def test_round1_tool_json_strings_and_legacy_rows_are_structurally_redacted(
+    workflow_db: Any,
+) -> None:
+    context = SimpleNamespace(
+        case_id="case_round1_json_fields",
+        audit=AuditRecorder(workflow_db, "case_round1_json_fields"),
+        tool_failures=[],
+        invoice=lambda: SimpleNamespace(source=SimpleNamespace(source_id="src_round1_json")),
+    )
+    usage = UsageSummary()
+    request = ToolCallRequestEvent(
+        source="coordinator",
+        content=[
+            FunctionCall(
+                id="call_round1_valid",
+                name="lookup_valid",
+                arguments=json.dumps(
+                    {
+                        "invoice_number": "INV-1042",
+                        "nested": {"Authorization": "round1-argument-marker"},
+                        "prompt_tokens": 47,
+                    }
+                ),
+            ),
+            FunctionCall(
+                id="call_round1_malformed",
+                name="lookup_malformed",
+                arguments='{"api_key":"round1-malformed-marker"',
+            ),
+        ],
+    )
+    execution = ToolCallExecutionEvent(
+        source="coordinator",
+        content=[
+            FunctionExecutionResult(
+                call_id="call_round1_valid",
+                name="lookup_valid",
+                content=json.dumps(
+                    {
+                        "count": 3,
+                        "nested": {"Cookie": "round1-result-marker"},
+                        "safe_id": "row_1042",
+                    }
+                ),
+                is_error=False,
+            )
+        ],
+    )
+
+    _record_stream_event(request, context, usage)
+    _record_stream_event(execution, context, usage)
+
+    payloads = [json.loads(row["payload_json"]) for row in _event_rows(workflow_db)]
+    valid_arguments = payloads[0]["content"][0]["arguments"]
+    assert valid_arguments == (
+        '{"invoice_number":"INV-1042","nested":{"Authorization":"[REDACTED]"},"prompt_tokens":47}'
+    )
+    malformed_arguments = payloads[1]["content"][0]["arguments"]
+    assert isinstance(malformed_arguments, str)
+    assert len(malformed_arguments) <= 4096
+    assert "round1-malformed-marker" not in malformed_arguments
+    result_content = payloads[2]["content"][0]["content"]
+    assert result_content == ('{"count":3,"nested":{"Cookie":"[REDACTED]"},"safe_id":"row_1042"}')
+
+    legacy_payload = json.dumps(
+        {
+            "type": "ToolCallRequestEvent",
+            "source": "legacy_agent",
+            "metadata": {"headers": "Cookie: round1-legacy-header-marker"},
+            "content": [
+                {
+                    "id": "call_round1_legacy",
+                    "name": "legacy_lookup",
+                    "arguments": json.dumps(
+                        {
+                            "invoice_number": "INV-LEGACY",
+                            "nested": {"api_key": "round1-legacy-json-marker"},
+                        }
+                    ),
+                }
+            ],
+        }
+    )
+    with connect_database(workflow_db) as connection:
+        connection.execute(
+            "INSERT INTO events(event_id, case_id, source_id, event_type, payload_json, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "evt_round1_legacy",
+                "case_round1_json_fields",
+                "src_round1_json",
+                "autogen.ToolCallRequestEvent",
+                legacy_payload,
+                "2026-08-10T00:00:00+00:00",
+            ),
+        )
+        connection.commit()
+    presented = queries.events_after(workflow_db, "case_round1_json_fields")[-1]
+    assert "round1-legacy-header-marker" not in presented.payload_json
+    assert "round1-legacy-json-marker" not in presented.payload_json
+    presented_payload = json.loads(presented.payload_json)
+    assert set(presented_payload) == {"content", "source", "type"}
+    assert json.loads(presented_payload["content"][0]["arguments"])["nested"] == {
+        "api_key": "[REDACTED]"
+    }
+
+
+def test_round1_stream_rows_whitelist_tool_and_non_tool_fields(workflow_db: Any) -> None:
+    context = SimpleNamespace(
+        case_id="case_round1_whitelist",
+        audit=AuditRecorder(workflow_db, "case_round1_whitelist"),
+        tool_failures=[],
+        invoice=lambda: SimpleNamespace(source=SimpleNamespace(source_id="src_round1_whitelist")),
+    )
+    usage = UsageSummary()
+    tool_event = ToolCallRequestEvent(
+        source="coordinator",
+        models_usage={"prompt_tokens": 11, "completion_tokens": 7},
+        metadata={
+            "request_id": "req_round1_safe",
+            "headers": "Cookie: round1-tool-header-marker",
+            "raw_body": "round1-tool-body-marker",
+        },
+        content=[
+            FunctionCall(
+                id="call_round1_safe",
+                name="lookup_invoice",
+                arguments='{"invoice_number":"INV-1042"}',
+            )
+        ],
+    )
+    text_event = TextMessage(
+        content="ordinary model summary",
+        source="coordinator",
+        models_usage={"prompt_tokens": 13, "completion_tokens": 5},
+        metadata={
+            "request_id": "Cookie: round1-unsafe-request-id",
+            "headers": "Set-Cookie: round1-text-header-marker",
+            "raw_response": "round1-text-response-marker",
+        },
+    )
+
+    _record_stream_event(tool_event, context, usage)
+    _record_stream_event(text_event, context, usage)
+
+    rows = _event_rows(workflow_db)
+    tool_payload = json.loads(rows[0]["payload_json"])
+    text_payload = json.loads(rows[1]["payload_json"])
+    assert set(tool_payload) == {"content", "models_usage", "source", "type"}
+    assert set(tool_payload["content"][0]) == {"arguments", "id", "name"}
+    assert tool_payload["content"][0]["id"] == "call_round1_safe"
+    assert tool_payload["models_usage"] == {"completion_tokens": 7, "prompt_tokens": 11}
+    assert rows[0]["provider_request_id"] == "req_round1_safe"
+    assert set(text_payload) == {"content", "models_usage", "source", "type"}
+    assert text_payload["content"] == "ordinary model summary"
+    assert text_payload["models_usage"] == {"completion_tokens": 5, "prompt_tokens": 13}
+    assert rows[1]["provider_request_id"] is None
+    assert usage.prompt_tokens == 24
+    assert usage.completion_tokens == 12
+    assert usage.model_calls == 2
+    assert usage.tool_calls == 1
+    encoded_rows = json.dumps([dict(row) for row in rows], sort_keys=True)
+    for marker in (
+        "round1-tool-header-marker",
+        "round1-tool-body-marker",
+        "round1-unsafe-request-id",
+        "round1-text-header-marker",
+        "round1-text-response-marker",
+    ):
+        assert marker not in encoded_rows
 
 
 def test_stream_tool_events_preserve_duplicate_items_without_deduplicating_usage(
