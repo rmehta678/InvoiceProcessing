@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -15,7 +15,11 @@ from invoice_agents.config import Settings
 from invoice_agents.db.store import ExecutionClaim, validate_execution_claim
 from invoice_agents.isolated_process import (
     IsolatedProcessCleanupError,
+    PrivatePipeEndpoint,
+    PrivatePipeInput,
+    private_pipe_channel,
     run_isolated_process,
+    send_private_frame,
 )
 from invoice_agents.wire_settings import decode_wire_settings, serialize_wire_settings
 from invoice_agents.worker_environment import sanitized_worker_environment
@@ -47,31 +51,24 @@ def _lifecycle_worker_command() -> list[str]:
     return [sys.executable, "-m", "invoice_agents.lifecycle_worker"]
 
 
-def _private_credential_channel() -> tuple[socket.socket, socket.socket]:
-    """Create one anonymous, message-preserving local credential channel."""
+def _private_credential_channel() -> tuple[PrivatePipeEndpoint, PrivatePipeEndpoint]:
+    """Create one anonymous, strictly directional credential pipe."""
 
-    reader, writer = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
-    buffer_bytes = 4 * (LIFECYCLE_MAX_CREDENTIAL_BYTES + 1)
-    try:
-        reader.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buffer_bytes)
-        writer.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, buffer_bytes)
-    except BaseException:
-        reader.close()
-        writer.close()
-        raise
-    return reader, writer
+    return private_pipe_channel()
 
 
-def _send_private_credential(writer: socket.socket, credential: bytearray) -> None:
-    """Send exactly one bounded datagram without creating another secret buffer."""
+def _send_private_credential(
+    writer: PrivatePipeEndpoint,
+    credential: bytearray,
+) -> None:
+    """Compatibility seam for focused frame-reader tests."""
 
-    view = memoryview(credential)
-    try:
-        sent = writer.send(view)
-    finally:
-        view.release()
-    if sent != len(credential):
-        raise OSError("private credential transport was incomplete")
+    send_private_frame(
+        writer,
+        credential,
+        max_payload_bytes=LIFECYCLE_MAX_CREDENTIAL_BYTES,
+        deadline=time.monotonic() + 1.0,
+    )
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -284,11 +281,6 @@ def run_lifecycle_process(
                 started_at=started_at,
                 credential_fd=credential_reader.fileno(),
             )
-            _send_private_credential(credential_writer, credential)
-            credential_writer.close()
-            for index in range(len(credential)):
-                credential[index] = 0
-            credential_fd = credential_reader.detach()
             try:
                 outcome = run_isolated_process(
                     command=_lifecycle_worker_command(),
@@ -296,7 +288,13 @@ def run_lifecycle_process(
                     timeout_seconds=timeout_seconds,
                     max_response_bytes=LIFECYCLE_MAX_MESSAGE_BYTES,
                     cancel_requested=cancel_requested,
-                    pass_fds=(credential_fd,),
+                    pass_fds=(credential_reader.fileno(),),
+                    private_input=PrivatePipeInput(
+                        reader=credential_reader,
+                        writer=credential_writer,
+                        payload=credential,
+                        max_payload_bytes=LIFECYCLE_MAX_CREDENTIAL_BYTES,
+                    ),
                     env=sanitized_worker_environment(),
                 )
             except IsolatedProcessCleanupError:

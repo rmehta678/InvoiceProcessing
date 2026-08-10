@@ -370,10 +370,13 @@ def test_round4_lifecycle_worker_uses_private_credential_fd_and_kills_descendant
     )
     child_code = (
         "import hashlib,json,os,subprocess,sys,time; "
+        "from invoice_agents.lifecycle_worker import _read_private_credential; "
         "p=json.loads(sys.stdin.buffer.read()); "
-        "s=os.read(p['credential_fd'],65537).decode(); "
-        f"open({str(receipt)!r},'w',encoding='utf-8').write(hashlib.sha256(s.encode()).hexdigest()); "
+        "s=_read_private_credential(p['credential_fd']); "
+        "d=hashlib.sha256(s).hexdigest(); "
+        "s[:]=bytes(len(s)); "
         f"subprocess.Popen([sys.executable,'-c',{descendant_code!r}]); "
+        f"open({str(receipt)!r},'w',encoding='utf-8').write(d); "
         "time.sleep(30)"
     )
     command = [sys.executable, "-c", child_code]
@@ -387,10 +390,18 @@ def test_round4_lifecycle_worker_uses_private_credential_fd_and_kills_descendant
         credential_fd=99,
     )
     assert canary.encode() not in encoded
+    _secret[:] = bytes(len(_secret))
     assert all(canary not in argument for argument in command)
     cancel_requested = threading.Event()
-    timer = threading.Timer(0.08, cancel_requested.set)
-    timer.start()
+
+    def cancel_after_worker_started() -> None:
+        deadline = time.monotonic() + 0.75
+        while time.monotonic() < deadline and not receipt.exists():
+            time.sleep(0.01)
+        cancel_requested.set()
+
+    cancellation = threading.Thread(target=cancel_after_worker_started)
+    cancellation.start()
     try:
         outcome = lifecycle_process.run_lifecycle_process(
             mode="process",
@@ -401,7 +412,7 @@ def test_round4_lifecycle_worker_uses_private_credential_fd_and_kills_descendant
             cancel_requested=cancel_requested,
         )
     finally:
-        timer.cancel()
+        cancellation.join(timeout=1.0)
     assert outcome.error_code == "LIFECYCLE_WORKER_CANCELLED"
     assert canary not in repr(outcome)
     assert receipt.read_text(encoding="utf-8") == hashlib.sha256(canary.encode()).hexdigest()

@@ -7,8 +7,8 @@ import hashlib
 import json
 import logging
 import os
-import socket
 import sqlite3
+import struct
 import sys
 import threading
 from datetime import UTC, datetime, timedelta, timezone
@@ -1077,26 +1077,21 @@ def test_round5_private_channel_delivers_once_and_zeroes_parent_buffer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The secret crosses one datagram only; metadata, env, argv, and buffers stay clean."""
+    """The secret crosses one frame only; metadata, env, argv, and buffers stay clean."""
 
     canary = "round5-private-datagram-canary"
     settings, started_at, claim = _round5_lifecycle_inputs(tmp_path, canary)
     child_code = (
         "import json,os,sys; "
+        "from invoice_agents.lifecycle_worker import _read_private_credential; "
         "p=json.loads(sys.stdin.buffer.read()); "
-        "b=bytearray(os.read(p['credential_fd'],16385)); "
-        "os.close(p['credential_fd']); "
+        "b=_read_private_credential(p['credential_fd']); "
         "b[:]=bytes(len(b)); "
         "sys.stdout.buffer.write(b'{\"ok\":true}')"
     )
     command = [sys.executable, "-c", child_code]
     monkeypatch.setattr(lifecycle_process, "_lifecycle_worker_command", lambda: command)
-    real_send = lifecycle_process._send_private_credential
     retained_buffers: list[bytearray] = []
-
-    def observed_send(writer: socket.socket, credential: bytearray) -> None:
-        retained_buffers.append(credential)
-        real_send(writer, credential)
 
     real_run = isolated_process.run_isolated_process
     observed_requests: list[bytes] = []
@@ -1109,9 +1104,9 @@ def test_round5_private_channel_delivers_once_and_zeroes_parent_buffer(
         descriptor = kwargs["pass_fds"][0]
         os.fstat(descriptor)
         observed_descriptors.append(descriptor)
+        retained_buffers.append(kwargs["private_input"].payload)
         return real_run(**kwargs)
 
-    monkeypatch.setattr(lifecycle_process, "_send_private_credential", observed_send)
     monkeypatch.setattr(lifecycle_process, "run_isolated_process", observed_run)
     outcome = lifecycle_process.run_lifecycle_process(
         mode="process",
@@ -1167,10 +1162,10 @@ def test_round5_descendant_inherits_neither_credential_fd_nor_ambient_aliases(
     child_code = "\n".join(
         (
             "import hashlib, json, os, subprocess, sys",
+            "from invoice_agents.lifecycle_worker import _read_private_credential",
             "payload = json.loads(sys.stdin.buffer.read())",
             "descriptor = payload['credential_fd']",
-            "credential = bytearray(os.read(descriptor, 16385))",
-            "os.close(descriptor)",
+            "credential = _read_private_credential(descriptor)",
             "digest = hashlib.sha256(credential).hexdigest()",
             "credential[:] = bytes(len(credential))",
             f"subprocess.run([sys.executable, '-c', {descendant_code!r}, str(descriptor), digest], check=True, close_fds=False)",
@@ -1208,7 +1203,7 @@ def test_round5_descendant_inherits_neither_credential_fd_nor_ambient_aliases(
         ("crash", "LIFECYCLE_WORKER_CRASHED"),
         ("timeout", "LIFECYCLE_WORKER_TIMED_OUT"),
         ("cancel", "LIFECYCLE_WORKER_CANCELLED"),
-        ("start", "LIFECYCLE_WORKER_CLEANUP_FAILED"),
+        ("start", "LIFECYCLE_WORKER_CRASHED"),
     ],
 )
 def test_round5_parent_credential_descriptor_closes_on_every_worker_path(
@@ -1269,8 +1264,8 @@ def test_round5_parent_credential_descriptor_closes_on_every_worker_path(
         os.fstat(descriptors[0])
 
 
-def test_round5_worker_reads_one_bounded_datagram_and_closes_before_return() -> None:
-    """The real worker reader consumes one anonymous message and closes its descriptor."""
+def test_round5_worker_reads_one_bounded_frame_and_closes_before_return() -> None:
+    """The real worker reader consumes one anonymous frame and closes its descriptor."""
 
     canary = bytearray(b"round5-worker-reader-canary")
     reader, writer = lifecycle_process._private_credential_channel()
@@ -1289,73 +1284,31 @@ def test_round5_worker_reads_one_bounded_datagram_and_closes_before_return() -> 
         canary[:] = bytes(len(canary))
 
 
-@pytest.mark.parametrize("received", [0, lifecycle_process.LIFECYCLE_MAX_CREDENTIAL_BYTES + 1])
-def test_round5_worker_rejects_invalid_datagram_size_and_zeroes_buffer(
-    monkeypatch: pytest.MonkeyPatch,
-    received: int,
+@pytest.mark.parametrize("declared", [0, lifecycle_process.LIFECYCLE_MAX_CREDENTIAL_BYTES + 1])
+def test_round5_worker_rejects_invalid_frame_size_and_closes_reader(
+    declared: int,
 ) -> None:
-    """Empty/oversized one-shot reads close transport and erase the receive buffer."""
+    """Empty/oversized frames are rejected through a real anonymous pipe."""
 
-    observed_buffers: list[bytearray] = []
-
-    class FakeTransport:
-        family = socket.AF_UNIX
-        closed = False
-
-        @staticmethod
-        def getsockopt(_level: int, _option: int) -> int:
-            return socket.SOCK_DGRAM
-
-        def recv_into(self, buffer: bytearray, size: int) -> int:
-            assert size == lifecycle_process.LIFECYCLE_MAX_CREDENTIAL_BYTES + 1
-            buffer[:] = b"q" * len(buffer)
-            observed_buffers.append(buffer)
-            return received
-
-        def close(self) -> None:
-            self.closed = True
-
-    transport = FakeTransport()
-    monkeypatch.setattr(
-        lifecycle_worker.socket,
-        "socket",
-        lambda *, fileno: transport,
-    )
+    descriptor, writer = os.pipe()
+    os.write(writer, struct.pack("!I", declared))
+    os.close(writer)
     with pytest.raises(ValueError, match="credential size"):
-        lifecycle_worker._read_private_credential(91)
-    assert transport.closed is True
-    assert observed_buffers and not any(observed_buffers[0])
+        lifecycle_worker._read_private_credential(descriptor)
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
 
 
-def test_round5_worker_closes_transport_when_private_read_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A receive failure cannot strand the inherited credential descriptor."""
+def test_round5_worker_closes_transport_when_private_read_fails() -> None:
+    """A partial real frame cannot strand the inherited credential descriptor."""
 
-    class FailingTransport:
-        family = socket.AF_UNIX
-        closed = False
-
-        @staticmethod
-        def getsockopt(_level: int, _option: int) -> int:
-            return socket.SOCK_DGRAM
-
-        @staticmethod
-        def recv_into(_buffer: bytearray, _size: int) -> int:
-            raise OSError("round5 synthetic private read failure")
-
-        def close(self) -> None:
-            self.closed = True
-
-    transport = FailingTransport()
-    monkeypatch.setattr(
-        lifecycle_worker.socket,
-        "socket",
-        lambda *, fileno: transport,
-    )
-    with pytest.raises(OSError, match="synthetic private read failure"):
-        lifecycle_worker._read_private_credential(92)
-    assert transport.closed is True
+    descriptor, writer = os.pipe()
+    os.write(writer, b"\x00\x00")
+    os.close(writer)
+    with pytest.raises(ValueError, match="incomplete private credential frame"):
+        lifecycle_worker._read_private_credential(descriptor)
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
 
 
 def test_round5_provider_output_cannot_expose_private_credential(

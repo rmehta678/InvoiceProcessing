@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import os
-import socket
+import stat
+import struct
 import sys
 from typing import Any
 
@@ -31,29 +33,54 @@ def _disable_core_dumps() -> None:
         return
 
 
+def _zero_buffer(buffer: bytearray) -> None:
+    for index in range(len(buffer)):
+        buffer[index] = 0
+
+
+def _read_exact(descriptor: int, buffer: bytearray) -> None:
+    view = memoryview(buffer)
+    offset = 0
+    try:
+        while offset < len(view):
+            received = os.readv(descriptor, [view[offset:]])
+            if received <= 0 or received > len(view) - offset:
+                raise ValueError("incomplete private credential frame")
+            offset += received
+    finally:
+        view.release()
+
+
 def _read_private_credential(descriptor: int) -> bytearray:
+    """Read one exact bounded frame and close the only readable endpoint."""
+
     if type(descriptor) is not int or descriptor < 3:
         raise ValueError("invalid private credential descriptor")
-    credential = bytearray(LIFECYCLE_MAX_CREDENTIAL_BYTES + 1)
-    transport: socket.socket | None = None
+    header = bytearray(4)
+    credential = bytearray()
+    completed = False
+    close_error: BaseException | None = None
     try:
-        transport = socket.socket(fileno=descriptor)
-        if (
-            transport.family != socket.AF_UNIX
-            or transport.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_DGRAM
-        ):
+        flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+        if flags & os.O_ACCMODE != os.O_RDONLY or not stat.S_ISFIFO(os.fstat(descriptor).st_mode):
             raise ValueError("invalid private credential transport")
-        received = transport.recv_into(credential, LIFECYCLE_MAX_CREDENTIAL_BYTES + 1)
+        _read_exact(descriptor, header)
+        (credential_size,) = struct.unpack_from("!I", header)
+        if credential_size < 1 or credential_size > LIFECYCLE_MAX_CREDENTIAL_BYTES:
+            raise ValueError("invalid private credential size")
+        credential = bytearray(credential_size)
+        _read_exact(descriptor, credential)
+        completed = True
     finally:
-        if transport is None:
+        try:
             os.close(descriptor)
-        else:
-            transport.close()
-    if received < 1 or received > LIFECYCLE_MAX_CREDENTIAL_BYTES:
-        for index in range(len(credential)):
-            credential[index] = 0
-        raise ValueError("invalid private credential size")
-    del credential[received:]
+        except BaseException as exc:
+            close_error = exc
+        _zero_buffer(header)
+        if not completed or close_error is not None:
+            _zero_buffer(credential)
+    if close_error is not None:
+        raise close_error
     return credential
 
 
