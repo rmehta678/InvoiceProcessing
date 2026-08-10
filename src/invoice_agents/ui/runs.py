@@ -17,8 +17,14 @@ from typing import Any
 from uuid import uuid4
 
 from invoice_agents.config import Settings
-from invoice_agents.models import CaseResult
-from invoice_agents.orchestration import prepare_invoice, resume_case, run_prepared_case
+from invoice_agents.db.store import ExecutionClaim, WorkflowStore
+from invoice_agents.models import CaseResult, CaseStatus
+from invoice_agents.orchestration import (
+    EXECUTION_LEASE_SECONDS,
+    prepare_claimed_invoice,
+    resume_case,
+    run_prepared_case,
+)
 
 
 @dataclass(slots=True)
@@ -30,6 +36,7 @@ class RunHandle:
     state: str  # "queued" | "running" | "done"
     started_at: datetime
     task: asyncio.Task[CaseResult] | None = None
+    claim: ExecutionClaim | None = None
     error: str | None = None
 
 
@@ -40,6 +47,7 @@ class BatchEntry:
     path: Path
     case_id: str
     prepared_started_at: datetime | None
+    claim: ExecutionClaim | None = None
     result: CaseResult | None = None
 
     @property
@@ -111,25 +119,37 @@ class RunRegistry:
     async def start_process(self, path: Path, settings: Settings) -> str | CaseResult:
         """Prepare and launch one case; terminal prepare failures are returned as-is."""
 
-        prepared = await asyncio.to_thread(prepare_invoice, path, settings)
+        prepared = await asyncio.to_thread(prepare_claimed_invoice, path, settings)
         if isinstance(prepared, CaseResult):
             return prepared
-        case_id, started_at = prepared
+        case_id, started_at, claim = prepared
         self._launch(
             case_id,
             "process",
-            run_prepared_case(case_id, started_at, settings),
+            run_prepared_case(case_id, started_at, settings, claim=claim),
+            claim=claim,
             source_path=path,
         )
         return case_id
 
     def start_resume(self, case_id: str, settings: Settings) -> RunHandle:
-        """Launch resume; the registry hint never replaces resume_case's DB claim."""
+        """Claim resume authority before scheduling so storage proves the handoff."""
 
         existing = self._runs.get(case_id)
         if existing is not None and existing.state != "done":
             return existing
-        return self._launch(case_id, "resume", resume_case(case_id, settings), source_path=None)
+        claim = WorkflowStore(settings).claim_case_execution(
+            case_id,
+            frozenset({CaseStatus.NEEDS_HUMAN}),
+            EXECUTION_LEASE_SECONDS,
+        )
+        return self._launch(
+            case_id,
+            "resume",
+            resume_case(case_id, settings, claim=claim),
+            claim=claim,
+            source_path=None,
+        )
 
     def _launch(
         self,
@@ -137,9 +157,16 @@ class RunRegistry:
         kind: str,
         run: Coroutine[Any, Any, CaseResult],
         *,
+        claim: ExecutionClaim,
         source_path: Path | None,
     ) -> RunHandle:
-        handle = RunHandle(case_id=case_id, kind=kind, state="running", started_at=_now())
+        handle = RunHandle(
+            case_id=case_id,
+            kind=kind,
+            state="running",
+            started_at=_now(),
+            claim=claim,
+        )
         source_key = str(source_path.resolve()) if source_path is not None else None
         if source_key is not None:
             self._sources[source_key] = case_id
@@ -166,7 +193,7 @@ class RunRegistry:
         self._batches[batch.batch_id] = batch
         prepared_entries: list[BatchEntry] = []
         for path in paths:
-            prepared = await asyncio.to_thread(prepare_invoice, path, settings)
+            prepared = await asyncio.to_thread(prepare_claimed_invoice, path, settings)
             if isinstance(prepared, CaseResult):
                 entry = BatchEntry(
                     path=path,
@@ -175,10 +202,19 @@ class RunRegistry:
                     result=prepared,
                 )
             else:
-                entry = BatchEntry(path=path, case_id=prepared[0], prepared_started_at=prepared[1])
+                entry = BatchEntry(
+                    path=path,
+                    case_id=prepared[0],
+                    prepared_started_at=prepared[1],
+                    claim=prepared[2],
+                )
                 prepared_entries.append(entry)
                 self._runs[entry.case_id] = RunHandle(
-                    case_id=entry.case_id, kind="batch", state="queued", started_at=_now()
+                    case_id=entry.case_id,
+                    kind="batch",
+                    state="queued",
+                    started_at=_now(),
+                    claim=entry.claim,
                 )
             batch.entries.append(entry)
         batch.task = asyncio.create_task(
@@ -198,8 +234,15 @@ class RunRegistry:
                 handle.state = "running"
                 started_at = entry.prepared_started_at
                 assert started_at is not None  # only prepared entries reach here
+                claim = entry.claim
+                assert claim is not None  # retained preparation authority is mandatory
                 try:
-                    await run_prepared_case(entry.case_id, started_at, settings)
+                    await run_prepared_case(
+                        entry.case_id,
+                        started_at,
+                        settings,
+                        claim=claim,
+                    )
                 except BaseException as exc:
                     # Surfaced verbatim in the matrix; run_prepared_case already
                     # persists its own terminal result for expected failures.

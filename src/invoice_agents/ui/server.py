@@ -6,8 +6,11 @@ truncated hashes); none of them alters, softens, or recomputes a stored status.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -19,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from invoice_agents.config import Settings
+from invoice_agents.db.store import WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.ui.routes import router
 from invoice_agents.ui.runs import RunRegistry
@@ -178,13 +182,21 @@ def build_templates() -> Jinja2Templates:
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the console app; no docs endpoints, localhost intent, no auth layer."""
 
+    selected_settings = settings or Settings()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        await asyncio.to_thread(WorkflowStore(selected_settings).recover_expired_executions)
+        yield
+
     app = FastAPI(
         title="Galatiq Invoice Console",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=lifespan,
     )
-    app.state.settings = settings or Settings()
+    app.state.settings = selected_settings
     app.state.registry = RunRegistry()
     app.state.templates = build_templates()
     app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")

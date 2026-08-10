@@ -438,14 +438,16 @@ async def test_malformed_provider_response_categorized(
     record = _error_record(validation_error)
     assert record.category == "PROVIDER"
     assert record.stop_reason == "PROVIDER_RESPONSE_INVALID"
-    assert "response validation sentinel" in record.message
+    assert record.message == "provider response failed schema validation"
+    assert "response validation sentinel" not in record.message
 
     with pytest.raises(json.JSONDecodeError) as decode_error:
         json.loads("{not json")
     decode_record = _error_record(decode_error.value)
     assert decode_record.category == "SCHEMA"
     assert decode_record.stop_reason == "RESPONSE_DECODE_FAILED"
-    assert decode_record.message == str(decode_error.value)
+    assert decode_record.message == "response JSON decoding failed"
+    assert str(decode_error.value) not in decode_record.message
 
     case_id, started_at = _prepare(invoice_dir, settings)
     monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: StubModelClient())
@@ -457,7 +459,8 @@ async def test_malformed_provider_response_categorized(
     assert result.status is CaseStatus.FAILED
     assert result.errors[0].category == "PROVIDER"
     assert result.errors[0].stop_reason == "PROVIDER_RESPONSE_INVALID"
-    assert "response validation sentinel" in result.errors[0].message
+    assert result.errors[0].message == "provider response failed schema validation"
+    assert "response validation sentinel" not in result.model_dump_json()
 
 
 def test_payment_ledger_write_failure(invoice_dir: Path, settings: Settings) -> None:

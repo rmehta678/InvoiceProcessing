@@ -15,10 +15,14 @@ from typing import Any
 
 from sse_starlette import ServerSentEvent
 
-from invoice_agents.ui.queries import EventRow, case_header, events_after
+from invoice_agents.db.store import WorkflowStore
+from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
+from invoice_agents.models import CaseResult, ErrorRecord
+from invoice_agents.ui.queries import EventRow, events_after
 from invoice_agents.ui.runs import RunRegistry
 
 POLL_SECONDS = 1.0
+HEARTBEAT_SECONDS = 15.0
 
 
 def _tool_names(content: Any) -> list[dict[str, Any]]:
@@ -68,21 +72,79 @@ def summarize_event(row: EventRow) -> dict[str, Any]:
 def terminal_payload(
     workflow_db: Path, case_id: str, registry: RunRegistry
 ) -> dict[str, Any] | None:
-    """The stored terminal state for the case, or None while a result is pending."""
+    """Return storage-derived terminal state or None for one valid active lease."""
 
-    if registry.is_running(case_id):
-        return None
-    header = case_header(workflow_db, case_id)
-    if header is None:
+    store = WorkflowStore(workflow_db)
+    try:
+        snapshot = store.load_case_execution_snapshot(case_id)
+    except InvoiceAgentsError as exc:
+        return _recovery_failure_payload(
+            case_id,
+            exc.stop_reason
+            if exc.stop_reason in {"PERSISTED_RESULT_INVALID", "EXECUTION_AUTHORITY_CORRUPT"}
+            else "EXECUTION_RECOVERY_FAILED",
+        )
+    except Exception:
+        return _recovery_failure_payload(case_id, "EXECUTION_RECOVERY_FAILED")
+    if snapshot is None:
         return {"case_id": case_id, "missing": True}
-    run_error = registry.run_error(case_id)
-    if not header.has_result and run_error is None:
+    if snapshot.has_valid_lease:
         return None
+    if snapshot.execution_state == "FINISHED":
+        if snapshot.result is None:
+            return _recovery_failure_payload(case_id, "PERSISTED_RESULT_INVALID")
+        return _stored_terminal_payload(case_id, snapshot.result, registry)
+    try:
+        store.recover_expired_executions(case_id=case_id)
+        snapshot = store.load_case_execution_snapshot(case_id)
+    except InvoiceAgentsError as exc:
+        return _recovery_failure_payload(
+            case_id,
+            exc.stop_reason
+            if exc.stop_reason in {"PERSISTED_RESULT_INVALID", "EXECUTION_AUTHORITY_CORRUPT"}
+            else "EXECUTION_RECOVERY_FAILED",
+        )
+    except Exception:
+        return _recovery_failure_payload(case_id, "EXECUTION_RECOVERY_FAILED")
+    if snapshot is None:
+        return _recovery_failure_payload(case_id, "EXECUTION_RECOVERY_FAILED")
+    if snapshot.has_valid_lease:
+        return None
+    if snapshot.execution_state != "FINISHED" or snapshot.result is None:
+        return _recovery_failure_payload(case_id, "EXECUTION_RECOVERY_FAILED")
+    return _stored_terminal_payload(case_id, snapshot.result, registry)
+
+
+def _stored_terminal_payload(
+    case_id: str,
+    result: CaseResult,
+    registry: RunRegistry,
+) -> dict[str, Any]:
     return {
         "case_id": case_id,
-        "status": header.status,
-        "stop_reason": header.stop_reason,
-        "run_error": run_error,
+        "status": str(result.status),
+        "stop_reason": result.stop_reason,
+        "run_error": (
+            "background execution ended with an exception; persisted result is authoritative"
+            if registry.run_error(case_id) is not None
+            else None
+        ),
+    }
+
+
+def _recovery_failure_payload(case_id: str, stop_reason: str) -> dict[str, Any]:
+    error = ErrorRecord(
+        category=ErrorCategory.DATABASE,
+        message="persisted execution state could not be trusted or recovered",
+        case_id=case_id,
+        stop_reason=stop_reason,
+    )
+    return {
+        "case_id": case_id,
+        "status": "INCOMPLETE",
+        "stop_reason": stop_reason,
+        "run_error": None,
+        "recovery_error": error.model_dump(mode="json"),
     }
 
 
@@ -95,6 +157,8 @@ async def case_event_stream(
     """Yield stored events as they appear, then one terminal event, then stop."""
 
     last_seq = after_seq
+    loop = asyncio.get_running_loop()
+    last_heartbeat = loop.time()
     while True:
         rows = await asyncio.to_thread(events_after, workflow_db, case_id, last_seq)
         for row in rows:
@@ -111,4 +175,10 @@ async def case_event_stream(
                 data=json.dumps(terminal, ensure_ascii=False, default=str),
             )
             return
-        await asyncio.sleep(POLL_SECONDS)
+        observed_at = loop.time()
+        since_heartbeat = observed_at - last_heartbeat
+        if since_heartbeat >= HEARTBEAT_SECONDS:
+            yield ServerSentEvent(comment="heartbeat")
+            last_heartbeat = loop.time()
+            since_heartbeat = 0.0
+        await asyncio.sleep(min(POLL_SECONDS, max(0.0, HEARTBEAT_SECONDS - since_heartbeat)))

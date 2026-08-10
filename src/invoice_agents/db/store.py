@@ -6,6 +6,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Never, TypeVar, cast
 from uuid import uuid4
@@ -26,11 +27,16 @@ from invoice_agents.models import (
     CaseResult,
     CaseStatus,
     Critique,
+    ErrorRecord,
     ExtractedInvoice,
     FinalDecision,
     HumanDecision,
     HumanDecisionKind,
     IdentityCandidate,
+    Money,
+    PaymentResult,
+    PaymentStatus,
+    PersistedPaymentRow,
     ReviewRequest,
     SourceArtifact,
 )
@@ -48,6 +54,15 @@ class ExecutionClaim:
     token: str
     generation: int
     expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CaseExecutionSnapshot:
+    """One authoritative cases-row view for SSE terminal/lease decisions."""
+
+    result: CaseResult | None
+    execution_state: str
+    has_valid_lease: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1110,6 +1125,476 @@ class WorkflowStore:
                 self._raise_stale_execution_claim(claim)
             connection.commit()
 
+    def handoff_case_execution(self, claim: ExecutionClaim, lease_seconds: int) -> ExecutionClaim:
+        """Atomically replace preparation authority with the claim used by its run."""
+
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        token = f"exec_{uuid4().hex}"
+        with connect_database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            handed_off_at = datetime.now(UTC)
+            self._require_current_claim(connection, claim, handed_off_at)
+            generation = claim.generation + 1
+            expires_at = handed_off_at + timedelta(seconds=lease_seconds)
+            updated = connection.execute(
+                "UPDATE cases SET execution_token = ?, execution_generation = ?, "
+                "lease_expires_at = ?, updated_at = ? WHERE case_id = ? "
+                "AND execution_token = ? AND execution_generation = ? "
+                "AND execution_state = 'RUNNING' AND lease_expires_at > ?",
+                (
+                    token,
+                    generation,
+                    expires_at.isoformat(),
+                    handed_off_at.isoformat(),
+                    claim.case_id,
+                    claim.token,
+                    claim.generation,
+                    handed_off_at.isoformat(),
+                ),
+            )
+            if updated.rowcount != 1:
+                connection.rollback()
+                self._raise_stale_execution_claim(claim)
+            connection.commit()
+        return ExecutionClaim(claim.case_id, token, generation, expires_at)
+
+    def has_valid_execution_lease(
+        self, case_id: str, *, checked_at: datetime | None = None
+    ) -> bool:
+        """Return whether storage proves a current, nonexpired RUNNING authority."""
+
+        observed_at = checked_at or datetime.now(UTC)
+        self._require_canonical_utc_clock(observed_at)
+        with connect_database(self.path, read_only=True) as connection:
+            row = connection.execute(
+                "SELECT execution_token, execution_generation, execution_state, "
+                "lease_expires_at FROM cases WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()
+        if row is None:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                f"case does not exist: {case_id}",
+                case_id=case_id,
+                stop_reason="CASE_NOT_FOUND",
+            )
+        if not self._authority_tuple_is_valid(row):
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                f"case {case_id} has a contradictory execution authority tuple",
+                case_id=case_id,
+                stop_reason="EXECUTION_AUTHORITY_CORRUPT",
+            )
+        lease = parse_canonical_utc(row["lease_expires_at"])
+        return row["execution_state"] == "RUNNING" and lease is not None and lease > observed_at
+
+    def load_case_execution_snapshot(
+        self,
+        case_id: str,
+        *,
+        checked_at: datetime | None = None,
+    ) -> CaseExecutionSnapshot | None:
+        """Read result identity and execution authority from one SQLite row snapshot."""
+
+        if checked_at is not None:
+            self._require_canonical_utc_clock(checked_at)
+        with connect_database(self.path, read_only=True) as connection:
+            row = connection.execute(
+                "SELECT case_id, source_id, status, stop_reason, result_json, "
+                "execution_token, execution_generation, execution_state, lease_expires_at "
+                "FROM cases WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()
+            observed_at = checked_at or datetime.now(UTC)
+        if row is None:
+            return None
+        if not self._authority_tuple_is_valid(row):
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                f"case {case_id} has a contradictory execution authority tuple",
+                case_id=case_id,
+                stop_reason="EXECUTION_AUTHORITY_CORRUPT",
+            )
+        result: CaseResult | None = None
+        if row["result_json"] is not None:
+            try:
+                result = CaseResult.model_validate_json(row["result_json"], strict=True)
+            except ValueError as exc:
+                raise InvoiceAgentsError(
+                    ErrorCategory.DATABASE,
+                    "case has an invalid persisted result",
+                    case_id=case_id,
+                    stop_reason="PERSISTED_RESULT_INVALID",
+                ) from exc
+            if (
+                result.case_id != row["case_id"]
+                or result.source_id != row["source_id"]
+                or str(result.status) != row["status"]
+                or result.stop_reason != row["stop_reason"]
+            ):
+                raise InvoiceAgentsError(
+                    ErrorCategory.DATABASE,
+                    "case result does not match its relational authority row",
+                    case_id=case_id,
+                    stop_reason="PERSISTED_RESULT_INVALID",
+                )
+        lease = parse_canonical_utc(row["lease_expires_at"])
+        execution_state = str(row["execution_state"])
+        return CaseExecutionSnapshot(
+            result=result,
+            execution_state=execution_state,
+            has_valid_lease=(
+                execution_state == "RUNNING" and lease is not None and lease > observed_at
+            ),
+        )
+
+    def recover_expired_executions(
+        self,
+        *,
+        now: datetime | None = None,
+        case_id: str | None = None,
+    ) -> list[str]:
+        """Atomically terminalize abandoned nonterminal authorities in case-ID order.
+
+        Recovery advances the execution generation and replaces the abandoned token.
+        A worker holding the prior claim therefore cannot overwrite the recovered result.
+        The case update and recovery audit event commit in the same SQLite transaction.
+        """
+
+        recovered_at = now or datetime.now(UTC)
+        self._require_canonical_utc_clock(recovered_at)
+        if not self.path.is_file():
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                f"workflow database does not exist: {self.path}",
+                stop_reason="DATABASE_MISSING",
+            )
+        recovered: list[str] = []
+        with connect_database(self.path) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                sql = (
+                    "SELECT case_id, source_id, status, stop_reason, result_json, started_at, "
+                    "execution_token, execution_generation, execution_state, lease_expires_at "
+                    "FROM cases WHERE execution_state IN ('IDLE', 'RUNNING') "
+                    "AND status IN ('INCOMPLETE', 'NEEDS_HUMAN')"
+                )
+                params: tuple[str, ...] = ()
+                if case_id is not None:
+                    sql += " AND case_id = ?"
+                    params = (case_id,)
+                sql += " ORDER BY case_id"
+                rows = connection.execute(sql, params).fetchall()
+                for row in rows:
+                    if not self._authority_tuple_is_valid(row):
+                        raise InvoiceAgentsError(
+                            ErrorCategory.DATABASE,
+                            f"case {row['case_id']} has a contradictory execution authority tuple",
+                            case_id=str(row["case_id"]),
+                            stop_reason="EXECUTION_AUTHORITY_CORRUPT",
+                        )
+                    lease = parse_canonical_utc(row["lease_expires_at"])
+                    if row["execution_state"] == "RUNNING" and (
+                        lease is None or lease > recovered_at
+                    ):
+                        continue
+                    started_at = parse_canonical_utc(row["started_at"])
+                    if started_at is None:
+                        raise InvoiceAgentsError(
+                            ErrorCategory.DATABASE,
+                            "case has a noncanonical persisted start timestamp",
+                            case_id=str(row["case_id"]),
+                            stop_reason="PERSISTED_RESULT_INVALID",
+                        )
+                    previous: CaseResult | None = None
+                    if row["result_json"] is not None:
+                        try:
+                            previous = CaseResult.model_validate_json(
+                                row["result_json"], strict=True
+                            )
+                        except ValueError as exc:
+                            raise InvoiceAgentsError(
+                                ErrorCategory.DATABASE,
+                                "case has an invalid persisted result",
+                                case_id=str(row["case_id"]),
+                                stop_reason="PERSISTED_RESULT_INVALID",
+                            ) from exc
+                        if (
+                            previous.case_id != row["case_id"]
+                            or previous.source_id != row["source_id"]
+                        ):
+                            raise InvoiceAgentsError(
+                                ErrorCategory.DATABASE,
+                                "case result identity does not match its relational row",
+                                case_id=str(row["case_id"]),
+                                stop_reason="PERSISTED_RESULT_INVALID",
+                            )
+                    (
+                        recovered_final,
+                        recovered_review,
+                        recovered_payment,
+                    ) = self._load_relational_recovery_evidence(
+                        connection,
+                        str(row["case_id"]),
+                        cast(str | None, row["source_id"]),
+                    )
+                    if previous is not None:
+                        self._require_relational_terminal_facts(
+                            previous,
+                            recovered_final,
+                            recovered_review,
+                            recovered_payment,
+                        )
+                    recovery_error = ErrorRecord(
+                        category=ErrorCategory.ORCHESTRATION,
+                        message="execution lease expired before a terminal result was recorded",
+                        case_id=str(row["case_id"]),
+                        stop_reason="ORPHANED_EXECUTION",
+                        details={
+                            "abandoned_execution_generation": int(row["execution_generation"])
+                        },
+                    )
+                    if previous is None:
+                        result = CaseResult(
+                            case_id=str(row["case_id"]),
+                            source_id=row["source_id"],
+                            status=CaseStatus.INCOMPLETE,
+                            stop_reason="ORPHANED_EXECUTION",
+                            final_decision=recovered_final,
+                            review_request=recovered_review,
+                            payment=recovered_payment,
+                            errors=[recovery_error],
+                            started_at=started_at,
+                            finished_at=recovered_at,
+                        )
+                    else:
+                        result = previous.model_copy(
+                            update={
+                                "status": CaseStatus.INCOMPLETE,
+                                "stop_reason": "ORPHANED_EXECUTION",
+                                "final_decision": recovered_final,
+                                "review_request": recovered_review,
+                                "payment": recovered_payment,
+                                "errors": [*previous.errors, recovery_error],
+                                "finished_at": recovered_at,
+                            },
+                            deep=True,
+                        )
+                    recovery_generation = int(row["execution_generation"]) + 1
+                    recovery_token = f"recovery_{uuid4().hex}"
+                    updated = connection.execute(
+                        "UPDATE cases SET status = ?, stop_reason = ?, result_json = ?, "
+                        "updated_at = ?, finished_at = ?, execution_token = ?, "
+                        "execution_generation = ?, execution_state = 'FINISHED', "
+                        "lease_expires_at = NULL WHERE case_id = ? AND status = ? "
+                        "AND execution_token IS ? AND execution_generation = ? "
+                        "AND execution_state = ? AND lease_expires_at IS ?",
+                        (
+                            result.status,
+                            result.stop_reason,
+                            result.model_dump_json(),
+                            recovered_at.isoformat(),
+                            result.finished_at.isoformat(),
+                            recovery_token,
+                            recovery_generation,
+                            row["case_id"],
+                            row["status"],
+                            row["execution_token"],
+                            row["execution_generation"],
+                            row["execution_state"],
+                            row["lease_expires_at"],
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        raise InvoiceAgentsError(
+                            ErrorCategory.ORCHESTRATION,
+                            "execution authority changed during recovery",
+                            case_id=str(row["case_id"]),
+                            stop_reason="EXECUTION_RECOVERY_RACE",
+                        )
+                    connection.execute(
+                        "INSERT INTO events(event_id, case_id, source_id, event_type, "
+                        "payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            f"evt_{uuid4().hex}",
+                            row["case_id"],
+                            row["source_id"],
+                            "case.execution_recovered",
+                            json.dumps(
+                                {
+                                    "status": str(result.status),
+                                    "stop_reason": result.stop_reason,
+                                    "abandoned_execution_generation": int(
+                                        row["execution_generation"]
+                                    ),
+                                    "recovery_execution_generation": recovery_generation,
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            recovered_at.isoformat(),
+                        ),
+                    )
+                    recovered.append(str(row["case_id"]))
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return recovered
+
+    @staticmethod
+    def _load_relational_recovery_evidence(
+        connection: sqlite3.Connection,
+        case_id: str,
+        source_id: str | None,
+    ) -> tuple[FinalDecision | None, ReviewRequest | None, PaymentResult | None]:
+        """Strictly reconstruct durable evidence when the aggregate JSON is absent."""
+
+        final_row = connection.execute(
+            "SELECT payload_json, decision_generation, source_id "
+            "FROM final_decisions WHERE case_id = ?",
+            (case_id,),
+        ).fetchone()
+        review_row = connection.execute(
+            "SELECT payload_json, execution_generation FROM review_requests "
+            "WHERE case_id = ? ORDER BY sequence DESC LIMIT 1",
+            (case_id,),
+        ).fetchone()
+        payment_rows = connection.execute(
+            "SELECT payment_id, case_id, idempotency_key, vendor, amount, currency, "
+            "status, error, created_at, decision_generation, evidence_snapshot_digest, "
+            "source_id, invoice_number, review_id FROM payments WHERE case_id = ? "
+            "ORDER BY created_at, payment_id",
+            (case_id,),
+        ).fetchall()
+        try:
+            final = (
+                FinalDecision.model_validate_json(final_row["payload_json"], strict=True)
+                if final_row is not None
+                else None
+            )
+            review = (
+                ReviewRequest.model_validate_json(review_row["payload_json"], strict=True)
+                if review_row is not None
+                else None
+            )
+            if len(payment_rows) > 1:
+                raise ValueError("multiple case-local payment ledger rows are ambiguous")
+            persisted_payment = (
+                PersistedPaymentRow.model_validate(dict(payment_rows[0]), strict=True)
+                if payment_rows
+                else None
+            )
+        except ValueError as exc:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "relational recovery evidence has an invalid storage shape",
+                case_id=case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from exc
+        generations_match = persisted_payment is None or (
+            final_row is not None
+            and persisted_payment.decision_generation == int(final_row["decision_generation"])
+        )
+        sources_match = (final_row is None or final_row["source_id"] == source_id) and (
+            persisted_payment is None or persisted_payment.source_id == source_id
+        )
+        payment_authorized = persisted_payment is None or (
+            final is not None and final.payment_eligible and str(final.decision) == "APPROVE"
+        )
+        if not generations_match or not sources_match or not payment_authorized:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "relational recovery evidence does not match execution authority",
+                case_id=case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
+            )
+        payment = (
+            PaymentResult(
+                payment_id=persisted_payment.payment_id,
+                case_id=persisted_payment.case_id,
+                idempotency_key=persisted_payment.idempotency_key,
+                status=PaymentStatus(persisted_payment.status),
+                vendor=persisted_payment.vendor,
+                amount=Money(
+                    amount=Decimal(persisted_payment.amount),
+                    currency=persisted_payment.currency,
+                ),
+                processed_at=datetime.fromisoformat(persisted_payment.created_at),
+                error=persisted_payment.error,
+            )
+            if persisted_payment is not None
+            else None
+        )
+        return final, review, payment
+
+    @staticmethod
+    def _require_relational_terminal_facts(
+        aggregate: CaseResult,
+        relational_final: FinalDecision | None,
+        relational_review: ReviewRequest | None,
+        relational_payment: PaymentResult | None,
+    ) -> None:
+        """Reject aggregate authorization facts whose relational authority vanished."""
+
+        payment_requires_ledger = aggregate.payment is not None
+        if (
+            (aggregate.final_decision is not None and relational_final is None)
+            or (aggregate.review_request is not None and relational_review is None)
+            or (payment_requires_ledger and relational_payment is None)
+        ):
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "aggregate terminal facts are missing relational authority",
+                case_id=aggregate.case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
+            )
+
+    def merge_relational_case_evidence(self, result: CaseResult) -> CaseResult:
+        """Overlay strictly validated relational facts on one terminal envelope."""
+
+        with connect_database(self.path, read_only=True) as connection:
+            case_row = connection.execute(
+                "SELECT source_id FROM cases WHERE case_id = ?",
+                (result.case_id,),
+            ).fetchone()
+            if case_row is None:
+                raise InvoiceAgentsError(
+                    ErrorCategory.DATABASE,
+                    "terminal evidence case does not exist",
+                    case_id=result.case_id,
+                    stop_reason="CASE_NOT_FOUND",
+                )
+            source_id = cast(str | None, case_row["source_id"])
+            if result.source_id != source_id:
+                raise InvoiceAgentsError(
+                    ErrorCategory.DATABASE,
+                    "terminal result identity does not match its relational case",
+                    case_id=result.case_id,
+                    stop_reason="PERSISTED_RESULT_INVALID",
+                )
+            final, review, payment = self._load_relational_recovery_evidence(
+                connection,
+                result.case_id,
+                source_id,
+            )
+            self._require_relational_terminal_facts(result, final, review, payment)
+        return result.model_copy(
+            update={
+                "final_decision": final,
+                "review_request": review,
+                "payment": payment,
+            },
+            deep=True,
+        )
+
+    @staticmethod
+    def _require_canonical_utc_clock(value: datetime) -> None:
+        offset = value.utcoffset()
+        if value.tzinfo is None or offset is None or offset != timedelta(0):
+            raise ValueError("recovery clock must be timezone-aware UTC")
+
     @staticmethod
     def _authority_tuple_is_valid(row: sqlite3.Row) -> bool:
         state = row["execution_state"]
@@ -2121,6 +2606,49 @@ class WorkflowStore:
                 connection.rollback()
                 self._raise_stale_execution_claim(claim)
             connection.commit()
+
+    def update_finished_case_result(self, result: CaseResult, claim: ExecutionClaim) -> None:
+        """Replace only this generation's terminal envelope after a secondary fault."""
+
+        if claim.case_id != result.case_id:
+            self._raise_stale_execution_claim(claim)
+        with connect_database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            written_at = datetime.now(UTC).isoformat()
+            updated = connection.execute(
+                "UPDATE cases SET status = ?, stop_reason = ?, result_json = ?, "
+                "updated_at = ?, finished_at = ? WHERE case_id = ? "
+                "AND execution_token = ? AND execution_generation = ? "
+                "AND execution_state = 'FINISHED' AND lease_expires_at IS NULL",
+                (
+                    result.status,
+                    result.stop_reason,
+                    result.model_dump_json(),
+                    written_at,
+                    result.finished_at.isoformat(),
+                    result.case_id,
+                    claim.token,
+                    claim.generation,
+                ),
+            )
+            if updated.rowcount != 1:
+                connection.rollback()
+                self._raise_stale_execution_claim(claim)
+            connection.commit()
+
+    def load_case_source_id(self, case_id: str) -> str | None:
+        with connect_database(self.path, read_only=True) as connection:
+            row = connection.execute(
+                "SELECT source_id FROM cases WHERE case_id = ?", (case_id,)
+            ).fetchone()
+        if row is None:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                f"case does not exist: {case_id}",
+                case_id=case_id,
+                stop_reason="CASE_NOT_FOUND",
+            )
+        return cast(str | None, row["source_id"])
 
     def load_result(self, case_id: str) -> CaseResult | None:
         with connect_database(self.path, read_only=True) as connection:

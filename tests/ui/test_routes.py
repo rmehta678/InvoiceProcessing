@@ -26,7 +26,8 @@ from markupsafe import escape
 from invoice_agents.agents.decision_rules import unaddressed_blockers
 from invoice_agents.config import Settings
 from invoice_agents.db.core import connect_database
-from invoice_agents.db.store import WorkflowStore
+from invoice_agents.db.store import ExecutionClaim, WorkflowStore
+from invoice_agents.errors import InvoiceAgentsError
 from invoice_agents.models import CaseResult, CaseStatus, RiskAssessment
 from invoice_agents.ui import queries
 
@@ -78,13 +79,17 @@ def blocker_control_names(html: str) -> dict[str, list[str]]:
 def stub_runs(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> None:
     """Replace the model-run boundary with an instant stored SUCCEEDED result."""
 
-    async def fake_run(case_id: str, started_at: datetime, settings: Settings) -> CaseResult:
+    async def fake_run(
+        case_id: str,
+        started_at: datetime,
+        settings: Settings,
+        *,
+        claim: ExecutionClaim | None = None,
+    ) -> CaseResult:
         calls.append(case_id)
         store = WorkflowStore(settings.workflow_db)
         invoice = store.load_extraction(case_id)
-        claim = store.claim_case_execution(
-            case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
-        )
+        assert claim is not None
         result = CaseResult(
             case_id=case_id,
             source_id=invoice.source.source_id,
@@ -143,20 +148,21 @@ def test_dashboard_htmx_returns_fragment(client: TestClient, settings: Settings)
     assert "INV-1001" in response.text
 
 
-def test_dashboard_preflight_failure_disables_actions(settings: Settings, ui_workdir: Path) -> None:
+def test_missing_database_aborts_startup_without_creating_storage(
+    settings: Settings, ui_workdir: Path
+) -> None:
     from invoice_agents.ui.server import create_app
 
+    missing_database = ui_workdir / "missing-workflow.db"
     broken = Settings(
         xai_api_key="test-only-not-a-real-key",
         inventory_db=settings.inventory_db,
-        workflow_db=ui_workdir / "missing-workflow.db",
+        workflow_db=missing_database,
     )
-    with TestClient(create_app(broken)) as client:
-        response = client.get("/")
-    assert response.status_code == 200
-    assert "DATABASE_MISSING" in response.text
-    assert "aria-disabled" in response.text
-    assert "invoice_agents.db migrate" in response.text
+    with pytest.raises(InvoiceAgentsError) as error, TestClient(create_app(broken)):
+        pass
+    assert error.value.stop_reason == "DATABASE_MISSING"
+    assert not missing_database.exists()
 
 
 # ------------------------------------------------------------------------- case detail
@@ -515,12 +521,15 @@ def test_reject_decision_recorded_and_resumable(
 
     resumed: list[str] = []
 
-    async def fake_resume(resume_case_id: str, resume_settings: Settings) -> CaseResult:
+    async def fake_resume(
+        resume_case_id: str,
+        resume_settings: Settings,
+        *,
+        claim: ExecutionClaim | None = None,
+    ) -> CaseResult:
         resumed.append(resume_case_id)
         store = WorkflowStore(resume_settings.workflow_db)
-        claim = store.claim_case_execution(
-            resume_case_id, frozenset({CaseStatus.NEEDS_HUMAN}), lease_seconds=60
-        )
+        assert claim is not None
         result = store.load_result(resume_case_id)
         assert result is not None
         finished = result.model_copy(
