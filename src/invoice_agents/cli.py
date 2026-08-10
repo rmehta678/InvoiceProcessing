@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
@@ -252,7 +253,7 @@ def review_resume(case_id: str) -> None:
     _exit_for(result)
 
 
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
 
 
 @app.command("ui")
@@ -285,6 +286,26 @@ def ui_command(
         )
         raise typer.Exit(1)
     try:
+        settings = _settings()
+    except ValidationError as exc:
+        if any("ui_allowed_hosts" in error["loc"] for error in exc.errors()):
+            console.print(
+                "invalid UI allowed host configuration; use exact bare host names without "
+                "wildcards, ports, or schemes",
+                style="red",
+            )
+            raise typer.Exit(1) from exc
+        raise
+    if host not in LOOPBACK_HOSTS and not settings.ui_allowed_hosts:
+        console.print(
+            "remote binding also requires an explicit INVOICE_UI_ALLOWED_HOSTS JSON list "
+            "of exact browser host names",
+            style="red",
+        )
+        raise typer.Exit(1)
+    configured_hosts = (host,) if host in LOOPBACK_HOSTS else settings.ui_allowed_hosts
+    configured_origins = tuple(f"http://{allowed_host}:{port}" for allowed_host in configured_hosts)
+    try:
         import uvicorn
 
         from invoice_agents.ui.server import create_app
@@ -294,7 +315,6 @@ def ui_command(
             style="red",
         )
         raise typer.Exit(1) from exc
-    settings = _settings()
     if init_db:
         try:
             applied = ensure_databases(settings)
@@ -305,7 +325,16 @@ def ui_command(
             state = f"applied migrations {versions}" if versions else "already migrated"
             console.print(f"{kind} database ready ({state}), verified")
     console.print(f"Galatiq invoice console on http://{host}:{port} (Ctrl+C stops it)")
-    uvicorn.run(create_app(settings), host=host, port=port, log_level="warning")
+    uvicorn.run(
+        create_app(
+            settings,
+            allowed_hosts=configured_hosts,
+            allowed_origins=configured_origins,
+        ),
+        host=host,
+        port=port,
+        log_level="warning",
+    )
 
 
 @app.command("contract")

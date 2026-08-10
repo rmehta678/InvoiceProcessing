@@ -12,6 +12,7 @@
 <section class="card" id="single">
   <h2>Process invoices</h2>
   <form method="post" action="/submit" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <fieldset {% if not preflight.ok %}disabled{% endif %}>
       <legend>Pick one or more existing files under <span class="mono">{{ invoice_dir }}</span></legend>
       {% if files %}
@@ -53,6 +54,7 @@
 <section class="card" id="batch">
   <h2>Run batch</h2>
   <form method="post" action="/batch">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <fieldset {% if not preflight.ok %}disabled{% endif %}>
       <legend>All {{ files|length }} supported files in <span class="mono">{{ invoice_dir }}</span></legend>
       <label class="inline">Concurrency

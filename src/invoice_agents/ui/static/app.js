@@ -6,6 +6,16 @@
 (function () {
   "use strict";
 
+  /* ---------------------------------------------- HTMX mutation protection */
+
+  document.body.addEventListener("htmx:configRequest", function (event) {
+    var verb = String(event.detail.verb || "GET").toUpperCase();
+    if (verb === "GET" || verb === "HEAD" || verb === "OPTIONS") return;
+    if (event.detail.parameters && event.detail.parameters.csrf_token !== undefined) return;
+    var token = document.querySelector("meta[name=csrf-token]");
+    if (token && token.content) event.detail.headers["X-CSRF-Token"] = token.content;
+  });
+
   /* ------------------------------------------------------------ copy buttons */
 
   document.addEventListener("click", function (event) {

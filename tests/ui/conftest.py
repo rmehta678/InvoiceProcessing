@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import shutil
 from collections.abc import Iterator
+from html.parser import HTMLParser
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
@@ -15,6 +17,46 @@ from invoice_agents.ui.server import create_app
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = REPO_ROOT / "data" / "invoices"
+TEST_ORIGIN = "http://testserver"
+
+
+class _CSRFTokenParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tokens: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if (
+            tag == "input"
+            and attributes.get("type") == "hidden"
+            and attributes.get("name") == "csrf_token"
+            and attributes.get("value")
+        ):
+            self.tokens.append(str(attributes["value"]))
+
+
+class CSRFTestClient(TestClient):
+    """Exercise the real token flow while keeping legacy route calls concise."""
+
+    def _csrf_token(self) -> str:
+        page = super().get("/submit")
+        parser = _CSRFTokenParser()
+        parser.feed(page.text)
+        assert parser.tokens
+        assert len(set(parser.tokens)) == 1
+        return parser.tokens[0]
+
+    def request(self, method: str, url: str, **kwargs: Any):  # type: ignore[no-untyped-def]
+        if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+            headers = dict(kwargs.pop("headers", {}) or {})
+            headers.setdefault("Origin", TEST_ORIGIN)
+            kwargs["headers"] = headers
+            if not any(name.lower() == "x-csrf-token" for name in headers):
+                data = dict(kwargs.pop("data", {}) or {})
+                data.setdefault("csrf_token", self._csrf_token())
+                kwargs["data"] = data
+        return super().request(method, url, **kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -46,10 +88,20 @@ def ui_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture
 def app(settings: Settings, ui_workdir: Path) -> FastAPI:
-    return create_app(settings)
+    return create_app(
+        settings,
+        allowed_hosts=("testserver",),
+        allowed_origins=(TEST_ORIGIN,),
+    )
+
+
+@pytest.fixture
+def raw_client(app: FastAPI) -> Iterator[TestClient]:
+    with TestClient(app, base_url=TEST_ORIGIN) as test_client:
+        yield test_client
 
 
 @pytest.fixture
 def client(app: FastAPI) -> Iterator[TestClient]:
-    with TestClient(app) as test_client:
+    with CSRFTestClient(app, base_url=TEST_ORIGIN) as test_client:
         yield test_client

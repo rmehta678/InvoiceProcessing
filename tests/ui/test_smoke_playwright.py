@@ -89,7 +89,16 @@ def server_url(
     monkeypatch.setattr("invoice_agents.ui.runs.resume_case", fake_resume)
 
     port = _free_port()
-    config = uvicorn.Config(create_app(settings), host="127.0.0.1", port=port, log_level="error")
+    config = uvicorn.Config(
+        create_app(
+            settings,
+            allowed_hosts=("127.0.0.1",),
+            allowed_origins=(f"http://127.0.0.1:{port}",),
+        ),
+        host="127.0.0.1",
+        port=port,
+        log_level="error",
+    )
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()

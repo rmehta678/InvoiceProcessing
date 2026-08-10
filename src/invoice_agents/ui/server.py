@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import sqlite3
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -17,15 +18,25 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi.responses import PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from invoice_agents.config import Settings
 from invoice_agents.db.store import WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.ui.routes import router
 from invoice_agents.ui.runs import RunRegistry
+from invoice_agents.ui.security import (
+    DEFAULT_ALLOWED_HOSTS,
+    DEFAULT_ALLOWED_ORIGINS,
+    SECURITY_HEADERS,
+    CSRFMiddleware,
+    SecurityHeadersMiddleware,
+    csrf_token,
+    validate_allowed_hosts,
+)
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 
@@ -167,7 +178,10 @@ def middle(value: Any, keep: int = 10, tail: int = 6) -> str:
 
 
 def build_templates() -> Jinja2Templates:
-    templates = Jinja2Templates(directory=PACKAGE_DIR / "templates")
+    templates = Jinja2Templates(
+        directory=PACKAGE_DIR / "templates",
+        context_processors=[lambda request: {"csrf_token": csrf_token(request)}],
+    )
     templates.env.filters["fmt_dt"] = fmt_dt
     templates.env.filters["fmt_amount"] = fmt_amount
     templates.env.filters["fmt_signed"] = fmt_signed
@@ -179,7 +193,12 @@ def build_templates() -> Jinja2Templates:
     return templates
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    allowed_hosts: Sequence[str] = DEFAULT_ALLOWED_HOSTS,
+    allowed_origins: Sequence[str] = DEFAULT_ALLOWED_ORIGINS,
+) -> FastAPI:
     """Build the console app; no docs endpoints, localhost intent, no auth layer."""
 
     selected_settings = settings or Settings()
@@ -196,6 +215,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url=None,
         lifespan=lifespan,
     )
+    configured_hosts = validate_allowed_hosts(allowed_hosts)
+    configured_origins = tuple(allowed_origins)
+    app.add_middleware(
+        CSRFMiddleware,
+        secret=secrets.token_bytes(32),
+        allowed_origins=configured_origins,
+        max_body_bytes=selected_settings.source_max_bytes + 1_048_576,
+    )
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=configured_hosts,
+        www_redirect=False,
+    )
+    app.add_middleware(SecurityHeadersMiddleware)
     app.state.settings = selected_settings
     app.state.registry = RunRegistry()
     app.state.templates = build_templates()
@@ -224,5 +257,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             status_code=500,
         )
         return response
+
+    @app.exception_handler(Exception)
+    async def unhandled_error(_request: Request, _exc: Exception) -> Response:
+        return PlainTextResponse(
+            "Internal Server Error",
+            status_code=500,
+            headers=SECURITY_HEADERS,
+        )
 
     return app

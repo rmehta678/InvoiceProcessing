@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -13,6 +14,7 @@ from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 
 XAI_MODEL = "grok-4.5"
 XAI_BASE_URL = "https://api.x.ai/v1"
+_UI_HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 
 class Settings(BaseSettings):
@@ -59,6 +61,7 @@ class Settings(BaseSettings):
     model_timeout_seconds: float = Field(default=120.0, gt=0, le=600)
     transient_retries: int = Field(default=2, ge=0, le=5)
     case_concurrency: int = Field(default=2, ge=1, le=8)
+    ui_allowed_hosts: tuple[str, ...] = ()
     log_level: str = "INFO"
 
     @field_validator("review_threshold_currency")
@@ -77,6 +80,29 @@ class Settings(BaseSettings):
         if not isinstance(value, str) or value.strip().upper() != "DELETE":
             raise ValueError("SQLite journal mode must be DELETE")
         return "DELETE"
+
+    @field_validator("ui_allowed_hosts")
+    @classmethod
+    def validate_ui_allowed_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized: list[str] = []
+        for raw_host in value:
+            host = raw_host.strip().lower()
+            labels = host.split(".")
+            if (
+                not host
+                or raw_host != host
+                or len(host) > 253
+                or "*" in host
+                or any(character.isspace() for character in host)
+                or ":" in host
+                or "/" in host
+                or "\\" in host
+                or any(not _UI_HOST_LABEL.fullmatch(label) for label in labels)
+            ):
+                raise ValueError(f"invalid UI allowed host: {raw_host!r}")
+            if host not in normalized:
+                normalized.append(host)
+        return tuple(normalized)
 
     def assert_delete_journal_mode(self) -> None:
         """Defend production boundaries even if model validation was explicitly bypassed."""

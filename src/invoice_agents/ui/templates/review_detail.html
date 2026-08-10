@@ -127,6 +127,7 @@
           <p class="stream-note pulsing">The case is resuming &mdash; <a href="/cases/{{ review.case_id }}/live">watch it live</a>.</p>
           {% else %}
           <form method="post" action="/cases/{{ review.case_id }}/resume">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <button type="submit" class="primary">Resume case now</button>
           </form>
           <p class="small dim">Resuming hands the recorded decision back to the stopped team and returns you to the review queue; watch progress on the case's <a href="/cases/{{ review.case_id }}/live">live view</a>.</p>
@@ -140,6 +141,7 @@
 
       {% else %}
       <form method="post" action="/reviews/{{ review.review_id }}/decision" data-decision-form>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <p>
           <label for="reviewer">Reviewer <span class="dim">(required)</span></label><br>
           <input type="text" id="reviewer" name="reviewer" required
