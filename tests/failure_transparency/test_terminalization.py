@@ -4586,21 +4586,55 @@ def test_recovery_uses_exact_utc_lease_boundary_and_rejects_naive_clock(
     assert recovered.stop_reason == "ORPHANED_EXECUTION"
 
 
-def test_terminal_payload_recovers_restart_without_memory_task(
+def test_terminal_payload_is_observational_for_an_expired_execution(
     invoice_dir: Path, settings: Settings
 ) -> None:
-    """In-memory task absence must not leave a lease-free case streaming forever."""
+    """Reading terminal state must not acquire recovery's durable write authority."""
 
     case_id, _started_at = _prepared_case(invoice_dir, settings)
+    store = WorkflowStore(settings)
+    claim = store.claim_case_execution(
+        case_id,
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+    expired_at = datetime.now(UTC) - timedelta(seconds=1)
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "UPDATE cases SET lease_expires_at = ? WHERE case_id = ?",
+            (expired_at.isoformat(), case_id),
+        )
+        connection.commit()
+    before = settings.workflow_db.read_bytes()
 
     payload = terminal_payload(settings.workflow_db, case_id, RunRegistry())
 
+    assert settings.workflow_db.read_bytes() == before
     assert payload is not None
-    assert payload["status"] == "INCOMPLETE"
-    assert payload["stop_reason"] == "ORPHANED_EXECUTION"
-    stored = WorkflowStore(settings.workflow_db).load_result(case_id)
-    assert stored is not None
-    assert stored.stop_reason == "ORPHANED_EXECUTION"
+    assert payload["status"] == "UNAVAILABLE"
+    assert payload["stop_reason"] == "EXECUTION_RECOVERY_FAILED"
+    assert payload["recovery_verified"] is False
+    assert store.load_result(case_id) is None
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        authority = connection.execute(
+            "SELECT execution_token, execution_generation, execution_state, "
+            "lease_expires_at, result_json, finished_at FROM cases WHERE case_id = ?",
+            (case_id,),
+        ).fetchone()
+        recovery_events = connection.execute(
+            "SELECT COUNT(*) FROM events WHERE case_id = ? "
+            "AND event_type = 'case.execution_recovered'",
+            (case_id,),
+        ).fetchone()[0]
+    assert tuple(authority) == (
+        claim.token,
+        claim.generation,
+        "RUNNING",
+        expired_at.isoformat(),
+        None,
+        None,
+    )
+    assert recovery_events == 0
 
 
 @pytest.mark.asyncio
@@ -5011,7 +5045,7 @@ def test_sse_never_emits_result_observed_before_concurrent_finish(
     assert payload["stop_reason"] == "DECISION_APPROVE"
 
 
-def test_sse_reloads_terminal_result_when_concurrent_recovery_wins(
+def test_terminal_payload_never_invokes_recovery(
     invoice_dir: Path,
     settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
@@ -5024,23 +5058,31 @@ def test_sse_reloads_terminal_result_when_concurrent_recovery_wins(
         lease_seconds=60,
     )
     _expire_running_case(settings, case_id)
-    original_recover = WorkflowStore.recover_expired_executions
+    recovery_calls: list[str | None] = []
 
-    def lose_after_other_recovery(self: WorkflowStore, **kwargs: object) -> list[str]:
-        assert original_recover(self, **kwargs) == [case_id]
-        return []
+    def forbidden_request_recovery(
+        _self: WorkflowStore,
+        *,
+        now: datetime | None = None,
+        case_id: str | None = None,
+    ) -> list[str]:
+        del now
+        recovery_calls.append(case_id)
+        raise AssertionError("a read path invoked durable recovery")
 
     monkeypatch.setattr(
         WorkflowStore,
         "recover_expired_executions",
-        lose_after_other_recovery,
+        forbidden_request_recovery,
     )
 
     payload = terminal_payload(settings.workflow_db, case_id, RunRegistry())
 
+    assert recovery_calls == []
     assert payload is not None
-    assert payload["status"] == "INCOMPLETE"
-    assert payload["stop_reason"] == "ORPHANED_EXECUTION"
+    assert payload["status"] == "UNAVAILABLE"
+    assert payload["stop_reason"] == "EXECUTION_RECOVERY_FAILED"
+    assert payload["recovery_verified"] is False
 
 
 def _expire_running_case(settings: Settings, case_id: str) -> tuple[int, str]:

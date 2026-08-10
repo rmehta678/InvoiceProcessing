@@ -6,7 +6,6 @@ truncated hashes); none of them alters, softens, or recomputes a stored status.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import secrets
 import sqlite3
@@ -23,8 +22,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from invoice_agents.config import Settings
-from invoice_agents.db.store import WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
+from invoice_agents.ui.recovery import RecoveryCoordinator, RecoveryHealthMiddleware
 from invoice_agents.ui.routes import router
 from invoice_agents.ui.runs import RunRegistry
 from invoice_agents.ui.security import (
@@ -41,6 +40,7 @@ from invoice_agents.ui.security import (
 )
 
 PACKAGE_DIR = Path(__file__).resolve().parent
+RECOVERY_SCAN_INTERVAL_SECONDS = 1.0
 
 NOT_FOUND_STOPS = {
     "CASE_NOT_FOUND",
@@ -217,10 +217,18 @@ def create_app(
     elif len(configured_secret) < 32:
         raise ValueError("INVOICE_UI_SESSION_SECRET must contain at least 32 bytes")
 
+    recovery_coordinator = RecoveryCoordinator(
+        selected_settings,
+        scan_interval_seconds=RECOVERY_SCAN_INTERVAL_SECONDS,
+    )
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        await asyncio.to_thread(WorkflowStore(selected_settings).recover_expired_executions)
-        yield
+        await recovery_coordinator.start()
+        try:
+            yield
+        finally:
+            await recovery_coordinator.close()
 
     app = FastAPI(
         title="Galatiq Invoice Console",
@@ -228,6 +236,10 @@ def create_app(
         redoc_url=None,
         openapi_url=None,
         lifespan=lifespan,
+    )
+    app.add_middleware(
+        RecoveryHealthMiddleware,
+        coordinator=recovery_coordinator,
     )
     app.add_middleware(
         CSRFMiddleware,
@@ -242,6 +254,7 @@ def create_app(
     app.add_middleware(SecurityHeadersMiddleware)
     app.state.settings = selected_settings
     app.state.registry = RunRegistry()
+    app.state.recovery_coordinator = recovery_coordinator
     app.state.templates = build_templates()
     app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")
     app.include_router(router)

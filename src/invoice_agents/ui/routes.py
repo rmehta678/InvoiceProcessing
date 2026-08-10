@@ -39,6 +39,7 @@ from invoice_agents.models import (
 from invoice_agents.orchestration import validate_case_concurrency
 from invoice_agents.ui import queries
 from invoice_agents.ui.preflight import key_present, run_preflight
+from invoice_agents.ui.recovery import RecoveryCoordinator
 from invoice_agents.ui.runs import RunRegistry
 from invoice_agents.ui.security import secure_cookie
 from invoice_agents.ui.sse import case_event_stream
@@ -82,6 +83,11 @@ def _settings(request: Request) -> Settings:
 def _registry(request: Request) -> RunRegistry:
     registry: RunRegistry = request.app.state.registry
     return registry
+
+
+def _recovery_coordinator(request: Request) -> RecoveryCoordinator:
+    coordinator: RecoveryCoordinator = request.app.state.recovery_coordinator
+    return coordinator
 
 
 def _store(request: Request) -> WorkflowStore:
@@ -435,6 +441,7 @@ async def case_events(request: Request, case_id: str, after: int = 0) -> EventSo
             _registry(request),
             after,
             settings=settings,
+            recovery_coordinator=_recovery_coordinator(request),
         )
     )
 
