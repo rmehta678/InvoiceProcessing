@@ -20,6 +20,7 @@ from factories import (
     make_pending_review_case,
     make_succeeded_case,
 )
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from markupsafe import escape
 
@@ -785,6 +786,30 @@ def test_batch_runs_matrix_until_terminal(
     assert "STUB_RUN_RECORDED" in final.text
     assert "SUCCEEDED" in final.text
     assert len(calls) == 2, "both prepared files ran exactly once"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_status"),
+    [("0", 400), ("-1", 400), ("9", 400), ("true", 422), ("1.5", 422)],
+)
+def test_batch_rejects_invalid_concurrency_before_registry_mutation(
+    client: TestClient,
+    app: FastAPI,
+    value: str,
+    expected_status: int,
+) -> None:
+    registry = app.state.registry
+    assert registry._batches == {}
+
+    response = client.post(
+        "/batch",
+        data={"concurrency": value},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == expected_status
+    assert registry._batches == {}
+    assert registry._runs == {}
 
 
 def test_batch_unknown_is_404(client: TestClient) -> None:

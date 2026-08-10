@@ -44,6 +44,7 @@ from invoice_agents.models import (
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 REQUIRED_JOURNAL_MODE = "delete"
+_DATETIME_WIRE_TYPE = datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +64,9 @@ class CaseExecutionSnapshot:
     result: CaseResult | None
     execution_state: str
     has_valid_lease: bool
+    execution_token: str | None
+    execution_generation: int
+    lease_expires_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,12 +110,61 @@ def parse_canonical_utc(value: object) -> datetime | None:
 def execution_claim_expiry_iso(claim: ExecutionClaim) -> str | None:
     """Return the claim's canonical UTC lease text or reject its runtime shape."""
 
+    if type(claim) is not ExecutionClaim:
+        return None
     expires_at = claim.expires_at
-    if type(expires_at) is not datetime or expires_at.tzinfo is not UTC:
+    if (
+        type(claim.case_id) is not str
+        or not claim.case_id.strip()
+        or claim.case_id != claim.case_id.strip()
+        or type(claim.token) is not str
+        or not claim.token.strip()
+        or claim.token != claim.token.strip()
+        or type(claim.generation) is not int
+        or claim.generation <= 0
+        or type(expires_at) is not _DATETIME_WIRE_TYPE
+        or expires_at.tzinfo is not UTC
+    ):
         return None
     encoded = expires_at.isoformat()
     parsed = parse_canonical_utc(encoded)
     return encoded if parsed == expires_at else None
+
+
+def validate_execution_claim(
+    claim: object,
+    *,
+    expected_case_id: str | None = None,
+) -> ExecutionClaim:
+    """Return one exact canonical claim or fail before any storage/provider boundary."""
+
+    if type(claim) is ExecutionClaim:
+        exact = claim
+        valid = execution_claim_expiry_iso(exact) is not None
+        if expected_case_id is not None:
+            valid = (
+                valid
+                and type(expected_case_id) is str
+                and bool(expected_case_id.strip())
+                and exact.case_id == expected_case_id
+            )
+        if valid:
+            return exact
+    case_id = (
+        claim.case_id
+        if type(claim) is ExecutionClaim
+        and type(claim.case_id) is str
+        and bool(claim.case_id.strip())
+        else expected_case_id
+        if type(expected_case_id) is str and bool(expected_case_id.strip())
+        else None
+    )
+    raise InvoiceAgentsError(
+        ErrorCategory.ORCHESTRATION,
+        "execution claim has an invalid runtime shape or case binding",
+        case_id=case_id,
+        stop_reason="STALE_EXECUTION_CLAIM",
+    ) from None
 
 
 def _authoritative_source_for_case(connection: sqlite3.Connection, case_id: str) -> SourceArtifact:
@@ -935,8 +988,72 @@ class WorkflowStore:
     def require_current_execution_claim(self, claim: ExecutionClaim) -> None:
         """Prove exact, unexpired execution authority without mutating storage."""
 
+        claim = validate_execution_claim(claim)
         with connect_database(self.path, read_only=True) as connection:
             self._begin_current_read(connection, claim)
+
+    def load_authoritative_case_source_id(self, claim: ExecutionClaim) -> str:
+        """Validate and return the source identity in the exact claim's read snapshot."""
+
+        claim = validate_execution_claim(claim)
+        with connect_database(self.path, read_only=True) as connection:
+            self._begin_current_read(connection, claim)
+            try:
+                return _authoritative_source_for_case(connection, claim.case_id).source_id
+            except EvidenceSnapshotError:
+                raise InvoiceAgentsError(
+                    ErrorCategory.DATABASE,
+                    "case source authority is missing or inconsistent",
+                    case_id=claim.case_id,
+                    stop_reason="PERSISTED_RESULT_INVALID",
+                ) from None
+
+    def load_recovery_case_source_id(self, claim: ExecutionClaim) -> str:
+        """Load source authority for this exact running or finished generation."""
+
+        claim = validate_execution_claim(claim)
+        with connect_database(self.path, read_only=True) as connection:
+            connection.execute("BEGIN")
+            row = connection.execute(
+                "SELECT execution_token, execution_generation, execution_state, "
+                "lease_expires_at FROM cases WHERE case_id = ?",
+                (claim.case_id,),
+            ).fetchone()
+            if row is not None and not self._authority_tuple_is_valid(row):
+                raise InvoiceAgentsError(
+                    ErrorCategory.DATABASE,
+                    "case has a contradictory execution authority tuple",
+                    case_id=claim.case_id,
+                    stop_reason="EXECUTION_AUTHORITY_CORRUPT",
+                ) from None
+            exact_running = (
+                row is not None
+                and row["execution_state"] == "RUNNING"
+                and row["lease_expires_at"] == claim.expires_at.isoformat()
+                and claim.expires_at > datetime.now(UTC)
+            )
+            exact_finished = (
+                row is not None
+                and row["execution_state"] == "FINISHED"
+                and row["lease_expires_at"] is None
+            )
+            if (
+                row is None
+                or row["execution_token"] != claim.token
+                or type(row["execution_generation"]) is not int
+                or row["execution_generation"] != claim.generation
+                or not (exact_running or exact_finished)
+            ):
+                self._raise_stale_execution_claim(claim)
+            try:
+                return _authoritative_source_for_case(connection, claim.case_id).source_id
+            except EvidenceSnapshotError:
+                raise InvoiceAgentsError(
+                    ErrorCategory.DATABASE,
+                    "case source authority is missing or inconsistent",
+                    case_id=claim.case_id,
+                    stop_reason="PERSISTED_RESULT_INVALID",
+                ) from None
 
     def register_source(self, source: SourceArtifact) -> None:
         with connect_database(self.path) as connection:
@@ -1091,6 +1208,7 @@ class WorkflowStore:
     def renew_case_execution(self, claim: ExecutionClaim, lease_seconds: int) -> ExecutionClaim:
         """Renew only the still-current, unexpired execution claim."""
 
+        claim = validate_execution_claim(claim)
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         with connect_database(self.path) as connection:
@@ -1120,6 +1238,7 @@ class WorkflowStore:
     def release_case_execution(self, claim: ExecutionClaim) -> None:
         """Release a preparation-only claim without fabricating a terminal result."""
 
+        claim = validate_execution_claim(claim)
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             released_at = datetime.now(UTC)
@@ -1145,6 +1264,7 @@ class WorkflowStore:
     def handoff_case_execution(self, claim: ExecutionClaim, lease_seconds: int) -> ExecutionClaim:
         """Atomically replace preparation authority with the claim used by its run."""
 
+        claim = validate_execution_claim(claim)
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         token = f"exec_{uuid4().hex}"
@@ -1264,6 +1384,9 @@ class WorkflowStore:
             has_valid_lease=(
                 execution_state == "RUNNING" and lease is not None and lease > observed_at
             ),
+            execution_token=cast(str | None, row["execution_token"]),
+            execution_generation=int(row["execution_generation"]),
+            lease_expires_at=lease,
         )
 
     def recover_expired_executions(
@@ -1761,6 +1884,7 @@ class WorkflowStore:
         claim: ExecutionClaim,
         checked_at: datetime,
     ) -> None:
+        claim = validate_execution_claim(claim)
         row = connection.execute(
             "SELECT execution_token, execution_generation, execution_state, "
             "lease_expires_at FROM cases WHERE case_id = ?",
@@ -1830,8 +1954,7 @@ class WorkflowStore:
     def save_extraction(
         self, case_id: str, invoice: ExtractedInvoice, claim: ExecutionClaim
     ) -> str:
-        if claim.case_id != case_id:
-            self._raise_stale_execution_claim(claim)
+        claim = validate_execution_claim(claim, expected_case_id=case_id)
         extraction_id = f"ext_{uuid4().hex}"
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1893,6 +2016,7 @@ class WorkflowStore:
         return ExtractedInvoice.model_validate_json(row["payload_json"])
 
     def load_current_extraction(self, claim: ExecutionClaim) -> ExtractedInvoice:
+        claim = validate_execution_claim(claim)
         with connect_database(self.path, read_only=True) as connection:
             self._begin_current_read(connection, claim)
             row = connection.execute(
@@ -1928,8 +2052,7 @@ class WorkflowStore:
         )
 
     def save_comparison(self, case_id: str, kind: str, payload: Any, claim: ExecutionClaim) -> str:
-        if claim.case_id != case_id:
-            self._raise_stale_execution_claim(claim)
+        claim = validate_execution_claim(claim, expected_case_id=case_id)
         comparison_id = f"cmp_{uuid4().hex}"
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1962,6 +2085,7 @@ class WorkflowStore:
         return json.loads(row["payload_json"]) if row else None
 
     def load_current_comparison(self, claim: ExecutionClaim, kind: str) -> Any:
+        claim = validate_execution_claim(claim)
         with connect_database(self.path, read_only=True) as connection:
             self._begin_current_read(connection, claim)
             row = connection.execute(
@@ -1991,6 +2115,7 @@ class WorkflowStore:
         return Critique.model_validate(payload)
 
     def load_current_critique(self, claim: ExecutionClaim) -> Critique:
+        claim = validate_execution_claim(claim)
         payload = self._load_current_payload("critique_results", claim)
         if not payload:
             raise InvoiceAgentsError(
@@ -2004,6 +2129,7 @@ class WorkflowStore:
     def adopt_latest_evidence(self, claim: ExecutionClaim) -> None:
         """Promote one complete, coherent immediate-predecessor snapshot."""
 
+        claim = validate_execution_claim(claim)
         with connect_database(self.path) as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -2140,6 +2266,7 @@ class WorkflowStore:
     def promote_predecessor_extraction(self, claim: ExecutionClaim) -> ExtractedInvoice:
         """Promote only preparation's immediate-predecessor extraction into a fresh run."""
 
+        claim = validate_execution_claim(claim)
         with connect_database(self.path) as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -2262,13 +2389,12 @@ class WorkflowStore:
         visible IntegrityError instead of a silently reordered queue.
         """
 
+        claim = validate_execution_claim(claim, expected_case_id=review.case_id)
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             written_at = datetime.now(UTC)
             self._require_current_claim(connection, claim, written_at)
             self._assert_evidence_generation_mutable(connection, review.case_id, claim.generation)
-            if claim.case_id != review.case_id:
-                self._raise_stale_execution_claim(claim)
             try:
                 snapshot = load_generation_evidence_snapshot(
                     connection,
@@ -2331,6 +2457,7 @@ class WorkflowStore:
     def load_current_review(self, claim: ExecutionClaim) -> ReviewRequest | None:
         """Return only the latest review owned by the current unexpired generation."""
 
+        claim = validate_execution_claim(claim)
         with connect_database(self.path, read_only=True) as connection:
             self._begin_current_read(connection, claim)
             row = connection.execute(
@@ -2530,8 +2657,7 @@ class WorkflowStore:
     def save_final_decision(
         self, case_id: str, decision: FinalDecision, claim: ExecutionClaim
     ) -> None:
-        if claim.case_id != case_id:
-            self._raise_stale_execution_claim(claim)
+        claim = validate_execution_claim(claim, expected_case_id=case_id)
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             written_at = datetime.now(UTC).isoformat()
@@ -2677,6 +2803,7 @@ class WorkflowStore:
     def load_current_final_decision(self, claim: ExecutionClaim) -> FinalDecision | None:
         """Return only a final decision owned by the current unexpired generation."""
 
+        claim = validate_execution_claim(claim)
         with connect_database(self.path, read_only=True) as connection:
             self._begin_current_read(connection, claim)
             row = connection.execute(
@@ -2687,8 +2814,7 @@ class WorkflowStore:
         return FinalDecision.model_validate_json(row["payload_json"], strict=True) if row else None
 
     def save_team_state(self, case_id: str, state: dict[str, Any], claim: ExecutionClaim) -> None:
-        if claim.case_id != case_id:
-            self._raise_stale_execution_claim(claim)
+        claim = validate_execution_claim(claim, expected_case_id=case_id)
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             written_at = datetime.now(UTC).isoformat()
@@ -2726,12 +2852,12 @@ class WorkflowStore:
         return json.loads(row["team_state_json"]) if row["team_state_json"] else None
 
     def finish_case(self, result: CaseResult, claim: ExecutionClaim) -> None:
-        if claim.case_id != result.case_id:
-            self._raise_stale_execution_claim(claim)
+        claim = validate_execution_claim(claim, expected_case_id=result.case_id)
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             written_at = datetime.now(UTC).isoformat()
             self._require_current_claim(connection, claim, datetime.fromisoformat(written_at))
+            self._require_terminal_result_identity(connection, result)
             updated = connection.execute(
                 "UPDATE cases SET status = ?, stop_reason = ?, result_json = ?, updated_at = ?, "
                 "finished_at = ?, execution_state = 'FINISHED', lease_expires_at = NULL "
@@ -2757,11 +2883,11 @@ class WorkflowStore:
     def update_finished_case_result(self, result: CaseResult, claim: ExecutionClaim) -> None:
         """Replace only this generation's terminal envelope after a secondary fault."""
 
-        if claim.case_id != result.case_id:
-            self._raise_stale_execution_claim(claim)
+        claim = validate_execution_claim(claim, expected_case_id=result.case_id)
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             written_at = datetime.now(UTC).isoformat()
+            self._require_terminal_result_identity(connection, result)
             updated = connection.execute(
                 "UPDATE cases SET status = ?, stop_reason = ?, result_json = ?, "
                 "updated_at = ?, finished_at = ? WHERE case_id = ? "
@@ -2782,6 +2908,30 @@ class WorkflowStore:
                 connection.rollback()
                 self._raise_stale_execution_claim(claim)
             connection.commit()
+
+    @staticmethod
+    def _require_terminal_result_identity(
+        connection: sqlite3.Connection,
+        result: CaseResult,
+    ) -> None:
+        """Validate aggregate source identity against authoritative rows in this write tx."""
+
+        try:
+            source = _authoritative_source_for_case(connection, result.case_id)
+        except EvidenceSnapshotError:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "terminal result source authority is missing or inconsistent",
+                case_id=result.case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from None
+        if result.source_id != source.source_id:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "terminal result identity does not match its authoritative source",
+                case_id=result.case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from None
 
     def load_case_source_id(self, case_id: str) -> str | None:
         with connect_database(self.path, read_only=True) as connection:
@@ -2843,11 +2993,10 @@ class WorkflowStore:
         payload: Any,
         claim: ExecutionClaim,
     ) -> None:
+        claim = validate_execution_claim(claim, expected_case_id=case_id)
         allowed = {"identity_results", "critique_results"}
         if table not in allowed:
             raise ValueError(f"unsupported payload table: {table}")
-        if claim.case_id != case_id:
-            self._raise_stale_execution_claim(claim)
         with connect_database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             written_at = datetime.now(UTC)
@@ -2895,6 +3044,7 @@ class WorkflowStore:
         return json.loads(row["payload_json"]) if row else []
 
     def _load_current_payload(self, table: str, claim: ExecutionClaim) -> Any:
+        claim = validate_execution_claim(claim)
         allowed = {"identity_results", "critique_results"}
         if table not in allowed:
             raise ValueError(f"unsupported payload table: {table}")
@@ -2910,5 +3060,6 @@ class WorkflowStore:
     def _begin_current_read(self, connection: sqlite3.Connection, claim: ExecutionClaim) -> None:
         """Pin a read snapshot after proving the claim is current in that snapshot."""
 
+        claim = validate_execution_claim(claim)
         connection.execute("BEGIN")
         self._require_current_claim(connection, claim, datetime.now(UTC))

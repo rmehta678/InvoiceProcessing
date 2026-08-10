@@ -33,6 +33,7 @@ from invoice_agents.models import (
     HumanDecisionKind,
     ReviewRequest,
 )
+from invoice_agents.orchestration import validate_case_concurrency
 from invoice_agents.ui import queries
 from invoice_agents.ui.preflight import key_present, run_preflight
 from invoice_agents.ui.runs import RunRegistry
@@ -290,7 +291,7 @@ async def case_resume(request: Request, case_id: str) -> Response:
             stop_reason="HUMAN_DECISION_MISSING",
         )
         return _render(request, "error.html", {"nav": None, "error": error}, status_code=409)
-    registry.start_resume(case_id, settings)
+    await registry.start_resume(case_id, settings)
     return RedirectResponse("/reviews", status_code=303)
 
 
@@ -630,8 +631,16 @@ async def submit_batch(
             stop_reason="SOURCE_NOT_FOUND",
         )
         return _render(request, "error.html", {"nav": None, "error": error}, status_code=400)
-    bounded = max(1, min(8, concurrency or settings.case_concurrency))
-    batch = await registry.start_batch(paths, settings, bounded)
+    try:
+        selected_concurrency = validate_case_concurrency(concurrency, settings.case_concurrency)
+    except ValueError:
+        error = InvoiceAgentsError(
+            ErrorCategory.CONFIGURATION,
+            "batch concurrency must be a positive integer",
+            stop_reason="INVALID_CONCURRENCY",
+        )
+        return _render(request, "error.html", {"nav": None, "error": error}, status_code=400)
+    batch = await registry.start_batch(paths, settings, selected_concurrency)
     return RedirectResponse(f"/batches/{batch.batch_id}", status_code=303)
 
 

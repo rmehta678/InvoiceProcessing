@@ -23,6 +23,7 @@ from invoice_agents.db.store import (
     load_authoritative_review_authorization,
     load_authorization_evidence_snapshot,
     parse_canonical_utc,
+    validate_execution_claim,
     validated_evidence_facts,
 )
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
@@ -262,19 +263,13 @@ def mock_payment(
 ) -> PaymentResult:
     """Authorize and record payment from one transaction-local evidence snapshot."""
 
+    claim = validate_execution_claim(claim, expected_case_id=case_id)
     if store.path != workflow_db.resolve():
         raise InvoiceAgentsError(
             ErrorCategory.DATABASE,
             "payment store and workflow database paths do not match",
             case_id=case_id,
             stop_reason="PAYMENT_DATABASE_MISMATCH",
-        )
-    if claim.case_id != case_id:
-        raise InvoiceAgentsError(
-            ErrorCategory.PAYMENT,
-            "payment execution claim does not belong to this case",
-            case_id=case_id,
-            stop_reason="STALE_EXECUTION_CLAIM",
         )
     snapshot_settings = store._snapshot_settings()
 

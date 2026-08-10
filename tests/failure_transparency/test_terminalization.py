@@ -6,11 +6,12 @@ import asyncio
 import json
 import os
 import sqlite3
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Event, Timer
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -18,7 +19,7 @@ from autogen_agentchat.base import TaskResult
 from fastapi.testclient import TestClient
 from ui.factories import make_pending_review_case, make_succeeded_case
 
-from invoice_agents import orchestration
+from invoice_agents import orchestration, terminal_process
 from invoice_agents.config import Settings
 from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
@@ -62,6 +63,12 @@ def _prepared_case(invoice_dir: Path, settings: Settings) -> tuple[str, datetime
     prepared = orchestration.prepare_case(invoice_dir / "invoice_1001.txt", settings)
     assert isinstance(prepared, tuple)
     return prepared
+
+
+def _failed_terminal_worker(**_kwargs: object) -> terminal_process.TerminalProcessOutcome:
+    """Protocol-level terminal failure for fresh-interpreter boundary tests."""
+
+    return terminal_process.TerminalProcessOutcome(None, "TERMINAL_WORKER_FAILED")
 
 
 async def _run_prepared_with_new_claim(
@@ -202,11 +209,14 @@ async def test_cancellation_during_terminal_evidence_refresh_is_recovery_durable
         return original_record(self, event_type, *args, **kwargs)
 
     monkeypatch.setattr(orchestration.AuditRecorder, "record", fail_final_audit)
-    monkeypatch.setattr(
-        WorkflowStore,
-        "update_finished_case_result",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(asyncio.CancelledError),
-    )
+    original_terminal_process = orchestration.run_terminal_process
+
+    def cancel_update(**kwargs: object) -> terminal_process.TerminalProcessOutcome:
+        if kwargs["mode"] == "update":
+            raise asyncio.CancelledError
+        return original_terminal_process(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(orchestration, "run_terminal_process", cancel_update)
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(asyncio.CancelledError):
@@ -247,13 +257,14 @@ async def test_process_control_during_terminal_evidence_refresh_is_reraised(
         return original_record(self, event_type, *args, **kwargs)
 
     monkeypatch.setattr(orchestration.AuditRecorder, "record", fail_final_audit)
-    monkeypatch.setattr(
-        WorkflowStore,
-        "update_finished_case_result",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            SystemExit("terminal refresh sk-proj-private-sentinel")
-        ),
-    )
+    original_terminal_process = orchestration.run_terminal_process
+
+    def exit_update(**kwargs: object) -> terminal_process.TerminalProcessOutcome:
+        if kwargs["mode"] == "update":
+            raise SystemExit("terminal refresh sk-proj-private-sentinel")
+        return original_terminal_process(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(orchestration, "run_terminal_process", exit_update)
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(SystemExit):
@@ -566,11 +577,12 @@ async def test_ui_single_launch_hands_off_durable_claim_before_return(
     handle.task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await handle.task
-    if captured[0] is not None:
-        WorkflowStore(settings).release_case_execution(captured[0])
 
     assert lease_was_durable
     assert captured[0] is not None
+    snapshot = WorkflowStore(settings).load_case_execution_snapshot(outcome)
+    assert snapshot is not None and snapshot.execution_state == "FINISHED"
+    assert snapshot.result is not None and snapshot.result.stop_reason == "CANCELLED"
 
 
 @pytest.mark.asyncio
@@ -596,18 +608,19 @@ async def test_ui_resume_claims_before_scheduling(
 
     monkeypatch.setattr(ui_runs, "resume_case", block_resume)
     registry = RunRegistry()
-    handle = registry.start_resume(case_id, settings)
+    handle = await registry.start_resume(case_id, settings)
     lease_was_durable = WorkflowStore(settings).has_valid_execution_lease(case_id)
     assert handle.task is not None
     await asyncio.wait_for(started.wait(), timeout=0.2)
     handle.task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await handle.task
-    if captured[0] is not None:
-        WorkflowStore(settings).release_case_execution(captured[0])
 
     assert lease_was_durable
     assert captured[0] is not None
+    snapshot = WorkflowStore(settings).load_case_execution_snapshot(case_id)
+    assert snapshot is not None and snapshot.execution_state == "FINISHED"
+    assert snapshot.result is not None and snapshot.result.stop_reason == "CANCELLED"
 
 
 @pytest.mark.asyncio
@@ -1262,7 +1275,7 @@ def test_terminal_payload_reports_corrupt_persisted_result_explicitly(
     store.finish_case(
         CaseResult(
             case_id=case_id,
-            source_id=None,
+            source_id=store.load_case_source_id(case_id),
             status=CaseStatus.FAILED,
             stop_reason="FIXTURE_TERMINAL",
             started_at=started_at,
@@ -1736,10 +1749,7 @@ async def test_terminal_db_failure_writes_atomic_recovery_artifact(
     monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: _ClosingClient())
     monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: _MaxMessagesTeam())
 
-    def fail_terminal_write(_self: WorkflowStore, _result: CaseResult, _claim: object) -> None:
-        raise sqlite3.OperationalError("terminal write sk-proj-secret")
-
-    monkeypatch.setattr(WorkflowStore, "finish_case", fail_terminal_write)
+    monkeypatch.setattr(orchestration, "run_terminal_process", _failed_terminal_worker)
     monkeypatch.chdir(tmp_path)
 
     result = await _run_prepared_with_new_claim(case_id, started_at, settings)
@@ -1751,7 +1761,8 @@ async def test_terminal_db_failure_writes_atomic_recovery_artifact(
     assert recovery.is_file()
     assert not (recovery.parent / f"{case_id}.recovery.json.tmp").exists()
     payload = json.loads(recovery.read_text(encoding="utf-8"))
-    assert payload["recovery_format"] == 1
+    assert payload["recovery_format"] == 2
+    assert payload["case_id"] == case_id
     assert payload["case_result"]["case_id"] == case_id
     assert payload["terminal_persistence_error"]["stop_reason"] == ("TERMINAL_PERSISTENCE_FAILED")
     assert "sk-proj-secret" not in recovery.read_text(encoding="utf-8")
@@ -1769,16 +1780,13 @@ async def test_terminal_db_and_recovery_artifact_failure_raise_explicitly(
     monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: _ClosingClient())
     monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: _MaxMessagesTeam())
 
-    def fail_terminal_write(_self: WorkflowStore, _result: CaseResult, _claim: object) -> None:
-        raise sqlite3.OperationalError("terminal database private sentinel")
-
     def fail_recovery_replace(
         _source: os.PathLike[str] | str, target: os.PathLike[str] | str
     ) -> None:
         assert str(target).endswith(f"{case_id}.recovery.json")
         raise OSError("recovery artifact private sentinel")
 
-    monkeypatch.setattr(WorkflowStore, "finish_case", fail_terminal_write)
+    monkeypatch.setattr(orchestration, "run_terminal_process", _failed_terminal_worker)
     monkeypatch.setattr(os, "replace", fail_recovery_replace)
     monkeypatch.chdir(tmp_path)
 
@@ -1812,13 +1820,7 @@ async def test_recovery_artifact_process_control_becomes_one_chainless_failure(
 
     monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: ObservedClient())
     monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: _MaxMessagesTeam())
-    monkeypatch.setattr(
-        WorkflowStore,
-        "finish_case",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            sqlite3.OperationalError("terminal database private sentinel")
-        ),
-    )
+    monkeypatch.setattr(orchestration, "run_terminal_process", _failed_terminal_worker)
     monkeypatch.setattr(
         orchestration,
         "_write_recovery_artifact",
@@ -1893,7 +1895,7 @@ async def test_cancelled_execution_bounds_hung_client_cleanup(
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(
             _run_prepared_with_new_claim(case_id, started_at, settings),
-            timeout=0.2,
+            timeout=2.0,
         )
 
     await asyncio.wait_for(close_finished.wait(), timeout=0.2)
@@ -1965,17 +1967,18 @@ async def test_cancellation_during_terminal_write_retries_cancel_result_once(
     case_id, started_at = _prepared_case(invoice_dir, settings)
     monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: _ClosingClient())
     monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: _MaxMessagesTeam())
-    original_finish = WorkflowStore.finish_case
     calls = 0
 
-    def cancel_first_finish(self: WorkflowStore, result: CaseResult, claim: ExecutionClaim) -> None:
+    original_terminal_process = orchestration.run_terminal_process
+
+    def cancel_first_finish(**kwargs: object) -> terminal_process.TerminalProcessOutcome:
         nonlocal calls
         calls += 1
         if calls == 1:
             raise asyncio.CancelledError
-        original_finish(self, result, claim)
+        return original_terminal_process(**kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(WorkflowStore, "finish_case", cancel_first_finish)
+    monkeypatch.setattr(orchestration, "run_terminal_process", cancel_first_finish)
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(asyncio.CancelledError):
@@ -2003,12 +2006,12 @@ async def test_cancelled_execution_does_not_repeat_failed_terminal_write(
     monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: _CancelledTeam())
     calls = 0
 
-    def fail_terminal_write(_self: WorkflowStore, _result: CaseResult, _claim: object) -> None:
+    def fail_terminal_write(**_kwargs: object) -> terminal_process.TerminalProcessOutcome:
         nonlocal calls
         calls += 1
-        raise sqlite3.OperationalError("terminal write private credential")
+        return terminal_process.TerminalProcessOutcome(None, "TERMINAL_WORKER_FAILED")
 
-    monkeypatch.setattr(WorkflowStore, "finish_case", fail_terminal_write)
+    monkeypatch.setattr(orchestration, "run_terminal_process", fail_terminal_write)
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(asyncio.CancelledError):
@@ -2642,13 +2645,7 @@ async def test_ui_batch_cancel_surfaces_active_terminal_recovery_failure(
     assert batch.task is not None
     await asyncio.wait_for(started.wait(), timeout=0.5)
 
-    monkeypatch.setattr(
-        WorkflowStore,
-        "finish_case",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            sqlite3.OperationalError("batch terminal persistence private sentinel")
-        ),
-    )
+    monkeypatch.setattr(orchestration, "run_terminal_process", _failed_terminal_worker)
     monkeypatch.setattr(
         orchestration,
         "_write_recovery_artifact",
@@ -2697,13 +2694,7 @@ async def test_ui_batch_cancel_publishes_recovery_for_active_and_queued_claims(
     )
     assert batch.task is not None
     await asyncio.wait_for(started.wait(), timeout=0.5)
-    monkeypatch.setattr(
-        WorkflowStore,
-        "finish_case",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            sqlite3.OperationalError("batch terminal persistence private sentinel")
-        ),
-    )
+    monkeypatch.setattr(orchestration, "run_terminal_process", _failed_terminal_worker)
 
     batch.task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -2737,9 +2728,6 @@ async def test_one_terminal_db_failure_publishes_recovery_exactly_once(
     monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: _ClosingClient())
     monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: _MaxMessagesTeam())
 
-    def fail_finish(_self: WorkflowStore, _result: CaseResult, _claim: ExecutionClaim) -> None:
-        raise sqlite3.OperationalError("single terminal persistence failure")
-
     publications: list[str] = []
     original_publish = orchestration._write_recovery_artifact
 
@@ -2747,7 +2735,7 @@ async def test_one_terminal_db_failure_publishes_recovery_exactly_once(
         publications.append(result.case_id)
         return original_publish(result, error)
 
-    monkeypatch.setattr(WorkflowStore, "finish_case", fail_finish)
+    monkeypatch.setattr(orchestration, "run_terminal_process", _failed_terminal_worker)
     monkeypatch.setattr(orchestration, "_write_recovery_artifact", count_publish)
     monkeypatch.chdir(tmp_path)
 
@@ -2990,13 +2978,7 @@ async def test_ui_batch_recovery_failure_precedes_ordinary_child_failure(
         raise AssertionError("unreachable")
 
     monkeypatch.setattr(ui_runs, "run_prepared_case", fail_first_runner)
-    monkeypatch.setattr(
-        WorkflowStore,
-        "finish_case",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            sqlite3.OperationalError("terminal persistence sentinel")
-        ),
-    )
+    monkeypatch.setattr(orchestration, "run_terminal_process", _failed_terminal_worker)
     monkeypatch.setattr(
         orchestration,
         "_write_recovery_artifact",
@@ -3060,13 +3042,7 @@ async def test_core_batch_recovery_failure_precedes_later_ordinary_child_failure
         raise AssertionError("unreachable")
 
     monkeypatch.setattr(orchestration, "run_prepared_case", block_then_fail)
-    monkeypatch.setattr(
-        WorkflowStore,
-        "finish_case",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            sqlite3.OperationalError("terminal persistence sentinel")
-        ),
-    )
+    monkeypatch.setattr(orchestration, "run_terminal_process", _failed_terminal_worker)
     monkeypatch.setattr(
         orchestration,
         "_write_recovery_artifact",
@@ -3117,18 +3093,7 @@ async def test_blocking_terminal_write_times_out_without_blocking_event_loop(
     prepared = orchestration.prepare_claimed_invoice(invoice_dir / "invoice_1001.txt", settings)
     assert isinstance(prepared, tuple)
     case_id, started_at, claim = prepared
-    original_finish = WorkflowStore.finish_case
-    release = Event()
-    completed = Event()
-
-    def blocking_finish(
-        store: WorkflowStore, result: CaseResult, exact_claim: ExecutionClaim
-    ) -> None:
-        try:
-            assert release.wait(timeout=1)
-            original_finish(store, result, exact_claim)
-        finally:
-            completed.set()
+    worker_pid = tmp_path / "terminal-worker.pid"
 
     publications: list[str] = []
     original_publish = orchestration._write_recovery_artifact
@@ -3137,33 +3102,38 @@ async def test_blocking_terminal_write_times_out_without_blocking_event_loop(
         publications.append(result.case_id)
         return original_publish(result, error)
 
-    monkeypatch.setattr(WorkflowStore, "finish_case", blocking_finish)
+    monkeypatch.setattr(
+        terminal_process,
+        "_terminal_worker_command",
+        lambda: [
+            sys.executable,
+            "-c",
+            (
+                "import os,time; from pathlib import Path; "
+                f"Path({str(worker_pid)!r}).write_text(str(os.getpid())); time.sleep(10)"
+            ),
+        ],
+    )
     monkeypatch.setattr(orchestration, "_write_recovery_artifact", count_publish)
     monkeypatch.setattr(orchestration, "DURABILITY_DEADLINE_SECONDS", 0.03)
     monkeypatch.chdir(tmp_path)
-    release_timer = Timer(0.2, release.set)
-    release_timer.start()
     before = asyncio.get_running_loop().time()
-    try:
-        with pytest.raises(InvoiceAgentsError) as excinfo:
-            await orchestration._durably_cancel_unstarted_claim(
-                case_id, started_at, settings, claim
-            )
-        elapsed = asyncio.get_running_loop().time() - before
-        assert excinfo.value.stop_reason == "TERMINAL_DURABILITY_TIMEOUT"
-        assert excinfo.value.__cause__ is None
-        assert excinfo.value.__context__ is None
-        assert elapsed < 0.15
-        recovery = tmp_path / "artifacts" / "results" / f"{case_id}.recovery.json"
-        payload = json.loads(recovery.read_text(encoding="utf-8"))
-        assert payload["terminal_persistence_error"]["stop_reason"] == (
-            "TERMINAL_DURABILITY_TIMEOUT"
-        )
-        assert publications == [case_id]
-    finally:
-        release.set()
-        release_timer.cancel()
-        assert await asyncio.to_thread(completed.wait, 1)
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        await orchestration._durably_cancel_unstarted_claim(case_id, started_at, settings, claim)
+    elapsed = asyncio.get_running_loop().time() - before
+    assert excinfo.value.stop_reason == "TERMINAL_DURABILITY_TIMEOUT"
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+    assert elapsed < 2.0
+    recovery = tmp_path / "artifacts" / "results" / f"{case_id}.recovery.json"
+    payload = json.loads(recovery.read_text(encoding="utf-8"))
+    assert payload["terminal_persistence_error"]["stop_reason"] == (
+        "TERMINAL_DURABILITY_TIMEOUT"
+    )
+    assert publications == [case_id]
+    pid = int(worker_pid.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
 
 
 @pytest.mark.asyncio
@@ -3182,19 +3152,6 @@ async def test_ui_batch_timeout_publishes_once_and_leaves_handle_unresolved(
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
 
-    original_finish = WorkflowStore.finish_case
-    release = Event()
-    completed = Event()
-
-    def blocking_finish(
-        store: WorkflowStore, result: CaseResult, exact_claim: ExecutionClaim
-    ) -> None:
-        try:
-            assert release.wait(timeout=1)
-            original_finish(store, result, exact_claim)
-        finally:
-            completed.set()
-
     publications: list[str] = []
     original_publish = orchestration._write_recovery_artifact
 
@@ -3203,7 +3160,11 @@ async def test_ui_batch_timeout_publishes_once_and_leaves_handle_unresolved(
         return original_publish(result, error)
 
     monkeypatch.setattr(ui_runs, "run_prepared_case", blocking_runner)
-    monkeypatch.setattr(WorkflowStore, "finish_case", blocking_finish)
+    monkeypatch.setattr(
+        terminal_process,
+        "_terminal_worker_command",
+        lambda: [sys.executable, "-c", "import time; time.sleep(10)"],
+    )
     monkeypatch.setattr(orchestration, "_write_recovery_artifact", count_publish)
     monkeypatch.setattr(orchestration, "DURABILITY_DEADLINE_SECONDS", 0.03)
     monkeypatch.setattr(ui_runs, "DURABILITY_DEADLINE_SECONDS", 0.03)
@@ -3212,27 +3173,20 @@ async def test_ui_batch_timeout_publishes_once_and_leaves_handle_unresolved(
     batch = await registry.start_batch([invoice_dir / "invoice_1001.txt"], settings, concurrency=1)
     assert batch.task is not None
     await asyncio.wait_for(runner_started.wait(), timeout=1)
-    release_timer = Timer(0.2, release.set)
-    release_timer.start()
     before = asyncio.get_running_loop().time()
-    try:
-        batch.task.cancel()
-        with pytest.raises(InvoiceAgentsError) as excinfo:
-            await asyncio.wait_for(batch.task, timeout=0.5)
-        elapsed = asyncio.get_running_loop().time() - before
-        assert excinfo.value.stop_reason == "TERMINAL_DURABILITY_TIMEOUT"
-        assert excinfo.value.__cause__ is None
-        assert excinfo.value.__context__ is None
-        assert elapsed < 0.15
-        recovery = tmp_path / "artifacts" / "results" / f"{batch.entries[0].case_id}.recovery.json"
-        assert recovery.is_file()
-        assert publications == [batch.entries[0].case_id]
-        handle = registry.handle(batch.entries[0].case_id)
-        assert handle is not None and handle.state == "unresolved"
-    finally:
-        release.set()
-        release_timer.cancel()
-        assert await asyncio.to_thread(completed.wait, 1)
+    batch.task.cancel()
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        await asyncio.wait_for(batch.task, timeout=5.0)
+    elapsed = asyncio.get_running_loop().time() - before
+    assert excinfo.value.stop_reason == "TERMINAL_DURABILITY_TIMEOUT"
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+    assert elapsed < 4.0
+    recovery = tmp_path / "artifacts" / "results" / f"{batch.entries[0].case_id}.recovery.json"
+    assert recovery.is_file()
+    assert publications == [batch.entries[0].case_id]
+    handle = registry.handle(batch.entries[0].case_id)
+    assert handle is not None and handle.state == "unresolved"
 
 
 @pytest.mark.asyncio

@@ -38,7 +38,7 @@
     <a href="/cases/{{ header.case_id }}/live">watch it live</a>.</p>
   {% endif %}
   {% if run_error %}
-  <p class="text-fail small">Background run error (verbatim): {{ run_error }}</p>
+  <p class="text-fail small">Background run error code: {{ run_error }}</p>
   {% endif %}
   {% if review and review.status == 'PENDING' %}
   <p class="stream-note no-print">This case is waiting for a human decision &mdash;

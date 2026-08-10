@@ -21,7 +21,7 @@ from invoice_agents.agents.decision_rules import (
     validate_final_decision,
 )
 from invoice_agents.config import XAI_BASE_URL, XAI_MODEL, Settings
-from invoice_agents.db.store import ExecutionClaim, WorkflowStore
+from invoice_agents.db.store import ExecutionClaim, WorkflowStore, validate_execution_claim
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.hitl.service import create_review_request
 from invoice_agents.models import (
@@ -59,6 +59,9 @@ class AgentCaseContext:
     claim: ExecutionClaim
     payment_result: PaymentResult | None = None
     tool_failures: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.claim = validate_execution_claim(self.claim, expected_case_id=self.case_id)
 
     def invoice(self) -> ExtractedInvoice:
         return self.store.load_current_extraction(self.claim)

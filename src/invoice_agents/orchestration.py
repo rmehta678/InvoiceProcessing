@@ -8,11 +8,12 @@ import os
 import re
 import sqlite3
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 import openai
@@ -23,7 +24,7 @@ from autogen_agentchat.messages import (
     ToolCallExecutionEvent,
     ToolCallRequestEvent,
 )
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from invoice_agents.agents.team import AgentCaseContext, build_team, create_model_client
 from invoice_agents.config import XAI_BASE_URL, XAI_MODEL, Settings
@@ -31,7 +32,8 @@ from invoice_agents.db.core import DatabaseKind, verify_database
 from invoice_agents.db.store import (
     ExecutionClaim,
     WorkflowStore,
-    execution_claim_expiry_iso,
+    parse_canonical_utc,
+    validate_execution_claim,
 )
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import (
@@ -48,6 +50,7 @@ from invoice_agents.models import (
 )
 from invoice_agents.observability.audit import AuditRecorder, bind_audit_recorder
 from invoice_agents.source_store import snapshot_source
+from invoice_agents.terminal_process import TerminalProcessOutcome, run_terminal_process
 from invoice_agents.tools.comparison import (
     InventoryReader,
     apply_mapping_evidence,
@@ -64,6 +67,9 @@ EXECUTION_LEASE_SECONDS = 21_600
 EXECUTION_RENEWAL_INTERVAL_SECONDS = 30.0
 CLIENT_CLOSE_TIMEOUT_SECONDS = 5.0
 DURABILITY_DEADLINE_SECONDS = 5.0
+TERMINAL_WORKER_CLEANUP_GRACE_SECONDS = 5.0
+RECOVERY_ARTIFACT_FORMAT: Literal[2] = 2
+RECOVERY_ARTIFACT_MAX_BYTES = 1_048_576
 
 
 def is_max_messages_stop(stop_reason: str) -> bool:
@@ -74,6 +80,15 @@ def is_max_messages_stop(stop_reason: str) -> bool:
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def validate_case_concurrency(value: object, configured_default: object) -> int:
+    """Select only an exact positive integer; ``None`` alone requests the default."""
+
+    selected = configured_default if value is None else value
+    if type(selected) is not int or not 1 <= selected <= 8:
+        raise ValueError("concurrency must be an exact integer from 1 through 8")
+    return selected
 
 
 async def _run_with_lease_heartbeat[ResultT](
@@ -87,6 +102,7 @@ async def _run_with_lease_heartbeat[ResultT](
 ) -> ResultT:
     """Run one lifecycle while renewal failures cancel and replace its result."""
 
+    claim = validate_execution_claim(claim)
     if renewal_interval_seconds <= 0:
         raise ValueError("renewal_interval_seconds must be positive")
     stopped = asyncio.Event()
@@ -101,11 +117,14 @@ async def _run_with_lease_heartbeat[ResultT](
                     return None
                 except TimeoutError:
                     renewed = renew(current_claim, lease_seconds)
+                    renewed = validate_execution_claim(
+                        renewed,
+                        expected_case_id=current_claim.case_id,
+                    )
                     if (
                         renewed.case_id != current_claim.case_id
                         or renewed.token != current_claim.token
                         or renewed.generation != current_claim.generation
-                        or execution_claim_expiry_iso(renewed) is None
                         or renewed.expires_at <= current_claim.expires_at
                     ):
                         raise InvoiceAgentsError(
@@ -374,35 +393,132 @@ def _preserve_prior_result_evidence(result: CaseResult, previous: CaseResult | N
     )
 
 
+class _RecoveryEnvelope(BaseModel):
+    """Strict claim-bound recovery evidence; no ambient authority is serialized."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    recovery_format: Literal[2]
+    case_id: str
+    execution_token: str
+    execution_generation: int
+    lease_expires_at: str
+    case_result: CaseResult
+    terminal_persistence_error: ErrorRecord
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveryAuthority:
+    store: WorkflowStore
+    claim: ExecutionClaim
+
+
+_RECOVERY_AUTHORITY: ContextVar[_RecoveryAuthority] = ContextVar("task9_recovery_authority")
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError("duplicate recovery key")
+        payload[key] = value
+    return payload
+
+
+def _reject_json_constant(_value: str) -> object:
+    raise ValueError("non-finite recovery number")
+
+
+def _recovery_result_bound_to_authority(
+    result: CaseResult,
+    authority: _RecoveryAuthority,
+) -> CaseResult:
+    """Validate current DB authority and return a source-bound recovery aggregate."""
+
+    claim = validate_execution_claim(authority.claim, expected_case_id=result.case_id)
+    snapshot = authority.store.load_case_execution_snapshot(result.case_id)
+    exact_running_authority = (
+        snapshot is not None
+        and snapshot.execution_state == "RUNNING"
+        and snapshot.lease_expires_at == claim.expires_at
+    )
+    exact_finished_authority = (
+        snapshot is not None
+        and snapshot.execution_state == "FINISHED"
+        and snapshot.lease_expires_at is None
+    )
+    if (
+        snapshot is None
+        or snapshot.execution_token != claim.token
+        or snapshot.execution_generation != claim.generation
+        or not (exact_running_authority or exact_finished_authority)
+    ):
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "recovery artifact authority is no longer the exact active claim",
+            case_id=result.case_id,
+            stop_reason="TERMINAL_DURABILITY_UNRESOLVED",
+        ) from None
+    source_id = authority.store.load_recovery_case_source_id(claim)
+    if result.source_id not in {None, source_id}:
+        raise InvoiceAgentsError(
+            ErrorCategory.DATABASE,
+            "recovery result identity conflicts with authoritative source evidence",
+            case_id=result.case_id,
+            stop_reason="PERSISTED_RESULT_INVALID",
+        ) from None
+    source_bound = result.model_copy(update={"source_id": source_id}, deep=True)
+    return authority.store.merge_relational_case_evidence(source_bound)
+
+
 def _write_recovery_artifact(result: CaseResult, terminal_persistence_error: ErrorRecord) -> Path:
+    authority = _RECOVERY_AUTHORITY.get()
+    result = _recovery_result_bound_to_authority(result, authority)
+    claim = validate_execution_claim(authority.claim, expected_case_id=result.case_id)
+    if terminal_persistence_error.case_id != result.case_id:
+        raise ValueError("recovery persistence error is not case-bound")
     output_dir = Path("artifacts/results").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     target = output_dir / f"{result.case_id}.recovery.json"
+    envelope = _RecoveryEnvelope(
+        recovery_format=RECOVERY_ARTIFACT_FORMAT,
+        case_id=result.case_id,
+        execution_token=claim.token,
+        execution_generation=claim.generation,
+        lease_expires_at=claim.expires_at.isoformat(),
+        case_result=result,
+        terminal_persistence_error=terminal_persistence_error,
+    )
     payload = json.dumps(
-        {
-            "recovery_format": 1,
-            "case_result": result.model_dump(mode="json"),
-            "terminal_persistence_error": terminal_persistence_error.model_dump(mode="json"),
-        },
+        envelope.model_dump(mode="json"),
         default=str,
         ensure_ascii=False,
-        indent=2,
+        separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
+    if len(payload) > RECOVERY_ARTIFACT_MAX_BYTES:
+        raise ValueError("recovery artifact exceeds its bounded envelope")
     _atomic_publish(target, payload)
     return target
 
 
 def _recovery_artifact_or_raise(
-    result: CaseResult, terminal_persistence_error: ErrorRecord
+    result: CaseResult,
+    terminal_persistence_error: ErrorRecord,
+    *,
+    store: WorkflowStore,
+    claim: ExecutionClaim,
 ) -> None:
     """Publish recovery evidence once or raise one stable, chainless failure."""
 
     artifact_exc: BaseException | None = None
+    token = _RECOVERY_AUTHORITY.set(_RecoveryAuthority(store, claim))
     try:
         _write_recovery_artifact(result, terminal_persistence_error)
     except BaseException as exc:
         artifact_exc = exc
+    finally:
+        _RECOVERY_AUTHORITY.reset(token)
     if artifact_exc is None:
         return
     artifact_error = _secondary_error(
@@ -570,6 +686,220 @@ def _persist_terminal_result(
         )
 
 
+async def _terminal_process_write(
+    execution: _ClaimedExecution,
+    result: CaseResult,
+    *,
+    mode: Literal["finish", "update"],
+) -> tuple[object, CaseResult | None, BaseException | None]:
+    """Run one terminal write outside the event loop and return only authoritative reread."""
+
+    settings = execution.store._snapshot_settings()
+    def invoke() -> tuple[TerminalProcessOutcome, BaseException | None]:
+        try:
+            return (
+                run_terminal_process(
+                    mode=mode,
+                    settings=settings,
+                    claim=execution.claim,
+                    timeout_seconds=float(DURABILITY_DEADLINE_SECONDS),
+                    result=result,
+                ),
+                None,
+            )
+        except BaseException as exc:
+            # Process-control exceptions must be data before they cross an
+            # executor Future; SystemExit raised by a worker seam can otherwise
+            # escape asyncio's task ownership during loop shutdown.
+            return TerminalProcessOutcome(None, "TERMINAL_WORKER_FAILED"), exc
+
+    worker = asyncio.create_task(
+        asyncio.to_thread(invoke),
+        name=f"invoice-terminal-{mode}-{execution.case_id}",
+    )
+    boundary_control: BaseException | None = None
+    try:
+        outcome, boundary_control = await asyncio.shield(worker)
+    except asyncio.CancelledError as exc:
+        if worker.done():
+            outcome, boundary_control = worker.result()
+        else:
+            outcome, worker_control = await _await_task_despite_cancellation(
+                worker,
+                deadline=(
+                    monotonic()
+                    + DURABILITY_DEADLINE_SECONDS
+                    + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+                ),
+                case_id=execution.case_id,
+            )
+            boundary_control = worker_control or exc
+    snapshot = await asyncio.to_thread(
+        execution.store.load_case_execution_snapshot,
+        execution.case_id,
+    )
+    stored: CaseResult | None = None
+    if (
+        snapshot is not None
+        and snapshot.execution_state == "FINISHED"
+        and snapshot.result is not None
+    ):
+        stored = await asyncio.to_thread(
+            execution.store.merge_relational_case_evidence,
+            snapshot.result,
+        )
+    return outcome, stored, boundary_control
+
+
+def _terminal_process_error(
+    outcome: object,
+    *,
+    case_id: str,
+    update: bool,
+) -> ErrorRecord:
+    error_code = getattr(outcome, "error_code", None)
+    if error_code == "TERMINAL_WORKER_TIMEOUT":
+        return ErrorRecord(
+            category=ErrorCategory.TIMEOUT,
+            message="terminal database write exceeded its bounded helper deadline",
+            case_id=case_id,
+            stop_reason="TERMINAL_DURABILITY_TIMEOUT",
+        )
+    return ErrorRecord(
+        category=ErrorCategory.DATABASE,
+        message=(
+            "terminal database result update failed" if update else "terminal database write failed"
+        ),
+        case_id=case_id,
+        stop_reason="TERMINAL_PERSISTENCE_FAILED",
+        details={"worker_error_code": error_code or "TERMINAL_WORKER_FAILED"},
+    )
+
+
+async def _persist_terminal_result_safely(
+    execution: _ClaimedExecution,
+    result: CaseResult,
+    control_exception: BaseException | None,
+) -> _PersistenceOutcome:
+    """Persist in a terminable helper; cancellation may require one fenced update."""
+
+    outcome, stored, boundary_control = await _terminal_process_write(
+        execution,
+        result,
+        mode="finish",
+    )
+    control_exception = control_exception or boundary_control
+    if stored is not None:
+        if boundary_control is not None and _cancellation_may_define_outcome(control_exception):
+            cancelled = _cancelled_result(
+                execution.case_id,
+                stored.source_id,
+                execution.started_at,
+                stored,
+            )
+            return await _refresh_terminal_evidence_safely(
+                execution,
+                cancelled,
+                persisted=True,
+                persistence_error=None,
+                control_exception=control_exception,
+            )
+        return _PersistenceOutcome(stored, True, None, control_exception)
+    if isinstance(boundary_control, asyncio.CancelledError) and _cancellation_may_define_outcome(
+        control_exception
+    ):
+        cancelled = _cancelled_result(
+            execution.case_id,
+            result.source_id,
+            execution.started_at,
+            result,
+        )
+        retry_outcome, retry_stored, retry_control = await _terminal_process_write(
+            execution,
+            cancelled,
+            mode="finish",
+        )
+        control_exception = control_exception or retry_control
+        if retry_stored is not None:
+            return _PersistenceOutcome(
+                retry_stored,
+                True,
+                None,
+                control_exception,
+            )
+        outcome = retry_outcome
+        result = cancelled
+    snapshot = await asyncio.to_thread(
+        execution.store.load_case_execution_snapshot,
+        execution.case_id,
+    )
+    exact_claim_remains = (
+        snapshot is not None
+        and snapshot.execution_state == "RUNNING"
+        and snapshot.execution_token == execution.claim.token
+        and snapshot.execution_generation == execution.claim.generation
+        and snapshot.lease_expires_at == execution.claim.expires_at
+    )
+    if not exact_claim_remains:
+        raise _unresolved_durability_error(execution.case_id) from None
+    persistence_error = _terminal_process_error(
+        outcome,
+        case_id=execution.case_id,
+        update=False,
+    )
+    _append_error(result, persistence_error)
+    return _PersistenceOutcome(
+        result,
+        False,
+        persistence_error,
+        control_exception,
+    )
+
+
+async def _refresh_terminal_evidence_safely(
+    execution: _ClaimedExecution,
+    result: CaseResult,
+    *,
+    persisted: bool,
+    persistence_error: ErrorRecord | None,
+    control_exception: BaseException | None,
+) -> _PersistenceOutcome:
+    if not persisted:
+        assert persistence_error is not None
+        return _PersistenceOutcome(result, False, persistence_error, control_exception)
+    prior_control = control_exception
+    outcome, stored, boundary_control = await _terminal_process_write(
+        execution,
+        result,
+        mode="update",
+    )
+    control_exception = control_exception or boundary_control
+    if stored == result:
+        return _PersistenceOutcome(result, True, persistence_error, control_exception)
+    if isinstance(boundary_control, asyncio.CancelledError):
+        if _cancellation_may_define_outcome(prior_control):
+            result = _cancelled_result(
+                execution.case_id,
+                result.source_id,
+                execution.started_at,
+                result,
+            )
+        update_error = ErrorRecord(
+            category=ErrorCategory.CANCELLED,
+            message="terminal database result update was cancelled",
+            case_id=execution.case_id,
+            stop_reason="TERMINAL_RESULT_UPDATE_CANCELLED",
+        )
+    else:
+        update_error = _terminal_process_error(
+            outcome,
+            case_id=execution.case_id,
+            update=True,
+        )
+    _append_error(result, update_error)
+    return _PersistenceOutcome(result, False, update_error, control_exception)
+
+
 def _refresh_terminal_evidence(
     execution: _ClaimedExecution,
     result: CaseResult,
@@ -654,7 +984,7 @@ async def _execute_claimed_case(
     cancelled = False
     previous_result: CaseResult | None = None
     try:
-        execution.source_id = store.load_case_source_id(case_id)
+        execution.source_id = store.load_authoritative_case_source_id(claim)
         previous_result = store.load_result(case_id)
         result = await lifecycle(execution)
     except asyncio.CancelledError as exc:
@@ -735,7 +1065,11 @@ async def _execute_claimed_case(
     persistence_error: ErrorRecord | None = None
     # Cancellation becomes durable before cleanup, then is re-raised after bounded cleanup.
     if cancelled:
-        persistence = _persist_terminal_result(execution, result, control_exception)
+        persistence = await _persist_terminal_result_safely(
+            execution,
+            result,
+            control_exception,
+        )
         terminal_write_attempted = True
         result = persistence.result
         persisted = persistence.persisted
@@ -792,7 +1126,7 @@ async def _execute_claimed_case(
             control_exception = control_exception or exc
 
     if persisted:
-        refresh = _refresh_terminal_evidence(
+        refresh = await _refresh_terminal_evidence_safely(
             execution,
             result,
             persisted=persisted,
@@ -804,7 +1138,11 @@ async def _execute_claimed_case(
         persistence_error = refresh.persistence_error
         control_exception = refresh.control_exception
     elif not terminal_write_attempted:
-        persistence = _persist_terminal_result(execution, result, control_exception)
+        persistence = await _persist_terminal_result_safely(
+            execution,
+            result,
+            control_exception,
+        )
         terminal_write_attempted = True
         result = persistence.result
         persisted = persistence.persisted
@@ -835,7 +1173,7 @@ async def _execute_claimed_case(
                     stop_reason="FINAL_AUDIT_WRITE_CANCELLED",
                 ),
             )
-            refresh = _refresh_terminal_evidence(
+            refresh = await _refresh_terminal_evidence_safely(
                 execution,
                 result,
                 persisted=persisted,
@@ -859,7 +1197,7 @@ async def _execute_claimed_case(
             )
             if not isinstance(exc, Exception):
                 control_exception = control_exception or exc
-            refresh = _refresh_terminal_evidence(
+            refresh = await _refresh_terminal_evidence_safely(
                 execution,
                 result,
                 persisted=persisted,
@@ -891,7 +1229,7 @@ async def _execute_claimed_case(
                     stop_reason="RESULT_ARTIFACT_WRITE_CANCELLED",
                 ),
             )
-            refresh = _refresh_terminal_evidence(
+            refresh = await _refresh_terminal_evidence_safely(
                 execution,
                 result,
                 persisted=persisted,
@@ -915,7 +1253,7 @@ async def _execute_claimed_case(
             )
             if not isinstance(exc, Exception):
                 control_exception = control_exception or exc
-            refresh = _refresh_terminal_evidence(
+            refresh = await _refresh_terminal_evidence_safely(
                 execution,
                 result,
                 persisted=persisted,
@@ -928,7 +1266,12 @@ async def _execute_claimed_case(
             control_exception = refresh.control_exception
     if not persisted:
         assert persistence_error is not None
-        _recovery_artifact_or_raise(result, persistence_error)
+        _recovery_artifact_or_raise(
+            result,
+            persistence_error,
+            store=execution.store,
+            claim=execution.claim,
+        )
 
     if control_exception is not None:
         raise control_exception
@@ -969,7 +1312,12 @@ def _terminalize_preparation_failure(
     result = persistence.result
     if not persistence.persisted:
         assert persistence.persistence_error is not None
-        _recovery_artifact_or_raise(result, persistence.persistence_error)
+        _recovery_artifact_or_raise(
+            result,
+            persistence.persistence_error,
+            store=store,
+            claim=claim,
+        )
     if persistence.control_exception is not None:
         raise persistence.control_exception
     return _PreparationFailure(result=result, recovery_published=not persistence.persisted)
@@ -1025,7 +1373,16 @@ def _prepare_case(
     except BaseException as exc:
         failure = exc
     assert failure is not None
-    if case_created and store is not None and claim is not None:
+    if case_created and store is not None:
+        if claim is None:
+            try:
+                claim = store.claim_case_execution(
+                    case_id,
+                    frozenset({CaseStatus.INCOMPLETE}),
+                    EXECUTION_LEASE_SECONDS,
+                )
+            except BaseException as claim_failure:
+                raise _unresolved_durability_error(case_id, claim_failure) from None
         return _terminalize_preparation_failure(
             store=store,
             claim=claim,
@@ -1035,19 +1392,6 @@ def _prepare_case(
             failure=failure,
         )
     result = _failed_result(case_id, source_id, started_at, failure)
-    if case_created:
-        persistence_error = _secondary_error(
-            failure,
-            case_id=case_id,
-            category=ErrorCategory.DATABASE,
-            stop_reason="TERMINAL_PERSISTENCE_FAILED",
-            message="preparation failed before execution authority was acquired",
-        )
-        _append_error(result, persistence_error)
-        _recovery_artifact_or_raise(result, persistence_error)
-        if not isinstance(failure, Exception):
-            raise failure
-        return _PreparationFailure(result=result, recovery_published=True)
     if not isinstance(failure, Exception):
         raise failure
     return _PreparationFailure(result=result, recovery_published=False)
@@ -1270,13 +1614,7 @@ async def run_prepared_case(
             case_id=case_id,
             stop_reason="EXECUTION_CLAIM_MISSING",
         ) from None
-    if claim.case_id != case_id:
-        raise InvoiceAgentsError(
-            ErrorCategory.ORCHESTRATION,
-            "supplied execution claim belongs to a different case",
-            case_id=case_id,
-            stop_reason="STALE_EXECUTION_CLAIM",
-        ) from None
+    claim = validate_execution_claim(claim, expected_case_id=case_id)
     store = WorkflowStore(settings)
     store.require_current_execution_claim(claim)
 
@@ -1332,6 +1670,7 @@ async def run_prepared_case(
 
     async def heartbeat_lifecycle(execution: _ClaimedExecution) -> CaseResult:
         def replace_claim(renewed: ExecutionClaim) -> None:
+            renewed = validate_execution_claim(renewed, expected_case_id=case_id)
             execution.claim = renewed
             if execution.context is not None:
                 execution.context.claim = renewed
@@ -1461,26 +1800,70 @@ async def _await_task_despite_cancellation[ResultT](
     return task.result()
 
 
-def _recovery_artifact_is_valid(case_id: str) -> bool:
+def _recovery_artifact_is_valid(
+    case_id: str,
+    store: WorkflowStore,
+    claim: ExecutionClaim,
+) -> bool:
+    """Validate one bounded strict envelope against current DB and exact claim authority."""
+
+    try:
+        claim = validate_execution_claim(claim, expected_case_id=case_id)
+    except InvoiceAgentsError:
+        return False
     target = Path("artifacts/results").resolve() / f"{case_id}.recovery.json"
     try:
-        payload = json.loads(target.read_text(encoding="utf-8"))
-        result = CaseResult.model_validate_json(json.dumps(payload["case_result"]), strict=True)
-        persistence_error = ErrorRecord.model_validate_json(
-            json.dumps(payload["terminal_persistence_error"]), strict=True
+        raw = target.read_bytes()
+        if not raw or len(raw) > RECOVERY_ARTIFACT_MAX_BYTES:
+            return False
+        json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
         )
-    except (OSError, KeyError, TypeError, ValueError):
+        envelope = _RecoveryEnvelope.model_validate_json(raw, strict=True)
+        expires_at = parse_canonical_utc(envelope.lease_expires_at)
+        if expires_at is None or expires_at.tzinfo is not UTC:
+            return False
+        snapshot = store.load_case_execution_snapshot(case_id)
+        source_id = store.load_recovery_case_source_id(claim)
+        merged = store.merge_relational_case_evidence(envelope.case_result)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, InvoiceAgentsError, ValueError):
         return False
     return (
-        payload.get("recovery_format") == 1
-        and result.case_id == case_id
-        and persistence_error.case_id == case_id
-        and persistence_error.stop_reason
-        in {"TERMINAL_PERSISTENCE_FAILED", "TERMINAL_DURABILITY_TIMEOUT"}
+        envelope.recovery_format == RECOVERY_ARTIFACT_FORMAT
+        and envelope.case_id == case_id
+        and envelope.execution_token == claim.token
+        and envelope.execution_generation == claim.generation
+        and expires_at == claim.expires_at
+        and envelope.lease_expires_at == claim.expires_at.isoformat()
+        and envelope.case_result.case_id == case_id
+        and envelope.case_result.source_id == source_id
+        and merged == envelope.case_result
+        and envelope.terminal_persistence_error.case_id == case_id
+        and envelope.terminal_persistence_error.stop_reason
+        in {
+            "TERMINAL_PERSISTENCE_FAILED",
+            "TERMINAL_DURABILITY_TIMEOUT",
+            "TERMINAL_RESULT_UPDATE_CANCELLED",
+        }
+        and snapshot is not None
+        and snapshot.execution_state in {"RUNNING", "FINISHED"}
+        and snapshot.execution_token == claim.token
+        and snapshot.execution_generation == claim.generation
+        and (
+            snapshot.lease_expires_at == claim.expires_at
+            if snapshot.execution_state == "RUNNING"
+            else snapshot.lease_expires_at is None
+        )
     )
 
 
-def _claim_has_durable_terminal_evidence(case_id: str, settings: Settings) -> bool:
+def _claim_has_durable_terminal_evidence(
+    case_id: str,
+    settings: Settings,
+    claim: ExecutionClaim,
+) -> bool:
     store = WorkflowStore(settings)
     snapshot = store.load_case_execution_snapshot(case_id)
     if (
@@ -1490,7 +1873,7 @@ def _claim_has_durable_terminal_evidence(case_id: str, settings: Settings) -> bo
     ):
         store.merge_relational_case_evidence(snapshot.result)
         return True
-    return _recovery_artifact_is_valid(case_id)
+    return _recovery_artifact_is_valid(case_id, store, claim)
 
 
 def _unresolved_durability_error(
@@ -1511,9 +1894,17 @@ async def _inspect_claim_durability(
 ) -> dict[str, BaseException | None]:
     """Bound every read-only durability inspection and return one result per claim."""
 
-    async def inspect(case_id: str) -> tuple[str, BaseException | None]:
+    async def inspect(
+        case_id: str,
+        claim: ExecutionClaim,
+    ) -> tuple[str, BaseException | None]:
         task = asyncio.create_task(
-            asyncio.to_thread(_claim_has_durable_terminal_evidence, case_id, settings),
+            asyncio.to_thread(
+                _claim_has_durable_terminal_evidence,
+                case_id,
+                settings,
+                claim,
+            ),
             name=f"invoice-durability-inspect-{case_id}",
         )
         try:
@@ -1529,8 +1920,8 @@ async def _inspect_claim_durability(
         return case_id, None if durable else _unresolved_durability_error(case_id)
 
     inspection_tasks = [
-        asyncio.create_task(inspect(case_id), name=f"invoice-durability-{case_id}")
-        for case_id, _started, _claim in claims
+        asyncio.create_task(inspect(case_id, claim), name=f"invoice-durability-{case_id}")
+        for case_id, _started, claim in claims
     ]
 
     async def drain() -> list[tuple[str, BaseException | None]]:
@@ -1586,52 +1977,20 @@ async def _terminalize_unstarted_claim(
     settings: Settings,
     claim: ExecutionClaim,
 ) -> None:
-    """Persist cancellation in a bounded worker with one recovery publisher."""
+    """Persist cancellation in a terminable helper, then trust only authoritative reread."""
 
-    fallback = _cancelled_result(case_id, None, started_at)
-
-    @dataclass(frozen=True, slots=True)
-    class PersistenceOutcome:
-        result: CaseResult
-        failure: BaseException | None = None
-        control_exception: BaseException | None = None
-
-    def persist() -> PersistenceOutcome:
-        store = WorkflowStore(settings)
-        result = fallback
-        control_exception: BaseException | None = None
-        try:
-            store.require_current_execution_claim(claim)
-            source_id = store.load_case_source_id(case_id)
-            previous = store.load_result(case_id)
-            result = _cancelled_result(case_id, source_id, started_at, previous)
-            try:
-                result = store.merge_relational_case_evidence(result)
-            except BaseException as exc:
-                _append_error(
-                    result,
-                    _secondary_error(
-                        exc,
-                        case_id=case_id,
-                        category=ErrorCategory.DATABASE,
-                        stop_reason="TERMINAL_EVIDENCE_RECONCILIATION_FAILED",
-                        message="durable terminal evidence reconciliation failed",
-                    ),
-                )
-                if not isinstance(exc, Exception):
-                    control_exception = exc
-            store.finish_case(result, claim)
-        except BaseException as exc:
-            return PersistenceOutcome(
-                result=result,
-                failure=exc,
-                control_exception=control_exception,
-            )
-        return PersistenceOutcome(result=result, control_exception=control_exception)
+    claim = validate_execution_claim(claim, expected_case_id=case_id)
+    store = WorkflowStore(settings)
 
     async def publish_recovery(result: CaseResult, error: ErrorRecord) -> None:
         publication = asyncio.create_task(
-            asyncio.to_thread(_recovery_artifact_or_raise, result, error),
+            asyncio.to_thread(
+                _recovery_artifact_or_raise,
+                result,
+                error,
+                store=WorkflowStore(settings),
+                claim=claim,
+            ),
             name=f"invoice-cancel-recovery-{case_id}",
         )
         await _await_task_despite_cancellation(
@@ -1641,45 +2000,87 @@ async def _terminalize_unstarted_claim(
         )
 
     worker = asyncio.create_task(
-        asyncio.to_thread(persist),
+        asyncio.to_thread(
+            run_terminal_process,
+            mode="cancel_unstarted",
+            settings=settings,
+            claim=claim,
+            timeout_seconds=float(DURABILITY_DEADLINE_SECONDS),
+            started_at=started_at,
+        ),
         name=f"invoice-cancel-persistence-{case_id}",
     )
     try:
         outcome = await _await_task_despite_cancellation(
             worker,
-            deadline=monotonic() + DURABILITY_DEADLINE_SECONDS,
+            deadline=(
+                monotonic()
+                + DURABILITY_DEADLINE_SECONDS
+                + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+            ),
             case_id=case_id,
         )
-    except InvoiceAgentsError as exc:
-        if exc.stop_reason != "TERMINAL_DURABILITY_TIMEOUT":
-            raise
-        timeout_error = ErrorRecord(
+    except InvoiceAgentsError:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "terminal helper completion and cleanup could not be verified",
+            case_id=case_id,
+            stop_reason="TERMINAL_WORKER_CLEANUP_FAILED",
+        ) from None
+
+    snapshot = await asyncio.to_thread(store.load_case_execution_snapshot, case_id)
+    if (
+        snapshot is not None
+        and snapshot.execution_state == "FINISHED"
+        and snapshot.result is not None
+    ):
+        await asyncio.to_thread(store.merge_relational_case_evidence, snapshot.result)
+        return
+    exact_claim_remains = (
+        snapshot is not None
+        and snapshot.execution_state == "RUNNING"
+        and snapshot.execution_token == claim.token
+        and snapshot.execution_generation == claim.generation
+        and snapshot.lease_expires_at == claim.expires_at
+    )
+    if not exact_claim_remains:
+        raise _unresolved_durability_error(case_id) from None
+    if outcome.result is not None or outcome.error_code is None:
+        raise _unresolved_durability_error(case_id) from None
+
+    source_id = await asyncio.to_thread(store.load_authoritative_case_source_id, claim)
+    previous = await asyncio.to_thread(store.load_result, case_id)
+    fallback = _cancelled_result(case_id, source_id, started_at, previous)
+    fallback = await asyncio.to_thread(store.merge_relational_case_evidence, fallback)
+    if outcome.error_code == "TERMINAL_WORKER_TIMEOUT":
+        persistence_error = ErrorRecord(
             category=ErrorCategory.TIMEOUT,
             message="terminal cancellation persistence exceeded its monotonic deadline",
             case_id=case_id,
             stop_reason="TERMINAL_DURABILITY_TIMEOUT",
         )
-        _append_error(fallback, timeout_error)
-        await publish_recovery(fallback, timeout_error)
-        raise exc from None
-
-    if outcome.failure is not None:
+    else:
         persistence_error = _secondary_error(
-            outcome.failure,
+            InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "terminal helper did not commit its exact claim",
+                case_id=case_id,
+                stop_reason=outcome.error_code,
+            ),
             case_id=case_id,
             category=ErrorCategory.DATABASE,
             stop_reason="TERMINAL_PERSISTENCE_FAILED",
             message="terminal database write failed",
         )
-        _append_error(outcome.result, persistence_error)
-        await publish_recovery(outcome.result, persistence_error)
-        if not isinstance(outcome.failure, Exception):
-            raise outcome.failure
-        if outcome.control_exception is not None:
-            raise outcome.control_exception
-        return
-    if outcome.control_exception is not None:
-        raise outcome.control_exception
+    _append_error(fallback, persistence_error)
+    await publish_recovery(fallback, persistence_error)
+    if outcome.error_code == "TERMINAL_WORKER_TIMEOUT":
+        raise InvoiceAgentsError(
+            ErrorCategory.TIMEOUT,
+            persistence_error.message,
+            case_id=case_id,
+            stop_reason=persistence_error.stop_reason,
+        ) from None
 
 
 async def _durably_cancel_unstarted_claim(
@@ -1711,7 +2112,11 @@ async def _durably_cancel_unstarted_claims(
     drain_task = asyncio.create_task(drain(), name="invoice-unstarted-claims-drain")
     return await _await_task_despite_cancellation(
         drain_task,
-        deadline=monotonic() + (3 * DURABILITY_DEADLINE_SECONDS),
+        deadline=(
+            monotonic()
+            + (3 * DURABILITY_DEADLINE_SECONDS)
+            + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+        ),
     )
 
 
@@ -1720,6 +2125,7 @@ async def process_batch(
 ) -> list[CaseResult]:
     """Prepare all identities, then run independent fresh teams with bounded concurrency."""
 
+    selected_concurrency = validate_case_concurrency(concurrency, settings.case_concurrency)
     started_at = _now()
     try:
         preflight(settings)
@@ -1754,7 +2160,7 @@ async def process_batch(
         selected_failure.__cause__ = None
         selected_failure.__context__ = None
         raise selected_failure from None
-    semaphore = asyncio.Semaphore(concurrency or settings.case_concurrency)
+    semaphore = asyncio.Semaphore(selected_concurrency)
 
     async def bounded(item: tuple[str, datetime, ExecutionClaim]) -> CaseResult:
         try:
@@ -1772,7 +2178,11 @@ async def process_batch(
             )
             await _await_task_despite_cancellation(
                 durability_task,
-                deadline=monotonic() + (2 * DURABILITY_DEADLINE_SECONDS),
+                deadline=(
+                    monotonic()
+                    + (2 * DURABILITY_DEADLINE_SECONDS)
+                    + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+                ),
                 case_id=item[0],
             )
             raise
@@ -1794,7 +2204,11 @@ async def process_batch(
         drain_task = asyncio.create_task(drain(), name="invoice-batch-cancellation-drain")
         task_outcomes = await _await_task_despite_cancellation(
             drain_task,
-            deadline=monotonic() + (3 * DURABILITY_DEADLINE_SECONDS),
+            deadline=(
+                monotonic()
+                + (3 * DURABILITY_DEADLINE_SECONDS)
+                + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+            ),
         )
         durability = await _inspect_claim_durability(prepared, settings)
         unowned_cancelled_claims = [
@@ -1914,13 +2328,7 @@ async def resume_case(
             case_id=case_id,
             stop_reason="EXECUTION_CLAIM_MISSING",
         ) from None
-    if claim.case_id != case_id:
-        raise InvoiceAgentsError(
-            ErrorCategory.ORCHESTRATION,
-            "supplied execution claim belongs to a different case",
-            case_id=case_id,
-            stop_reason="STALE_EXECUTION_CLAIM",
-        ) from None
+    claim = validate_execution_claim(claim, expected_case_id=case_id)
     store = WorkflowStore(settings)
     store.require_current_execution_claim(claim)
 
@@ -2001,6 +2409,7 @@ async def resume_case(
             return _result_from_stop(context, task_result, previous.started_at, usage)
 
         def replace_claim(renewed: ExecutionClaim) -> None:
+            renewed = validate_execution_claim(renewed, expected_case_id=case_id)
             execution.claim = renewed
             if execution.context is not None:
                 execution.context.claim = renewed

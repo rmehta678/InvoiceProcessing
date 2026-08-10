@@ -19,12 +19,13 @@ from typing import Any
 from uuid import uuid4
 
 from invoice_agents.config import Settings
-from invoice_agents.db.store import ExecutionClaim
+from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.errors import InvoiceAgentsError
 from invoice_agents.models import CaseResult
 from invoice_agents.orchestration import (
     _DURABILITY_PRECEDENCE_STOPS,
     DURABILITY_DEADLINE_SECONDS,
+    TERMINAL_WORKER_CLEANUP_GRACE_SECONDS,
     _await_task_despite_cancellation,
     _durably_cancel_unstarted_claim,
     _durably_cancel_unstarted_claims,
@@ -34,6 +35,7 @@ from invoice_agents.orchestration import (
     prepare_claimed_invoice,
     resume_case,
     run_prepared_case,
+    validate_case_concurrency,
 )
 
 
@@ -80,6 +82,16 @@ class BatchState:
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _stable_run_error(exc: BaseException) -> str:
+    """Map arbitrary child failures to one parent-owned, non-secret registry code."""
+
+    if isinstance(exc, InvoiceAgentsError):
+        return f"BACKGROUND_{exc.category.value}_ERROR"
+    if isinstance(exc, asyncio.CancelledError):
+        return "BACKGROUND_CANCELLED"
+    return "UNEXPECTED_RUNTIME_ERROR"
 
 
 async def _prepare_claimed_for_launch(
@@ -143,14 +155,19 @@ class RunRegistry:
         return self._batches.get(batch_id)
 
     def _finish(self, handle: RunHandle, source_key: str | None) -> None:
-        handle.state = "done"
+        # The lifecycle owner, not this callback, decides whether terminal
+        # durability was proved.  A callback can run after same-tick
+        # cancellation, so treating task completion itself as success would
+        # orphan the already-issued execution claim.
+        if handle.state in {"queued", "running"}:
+            handle.state = "unresolved"
         if source_key is not None and self._sources.get(source_key) == handle.case_id:
             del self._sources[source_key]
         task = handle.task
         if task is not None and task.done() and not task.cancelled():
             exc = task.exception()
             if exc is not None:
-                handle.error = str(exc)
+                handle.error = _stable_run_error(exc)
 
     async def start_process(self, path: Path, settings: Settings) -> str | CaseResult:
         """Prepare and launch one case; terminal prepare failures are returned as-is."""
@@ -159,31 +176,36 @@ class RunRegistry:
         if isinstance(prepared, CaseResult):
             return prepared
         case_id, started_at, claim = prepared
-        self._launch(
+        await self._launch(
             case_id,
             "process",
             run_prepared_case(case_id, started_at, settings, claim=claim),
             claim=claim,
             source_path=path,
+            settings=settings,
+            claimed_started_at=started_at,
         )
         return case_id
 
-    def start_resume(self, case_id: str, settings: Settings) -> RunHandle:
+    async def start_resume(self, case_id: str, settings: Settings) -> RunHandle:
         """Claim resume authority before scheduling so storage proves the handoff."""
 
         existing = self._runs.get(case_id)
         if existing is not None and existing.state != "done":
             return existing
+        previous = WorkflowStore(settings).load_result(case_id)
         claim = claim_resumable_case(case_id, settings)
-        return self._launch(
+        return await self._launch(
             case_id,
             "resume",
             resume_case(case_id, settings, claim=claim),
             claim=claim,
             source_path=None,
+            settings=settings,
+            claimed_started_at=previous.started_at if previous is not None else _now(),
         )
 
-    def _launch(
+    async def _launch(
         self,
         case_id: str,
         kind: str,
@@ -191,7 +213,11 @@ class RunRegistry:
         *,
         claim: ExecutionClaim,
         source_path: Path | None,
+        settings: Settings,
+        claimed_started_at: datetime,
     ) -> RunHandle:
+        """Install a durability owner before exposing a single-run task."""
+
         handle = RunHandle(
             case_id=case_id,
             kind=kind,
@@ -202,9 +228,98 @@ class RunRegistry:
         source_key = str(source_path.resolve()) if source_path is not None else None
         if source_key is not None:
             self._sources[source_key] = case_id
-        handle.task = asyncio.create_task(run, name=f"invoice-ui-{kind}-{case_id}")
+        ownership_installed = asyncio.Event()
+        launch = asyncio.Event()
+
+        async def own_lifecycle() -> CaseResult:
+            child: asyncio.Task[CaseResult] | None = None
+            ownership_installed.set()
+            try:
+                await launch.wait()
+                child = asyncio.create_task(
+                    run,
+                    name=f"invoice-ui-{kind}-child-{case_id}",
+                )
+                result = await asyncio.shield(child)
+                durability = await _inspect_claim_durability(
+                    [(case_id, claimed_started_at, claim)],
+                    settings,
+                )
+                durability_failure = durability[case_id]
+                if durability_failure is not None:
+                    raise durability_failure
+                handle.state = "done"
+                return result
+            except BaseException as primary_failure:
+                outcomes: list[object] = []
+                if child is None:
+                    run.close()
+                elif not child.done():
+                    child.cancel()
+                    try:
+                        await _await_task_despite_cancellation(
+                            child,
+                            deadline=monotonic() + DURABILITY_DEADLINE_SECONDS,
+                            case_id=case_id,
+                        )
+                    except BaseException as drain_failure:
+                        outcomes.append(drain_failure)
+
+                durability = await _inspect_claim_durability(
+                    [(case_id, claimed_started_at, claim)],
+                    settings,
+                )
+                if durability[case_id] is not None:
+                    try:
+                        await _durably_cancel_unstarted_claim(
+                            case_id,
+                            claimed_started_at,
+                            settings,
+                            claim,
+                        )
+                    except BaseException as terminal_failure:
+                        outcomes.append(terminal_failure)
+                    durability = await _inspect_claim_durability(
+                        [(case_id, claimed_started_at, claim)],
+                        settings,
+                    )
+
+                handle.state = "done" if durability[case_id] is None else "unresolved"
+                selected_failure = _select_drained_failure(
+                    primary_failure,
+                    outcomes,
+                    durability,
+                )
+                selected_failure.__cause__ = None
+                selected_failure.__context__ = None
+                raise selected_failure from None
+
+        handle.task = asyncio.create_task(
+            own_lifecycle(),
+            name=f"invoice-ui-{kind}-{case_id}",
+        )
         handle.task.add_done_callback(lambda _task: self._finish(handle, source_key))
         self._runs[case_id] = handle
+        try:
+            await asyncio.shield(ownership_installed.wait())
+        except asyncio.CancelledError as cancellation:
+            handle.task.cancel()
+            try:
+                await _await_task_despite_cancellation(
+                    handle.task,
+                    deadline=(
+                        monotonic()
+                        + (3 * DURABILITY_DEADLINE_SECONDS)
+                        + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+                    ),
+                    case_id=case_id,
+                )
+            except asyncio.CancelledError:
+                raise cancellation from None
+            except BaseException as durability_failure:
+                raise durability_failure from None
+            raise cancellation
+        launch.set()
         return handle
 
     async def start_batch(
@@ -217,10 +332,14 @@ class RunRegistry:
         semaphore sized by the requested or configured concurrency.
         """
 
+        selected_concurrency = validate_case_concurrency(
+            concurrency,
+            settings.case_concurrency,
+        )
         batch = BatchState(
             batch_id=f"batch_{uuid4().hex[:12]}",
             created_at=_now(),
-            concurrency=concurrency or settings.case_concurrency,
+            concurrency=selected_concurrency,
         )
         self._batches[batch.batch_id] = batch
         prepared_entries: list[BatchEntry] = []
@@ -292,7 +411,11 @@ class RunRegistry:
                 with contextlib.suppress(asyncio.CancelledError):
                     await _await_task_despite_cancellation(
                         batch.task,
-                        deadline=monotonic() + (3 * DURABILITY_DEADLINE_SECONDS),
+                        deadline=(
+                            monotonic()
+                            + (3 * DURABILITY_DEADLINE_SECONDS)
+                            + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+                        ),
                     )
             else:
                 await asyncio.gather(batch.task, return_exceptions=True)
@@ -360,12 +483,16 @@ class RunRegistry:
                 )
                 await _await_task_despite_cancellation(
                     durability_task,
-                    deadline=monotonic() + (2 * DURABILITY_DEADLINE_SECONDS),
+                    deadline=(
+                        monotonic()
+                        + (2 * DURABILITY_DEADLINE_SECONDS)
+                        + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+                    ),
                     case_id=entry.case_id,
                 )
                 raise
             except BaseException as exc:
-                handle.error = type(exc).__name__
+                handle.error = _stable_run_error(exc)
                 raise
 
         ready_events = [asyncio.Event() for _entry in entries]
@@ -399,7 +526,11 @@ class RunRegistry:
             )
             outcomes = await _await_task_despite_cancellation(
                 drain_task,
-                deadline=monotonic() + (3 * DURABILITY_DEADLINE_SECONDS),
+                deadline=(
+                    monotonic()
+                    + (3 * DURABILITY_DEADLINE_SECONDS)
+                    + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+                ),
             )
             claims = [
                 (entry.case_id, entry.prepared_started_at, entry.claim)
