@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import select
 import selectors
@@ -53,6 +52,166 @@ _SERIALIZED_SETTINGS_FIELDS = frozenset(
         "log_level",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkerErrorContract:
+    category: ErrorCategory
+    message: str
+    count_detail_fields: tuple[str, ...] = ()
+
+
+_AUTHORIZATION_RECONCILIATION_COUNT_FIELDS = (
+    "review_request_count",
+    "human_decision_count",
+    "final_decision_count",
+    "payment_count",
+)
+_AUTHORIZATION_AUDIT_COUNT_FIELDS = (
+    "invalid_review_count",
+    "invalid_human_decision_count",
+    "invalid_snapshot_count",
+    "invalid_final_decision_count",
+    "invalid_payment_count",
+    "invalid_cardinality_count",
+    "invalid_quarantine_count",
+)
+
+_WORKER_DOMAIN_ERROR_CONTRACTS: dict[str, _WorkerErrorContract] = {
+    "AUTHORIZATION_INVENTORY_WAL_MODE_UNSUPPORTED": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "authorization inventory database must use DELETE journal mode",
+    ),
+    "AUTHORIZATION_RECONCILIATION_REQUIRED": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "workflow authorization reconciliation is required before migration 003",
+        _AUTHORIZATION_RECONCILIATION_COUNT_FIELDS,
+    ),
+    "DATABASE_AUTHORIZATION_CONTEXT_MISMATCH": _WorkerErrorContract(
+        ErrorCategory.CONFIGURATION,
+        "database migration authorization context does not match its target",
+    ),
+    "DATABASE_AUTHORIZATION_CONTEXT_REQUIRED": _WorkerErrorContract(
+        ErrorCategory.CONFIGURATION,
+        "database migration requires explicit authorization context",
+    ),
+    "DATABASE_AUTHORIZATION_PROVENANCE_INVALID": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "legacy workflow v3 authorization provenance is incomplete or inconsistent",
+        _AUTHORIZATION_AUDIT_COUNT_FIELDS,
+    ),
+    "DATABASE_CHANGED_DURING_VERIFICATION": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database source changed during migration verification",
+    ),
+    "DATABASE_INTEGRITY_FAILED": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database integrity verification failed",
+    ),
+    "DATABASE_LOCK_UNAVAILABLE": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database maintenance lock is unavailable",
+    ),
+    "DATABASE_MAINTENANCE_BINDING_FAILED": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database maintenance binding could not be verified",
+    ),
+    "DATABASE_MAINTENANCE_CLEANUP_FAILED": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database maintenance cleanup could not be verified",
+    ),
+    "DATABASE_MISSING": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "required database does not exist",
+    ),
+    "DATABASE_SCHEMA_MISMATCH": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database schema does not match the migration contract",
+    ),
+    "DATABASE_SIDECAR_UNSUPPORTED": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database sidecar files are not supported during migration",
+    ),
+    "DATABASE_SIGNATURE_INVALID": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database file signature is invalid",
+    ),
+    "DATABASE_SYMLINK_UNSUPPORTED": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database symlink paths are not supported during migration",
+    ),
+    "DATABASE_VERIFICATION_ERROR": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database verification failed",
+    ),
+    "DATABASE_VERSION_MISMATCH": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database schema version does not match the migration contract",
+    ),
+    "INVENTORY_WAL_MODE_UNSUPPORTED": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "inventory database must use DELETE journal mode",
+    ),
+    "LEGACY_RECONCILIATION_ARCHIVE_INVALID": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "legacy reconciliation archive failed integrity verification",
+    ),
+    "LEGACY_RECONCILIATION_ARCHIVE_UPGRADE_REQUIRED": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "legacy authorization archive requires a lossless upgrade",
+    ),
+    "LEGACY_RECONCILIATION_DELETE_INCOMPLETE": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "legacy authorization reconciliation did not remove every active row",
+    ),
+    "LEGACY_RECONCILIATION_FAILED": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "legacy authorization reconciliation failed atomically",
+    ),
+    "LEGACY_RECONCILIATION_STATE_INVALID": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "legacy authorization reconciliation state is invalid",
+    ),
+    "MIGRATION_FAILED": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database migration failed",
+    ),
+    "MIGRATION_HISTORY_INVALID": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database migration history is invalid",
+    ),
+    "MIGRATION_NOT_FOUND": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database migration resources are unavailable",
+    ),
+    "WORKFLOW_WAL_MODE_UNSUPPORTED": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "workflow database must use DELETE journal mode",
+    ),
+}
+
+_PARENT_WORKER_ERROR_CONTRACTS: dict[str, _WorkerErrorContract] = {
+    "MIGRATION_WORKER_PROTOCOL_INVALID": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database migration worker returned an invalid bounded response",
+    ),
+    "MIGRATION_WORKER_START_FAILED": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database migration worker could not be started",
+    ),
+    "MIGRATION_WORKER_CLEANUP_FAILED": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database migration worker session cleanup could not be verified",
+    ),
+    "MIGRATION_WORKER_TIMEOUT": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database migration worker exceeded its execution deadline",
+    ),
+    "MIGRATION_WORKER_CRASHED": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "database migration worker exited before returning a result",
+    ),
+}
 
 
 class _WorkerExitWatcher:
@@ -173,10 +332,14 @@ def _serialize_settings(settings: Settings | None) -> dict[str, object] | None:
     }
 
 
-def _protocol_error(stop_reason: str, message: str) -> DatabaseVerificationError:
+def _protocol_error(stop_reason: str, _message: str) -> DatabaseVerificationError:
+    contract = _PARENT_WORKER_ERROR_CONTRACTS.get(stop_reason)
+    if contract is None:
+        contract = _PARENT_WORKER_ERROR_CONTRACTS["MIGRATION_WORKER_PROTOCOL_INVALID"]
+        stop_reason = "MIGRATION_WORKER_PROTOCOL_INVALID"
     return DatabaseVerificationError(
-        ErrorCategory.DATABASE,
-        message,
+        contract.category,
+        contract.message,
         stop_reason=stop_reason,
     )
 
@@ -203,37 +366,102 @@ def _encode_request(
     return encoded
 
 
-def _safe_details(value: object, *, depth: int = 0) -> object:
-    if depth > 6:
-        raise ValueError("worker details are too deeply nested")
-    if value is None or type(value) in (bool, int):
-        return value
-    if type(value) is float:
-        if not math.isfinite(value):
-            raise ValueError("worker detail number is not finite")
-        return value
-    if isinstance(value, str):
-        if len(value) > 4_096:
-            raise ValueError("worker detail string is too large")
-        return value
-    if isinstance(value, (list, tuple)):
-        if len(value) > 256:
-            raise ValueError("worker detail list is too large")
-        return [_safe_details(item, depth=depth + 1) for item in value]
-    if isinstance(value, dict):
-        if len(value) > 256:
-            raise ValueError("worker detail mapping is too large")
-        safe: dict[str, object] = {}
-        for key, item in value.items():
-            if not isinstance(key, str) or len(key) > 256:
-                raise ValueError("worker detail key is invalid")
-            lowered = key.casefold().replace("-", "_")
-            if any(token in lowered for token in ("secret", "token", "password", "api_key")):
-                safe[key] = "[REDACTED]"
-            else:
-                safe[key] = _safe_details(item, depth=depth + 1)
-        return safe
-    raise ValueError("worker details contain an unsupported value")
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate worker response key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value: str) -> object:
+    raise ValueError("non-finite worker response number")
+
+
+def _canonical_count_details(
+    details: object,
+    fields: tuple[str, ...],
+) -> dict[str, int] | None:
+    if type(details) is not dict or set(details) != set(fields):
+        return None
+    canonical: dict[str, int] = {}
+    for detail_field in fields:
+        value = details[detail_field]
+        if type(value) is not int or value < 0 or value > 2**63 - 1:
+            return None
+        canonical[detail_field] = value
+    return canonical
+
+
+def _canonical_domain_message(
+    stop_reason: str,
+    contract: _WorkerErrorContract,
+    details: dict[str, int] | None,
+) -> str:
+    if stop_reason != "AUTHORIZATION_RECONCILIATION_REQUIRED":
+        return contract.message
+    assert details is not None
+    rendered = ", ".join(f"{field}={details[field]}" for field in contract.count_detail_fields)
+    return f"{contract.message} ({rendered})"
+
+
+def _canonical_worker_domain_error(
+    *,
+    category: object,
+    stop_reason: object,
+    details: object,
+    discard_uncontracted_details: bool,
+) -> dict[str, object] | None:
+    if type(stop_reason) is not str:
+        return None
+    contract = _WORKER_DOMAIN_ERROR_CONTRACTS.get(stop_reason)
+    if contract is None:
+        return None
+    category_value = category.value if isinstance(category, ErrorCategory) else category
+    if type(category_value) is not str or category_value != contract.category.value:
+        return None
+    canonical_details: dict[str, int] | None
+    if contract.count_detail_fields:
+        canonical_details = _canonical_count_details(details, contract.count_detail_fields)
+        if canonical_details is None:
+            return None
+    else:
+        if not discard_uncontracted_details and details is not None:
+            return None
+        canonical_details = None
+    return {
+        "category": contract.category.value,
+        "message": _canonical_domain_message(stop_reason, contract, canonical_details),
+        "stop_reason": stop_reason,
+        "details": canonical_details,
+    }
+
+
+def _encode_expected_worker_failure(
+    *,
+    category: object,
+    stop_reason: object,
+    details: object,
+) -> dict[str, object] | None:
+    """Build only a parent-defined domain payload from a trusted in-worker exception."""
+
+    return _canonical_worker_domain_error(
+        category=category,
+        stop_reason=stop_reason,
+        details=details,
+        discard_uncontracted_details=True,
+    )
+
+
+def _protocol_failure_payload() -> dict[str, object]:
+    contract = _PARENT_WORKER_ERROR_CONTRACTS["MIGRATION_WORKER_PROTOCOL_INVALID"]
+    return {
+        "category": contract.category.value,
+        "message": contract.message,
+        "stop_reason": "MIGRATION_WORKER_PROTOCOL_INVALID",
+        "details": None,
+    }
 
 
 def _decode_response(encoded: bytes) -> list[int]:
@@ -243,12 +471,16 @@ def _decode_response(encoded: bytes) -> list[int]:
             "database migration worker returned an invalid bounded response",
         )
     try:
-        payload = json.loads(encoded)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        payload = json.loads(
+            encoded,
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         raise _protocol_error(
             "MIGRATION_WORKER_PROTOCOL_INVALID",
             "database migration worker returned an invalid bounded response",
-        ) from exc
+        ) from None
     if not isinstance(payload, dict) or type(payload.get("ok")) is not bool:
         raise _protocol_error(
             "MIGRATION_WORKER_PROTOCOL_INVALID",
@@ -282,41 +514,23 @@ def _decode_response(encoded: bytes) -> list[int]:
             "MIGRATION_WORKER_PROTOCOL_INVALID",
             "database migration worker returned an invalid bounded response",
         )
-    category = error["category"]
-    message = error["message"]
-    stop_reason = error["stop_reason"]
-    if (
-        not isinstance(category, str)
-        or not isinstance(message, str)
-        or not 1 <= len(message) <= 4_096
-        or not isinstance(stop_reason, str)
-        or not 1 <= len(stop_reason) <= 256
-    ):
+    canonical = _canonical_worker_domain_error(
+        category=error["category"],
+        stop_reason=error["stop_reason"],
+        details=error["details"],
+        discard_uncontracted_details=False,
+    )
+    if canonical is None or error != canonical:
         raise _protocol_error(
             "MIGRATION_WORKER_PROTOCOL_INVALID",
             "database migration worker returned an invalid bounded response",
         )
-    try:
-        error_category = ErrorCategory(category)
-    except ValueError as exc:
-        raise _protocol_error(
-            "MIGRATION_WORKER_PROTOCOL_INVALID",
-            "database migration worker returned an invalid bounded response",
-        ) from exc
-    try:
-        details = _safe_details(error["details"])
-    except ValueError as exc:
-        raise _protocol_error(
-            "MIGRATION_WORKER_PROTOCOL_INVALID",
-            "database migration worker returned an invalid bounded response",
-        ) from exc
-    return_error = DatabaseVerificationError(
-        error_category,
-        message,
-        stop_reason=stop_reason,
-        details=details if isinstance(details, dict) else None,
+    raise DatabaseVerificationError(
+        ErrorCategory(str(canonical["category"])),
+        str(canonical["message"]),
+        stop_reason=str(canonical["stop_reason"]),
+        details=canonical["details"] if isinstance(canonical["details"], dict) else None,
     )
-    raise return_error
 
 
 def _capture_worker_session(process: subprocess.Popen[bytes]) -> _WorkerSession:
@@ -568,48 +782,27 @@ def _signal_worker_session_groups(
     members: tuple[_WorkerSessionMember, ...],
     signal_number: int,
 ) -> None:
-    """Signal each group only after an immediate reserved-session identity check."""
+    """Signal only groups whose identities are bound for the exact kernel action."""
 
     if sys.platform.startswith("linux"):
         _signal_worker_session_members_with_pidfds(worker, members, signal_number)
         return
+    if sys.platform != "darwin":
+        raise _WorkerCleanupFailure
+    if worker.process_id != worker.process_group_id or worker.process_id != worker.session_id:
+        raise _WorkerCleanupFailure
     groups: dict[int, list[int]] = {}
     for member in members:
         groups.setdefault(member.process_group_id, []).append(member.process_id)
     for process_group_id in sorted(groups):
-        if process_group_id == worker.process_group_id:
-            # The unreaped session leader has PID == PGID and reserves this
-            # group identity until the final wait below.
-            verified = True
-        else:
-            # A descendant-created group is signalled only while its own live
-            # group leader still anchors PGID inside the reserved SID.
-            anchors = [
-                process_id
-                for process_id in groups[process_group_id]
-                if process_id == process_group_id
-            ]
-            if len(anchors) != 1:
-                raise _WorkerCleanupFailure
-            process_id = anchors[0]
-            try:
-                first_session_id = os.getsid(process_id)
-                current_group_id = os.getpgid(process_id)
-                current_session_id = os.getsid(process_id)
-            except ProcessLookupError:
-                # The group anchor disappeared before signalling. Do not signal
-                # its numeric PGID; a complete re-enumeration decides what remains.
-                continue
-            except OSError as exc:
-                raise _WorkerCleanupFailure from exc
-            verified = (
-                first_session_id == worker.session_id
-                and current_session_id == worker.session_id
-                and current_group_id == process_group_id
-            )
-        if not verified:
+        if process_group_id != worker.process_group_id:
+            # Darwin has no supported public pidfd-like action. A descendant-created
+            # numeric PGID can be released and reused after any getsid/getpgid check,
+            # so retain the unreaped session and report cleanup failure instead.
             raise _WorkerCleanupFailure
         try:
+            # Popen(start_new_session=True) established PID == PGID == SID. The
+            # unreaped leader keeps this original PGID reserved through killpg.
             os.killpg(process_group_id, signal_number)
         except ProcessLookupError:
             continue
@@ -936,15 +1129,45 @@ def _run_migration_in_subprocess(
 
 
 def _copy_public_error(error: DatabaseVerificationError) -> DatabaseVerificationError:
-    """Copy only the stable domain payload; exception implementation details stay private."""
+    """Reconstruct only an exact parent-owned error contract without a private chain."""
 
-    return DatabaseVerificationError(
-        error.category,
-        error.message,
-        case_id=error.case_id,
-        stop_reason=error.stop_reason,
-        provider_request_id=error.provider_request_id,
-        details=error.details,
+    stop_reason = error.stop_reason
+    if type(stop_reason) is str:
+        parent_contract = _PARENT_WORKER_ERROR_CONTRACTS.get(stop_reason)
+        if parent_contract is not None and (
+            error.category is parent_contract.category
+            and error.message == parent_contract.message
+            and error.case_id is None
+            and error.provider_request_id is None
+            and error.details is None
+        ):
+            return DatabaseVerificationError(
+                parent_contract.category,
+                parent_contract.message,
+                stop_reason=stop_reason,
+            )
+        canonical = _canonical_worker_domain_error(
+            category=error.category,
+            stop_reason=stop_reason,
+            details=error.details,
+            discard_uncontracted_details=False,
+        )
+        if (
+            canonical is not None
+            and error.message == canonical["message"]
+            and error.case_id is None
+            and error.provider_request_id is None
+        ):
+            details = canonical["details"]
+            return DatabaseVerificationError(
+                ErrorCategory(str(canonical["category"])),
+                str(canonical["message"]),
+                stop_reason=str(canonical["stop_reason"]),
+                details=dict(details) if isinstance(details, dict) else None,
+            )
+    return _protocol_error(
+        "MIGRATION_WORKER_PROTOCOL_INVALID",
+        "database migration worker returned an invalid bounded response",
     )
 
 

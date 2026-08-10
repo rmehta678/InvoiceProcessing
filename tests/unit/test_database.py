@@ -1118,6 +1118,8 @@ def test_zero_header_pair_with_genuine_empty_sqlite_runtime_table_migrates(
         }[internal_name]
     )
     assert columns == expected_columns
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(f"SELECT COUNT(*) FROM {internal_name}").fetchone()[0] == 0
     data = bytearray(path.read_bytes())
     data[44:48] = (0).to_bytes(4, "big")
     data[56:60] = (0).to_bytes(4, "big")
@@ -1127,6 +1129,84 @@ def test_zero_header_pair_with_genuine_empty_sqlite_runtime_table_migrates(
 
     with connect_database(path, read_only=True) as connection:
         assert connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("internal_name", "create_internal", "retained_rows", "storage_query", "invalid_text_column"),
+    [
+        (
+            "sqlite_sequence",
+            "CREATE TABLE discarded (id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE discarded;",
+            "INSERT INTO sqlite_sequence(name, seq) VALUES "
+            "('orphan', 7), ('orphan', 8), (NULL, NULL), "
+            "(42, 3.5), (X'00FF', CAST(X'80' AS TEXT))",
+            "SELECT typeof(name), typeof(seq) FROM sqlite_sequence",
+            "seq",
+        ),
+        (
+            "sqlite_stat1",
+            "ANALYZE;",
+            "INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES "
+            "('orphan', 'missing', '1 2'), ('orphan', 'missing', 'duplicate'), "
+            "(NULL, NULL, NULL), (42, 3.5, X'00FF'), "
+            "(CAST(X'80' AS TEXT), X'01', 9)",
+            "SELECT typeof(tbl), typeof(idx), typeof(stat) FROM sqlite_stat1",
+            "tbl",
+        ),
+    ],
+    ids=["sequence-retained-rows", "stat1-retained-rows"],
+)
+def test_zero_header_pair_rejects_nonempty_canonical_sqlite_runtime_table_without_mutation(
+    tmp_path: Path,
+    internal_name: str,
+    create_internal: str,
+    retained_rows: str,
+    storage_query: str,
+    invalid_text_column: str,
+) -> None:
+    """Canonical catalog text cannot launder retained rows as an empty pre-schema DB."""
+
+    path = tmp_path / f"nonempty-canonical-{internal_name}.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(create_internal)
+        connection.execute(retained_rows)
+        schema_row = connection.execute(
+            "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema WHERE name = ?",
+            (internal_name,),
+        ).fetchone()
+        storage_classes = {
+            str(storage_class)
+            for row in connection.execute(storage_query).fetchall()
+            for storage_class in row
+        }
+        invalid_text_rows = connection.execute(
+            f"SELECT COUNT(*) FROM {internal_name} "
+            f"WHERE typeof({invalid_text_column}) = 'text' "
+            f"AND hex(CAST({invalid_text_column} AS BLOB)) = '80'"
+        ).fetchone()[0]
+        connection.commit()
+    assert schema_row is not None
+    assert schema_row[:3] == ("table", internal_name, internal_name)
+    assert (
+        schema_row[4]
+        == {
+            "sqlite_sequence": "CREATE TABLE sqlite_sequence(name,seq)",
+            "sqlite_stat1": "CREATE TABLE sqlite_stat1(tbl,idx,stat)",
+        }[internal_name]
+    )
+    assert storage_classes == {"null", "integer", "real", "text", "blob"}
+    assert invalid_text_rows == 1
+    data = bytearray(path.read_bytes())
+    data[44:48] = (0).to_bytes(4, "big")
+    data[56:60] = (0).to_bytes(4, "big")
+    path.write_bytes(data)
+    before = _directory_file_state(tmp_path)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.INVENTORY)
+
+    assert excinfo.value.stop_reason == "MIGRATION_HISTORY_INVALID"
+    assert _directory_file_state(tmp_path) == before
 
 
 @pytest.mark.parametrize(

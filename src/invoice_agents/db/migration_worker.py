@@ -15,38 +15,27 @@ from invoice_agents.errors import InvoiceAgentsError
 
 
 def _protocol_failure() -> dict[str, Any]:
+    from invoice_agents.db.migration_process import _protocol_failure_payload
+
     return {
         "ok": False,
-        "error": {
-            "category": "DATABASE",
-            "message": "database migration worker protocol was invalid",
-            "stop_reason": "MIGRATION_WORKER_PROTOCOL_INVALID",
-            "details": None,
-        },
+        "error": _protocol_failure_payload(),
     }
 
 
 def _safe_expected_failure(exc: InvoiceAgentsError) -> dict[str, Any]:
-    from invoice_agents.db.migration_process import _safe_details
+    from invoice_agents.db.migration_process import _encode_expected_worker_failure
 
-    try:
-        details = _safe_details(exc.details)
-        message = exc.message if 1 <= len(exc.message) <= 4_096 else "database migration failed"
-        stop_reason = (
-            exc.stop_reason
-            if exc.stop_reason is not None and 1 <= len(exc.stop_reason) <= 256
-            else "MIGRATION_FAILED"
-        )
-    except (TypeError, ValueError):
+    error = _encode_expected_worker_failure(
+        category=exc.category,
+        stop_reason=exc.stop_reason,
+        details=exc.details,
+    )
+    if error is None:
         return _protocol_failure()
     return {
         "ok": False,
-        "error": {
-            "category": exc.category.value,
-            "message": message,
-            "stop_reason": stop_reason,
-            "details": details,
-        },
+        "error": error,
     }
 
 

@@ -26,6 +26,113 @@ from invoice_agents.config import Settings
 from invoice_agents.db.core import DatabaseKind, migrate_database
 from invoice_agents.errors import DatabaseVerificationError, ErrorCategory
 
+_EXPECTED_WORKER_DOMAIN_MESSAGES = {
+    "AUTHORIZATION_INVENTORY_WAL_MODE_UNSUPPORTED": (
+        ErrorCategory.DATABASE,
+        "authorization inventory database must use DELETE journal mode",
+    ),
+    "AUTHORIZATION_RECONCILIATION_REQUIRED": (
+        ErrorCategory.DATABASE,
+        "workflow authorization reconciliation is required before migration 003 "
+        "(review_request_count=1, human_decision_count=2, final_decision_count=3, "
+        "payment_count=4)",
+    ),
+    "DATABASE_AUTHORIZATION_CONTEXT_MISMATCH": (
+        ErrorCategory.CONFIGURATION,
+        "database migration authorization context does not match its target",
+    ),
+    "DATABASE_AUTHORIZATION_CONTEXT_REQUIRED": (
+        ErrorCategory.CONFIGURATION,
+        "database migration requires explicit authorization context",
+    ),
+    "DATABASE_AUTHORIZATION_PROVENANCE_INVALID": (
+        ErrorCategory.DATABASE,
+        "legacy workflow v3 authorization provenance is incomplete or inconsistent",
+    ),
+    "DATABASE_CHANGED_DURING_VERIFICATION": (
+        ErrorCategory.DATABASE,
+        "database source changed during migration verification",
+    ),
+    "DATABASE_INTEGRITY_FAILED": (
+        ErrorCategory.DATABASE,
+        "database integrity verification failed",
+    ),
+    "DATABASE_LOCK_UNAVAILABLE": (
+        ErrorCategory.DATABASE,
+        "database maintenance lock is unavailable",
+    ),
+    "DATABASE_MAINTENANCE_BINDING_FAILED": (
+        ErrorCategory.DATABASE,
+        "database maintenance binding could not be verified",
+    ),
+    "DATABASE_MAINTENANCE_CLEANUP_FAILED": (
+        ErrorCategory.DATABASE,
+        "database maintenance cleanup could not be verified",
+    ),
+    "DATABASE_MISSING": (ErrorCategory.DATABASE, "required database does not exist"),
+    "DATABASE_SCHEMA_MISMATCH": (
+        ErrorCategory.DATABASE,
+        "database schema does not match the migration contract",
+    ),
+    "DATABASE_SIDECAR_UNSUPPORTED": (
+        ErrorCategory.DATABASE,
+        "database sidecar files are not supported during migration",
+    ),
+    "DATABASE_SIGNATURE_INVALID": (
+        ErrorCategory.DATABASE,
+        "database file signature is invalid",
+    ),
+    "DATABASE_SYMLINK_UNSUPPORTED": (
+        ErrorCategory.DATABASE,
+        "database symlink paths are not supported during migration",
+    ),
+    "DATABASE_VERIFICATION_ERROR": (
+        ErrorCategory.DATABASE,
+        "database verification failed",
+    ),
+    "DATABASE_VERSION_MISMATCH": (
+        ErrorCategory.DATABASE,
+        "database schema version does not match the migration contract",
+    ),
+    "INVENTORY_WAL_MODE_UNSUPPORTED": (
+        ErrorCategory.DATABASE,
+        "inventory database must use DELETE journal mode",
+    ),
+    "LEGACY_RECONCILIATION_ARCHIVE_INVALID": (
+        ErrorCategory.DATABASE,
+        "legacy reconciliation archive failed integrity verification",
+    ),
+    "LEGACY_RECONCILIATION_ARCHIVE_UPGRADE_REQUIRED": (
+        ErrorCategory.DATABASE,
+        "legacy authorization archive requires a lossless upgrade",
+    ),
+    "LEGACY_RECONCILIATION_DELETE_INCOMPLETE": (
+        ErrorCategory.DATABASE,
+        "legacy authorization reconciliation did not remove every active row",
+    ),
+    "LEGACY_RECONCILIATION_FAILED": (
+        ErrorCategory.DATABASE,
+        "legacy authorization reconciliation failed atomically",
+    ),
+    "LEGACY_RECONCILIATION_STATE_INVALID": (
+        ErrorCategory.DATABASE,
+        "legacy authorization reconciliation state is invalid",
+    ),
+    "MIGRATION_FAILED": (ErrorCategory.DATABASE, "database migration failed"),
+    "MIGRATION_HISTORY_INVALID": (
+        ErrorCategory.DATABASE,
+        "database migration history is invalid",
+    ),
+    "MIGRATION_NOT_FOUND": (
+        ErrorCategory.DATABASE,
+        "database migration resources are unavailable",
+    ),
+    "WORKFLOW_WAL_MODE_UNSUPPORTED": (
+        ErrorCategory.DATABASE,
+        "workflow database must use DELETE journal mode",
+    ),
+}
+
 
 def _assert_processes_gone(process_ids: list[int]) -> None:
     for process_id in process_ids:
@@ -43,6 +150,16 @@ def _kill_processes(process_ids: list[int]) -> None:
     for process_id in process_ids:
         with suppress(ProcessLookupError):
             os.kill(process_id, 9)
+
+
+def _release_quarantine_after_external_stop(process_ids: list[int]) -> None:
+    """Model an operator stopping an unsignalable Darwin descendant, then retry cleanup."""
+
+    _kill_processes(process_ids)
+    deadline = time.monotonic() + 2
+    while not migration_process._retry_quarantined_workers():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
 
 
 def _install_member_signal_controller(
@@ -112,10 +229,11 @@ def _setpgrp_worker_command(
     response: str,
     *,
     ignore_term: bool = False,
+    escape_group: bool = True,
 ) -> list[str]:
     child_script = (
         "import os,pathlib,signal,time;"
-        "os.setpgrp();"
+        + ("os.setpgrp();" if escape_group else "")
         + ("signal.signal(signal.SIGTERM,signal.SIG_IGN);" if ignore_term else "")
         + f"pathlib.Path({str(marker_path)!r}).write_text("
         "f'{os.getpid()} {os.getpgrp()} {os.getsid(0)}');"
@@ -272,7 +390,7 @@ def test_worker_rejects_malformed_secret_bearing_request_without_stderr_or_echo(
         "ok": False,
         "error": {
             "category": "DATABASE",
-            "message": "database migration worker protocol was invalid",
+            "message": "database migration worker returned an invalid bounded response",
             "stop_reason": "MIGRATION_WORKER_PROTOCOL_INVALID",
             "details": None,
         },
@@ -295,14 +413,234 @@ def test_worker_round_trips_expected_error_contract_with_json_safe_redaction() -
     with pytest.raises(DatabaseVerificationError) as excinfo:
         migration_process._decode_response(migration_process.encode_worker_response(response))
 
-    assert excinfo.value.category is original.category
-    assert excinfo.value.message == original.message
-    assert excinfo.value.stop_reason == original.stop_reason
-    assert excinfo.value.details == {
-        "missing_schema_objects": [["table", "payments", "payments"]],
-        "api_key": "[REDACTED]",
+    assert response == {
+        "ok": False,
+        "error": {
+            "category": "DATABASE",
+            "message": "database schema does not match the migration contract",
+            "stop_reason": "DATABASE_SCHEMA_MISMATCH",
+            "details": None,
+        },
     }
+    assert excinfo.value.category is original.category
+    assert excinfo.value.message == "database schema does not match the migration contract"
+    assert excinfo.value.stop_reason == original.stop_reason
+    assert excinfo.value.details is None
     assert secret not in str(response)
+
+
+@pytest.mark.parametrize("stop_reason", sorted(_EXPECTED_WORKER_DOMAIN_MESSAGES))
+def test_every_allowlisted_worker_domain_error_has_parent_owned_output(
+    stop_reason: str,
+) -> None:
+    category, expected_message = _EXPECTED_WORKER_DOMAIN_MESSAGES[stop_reason]
+    canary = f"canary-child-domain-{stop_reason.lower()}"
+    if stop_reason == "AUTHORIZATION_RECONCILIATION_REQUIRED":
+        details: dict[str, object] = {
+            "review_request_count": 1,
+            "human_decision_count": 2,
+            "final_decision_count": 3,
+            "payment_count": 4,
+        }
+    elif stop_reason == "DATABASE_AUTHORIZATION_PROVENANCE_INVALID":
+        details = {
+            "invalid_review_count": 1,
+            "invalid_human_decision_count": 2,
+            "invalid_snapshot_count": 3,
+            "invalid_final_decision_count": 4,
+            "invalid_payment_count": 5,
+            "invalid_cardinality_count": 6,
+            "invalid_quarantine_count": 7,
+        }
+    else:
+        details = {"child_controlled": [canary]}
+    original = DatabaseVerificationError(
+        category,
+        canary,
+        stop_reason=stop_reason,
+        details=details,
+    )
+
+    response = migration_worker._safe_expected_failure(original)
+    error_payload = response["error"]
+    assert isinstance(error_payload, dict)
+    expected_details = (
+        details
+        if stop_reason
+        in {
+            "AUTHORIZATION_RECONCILIATION_REQUIRED",
+            "DATABASE_AUTHORIZATION_PROVENANCE_INVALID",
+        }
+        else None
+    )
+    assert error_payload == {
+        "category": category.value,
+        "message": expected_message,
+        "stop_reason": stop_reason,
+        "details": expected_details,
+    }
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migration_process._decode_response(migration_process.encode_worker_response(response))
+    assert excinfo.value.category is category
+    assert excinfo.value.message == expected_message
+    assert excinfo.value.stop_reason == stop_reason
+    assert excinfo.value.details == expected_details
+    assert canary not in _exception_graph_text(excinfo.value)
+
+
+def test_public_worker_error_rejects_every_child_controlled_canary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canaries = {
+        "message": "canary-child-message",
+        "nested_key": "canary-child-nested-key",
+        "nested_value": "canary-child-nested-value",
+        "list_value": "canary-child-list-value",
+        "code": "CANARY_CHILD_CODE",
+        "traceback": "canary-child-traceback",
+        "cause": "canary-child-cause",
+        "context": "canary-child-context",
+        "stdout": "canary-child-stdout",
+        "stderr": "canary-child-stderr",
+    }
+    payloads = [
+        {
+            "ok": False,
+            "error": {
+                "category": "DATABASE",
+                "message": canaries["message"],
+                "stop_reason": "MIGRATION_HISTORY_INVALID",
+                "details": {
+                    canaries["nested_key"]: {
+                        "value": canaries["nested_value"],
+                        "items": [canaries["list_value"]],
+                    },
+                    "traceback": canaries["traceback"],
+                    "cause": canaries["cause"],
+                    "context": canaries["context"],
+                    "stdout": canaries["stdout"],
+                    "stderr": canaries["stderr"],
+                },
+            },
+        },
+        {
+            "ok": False,
+            "error": {
+                "category": "DATABASE",
+                "message": "database migration history is invalid",
+                "stop_reason": canaries["code"],
+                "details": None,
+            },
+        },
+    ]
+
+    for index, payload in enumerate(payloads):
+        encoded = json.dumps(payload)
+        command = [
+            sys.executable,
+            "-c",
+            (f"import sys;sys.stderr.write({canaries['stderr']!r});sys.stdout.write({encoded!r})"),
+        ]
+        monkeypatch.setattr(
+            migration_process,
+            "_worker_command",
+            lambda command=command: command,
+        )
+
+        with pytest.raises(DatabaseVerificationError) as excinfo:
+            migration_process.run_migration_in_subprocess(
+                tmp_path / f"child-controlled-error-{index}.db",
+                DatabaseKind.INVENTORY,
+                settings=None,
+            )
+
+        error = excinfo.value
+        assert error.stop_reason == "MIGRATION_WORKER_PROTOCOL_INVALID"
+        assert error.message == "database migration worker returned an invalid bounded response"
+        assert error.details is None
+        public_surface = _exception_graph_text(error)
+        for canary in canaries.values():
+            assert canary not in public_surface
+
+
+@pytest.mark.parametrize(
+    ("raw_response", "canary"),
+    [
+        (
+            '{"ok":false,"error":{"category":"DATABASE",'
+            '"message":"database migration history is invalid",'
+            '"stop_reason":"MIGRATION_HISTORY_INVALID","details":null},'
+            '"canary-extra-top-key":"canary-extra-top-value"}',
+            "canary-extra-top-value",
+        ),
+        (
+            '{"ok":false,"error":{"category":"DATABASE",'
+            '"message":"database migration history is invalid",'
+            '"stop_reason":"MIGRATION_HISTORY_INVALID","details":null,'
+            '"traceback":"canary-extra-error-key"}}',
+            "canary-extra-error-key",
+        ),
+        (
+            '{"ok":false,"error":{"category":"DATABASE",'
+            '"message":"canary-duplicate-key",'
+            '"message":"database migration history is invalid",'
+            '"stop_reason":"MIGRATION_HISTORY_INVALID","details":null}}',
+            "canary-duplicate-key",
+        ),
+        (
+            '{"ok":false,"error":{"category":"canary-category",'
+            '"message":"database migration history is invalid",'
+            '"stop_reason":"MIGRATION_HISTORY_INVALID","details":null}}',
+            "canary-category",
+        ),
+        (
+            '{"ok":false,"error":{"category":"DATABASE",'
+            '"message":"database migration history is invalid",'
+            '"stop_reason":"MIGRATION_HISTORY_INVALID",'
+            '"details":"canary-string-details"}}',
+            "canary-string-details",
+        ),
+        (
+            '{"ok":false,"error":{"category":"DATABASE",'
+            '"message":"database migration history is invalid",'
+            '"stop_reason":"MIGRATION_HISTORY_INVALID","details":NaN},'
+            '"canary-non-finite":"canary-non-finite-value"}',
+            "canary-non-finite-value",
+        ),
+    ],
+    ids=[
+        "extra-top-level-key",
+        "extra-error-key",
+        "duplicate-key",
+        "category-mismatch",
+        "string-details",
+        "non-finite-number",
+    ],
+)
+def test_worker_protocol_ambiguity_becomes_chainless_parent_owned_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_response: str,
+    canary: str,
+) -> None:
+    command = [sys.executable, "-c", f"import sys;sys.stdout.write({raw_response!r})"]
+    monkeypatch.setattr(migration_process, "_worker_command", lambda: command)
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migration_process.run_migration_in_subprocess(
+            tmp_path / "ambiguous-worker-response.db",
+            DatabaseKind.INVENTORY,
+            settings=None,
+        )
+
+    error = excinfo.value
+    assert error.stop_reason == "MIGRATION_WORKER_PROTOCOL_INVALID"
+    assert error.message == "database migration worker returned an invalid bounded response"
+    assert error.details is None
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert canary not in _exception_graph_text(error)
 
 
 def test_public_error_copy_discards_a_secret_bearing_exception_chain() -> None:
@@ -373,7 +711,7 @@ def test_worker_spawn_failure_has_stable_chainless_secret_safe_exception(
     assert secret not in _exception_graph_text(error)
 
 
-def test_worker_watcher_constructor_failure_cleans_entire_reserved_session(
+def test_worker_watcher_constructor_failure_cleans_or_quarantines_reserved_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -393,6 +731,7 @@ def test_worker_watcher_constructor_failure_cleans_entire_reserved_session(
         raise OSError(secret)
 
     monkeypatch.setattr(migration_process, "_WorkerExitWatcher", fail_watcher_after_child_creation)
+    signalled_targets = _install_member_signal_controller(monkeypatch, lambda _signal: False)
     process_ids: list[int] = []
 
     try:
@@ -407,10 +746,20 @@ def test_worker_watcher_constructor_failure_cleans_entire_reserved_session(
 
         assert child_group == child_pid
         assert child_session != child_group
-        assert excinfo.value.stop_reason == "MIGRATION_WORKER_START_FAILED"
-        _assert_processes_gone(process_ids)
+        if sys.platform == "darwin":
+            assert excinfo.value.stop_reason == "MIGRATION_WORKER_CLEANUP_FAILED"
+            assert len(migration_process._QUARANTINED_WORKERS) == 1
+            retained = next(iter(migration_process._QUARANTINED_WORKERS.values()))
+            assert retained.process.returncode is None
+            assert child_group not in signalled_targets
+        else:
+            assert excinfo.value.stop_reason == "MIGRATION_WORKER_START_FAILED"
+            _assert_processes_gone(process_ids)
     finally:
-        _kill_processes(process_ids)
+        if sys.platform == "darwin" and process_ids:
+            _release_quarantine_after_external_stop(process_ids)
+        else:
+            _kill_processes(process_ids)
 
 
 def test_worker_watcher_constructor_failure_has_no_secret_bearing_exception_chain(
@@ -548,7 +897,8 @@ def test_worker_expected_error_reaps_same_session_descendant_with_closed_stdio(
             "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
             f"pathlib.Path({str(pid_path)!r}).write_text(f'{{os.getpid()}} {{child.pid}}'); "
             "print(json.dumps({'ok':False,'error':{'category':'DATABASE',"
-            "'message':'schema audit failed','stop_reason':'MIGRATION_HISTORY_INVALID',"
+            "'message':'database migration history is invalid',"
+            "'stop_reason':'MIGRATION_HISTORY_INVALID',"
             "'details':None}}))"
         ),
     ]
@@ -575,7 +925,8 @@ def test_worker_expected_error_reaps_same_session_descendant_with_closed_stdio(
     [
         ('{"ok":true,"applied":[]}', None),
         (
-            '{"ok":false,"error":{"category":"DATABASE","message":"schema audit failed",'
+            '{"ok":false,"error":{"category":"DATABASE",'
+            '"message":"database migration history is invalid",'
             '"stop_reason":"MIGRATION_HISTORY_INVALID","details":null}}',
             "MIGRATION_HISTORY_INVALID",
         ),
@@ -594,10 +945,19 @@ def test_worker_reaps_same_session_descendant_that_escapes_leader_process_group(
         "_worker_command",
         lambda: _setpgrp_worker_command(marker_path, response),
     )
+    signalled_targets = _install_member_signal_controller(monkeypatch, lambda _signal: False)
     process_ids: list[int] = []
 
     try:
-        if expected_stop_reason is None:
+        if sys.platform == "darwin":
+            with pytest.raises(DatabaseVerificationError) as excinfo:
+                migration_process.run_migration_in_subprocess(
+                    tmp_path / "escaped-darwin.db",
+                    DatabaseKind.INVENTORY,
+                    settings=None,
+                )
+            assert excinfo.value.stop_reason == "MIGRATION_WORKER_CLEANUP_FAILED"
+        elif expected_stop_reason is None:
             assert (
                 migration_process.run_migration_in_subprocess(
                     tmp_path / "escaped-success.db",
@@ -619,9 +979,16 @@ def test_worker_reaps_same_session_descendant_that_escapes_leader_process_group(
 
         assert child_group == child_pid
         assert child_session != child_group
-        _assert_processes_gone(process_ids)
+        if sys.platform == "darwin":
+            assert len(migration_process._QUARANTINED_WORKERS) == 1
+            assert child_group not in signalled_targets
+        else:
+            _assert_processes_gone(process_ids)
     finally:
-        _kill_processes(process_ids)
+        if sys.platform == "darwin" and process_ids:
+            _release_quarantine_after_external_stop(process_ids)
+        else:
+            _kill_processes(process_ids)
 
 
 def test_worker_watcher_failure_quarantines_unreaped_session_until_cleanup_is_proven(
@@ -684,12 +1051,17 @@ def test_worker_watcher_failure_quarantines_unreaped_session_until_cleanup_is_pr
         assert unrelated.pid not in signalled_targets
 
         deny_group_signals = False
-        assert migration_process._retry_quarantined_workers()
+        if sys.platform == "darwin":
+            assert not migration_process._retry_quarantined_workers()
+            assert signalled_targets == []
+            assert quarantined_worker.process.returncode is None
+            _release_quarantine_after_external_stop([child_pid])
+        else:
+            assert migration_process._retry_quarantined_workers()
+            assert signalled_targets and set(signalled_targets) == {child_pid}
         assert quarantined_worker.process.returncode is not None
         _assert_processes_gone([child_pid])
         assert unrelated.poll() is None
-        expected_target = child_pid if sys.platform.startswith("linux") else child_group
-        assert signalled_targets and set(signalled_targets) == {expected_target}
         deadline = time.monotonic() + 1
         while migration_process._QUARANTINE_RETRY_THREAD_RUNNING:
             assert time.monotonic() < deadline
@@ -701,7 +1073,10 @@ def test_worker_watcher_failure_quarantines_unreaped_session_until_cleanup_is_pr
         ]
     finally:
         deny_group_signals = False
-        _kill_processes([child_pid] if child_pid else [])
+        if migration_process._QUARANTINED_WORKERS and child_pid:
+            _release_quarantine_after_external_stop([child_pid])
+        else:
+            _kill_processes([child_pid] if child_pid else [])
         unrelated.kill()
         unrelated.wait()
 
@@ -712,7 +1087,8 @@ def test_worker_watcher_failure_quarantines_unreaped_session_until_cleanup_is_pr
     [
         '{"ok":true,"applied":[]}',
         (
-            '{"ok":false,"error":{"category":"DATABASE","message":"schema audit failed",'
+            '{"ok":false,"error":{"category":"DATABASE",'
+            '"message":"database migration history is invalid",'
             '"stop_reason":"MIGRATION_HISTORY_INVALID","details":null}}'
         ),
     ],
@@ -732,6 +1108,7 @@ def test_worker_signal_permission_failure_overrides_response_and_can_be_retried(
             marker_path,
             worker_response,
             ignore_term=denied_signal == signal.SIGKILL,
+            escape_group=False,
         ),
     )
     monkeypatch.setattr(migration_process, "_WORKER_SHUTDOWN_SECONDS", 0.05)
@@ -967,7 +1344,10 @@ def test_worker_group_identity_uncertainty_never_signals_the_group(
     identity_fault: str,
 ) -> None:
     monkeypatch.setattr(migration_process.sys, "platform", "darwin")
-    worker = cast(Any, SimpleNamespace(session_id=101, process_group_id=101))
+    worker = cast(
+        Any,
+        SimpleNamespace(process_id=101, session_id=101, process_group_id=101),
+    )
     members = (migration_process._WorkerSessionMember(202, 202),)
     signals: list[tuple[int, int]] = []
     session_queries = 0
@@ -987,11 +1367,8 @@ def test_worker_group_identity_uncertainty_never_signals_the_group(
         lambda group_id, signal_number: signals.append((group_id, signal_number)),
     )
 
-    if identity_fault == "esrch":
+    with pytest.raises(migration_process._WorkerCleanupFailure):
         migration_process._signal_worker_session_groups(worker, members, signal.SIGKILL)
-    else:
-        with pytest.raises(migration_process._WorkerCleanupFailure):
-            migration_process._signal_worker_session_groups(worker, members, signal.SIGKILL)
 
     assert signals == []
 
@@ -1000,7 +1377,10 @@ def test_worker_group_without_live_group_leader_is_never_signalled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(migration_process.sys, "platform", "darwin")
-    worker = cast(Any, SimpleNamespace(session_id=101, process_group_id=101))
+    worker = cast(
+        Any,
+        SimpleNamespace(process_id=101, session_id=101, process_group_id=101),
+    )
     members = (migration_process._WorkerSessionMember(203, 202),)
     signals: list[tuple[int, int]] = []
     monkeypatch.setattr(migration_process.os, "getsid", lambda _process_id: 101)
@@ -1013,6 +1393,104 @@ def test_worker_group_without_live_group_leader_is_never_signalled(
 
     with pytest.raises(migration_process._WorkerCleanupFailure):
         migration_process._signal_worker_session_groups(worker, members, signal.SIGKILL)
+
+    assert signals == []
+
+
+def test_darwin_descendant_group_identity_change_at_action_boundary_never_signals_numeric_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A validated numeric PGID can be reassigned before killpg performs its action."""
+
+    monkeypatch.setattr(migration_process.sys, "platform", "darwin")
+    worker = cast(
+        Any,
+        SimpleNamespace(process_id=101, session_id=101, process_group_id=101),
+    )
+    members = (
+        migration_process._WorkerSessionMember(202, 202),
+        migration_process._WorkerSessionMember(203, 202),
+        migration_process._WorkerSessionMember(303, 303),
+        migration_process._WorkerSessionMember(304, 303),
+    )
+    final_validation_returned = False
+    unrelated_group_signals: list[tuple[int, int]] = []
+
+    def validated_getpgid(_process_id: int) -> int:
+        nonlocal final_validation_returned
+        final_validation_returned = True
+        return 202
+
+    def numeric_group_action(group_id: int, signal_number: int) -> None:
+        assert final_validation_returned
+        unrelated_group_signals.append((group_id, signal_number))
+
+    monkeypatch.setattr(migration_process.os, "getsid", lambda _process_id: 101)
+    monkeypatch.setattr(migration_process.os, "getpgid", validated_getpgid)
+    monkeypatch.setattr(migration_process.os, "killpg", numeric_group_action)
+
+    with pytest.raises(migration_process._WorkerCleanupFailure):
+        migration_process._signal_worker_session_groups(worker, members, signal.SIGKILL)
+
+    assert unrelated_group_signals == []
+
+
+def test_darwin_original_group_signal_is_bound_by_unreaped_leader_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = cast(
+        Any,
+        SimpleNamespace(process_id=101, process_group_id=101, session_id=101),
+    )
+    members = (
+        migration_process._WorkerSessionMember(202, 101),
+        migration_process._WorkerSessionMember(203, 101),
+    )
+    group_signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(migration_process.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        migration_process.os,
+        "killpg",
+        lambda group_id, signal_number: group_signals.append((group_id, signal_number)),
+    )
+
+    migration_process._signal_worker_session_groups(worker, members, signal.SIGTERM)
+
+    assert group_signals == [(101, signal.SIGTERM)]
+
+
+@pytest.mark.parametrize(
+    ("process_id", "process_group_id", "session_id"),
+    [(101, 102, 101), (101, 101, 102), (101, 102, 103)],
+)
+def test_darwin_initial_session_identity_mismatch_never_signals_any_group(
+    monkeypatch: pytest.MonkeyPatch,
+    process_id: int,
+    process_group_id: int,
+    session_id: int,
+) -> None:
+    worker = cast(
+        Any,
+        SimpleNamespace(
+            process_id=process_id,
+            process_group_id=process_group_id,
+            session_id=session_id,
+        ),
+    )
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(migration_process.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        migration_process.os,
+        "killpg",
+        lambda group_id, signal_number: signals.append((group_id, signal_number)),
+    )
+
+    with pytest.raises(migration_process._WorkerCleanupFailure):
+        migration_process._signal_worker_session_groups(
+            worker,
+            (migration_process._WorkerSessionMember(202, process_group_id),),
+            signal.SIGKILL,
+        )
 
     assert signals == []
 
@@ -1104,7 +1582,11 @@ def test_worker_identity_query_permission_failure_is_cleanup_failure(
     monkeypatch.setattr(
         migration_process,
         "_worker_command",
-        lambda: _setpgrp_worker_command(marker_path, '{"ok":true,"applied":[]}'),
+        lambda: _setpgrp_worker_command(
+            marker_path,
+            '{"ok":true,"applied":[]}',
+            escape_group=False,
+        ),
     )
     real_getsid = os.getsid
     deny_identity = True

@@ -541,6 +541,8 @@ def _is_sqlite_runtime_table(
     connection: sqlite3.Connection,
     entry: SQLiteSchemaEntry,
     entries: tuple[SQLiteSchemaEntry, ...],
+    *,
+    require_empty: bool = False,
 ) -> bool:
     """Recognize only the exact runtime tables this SQLite build proves it creates."""
 
@@ -569,6 +571,12 @@ def _is_sqlite_runtime_table(
     )
     if columns != expected_columns:
         return False
+    if (
+        require_empty
+        and connection.execute(f"SELECT 1 FROM {_quote_identifier(entry.name)} LIMIT 1").fetchone()
+        is not None
+    ):
+        return False
     for candidate in entries:
         if candidate is entry or candidate.object_type not in {"index", "trigger", "view"}:
             continue
@@ -583,6 +591,7 @@ def _non_internal_schema_objects(
     connection: sqlite3.Connection,
     *,
     allowed_names: frozenset[str] = frozenset(),
+    require_empty_runtime_tables: bool = False,
 ) -> tuple[SQLiteSchemaEntry, ...]:
     """Return every schema row except exact allowlisted rows and proven autoindexes."""
 
@@ -591,7 +600,12 @@ def _non_internal_schema_objects(
         entry
         for entry in entries
         if not (type(entry.name) is str and entry.name in allowed_names)
-        and not _is_sqlite_runtime_table(connection, entry, entries)
+        and not _is_sqlite_runtime_table(
+            connection,
+            entry,
+            entries,
+            require_empty=require_empty_runtime_tables,
+        )
         and not _is_sqlite_owned_autoindex(connection, entry, entries)
     )
 
@@ -611,7 +625,10 @@ def _read_migration_history(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'"
         ).fetchone()
         if table is None:
-            if _non_internal_schema_objects(connection):
+            if _non_internal_schema_objects(
+                connection,
+                require_empty_runtime_tables=True,
+            ):
                 raise ValueError("database has schema objects but no migration history")
             return ()
         rows = connection.execute("SELECT version FROM schema_version").fetchall()
@@ -631,6 +648,7 @@ def _read_migration_history(
         if not versions and _non_internal_schema_objects(
             connection,
             allowed_names=frozenset({"schema_version"}),
+            require_empty_runtime_tables=True,
         ):
             raise ValueError("empty migration history has unexpected schema objects")
         durable_table = connection.execute(
@@ -974,7 +992,10 @@ def _preflight_existing_migration_history(
         if (
             header_info is not None
             and header_info.is_pre_schema
-            and _non_internal_schema_objects(connection)
+            and _non_internal_schema_objects(
+                connection,
+                require_empty_runtime_tables=True,
+            )
         ):
             raise DatabaseVerificationError(
                 ErrorCategory.DATABASE,
