@@ -39,7 +39,7 @@ SECURITY_HEADERS = {
     ),
     "X-Frame-Options": "DENY",
     "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
+    "Referrer-Policy": "same-origin",
 }
 _PROXY_ORIGIN_HEADERS = (
     "forwarded",
@@ -239,11 +239,15 @@ def _has_strict_same_origin(
         return False
     if len(origin_values) > 1 or len(referer_values) > 1:
         return False
-    if origin_values and _parsed_origin(origin_values[0], referer=False) != request_origin:
+    referer_origin = _parsed_origin(referer_values[0], referer=True) if referer_values else None
+    if referer_values and referer_origin != request_origin:
         return False
-    return not (
-        referer_values and _parsed_origin(referer_values[0], referer=True) != request_origin
-    )
+    if not origin_values:
+        return referer_origin == request_origin
+    origin_value = origin_values[0]
+    if origin_value == "null":
+        return referer_origin == request_origin
+    return _parsed_origin(origin_value, referer=False) == request_origin
 
 
 def _session_signature(session_id: str, secret: bytes) -> str:

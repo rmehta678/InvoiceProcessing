@@ -13,23 +13,39 @@ runner = CliRunner()
 
 
 def test_ui_refuses_non_loopback_host_without_flag() -> None:
-    result = runner.invoke(app, ["ui", "--host", "0.0.0.0"])
+    server_calls = 0
+
+    def forbidden_run(*_args: object, **_kwargs: object) -> None:
+        nonlocal server_calls
+        server_calls += 1
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("uvicorn.run", forbidden_run)
+        result = runner.invoke(app, ["ui", "--host", "0.0.0.0"])
     assert result.exit_code == 1
     assert "allow-remote-i-understand" in result.output
     assert "no authentication" in result.output
+    assert server_calls == 0
 
 
 def test_ui_remote_acknowledgement_also_requires_explicit_allowed_hosts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    server_calls = 0
+
+    def forbidden_run(*_args: object, **_kwargs: object) -> None:
+        nonlocal server_calls
+        server_calls += 1
+
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+    monkeypatch.setattr("uvicorn.run", forbidden_run)
     result = runner.invoke(
         app,
         ["ui", "--host", "0.0.0.0", "--allow-remote-i-understand", "--no-init-db"],
     )
     assert result.exit_code == 1
     assert "INVOICE_UI_ALLOWED_HOSTS" in result.output
+    assert server_calls == 0
 
 
 def test_ui_remote_binding_passes_explicit_hosts_and_origins_to_the_app(
@@ -69,15 +85,22 @@ def test_ui_remote_binding_passes_explicit_hosts_and_origins_to_the_app(
 def test_ui_remote_binding_requires_a_shared_session_secret(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    server_calls = 0
+
+    def forbidden_run(*_args: object, **_kwargs: object) -> None:
+        nonlocal server_calls
+        server_calls += 1
+
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("INVOICE_UI_ALLOWED_HOSTS", '["console.example"]')
-    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+    monkeypatch.setattr("uvicorn.run", forbidden_run)
     result = runner.invoke(
         app,
         ["ui", "--host", "0.0.0.0", "--allow-remote-i-understand", "--no-init-db"],
     )
     assert result.exit_code == 1
     assert "INVOICE_UI_SESSION_SECRET" in result.output
+    assert server_calls == 0
 
 
 def test_ui_ipv6_loopback_needs_no_remote_ack_and_uses_bracketed_origin(
@@ -113,15 +136,22 @@ def test_ui_ipv6_loopback_needs_no_remote_ack_and_uses_bracketed_origin(
 def test_ui_remote_binding_rejects_wildcard_allowed_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    server_calls = 0
+
+    def forbidden_run(*_args: object, **_kwargs: object) -> None:
+        nonlocal server_calls
+        server_calls += 1
+
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("INVOICE_UI_ALLOWED_HOSTS", '["*"]')
-    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+    monkeypatch.setattr("uvicorn.run", forbidden_run)
     result = runner.invoke(
         app,
         ["ui", "--host", "0.0.0.0", "--allow-remote-i-understand", "--no-init-db"],
     )
     assert result.exit_code == 1
     assert "allowed host" in result.output.lower()
+    assert server_calls == 0
 
 
 def test_ui_help_documents_loopback_default() -> None:

@@ -109,7 +109,7 @@ def _assert_security_headers(response: Any) -> None:
     assert "frame-ancestors 'none'" in policy
     assert response.headers["x-frame-options"] == "DENY"
     assert response.headers["x-content-type-options"] == "nosniff"
-    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["referrer-policy"] == "same-origin"
 
 
 @pytest.mark.parametrize("attack", ["hostile_origin", "missing_token", "wrong_token"])
@@ -557,7 +557,16 @@ def test_reviewer_preference_cookie_uses_the_configured_origin_scheme(
             {"Origin": "https://evil.example", "Referer": "http://testserver/submit"},
             403,
         ),
+        (
+            {"Origin": "null", "Referer": "http://testserver/submit?from=review"},
+            404,
+        ),
         ({"Origin": "null"}, 403),
+        ({"Origin": "null", "Referer": ""}, 403),
+        ({"Origin": "null", "Referer": "not-an-origin"}, 403),
+        ({"Origin": "null", "Referer": "https://evil.example/review"}, 403),
+        ({"Origin": "null", "Referer": "http://testserver@evil.example/review"}, 403),
+        ({"Origin": "null", "Referer": "http://testserver.evil.example/review"}, 403),
         ({"Origin": "http://testserver/path"}, 403),
         ({"Origin": "http://user@testserver"}, 403),
         ({"Origin": "http://testserver#fragment"}, 403),
@@ -574,10 +583,12 @@ def test_reviewer_preference_cookie_uses_the_configured_origin_scheme(
 )
 def test_origin_and_referer_evidence_is_unambiguous_and_exact(
     raw_client: TestClient,
+    settings: Settings,
     headers: dict[str, str],
     expected_status: int,
 ) -> None:
     token = _rendered_token(raw_client)
+    before = _database_snapshot(settings)
     response = raw_client.post(
         "/submit",
         data={"existing": "missing.txt", "csrf_token": token},
@@ -585,6 +596,7 @@ def test_origin_and_referer_evidence_is_unambiguous_and_exact(
         follow_redirects=False,
     )
     assert response.status_code == expected_status
+    assert _database_snapshot(settings) == before
 
 
 def test_duplicate_origin_headers_are_rejected(raw_client: TestClient) -> None:
@@ -630,8 +642,10 @@ def test_base_exposes_the_session_token_for_htmx_headers(raw_client: TestClient)
 
 def test_form_and_header_token_together_are_rejected_as_ambiguous(
     raw_client: TestClient,
+    settings: Settings,
 ) -> None:
     token = _rendered_token(raw_client)
+    before = _database_snapshot(settings)
     response = raw_client.post(
         "/submit",
         data={"existing": "missing.txt", "csrf_token": token},
@@ -639,10 +653,15 @@ def test_form_and_header_token_together_are_rejected_as_ambiguous(
         follow_redirects=False,
     )
     assert response.status_code == 403
+    assert _database_snapshot(settings) == before
 
 
-def test_duplicate_form_tokens_are_rejected(raw_client: TestClient) -> None:
+def test_duplicate_form_tokens_are_rejected(
+    raw_client: TestClient,
+    settings: Settings,
+) -> None:
     token = _rendered_token(raw_client)
+    before = _database_snapshot(settings)
     response = raw_client.post(
         "/submit",
         data={"existing": "missing.txt", "csrf_token": [token, token]},
@@ -650,10 +669,15 @@ def test_duplicate_form_tokens_are_rejected(raw_client: TestClient) -> None:
         follow_redirects=False,
     )
     assert response.status_code == 403
+    assert _database_snapshot(settings) == before
 
 
-def test_duplicate_header_tokens_are_rejected(raw_client: TestClient) -> None:
+def test_duplicate_header_tokens_are_rejected(
+    raw_client: TestClient,
+    settings: Settings,
+) -> None:
     token = _rendered_token(raw_client)
+    before = _database_snapshot(settings)
     response = raw_client.post(
         "/submit",
         data={"existing": "missing.txt"},
@@ -665,11 +689,17 @@ def test_duplicate_header_tokens_are_rejected(raw_client: TestClient) -> None:
         follow_redirects=False,
     )
     assert response.status_code == 403
+    assert _database_snapshot(settings) == before
 
 
 @pytest.mark.parametrize("malformed", ["", "short", "A" * 42, "A" * 44, "A" * 42 + "!", "é" * 43])
-def test_malformed_tokens_are_rejected(raw_client: TestClient, malformed: str) -> None:
+def test_malformed_tokens_are_rejected(
+    raw_client: TestClient,
+    settings: Settings,
+    malformed: str,
+) -> None:
     _rendered_token(raw_client)
+    before = _database_snapshot(settings)
     response = raw_client.post(
         "/submit",
         data={"existing": "missing.txt", "csrf_token": malformed},
@@ -677,10 +707,15 @@ def test_malformed_tokens_are_rejected(raw_client: TestClient, malformed: str) -
         follow_redirects=False,
     )
     assert response.status_code == 403
+    assert _database_snapshot(settings) == before
 
 
-def test_query_string_token_is_not_accepted(raw_client: TestClient) -> None:
+def test_query_string_token_is_not_accepted(
+    raw_client: TestClient,
+    settings: Settings,
+) -> None:
     token = _rendered_token(raw_client)
+    before = _database_snapshot(settings)
     response = raw_client.post(
         f"/submit?csrf_token={token}",
         data={"existing": "missing.txt"},
@@ -688,14 +723,20 @@ def test_query_string_token_is_not_accepted(raw_client: TestClient) -> None:
         follow_redirects=False,
     )
     assert response.status_code == 403
+    assert _database_snapshot(settings) == before
 
 
 # ---------------------------------------------------------------- hosts, headers, and body ordering
 
 
-def test_untrusted_host_is_rejected(raw_client: TestClient) -> None:
+def test_untrusted_host_is_rejected(
+    raw_client: TestClient,
+    settings: Settings,
+) -> None:
+    before = _database_snapshot(settings)
     response = raw_client.get("/submit", headers={"Host": "evil.example"})
     assert response.status_code == 400
+    assert _database_snapshot(settings) == before
 
 
 @pytest.mark.parametrize(

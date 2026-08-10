@@ -21,7 +21,7 @@ import pytest
 from factories import make_pending_review_case, make_succeeded_case
 
 from invoice_agents.config import Settings
-from invoice_agents.db.store import WorkflowStore
+from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.models import CaseResult, CaseStatus
 
 pytestmark = pytest.mark.ui_smoke
@@ -51,12 +51,16 @@ def server_url(
 
     from invoice_agents.ui.server import create_app
 
-    async def fake_run(case_id: str, started_at: datetime, run_settings: Settings) -> CaseResult:
+    async def fake_run(
+        case_id: str,
+        started_at: datetime,
+        run_settings: Settings,
+        *,
+        claim: ExecutionClaim | None = None,
+    ) -> CaseResult:
+        assert claim is not None
         store = WorkflowStore(run_settings.workflow_db)
         invoice = store.load_extraction(case_id)
-        claim = store.claim_case_execution(
-            case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
-        )
         result = CaseResult(
             case_id=case_id,
             source_id=invoice.source.source_id,
@@ -68,11 +72,14 @@ def server_url(
         store.finish_case(result, claim)
         return result
 
-    async def fake_resume(case_id: str, run_settings: Settings) -> CaseResult:
+    async def fake_resume(
+        case_id: str,
+        run_settings: Settings,
+        *,
+        claim: ExecutionClaim | None = None,
+    ) -> CaseResult:
+        assert claim is not None
         store = WorkflowStore(run_settings.workflow_db)
-        claim = store.claim_case_execution(
-            case_id, frozenset({CaseStatus.NEEDS_HUMAN}), lease_seconds=60
-        )
         previous = store.load_result(case_id)
         assert previous is not None
         result = previous.model_copy(
@@ -167,10 +174,22 @@ def test_u1_decide_reject_and_resume_in_browser(
 def test_u2_submit_from_browser_reaches_terminal_banner(
     page: Any, server_url: str, settings: Settings
 ) -> None:
-    page.goto(server_url + "/submit")
+    loaded = page.goto(server_url + "/submit")
+    assert loaded is not None
     page.check("input[name='existing'][value='invoice_1001.txt']")
-    page.click("button:has-text('Process invoice')")
+    with page.expect_request(
+        lambda request: request.method == "POST" and request.url == server_url + "/submit"
+    ) as submitted_request:
+        page.click("button:has-text('Process invoice')")
+    submitted_response = submitted_request.value.response()
+    assert submitted_response is not None
+    assert submitted_response.status == 303
+    request_headers = submitted_request.value.all_headers()
+    assert request_headers["origin"] == server_url
+    assert request_headers["referer"] == server_url + "/submit"
+    assert loaded.headers["referrer-policy"] == "same-origin"
     page.wait_for_url("**/live")
+    assert page.url.endswith("/live")
     page.wait_for_selector(".terminal-banner", timeout=15000)
     assert "STUB_RUN_RECORDED" in page.inner_text(".terminal-banner")
 
