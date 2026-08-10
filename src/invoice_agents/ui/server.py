@@ -35,6 +35,7 @@ from invoice_agents.ui.security import (
     ExactTrustedHostMiddleware,
     SecurityHeadersMiddleware,
     csrf_token,
+    ui_authorities_are_loopback,
     validate_allowed_hosts,
     validate_allowed_origins,
 )
@@ -203,6 +204,18 @@ def create_app(
     """Build the console app; no docs endpoints, localhost intent, no auth layer."""
 
     selected_settings = settings or Settings()
+    configured_hosts = validate_allowed_hosts(allowed_hosts)
+    configured_origins = validate_allowed_origins(allowed_origins)
+    configured_secret = selected_settings.configured_ui_session_secret()
+    if configured_secret is None:
+        if not ui_authorities_are_loopback(configured_hosts, configured_origins):
+            raise ValueError(
+                "non-loopback UI authorities require INVOICE_UI_SESSION_SECRET so every "
+                "worker and restart uses the same explicit key"
+            )
+        configured_secret = secrets.token_bytes(32)
+    elif len(configured_secret) < 32:
+        raise ValueError("INVOICE_UI_SESSION_SECRET must contain at least 32 bytes")
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -216,12 +229,9 @@ def create_app(
         openapi_url=None,
         lifespan=lifespan,
     )
-    configured_hosts = validate_allowed_hosts(allowed_hosts)
-    configured_origins = validate_allowed_origins(allowed_origins)
-    configured_secret = selected_settings.configured_ui_session_secret()
     app.add_middleware(
         CSRFMiddleware,
-        secret=configured_secret if configured_secret is not None else secrets.token_bytes(32),
+        secret=configured_secret,
         allowed_origins=configured_origins,
         max_body_bytes=selected_settings.source_max_bytes + 1_048_576,
     )

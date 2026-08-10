@@ -18,7 +18,7 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.responses import PlainTextResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from invoice_agents.config import normalize_ui_host
+from invoice_agents.config import is_ui_loopback_host, normalize_ui_host
 
 CSRF_FIELD_NAME = "csrf_token"
 CSRF_HEADER_NAME = "x-csrf-token"
@@ -200,6 +200,19 @@ def validate_allowed_origins(values: Sequence[str]) -> tuple[str, ...]:
 
     _configured_origin_policy(values)
     return tuple(values)
+
+
+def ui_authorities_are_loopback(
+    allowed_hosts: Sequence[str],
+    allowed_origins: Sequence[str],
+) -> bool:
+    """Return true only when every exact configured authority is local loopback."""
+
+    configured_hosts = validate_allowed_hosts(allowed_hosts)
+    origin_policy = _configured_origin_policy(allowed_origins)
+    return all(is_ui_loopback_host(host) for host in configured_hosts) and all(
+        is_ui_loopback_host(host) for _scheme, host, _port in origin_policy.origins
+    )
 
 
 def _request_origin(scope: Scope, headers: Headers) -> Origin | None:

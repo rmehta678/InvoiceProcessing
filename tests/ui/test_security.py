@@ -319,28 +319,57 @@ def test_tampered_session_cookie_rejects_old_token_and_rotates_on_safe_request(
     assert rotated != token
 
 
-def test_new_application_secret_invalidates_an_old_signed_session(settings: Settings) -> None:
+def test_non_loopback_factory_requires_a_shared_secret_before_app_construction(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import invoice_agents.ui.server as ui_server
+
+    construction_calls = 0
+
+    def forbidden_app_construction(*_args: Any, **_kwargs: Any) -> FastAPI:
+        nonlocal construction_calls
+        construction_calls += 1
+        raise AssertionError("remote configuration must fail before FastAPI construction")
+
+    monkeypatch.setattr(ui_server, "FastAPI", forbidden_app_construction)
+    local_settings = settings.model_copy(update={"ui_session_secret": None})
+
+    with pytest.raises(ValueError, match="INVOICE_UI_SESSION_SECRET"):
+        ui_server.create_app(
+            local_settings,
+            allowed_hosts=("testserver",),
+            allowed_origins=("http://testserver",),
+        )
+
+    assert construction_calls == 0
+
+
+def test_new_local_application_secret_invalidates_an_old_signed_session(
+    settings: Settings,
+) -> None:
+    local_settings = settings.model_copy(update={"ui_session_secret": None})
     first_app = create_app(
-        settings,
-        allowed_hosts=("testserver",),
-        allowed_origins=("http://testserver",),
+        local_settings,
+        allowed_hosts=("127.0.0.2",),
+        allowed_origins=("http://127.0.0.2:8787",),
     )
-    with TestClient(first_app, base_url="http://testserver") as first:
+    with TestClient(first_app, base_url="http://127.0.0.2:8787") as first:
         token = _rendered_token(first)
         cookie = first.cookies.get(SESSION_COOKIE_NAME)
     assert cookie is not None
 
     second_app = create_app(
-        settings,
-        allowed_hosts=("testserver",),
-        allowed_origins=("http://testserver",),
+        local_settings,
+        allowed_hosts=("127.0.0.2",),
+        allowed_origins=("http://127.0.0.2:8787",),
     )
-    with TestClient(second_app, base_url="http://testserver") as second:
+    with TestClient(second_app, base_url="http://127.0.0.2:8787") as second:
         second.cookies.set(SESSION_COOKIE_NAME, cookie)
         response = second.post(
             "/submit",
             data={"existing": "missing.txt", "csrf_token": token},
-            headers={"Origin": "http://testserver"},
+            headers={"Origin": "http://127.0.0.2:8787"},
             follow_redirects=False,
         )
     assert response.status_code == 403
@@ -376,9 +405,43 @@ def test_explicit_shared_session_secret_survives_application_recreation(
     assert response.status_code == 404
 
 
+@pytest.mark.parametrize(
+    ("allowed_hosts", "allowed_origins"),
+    [
+        (("127.0.0.1", "console.example"), ("http://127.0.0.1:8787",)),
+        (("127.0.0.1",), ("http://127.0.0.1:8787", "http://console.example:8787")),
+        (("::1",), ("http://[::1]:8787", "http://192.0.2.10:8787")),
+    ],
+)
+def test_any_non_loopback_host_or_origin_requires_a_shared_session_secret(
+    settings: Settings,
+    allowed_hosts: tuple[str, ...],
+    allowed_origins: tuple[str, ...],
+) -> None:
+    local_settings = settings.model_copy(update={"ui_session_secret": None})
+
+    with pytest.raises(ValueError, match="INVOICE_UI_SESSION_SECRET"):
+        create_app(
+            local_settings,
+            allowed_hosts=allowed_hosts,
+            allowed_origins=allowed_origins,
+        )
+
+
 def test_short_explicit_session_secret_is_rejected() -> None:
     with pytest.raises(ValidationError, match="session secret"):
         Settings(ui_session_secret=SecretStr("predictable-short-secret"))
+
+
+def test_factory_rechecks_a_bypassed_short_shared_session_secret(settings: Settings) -> None:
+    bypassed_settings = settings.model_copy(update={"ui_session_secret": SecretStr("S" * 31)})
+
+    with pytest.raises(ValueError, match="at least 32 bytes"):
+        create_app(
+            bypassed_settings,
+            allowed_hosts=("testserver",),
+            allowed_origins=("https://testserver",),
+        )
 
 
 def test_blank_session_secret_keeps_local_random_key_mode() -> None:
@@ -393,13 +456,13 @@ def test_blank_session_secret_keeps_local_random_key_mode() -> None:
     ],
 )
 def test_cookie_secure_attribute_is_derived_from_the_single_allowed_scheme(
-    settings: Settings,
+    ui_settings: Settings,
     origin: str,
     host: str,
     secure: bool,
 ) -> None:
     scheme_app = create_app(
-        settings,
+        ui_settings,
         allowed_hosts=(host,),
         allowed_origins=(origin,),
     )
@@ -428,13 +491,14 @@ def test_mixed_http_and_https_allowed_origins_are_rejected(settings: Settings) -
 )
 def test_reviewer_preference_cookie_uses_the_configured_origin_scheme(
     settings: Settings,
+    ui_settings: Settings,
     origin: str,
     host: str,
     secure: bool,
 ) -> None:
     _, review = make_pending_review_case(settings)
     scheme_app = create_app(
-        settings,
+        ui_settings,
         allowed_hosts=(host,),
         allowed_origins=(origin,),
     )
@@ -654,9 +718,9 @@ def test_malformed_host_authorities_are_rejected(
     assert raw_client.get("/submit", headers={"Host": host}).status_code == 400
 
 
-def test_dns_host_matching_is_case_insensitive(settings: Settings) -> None:
+def test_dns_host_matching_is_case_insensitive(ui_settings: Settings) -> None:
     dns_app = create_app(
-        settings,
+        ui_settings,
         allowed_hosts=("console.example",),
         allowed_origins=("http://console.example",),
     )
@@ -665,9 +729,9 @@ def test_dns_host_matching_is_case_insensitive(settings: Settings) -> None:
     assert response.status_code == 200
 
 
-def test_dns_host_and_origin_case_normalize_together(settings: Settings) -> None:
+def test_dns_host_and_origin_case_normalize_together(ui_settings: Settings) -> None:
     dns_app = create_app(
-        settings,
+        ui_settings,
         allowed_hosts=("console.example",),
         allowed_origins=("http://console.example",),
     )
@@ -846,9 +910,9 @@ def test_security_headers_cover_success_and_handled_errors(raw_client: TestClien
         _assert_security_headers(response)
 
 
-def test_security_headers_cover_unhandled_errors(settings: Settings) -> None:
+def test_security_headers_cover_unhandled_errors(ui_settings: Settings) -> None:
     broken = create_app(
-        settings,
+        ui_settings,
         allowed_hosts=("testserver",),
         allowed_origins=("http://testserver",),
     )

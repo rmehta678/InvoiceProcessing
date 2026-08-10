@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from invoice_agents.config import Settings
 from invoice_agents.ui.server import create_app
@@ -18,6 +19,7 @@ from invoice_agents.ui.server import create_app
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = REPO_ROOT / "data" / "invoices"
 TEST_ORIGIN = "http://testserver"
+TEST_UI_SESSION_SECRET = SecretStr("test-only-shared-ui-session-secret-000000000000000")
 
 
 class _CSRFTokenParser(HTMLParser):
@@ -87,9 +89,17 @@ def ui_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture
-def app(settings: Settings, ui_workdir: Path) -> FastAPI:
+def ui_settings(settings: Settings) -> Settings:
+    """Use one explicit harmless key for every non-loopback TestClient app."""
+
+    settings.ui_session_secret = TEST_UI_SESSION_SECRET
+    return settings
+
+
+@pytest.fixture
+def app(ui_settings: Settings, ui_workdir: Path) -> FastAPI:
     return create_app(
-        settings,
+        ui_settings,
         allowed_hosts=("testserver",),
         allowed_origins=(TEST_ORIGIN,),
     )
