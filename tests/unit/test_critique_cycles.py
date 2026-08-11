@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
 from typing import Any
@@ -1090,6 +1090,80 @@ def test_schema_rejects_cycle_two_that_bypasses_application_transition_fencing(
                 first_id,
             ),
         )
+
+
+@pytest.mark.parametrize("sql_operation", ["insert", "update"])
+def test_schema_rejects_cycle_two_with_lexically_later_but_older_timestamp(
+    settings: Settings,
+    tmp_path: Path,
+    sql_operation: str,
+) -> None:
+    store, claim = _claimed_case(
+        settings,
+        tmp_path,
+        f"case_sql_cycle_two_offset_{sql_operation}",
+    )
+    requested_item = "recompute amount"
+    parent_id = store.save_critique(
+        claim.case_id,
+        _critique(requested_follow_up=[requested_item]),
+        claim,
+    )
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        parent = connection.execute(
+            "SELECT created_at, execution_generation FROM critique_results "
+            "WHERE critique_id = ?",
+            (parent_id,),
+        ).fetchone()
+    assert parent is not None
+    parent_created_at = str(parent["created_at"])
+    parent_timestamp = datetime.fromisoformat(parent_created_at)
+    older_timestamp = parent_timestamp - timedelta(hours=1)
+    lexically_later_but_older = older_timestamp.astimezone(
+        timezone(timedelta(hours=14))
+    ).isoformat()
+    assert lexically_later_but_older > parent_created_at
+    assert datetime.fromisoformat(lexically_later_but_older) < parent_timestamp
+
+    child_id = f"crit_sql_offset_{sql_operation}"
+    child = _critique(
+        cycle=2,
+        responds_to_critique_id=parent_id,
+        supported_findings=[requested_item],
+    )
+    child_values = (
+        child_id,
+        claim.case_id,
+        child.model_dump_json(),
+        (
+            lexically_later_but_older
+            if sql_operation == "insert"
+            else datetime.now(UTC).isoformat()
+        ),
+        int(parent["execution_generation"]),
+        parent_id,
+    )
+    with connect_database(settings.workflow_db) as connection:
+        if sql_operation == "update":
+            connection.execute(
+                "INSERT INTO critique_results("
+                "critique_id, case_id, payload_json, created_at, execution_generation, "
+                "cycle, responds_to_critique_id) VALUES (?, ?, ?, ?, ?, 2, ?)",
+                child_values,
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="CRITIQUE_RESPONSE_INVALID"):
+            if sql_operation == "insert":
+                connection.execute(
+                    "INSERT INTO critique_results("
+                    "critique_id, case_id, payload_json, created_at, execution_generation, "
+                    "cycle, responds_to_critique_id) VALUES (?, ?, ?, ?, ?, 2, ?)",
+                    child_values,
+                )
+            else:
+                connection.execute(
+                    "UPDATE critique_results SET created_at = ? WHERE critique_id = ?",
+                    (lexically_later_but_older, child_id),
+                )
 
 
 @pytest.mark.parametrize(

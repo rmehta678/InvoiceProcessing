@@ -378,6 +378,29 @@ def _strict_case_result_json(value: object) -> int:
     return 1
 
 
+def _strict_canonical_utc_micros(value: object) -> int | None:
+    """Return an exact UTC instant only for canonical Python ISO timestamps."""
+
+    if type(value) is not str:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() != UTC.utcoffset(parsed)
+        or parsed.isoformat() != value
+    ):
+        return None
+    delta = parsed - datetime(1970, 1, 1, tzinfo=UTC)
+    return (
+        delta.days * 86_400_000_000
+        + delta.seconds * 1_000_000
+        + delta.microseconds
+    )
+
+
 def _strict_critic_follow_up_payload(
     event_type: object,
     value: object,
@@ -478,6 +501,12 @@ def _register_workflow_migration_functions(connection: sqlite3.Connection) -> No
         _strict_critic_follow_up_payload,
         deterministic=True,
     )
+    connection.create_function(
+        "strict_canonical_utc_micros",
+        1,
+        _strict_canonical_utc_micros,
+        deterministic=True,
+    )
 
 
 @contextmanager
@@ -520,6 +549,12 @@ def connect_database(path: Path, *, read_only: bool = False) -> Iterator[sqlite3
                 "strict_critic_follow_up_payload",
                 3,
                 _strict_critic_follow_up_payload,
+                deterministic=True,
+            )
+            connection.create_function(
+                "strict_canonical_utc_micros",
+                1,
+                _strict_canonical_utc_micros,
                 deterministic=True,
             )
             connection.execute("PRAGMA foreign_keys = ON")

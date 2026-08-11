@@ -131,7 +131,10 @@ WHEN NEW.cycle = 2 AND NOT EXISTS (
       AND parent.cycle = 1
       AND typeof(NEW.execution_generation) = 'integer'
       AND NEW.execution_generation >= parent.execution_generation
-      AND NEW.created_at > parent.created_at
+      AND strict_canonical_utc_micros(NEW.created_at) IS NOT NULL
+      AND strict_canonical_utc_micros(parent.created_at) IS NOT NULL
+      AND strict_canonical_utc_micros(NEW.created_at)
+          > strict_canonical_utc_micros(parent.created_at)
       AND CASE
           WHEN json_valid(parent.payload_json) = 1 THEN
               COALESCE(json_array_length(parent.payload_json, '$.challenged_findings'), 0)
@@ -154,7 +157,10 @@ WHEN NEW.cycle = 2 AND NOT EXISTS (
       AND parent.cycle = 1
       AND typeof(NEW.execution_generation) = 'integer'
       AND NEW.execution_generation >= parent.execution_generation
-      AND NEW.created_at > parent.created_at
+      AND strict_canonical_utc_micros(NEW.created_at) IS NOT NULL
+      AND strict_canonical_utc_micros(parent.created_at) IS NOT NULL
+      AND strict_canonical_utc_micros(NEW.created_at)
+          > strict_canonical_utc_micros(parent.created_at)
       AND CASE
           WHEN json_valid(parent.payload_json) = 1 THEN
               COALESCE(json_array_length(parent.payload_json, '$.challenged_findings'), 0)
