@@ -379,11 +379,11 @@ def test_parent_descriptor_close_cannot_release_spawned_worker_transaction_lock(
     migration_thread.join(timeout=20)
     assert not migration_thread.is_alive()
     assert failures == []
-    assert applied == [[3, 4, 5]]
+    assert applied == [[3, 4, 5, 6, 7]]
     assert first_writer.startswith("LOCKED:database is locked")
     assert _rival_create_table(target) == "COMMITTED"
     with sqlite3.connect(target) as connection:
-        assert connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 5
+        assert connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 7
         assert (
             connection.execute(
                 "SELECT COUNT(*) FROM sqlite_master "
@@ -826,9 +826,7 @@ def test_worker_post_native_spawn_control_reaps_reserved_process_before_reraise(
             captured = captured_sessions[0]
             assert captured.cleaned
             watcher = captured.exit_watcher
-            assert watcher is None or (
-                watcher._kqueue is None and watcher._pidfd is None
-            )
+            assert watcher is None or (watcher._kqueue is None and watcher._pidfd is None)
     finally:
         for process in spawned:
             if process.poll() is None:
@@ -931,7 +929,7 @@ def test_worker_watcher_constructor_failure_retains_owner_until_cleanup_is_exact
             (
                 "import os,pathlib;"
                 f"pathlib.Path({str(marker_path)!r}).write_text(str(os.getpid()));"
-                "print('{\"ok\":true,\"applied\":[]}')"
+                'print(\'{"ok":true,"applied":[]}\')'
             ),
         ],
     )
@@ -1127,9 +1125,7 @@ def test_worker_exit_watcher_publishes_pidfd_before_pending_control(
 def test_worker_exit_watcher_retires_pidfd_before_ambiguous_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    watcher = migration_process._WorkerExitWatcher.__new__(
-        migration_process._WorkerExitWatcher
-    )
+    watcher = migration_process._WorkerExitWatcher.__new__(migration_process._WorkerExitWatcher)
     watcher._binding = migration_process._WorkerProcessBinding(12345)
     watcher._exited = False
     watcher._kqueue = None
@@ -1163,9 +1159,7 @@ def test_worker_exit_watcher_retires_kqueue_before_ambiguous_close() -> None:
                 raise OSError("injected ambiguous kqueue close")
 
     kernel_queue = AmbiguousKqueue()
-    watcher = migration_process._WorkerExitWatcher.__new__(
-        migration_process._WorkerExitWatcher
-    )
+    watcher = migration_process._WorkerExitWatcher.__new__(migration_process._WorkerExitWatcher)
     watcher._binding = migration_process._WorkerProcessBinding(12345)
     watcher._exited = False
     watcher._kqueue = kernel_queue
@@ -1444,7 +1438,7 @@ def test_worker_reaps_same_session_descendant_that_escapes_leader_process_group(
                     tmp_path / "escaped-domain-error.db",
                     DatabaseKind.INVENTORY,
                     settings=None,
-            )
+                )
             assert excinfo.value.stop_reason == expected_stop_reason
         if not process_ids:
             child_pid, child_group, child_session = map(int, marker_path.read_text().split())

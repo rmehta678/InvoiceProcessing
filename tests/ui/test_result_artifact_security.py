@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
 import json
 import multiprocessing
 import os
 import socket
+import stat
 import sys
 import time
 from multiprocessing.connection import Connection
@@ -15,13 +17,14 @@ from pathlib import Path
 
 import httpx
 import pytest
-from factories import make_succeeded_case
+from factories import make_failed_case, make_succeeded_case
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from invoice_agents.config import Settings
 from invoice_agents.db.core import connect_database
-from invoice_agents.db.store import WorkflowStore
+from invoice_agents.db.store import ResultArtifactBinding, WorkflowStore
 from invoice_agents.isolated_process import (
     IsolatedProcessCleanupError,
     IsolatedProcessResult,
@@ -57,9 +60,63 @@ def _legacy_result(settings: Settings, case_id: str, marker: str) -> str:
     return encoded
 
 
+def _binding_for_file(
+    case_id: str,
+    generation: int,
+    target: Path,
+) -> ResultArtifactBinding:
+    payload = target.read_bytes()
+    identity = target.stat(follow_symlinks=False)
+    assert stat.S_ISREG(identity.st_mode)
+    assert identity.st_nlink == 1
+    return ResultArtifactBinding(
+        case_id=case_id,
+        execution_generation=generation,
+        artifact_sha256=hashlib.sha256(payload).hexdigest(),
+        artifact_device=identity.st_dev,
+        artifact_inode=identity.st_ino,
+        artifact_file_type=stat.S_IFMT(identity.st_mode),
+        artifact_size_bytes=identity.st_size,
+    )
+
+
+def _persist_exact_binding(
+    settings: Settings,
+    case_id: str,
+    target: Path,
+) -> ResultArtifactBinding:
+    store = WorkflowStore(settings)
+    result, generation, _binding = store.load_result_with_artifact_binding(case_id)
+    assert result is not None
+    binding = _binding_for_file(case_id, generation, target)
+    store.save_result_artifact_binding(binding, result)
+    assert store.load_result_artifact_binding(case_id) == binding
+    return binding
+
+
+def _synthetic_binding(case_id: str) -> ResultArtifactBinding:
+    return ResultArtifactBinding(
+        case_id=case_id,
+        execution_generation=1,
+        artifact_sha256="a" * 64,
+        artifact_device=1,
+        artifact_inode=1,
+        artifact_file_type=stat.S_IFREG,
+        artifact_size_bytes=1,
+    )
+
+
+def _install_worker_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    binding: ResultArtifactBinding,
+) -> None:
+    monkeypatch.setattr(routes, "_RESULT_ARTIFACT_WORKER_BINDING", binding)
+
+
 def _descriptor_cleanup_probe(
     connection: Connection,
     target: str,
+    binding: ResultArtifactBinding,
     fault_index: int,
     timing: str,
 ) -> None:
@@ -92,6 +149,7 @@ def _descriptor_cleanup_probe(
 
     routes.os.open = tracking_open
     routes.os.close = faulting_close
+    routes._RESULT_ARTIFACT_WORKER_BINDING = binding
     error_type: str | None = None
     error_number: int | None = None
     try:
@@ -123,6 +181,7 @@ def _descriptor_cleanup_probe(
 
 def _run_descriptor_cleanup_probe(
     target: Path,
+    binding: ResultArtifactBinding,
     *,
     fault_index: int = -1,
     timing: str = "before",
@@ -131,7 +190,7 @@ def _run_descriptor_cleanup_probe(
     parent_connection, child_connection = context.Pipe(duplex=False)
     process = context.Process(
         target=_descriptor_cleanup_probe,
-        args=(child_connection, str(target), fault_index, timing),
+        args=(child_connection, str(target), binding, fault_index, timing),
     )
     try:
         process.start()
@@ -161,7 +220,9 @@ def test_result_artifact_is_bounded_bound_to_database_and_newly_sanitized(
     raw = _legacy_result(settings, case_id, marker)
     artifact_dir = ui_workdir / "artifacts" / "results"
     artifact_dir.mkdir(parents=True)
-    (artifact_dir / f"{case_id}.json").write_text(raw, encoding="utf-8")
+    target = artifact_dir / f"{case_id}.json"
+    target.write_text(raw, encoding="utf-8")
+    _persist_exact_binding(settings, case_id, target)
 
     response = client.get(f"/cases/{case_id}/result.json")
 
@@ -219,12 +280,23 @@ def test_result_artifact_rejects_invalid_or_unbound_content_without_echoing_it(
         payload["errors"][0]["message"] = marker
         candidate = json.dumps(payload)
     target.write_text(candidate, encoding="utf-8")
+    if mutation != "oversize":
+        _persist_exact_binding(settings, case_id, target)
+    else:
+        target.write_text(raw, encoding="utf-8")
+        _persist_exact_binding(settings, case_id, target)
+        target.write_text(candidate, encoding="utf-8")
 
     response = client.get(f"/cases/{case_id}/result.json")
 
     assert response.status_code == 409
     assert marker not in response.text
-    assert "RESULT_ARTIFACT_INVALID" in response.text
+    expected_stop_reason = (
+        "RESULT_ARTIFACT_BINDING_UNRESOLVED"
+        if mutation == "oversize"
+        else "RESULT_ARTIFACT_INVALID"
+    )
+    assert expected_stop_reason in response.text
 
 
 @pytest.mark.parametrize("node_kind", ["dangling_symlink", "directory", "fifo"])
@@ -238,6 +310,11 @@ def test_result_artifact_rejects_hostile_filesystem_nodes(
     artifact_dir = ui_workdir / "artifacts" / "results"
     artifact_dir.mkdir(parents=True)
     target = artifact_dir / f"{case_id}.json"
+    stored = WorkflowStore(settings).load_result(case_id)
+    assert stored is not None
+    target.write_text(stored.model_dump_json(), encoding="utf-8")
+    _persist_exact_binding(settings, case_id, target)
+    target.unlink()
     if node_kind == "dangling_symlink":
         target.symlink_to(artifact_dir / "does-not-exist.json")
     elif node_kind == "directory":
@@ -248,7 +325,7 @@ def test_result_artifact_rejects_hostile_filesystem_nodes(
     response = client.get(f"/cases/{case_id}/result.json")
 
     assert response.status_code == 409
-    assert "RESULT_ARTIFACT_INVALID" in response.text
+    assert response.json()["stop_reason"] == "RESULT_ARTIFACT_BINDING_UNRESOLVED"
 
 
 def test_result_artifact_rejects_excessive_nesting_without_parser_crash(
@@ -273,6 +350,7 @@ def test_result_artifact_rejects_excessive_nesting_without_parser_crash(
         + "}",
         encoding="utf-8",
     )
+    _persist_exact_binding(settings, case_id, target)
 
     response = client.get(f"/cases/{case_id}/result.json")
 
@@ -292,6 +370,8 @@ def test_result_artifact_open_is_descriptor_first_and_nonblocking(
     artifact_dir.mkdir(parents=True)
     target = (artifact_dir / f"{case_id}.json").absolute()
     target.write_text(raw, encoding="utf-8")
+    binding = _binding_for_file(case_id, 1, target)
+    _install_worker_binding(monkeypatch, binding)
     real_open = routes.os.open
     real_is_file = Path.is_file
 
@@ -329,33 +409,49 @@ def test_result_artifact_rejects_symlinked_results_parent_as_invalid(
     case_id = make_succeeded_case(settings)
     raw = _legacy_result(settings, case_id, "round4-parent-symlink-canary")
     artifact_root = ui_workdir / "artifacts"
-    artifact_root.mkdir()
+    results = artifact_root / "results"
+    results.mkdir(parents=True)
+    target = results / f"{case_id}.json"
+    target.write_text(raw, encoding="utf-8")
+    _persist_exact_binding(settings, case_id, target)
+    moved_results = artifact_root / "moved-results"
+    results.rename(moved_results)
     if parent_kind == "live_symlink":
         outside = ui_workdir / "outside-results"
         outside.mkdir()
         (outside / f"{case_id}.json").write_text(raw, encoding="utf-8")
-        (artifact_root / "results").symlink_to(outside, target_is_directory=True)
+        results.symlink_to(outside, target_is_directory=True)
     else:
-        (artifact_root / "results").symlink_to(
-            ui_workdir / "missing-results", target_is_directory=True
-        )
+        results.symlink_to(ui_workdir / "missing-results", target_is_directory=True)
 
     response = client.get(f"/cases/{case_id}/result.json")
 
     assert response.status_code == 409
-    assert "RESULT_ARTIFACT_INVALID" in response.text
+    assert response.json()["stop_reason"] == "RESULT_ARTIFACT_BINDING_UNRESOLVED"
 
 
 def test_result_artifact_reports_missing_parent_as_invalid_not_missing_file(
     client: TestClient,
     settings: Settings,
+    ui_workdir: Path,
 ) -> None:
     case_id = make_succeeded_case(settings)
+    stored = WorkflowStore(settings).load_result(case_id)
+    assert stored is not None
+    artifact_root = ui_workdir / "artifacts"
+    artifact_dir = artifact_root / "results"
+    artifact_dir.mkdir(parents=True)
+    target = artifact_dir / f"{case_id}.json"
+    target.write_text(stored.model_dump_json(), encoding="utf-8")
+    _persist_exact_binding(settings, case_id, target)
+    target.unlink()
+    artifact_dir.rmdir()
+    artifact_root.rmdir()
 
     response = client.get(f"/cases/{case_id}/result.json")
 
     assert response.status_code == 409
-    assert "RESULT_ARTIFACT_INVALID" in response.text
+    assert response.json()["stop_reason"] == "RESULT_ARTIFACT_BINDING_UNRESOLVED"
 
 
 def test_result_artifact_rejects_hardlinked_file(
@@ -368,13 +464,15 @@ def test_result_artifact_rejects_hardlinked_file(
     artifact_dir = ui_workdir / "artifacts" / "results"
     artifact_dir.mkdir(parents=True)
     outside = ui_workdir / "outside-result.json"
-    outside.write_text(raw, encoding="utf-8")
-    os.link(outside, artifact_dir / f"{case_id}.json")
+    target = artifact_dir / f"{case_id}.json"
+    target.write_text(raw, encoding="utf-8")
+    _persist_exact_binding(settings, case_id, target)
+    os.link(target, outside)
 
     response = client.get(f"/cases/{case_id}/result.json")
 
     assert response.status_code == 409
-    assert "RESULT_ARTIFACT_INVALID" in response.text
+    assert response.json()["stop_reason"] == "RESULT_ARTIFACT_BINDING_UNRESOLVED"
 
 
 def test_result_artifact_rejects_unix_socket_without_blocking(
@@ -386,6 +484,11 @@ def test_result_artifact_rejects_unix_socket_without_blocking(
     artifact_dir = ui_workdir / "artifacts" / "results"
     artifact_dir.mkdir(parents=True)
     target = artifact_dir / f"{case_id}.json"
+    stored = WorkflowStore(settings).load_result(case_id)
+    assert stored is not None
+    target.write_text(stored.model_dump_json(), encoding="utf-8")
+    _persist_exact_binding(settings, case_id, target)
+    target.unlink()
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         server.bind(str(Path("artifacts/results") / target.name))
@@ -395,7 +498,7 @@ def test_result_artifact_rejects_unix_socket_without_blocking(
         server.close()
 
     assert response.status_code == 409
-    assert "RESULT_ARTIFACT_INVALID" in response.text
+    assert response.json()["stop_reason"] == "RESULT_ARTIFACT_BINDING_UNRESOLVED"
 
 
 def test_result_artifact_rejects_parent_swap_during_descriptor_walk(
@@ -409,6 +512,8 @@ def test_result_artifact_rejects_parent_swap_during_descriptor_walk(
     results = artifact_root / "results"
     results.mkdir(parents=True)
     (results / f"{case_id}.json").write_text(raw, encoding="utf-8")
+    binding = _binding_for_file(case_id, 1, results / f"{case_id}.json")
+    _install_worker_binding(monkeypatch, binding)
     outside = ui_workdir / "outside-results"
     outside.mkdir()
     (outside / f"{case_id}.json").write_text(raw, encoding="utf-8")
@@ -445,6 +550,10 @@ def test_result_artifact_parent_swap_cannot_turn_final_enoent_into_missing(
     artifact_root = ui_workdir / "artifacts"
     results = artifact_root / "results"
     results.mkdir(parents=True)
+    target = results / f"{case_id}.json"
+    target.write_bytes(b"{}")
+    binding = _binding_for_file(case_id, 1, target)
+    _install_worker_binding(monkeypatch, binding)
     outside = ui_workdir / "outside-results"
     outside.mkdir()
     moved_results = artifact_root / "moved-results"
@@ -461,6 +570,7 @@ def test_result_artifact_parent_swap_cannot_turn_final_enoent_into_missing(
         nonlocal swapped
         if not swapped and Path(path).name == f"{case_id}.json":
             results.rename(moved_results)
+            (moved_results / f"{case_id}.json").unlink()
             results.symlink_to(outside, target_is_directory=True)
             swapped = True
         return real_open(path, flags, mode, dir_fd=dir_fd)
@@ -485,6 +595,7 @@ def test_result_artifact_fails_closed_when_required_open_flag_is_unavailable(
     monkeypatch.delattr(routes.os, required_flag)
 
     target = (ui_workdir / "artifacts" / "results" / f"{case_id}.json").absolute()
+    _install_worker_binding(monkeypatch, _synthetic_binding(case_id))
     with pytest.raises(ValueError, match="required artifact open flag"):
         routes._read_bounded_regular_file(target)
 
@@ -500,27 +611,34 @@ async def test_result_artifact_blocking_work_does_not_stall_the_event_loop(
     raw = _legacy_result(settings, case_id, "round4-worker-thread-canary")
     artifact_dir = ui_workdir / "artifacts" / "results"
     artifact_dir.mkdir(parents=True)
-    (artifact_dir / f"{case_id}.json").write_text(raw, encoding="utf-8")
+    target = artifact_dir / f"{case_id}.json"
+    target.write_text(raw, encoding="utf-8")
+    _persist_exact_binding(settings, case_id, target)
     original_read = routes._read_bounded_regular_file_isolated
 
-    def slow_read(target: Path) -> bytes:
+    def slow_read(target: Path, binding: ResultArtifactBinding) -> bytes | None:
         time.sleep(0.15)
-        return original_read(target)
+        return original_read(target, binding)
 
     monkeypatch.setattr(routes, "_read_bounded_regular_file_isolated", slow_read)
     ticked_at: list[float] = []
-    began = time.monotonic()
+    began = 0.0
 
     async def watchdog() -> None:
         await asyncio.sleep(0.02)
         ticked_at.append(time.monotonic())
 
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
-        response, _ = await asyncio.gather(
-            async_client.get(f"/cases/{case_id}/result.json"),
-            watchdog(),
-        )
+    async with app.router.lifespan_context(app):
+        began = time.monotonic()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as async_client:
+            response, _ = await asyncio.gather(
+                async_client.get(f"/cases/{case_id}/result.json"),
+                watchdog(),
+            )
 
     assert response.status_code == 200
     assert ticked_at[0] - began < 0.1
@@ -536,7 +654,8 @@ def test_result_artifact_cleanup_attempts_every_owned_descriptor_and_contains_re
     artifact_dir.mkdir(parents=True)
     target = (artifact_dir / f"{case_id}.json").absolute()
     target.write_text(raw, encoding="utf-8")
-    baseline = _run_descriptor_cleanup_probe(target)
+    binding = _binding_for_file(case_id, 1, target)
+    baseline = _run_descriptor_cleanup_probe(target, binding)
     opened = baseline["opened"]
     assert isinstance(opened, list)
     assert baseline["error_type"] is None
@@ -548,6 +667,7 @@ def test_result_artifact_cleanup_attempts_every_owned_descriptor_and_contains_re
         for fault_index in range(descriptor_count):
             report = _run_descriptor_cleanup_probe(
                 target,
+                binding,
                 fault_index=fault_index,
                 timing=timing,
             )
@@ -574,11 +694,20 @@ def test_result_artifact_primary_error_precedes_descriptor_cleanup_error(
 ) -> None:
     artifact_dir = ui_workdir / "artifacts" / "results"
     artifact_dir.mkdir(parents=True)
-    target = (artifact_dir / f"case_round5_{primary}.json").absolute()
+    case_id = f"case_round5_{primary}"
+    target = (artifact_dir / f"{case_id}.json").absolute()
+    target.write_bytes(b"{}")
+    binding = _binding_for_file(case_id, 1, target)
+    target.unlink()
     if primary == "directory":
         target.mkdir()
 
-    report = _run_descriptor_cleanup_probe(target, fault_index=0, timing="before")
+    report = _run_descriptor_cleanup_probe(
+        target,
+        binding,
+        fault_index=0,
+        timing="before",
+    )
 
     assert report["error_type"] == expected_error
     assert report["attempts"] == report["opened"][::-1]
@@ -598,11 +727,16 @@ def test_result_artifact_reader_uses_only_the_public_isolated_controller(
 
     monkeypatch.setattr(routes, "run_isolated_process", controlled)
     target = (tmp_path / "case_public_controller.json").absolute()
+    binding = _synthetic_binding("case_public_controller")
 
-    assert routes._read_bounded_regular_file_isolated(
-        target,
-        cancel_requested=cancellation,
-    ) == raw
+    assert (
+        routes._read_bounded_regular_file_isolated(
+            target,
+            binding,
+            cancel_requested=cancellation,
+        )
+        == raw
+    )
     assert len(calls) == 1
     call = calls[0]
     assert set(call) == {
@@ -618,9 +752,13 @@ def test_result_artifact_reader_uses_only_the_public_isolated_controller(
     request = call["request"]
     assert isinstance(request, bytes)
     assert routes._decode_result_artifact_worker_request(request) == target
+    assert binding == routes._RESULT_ARTIFACT_WORKER_BINDING
     command = call["command"]
     assert isinstance(command, list)
-    assert Path(command[0]).resolve(strict=True) == Path(sys.executable).resolve(strict=True)
+    assert command[0] == sys.executable
+    assert Path(command[0]).is_absolute()
+    assert Path(command[0]).is_file()
+    assert os.access(command[0], os.X_OK)
     assert command[1] == "-I"
     assert Path(command[2]).is_absolute()
     assert Path(command[2]).name == "result_artifact_worker.py"
@@ -652,7 +790,9 @@ def test_result_artifact_root_is_captured_before_concurrent_cwd_changes(
     raw = _legacy_result(settings, case_id, "round5-cwd-canary")
     artifact_dir = ui_workdir / "artifacts" / "results"
     artifact_dir.mkdir(parents=True)
-    (artifact_dir / f"{case_id}.json").write_text(raw, encoding="utf-8")
+    target = artifact_dir / f"{case_id}.json"
+    target.write_text(raw, encoding="utf-8")
+    _persist_exact_binding(settings, case_id, target)
     attacker_cwd = tmp_path / "attacker-cwd"
     attacker_cwd.mkdir()
 
@@ -683,11 +823,11 @@ def test_result_artifact_process_failure_taxonomy_never_admits_output(
     marker = "artifact-worker-untrusted-output"
     selected = IsolatedProcessResult(marker.encode(), outcome.failure)
     monkeypatch.setattr(routes, "run_isolated_process", lambda **_kwargs: selected)
+    target = (tmp_path / "case_failure.json").absolute()
+    binding = _synthetic_binding("case_failure")
 
     with pytest.raises(routes._ResultArtifactWorkerError) as failure:
-        routes._read_bounded_regular_file_isolated(
-            (tmp_path / "case_failure.json").absolute()
-        )
+        routes._read_bounded_regular_file_isolated(target, binding)
 
     assert failure.value.error_code == expected_code
     assert marker not in str(failure.value)
@@ -707,13 +847,14 @@ def test_result_artifact_cleanup_ambiguity_poison_blocks_later_admission(
 
     monkeypatch.setattr(routes, "run_isolated_process", cleanup_ambiguous)
     target = (tmp_path / "case_cleanup.json").absolute()
+    binding = _synthetic_binding("case_cleanup")
 
     with pytest.raises(routes._ResultArtifactWorkerError) as first:
-        routes._read_bounded_regular_file_isolated(target)
+        routes._read_bounded_regular_file_isolated(target, binding)
     assert first.value.error_code == "RESULT_ARTIFACT_WORKER_CLEANUP_FAILED"
 
     with pytest.raises(routes._ResultArtifactWorkerError) as successor:
-        routes._read_bounded_regular_file_isolated(target)
+        routes._read_bounded_regular_file_isolated(target, binding)
     assert successor.value.error_code == "RESULT_ARTIFACT_OWNERSHIP_UNRESOLVED"
     assert calls == 1
 
@@ -722,12 +863,11 @@ def test_result_artifact_cleanup_ambiguity_poison_blocks_later_admission(
     ("response", "expected", "expected_code"),
     [
         (routes._RESULT_ARTIFACT_OK + b"{}", b"{}", None),
-        (routes._RESULT_ARTIFACT_MISSING, None, "missing"),
-        (routes._RESULT_ARTIFACT_INVALID, None, "RESULT_ARTIFACT_INVALID"),
+        (routes._RESULT_ARTIFACT_MISSING, None, None),
+        (routes._RESULT_ARTIFACT_INVALID, None, None),
         (b"artifact-untrusted-frame", None, "RESULT_ARTIFACT_WORKER_PROTOCOL_INVALID"),
         (
-            routes._RESULT_ARTIFACT_OK
-            + b"x" * (routes.RESULT_ARTIFACT_MAX_BYTES + 1),
+            routes._RESULT_ARTIFACT_OK + b"x" * (routes.RESULT_ARTIFACT_MAX_BYTES + 1),
             None,
             "RESULT_ARTIFACT_WORKER_PROTOCOL_INVALID",
         ),
@@ -746,16 +886,14 @@ def test_result_artifact_worker_frames_are_strict_and_bounded(
         lambda **_kwargs: IsolatedProcessResult(response, None),
     )
     target = (tmp_path / "case_frame.json").absolute()
+    binding = _synthetic_binding("case_frame")
 
-    if expected_code == "missing":
-        with pytest.raises(routes._ResultArtifactMissing):
-            routes._read_bounded_regular_file_isolated(target)
-    elif expected_code is not None:
+    if expected_code is not None:
         with pytest.raises(routes._ResultArtifactWorkerError) as failure:
-            routes._read_bounded_regular_file_isolated(target)
+            routes._read_bounded_regular_file_isolated(target, binding)
         assert failure.value.error_code == expected_code
     else:
-        assert routes._read_bounded_regular_file_isolated(target) == expected
+        assert routes._read_bounded_regular_file_isolated(target, binding) == expected
 
 
 def test_result_artifact_failure_response_is_sanitized_and_specific(
@@ -768,7 +906,9 @@ def test_result_artifact_failure_response_is_sanitized_and_specific(
     raw = _legacy_result(settings, case_id, "artifact-response-secret")
     artifact_dir = ui_workdir / "artifacts" / "results"
     artifact_dir.mkdir(parents=True)
-    (artifact_dir / f"{case_id}.json").write_text(raw, encoding="utf-8")
+    target = artifact_dir / f"{case_id}.json"
+    target.write_text(raw, encoding="utf-8")
+    _persist_exact_binding(settings, case_id, target)
     marker = "artifact-supervisor-private-error"
     monkeypatch.setattr(
         routes,
@@ -795,10 +935,13 @@ def test_result_artifact_preexisting_cancellation_fails_closed(
         return IsolatedProcessResult(None, "cancelled")
 
     monkeypatch.setattr(routes, "run_isolated_process", cancelled_controller)
+    target = (tmp_path / "case_cancelled.json").absolute()
+    binding = _synthetic_binding("case_cancelled")
 
     with pytest.raises(routes._ResultArtifactWorkerError) as failure:
         routes._read_bounded_regular_file_isolated(
-            (tmp_path / "case_cancelled.json").absolute(),
+            target,
+            binding,
             cancel_requested=cancellation,
         )
     assert failure.value.error_code == "RESULT_ARTIFACT_WORKER_CANCELLED"
@@ -816,10 +959,13 @@ def test_result_artifact_rejects_invalid_cancellation_owner_before_controller(
         return IsolatedProcessResult(routes._RESULT_ARTIFACT_OK + b"{}", None)
 
     monkeypatch.setattr(routes, "run_isolated_process", controller_not_admitted)
+    target = (tmp_path / "case_invalid_cancellation.json").absolute()
+    binding = _synthetic_binding("case_invalid_cancellation")
 
     with pytest.raises(ValueError, match="cancellation owner"):
         routes._read_bounded_regular_file_isolated(
-            (tmp_path / "case_invalid_cancellation.json").absolute(),
+            target,
+            binding,
             cancel_requested=object(),  # type: ignore[arg-type]
         )
 
@@ -835,11 +981,11 @@ def test_result_artifact_rejects_noncanonical_controller_result(
         "run_isolated_process",
         lambda **_kwargs: object(),
     )
+    target = (tmp_path / "case_invalid_controller_result.json").absolute()
+    binding = _synthetic_binding("case_invalid_controller_result")
 
     with pytest.raises(routes._ResultArtifactWorkerError) as failure:
-        routes._read_bounded_regular_file_isolated(
-            (tmp_path / "case_invalid_controller_result.json").absolute()
-        )
+        routes._read_bounded_regular_file_isolated(target, binding)
 
     assert failure.value.error_code == "RESULT_ARTIFACT_WORKER_PROTOCOL_INVALID"
 
@@ -849,33 +995,39 @@ def test_multiple_apps_keep_distinct_artifact_roots_across_cwd_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    case_id = make_succeeded_case(settings)
-    stored = WorkflowStore(settings).load_result(case_id)
-    assert stored is not None
-    encoded = stored.model_dump_json()
+    first_case_id = make_succeeded_case(settings)
+    second_case_id = make_failed_case(settings, "invoice_1002.txt")
     first_root = tmp_path / "first-app"
     second_root = tmp_path / "second-app"
     attacker_root = tmp_path / "attacker"
     for root in (first_root, second_root, attacker_root):
         root.mkdir()
-    for root in (first_root, second_root):
+    for root, case_id in (
+        (first_root, first_case_id),
+        (second_root, second_case_id),
+    ):
+        stored = WorkflowStore(settings).load_result(case_id)
+        assert stored is not None
         artifact_dir = root / "artifacts" / "results"
         artifact_dir.mkdir(parents=True)
-        (artifact_dir / f"{case_id}.json").write_text(encoded, encoding="utf-8")
+        target = artifact_dir / f"{case_id}.json"
+        target.write_text(stored.model_dump_json(), encoding="utf-8")
+        _persist_exact_binding(settings, case_id, target)
 
+    settings.ui_session_secret = SecretStr("test-only-result-artifact-session-secret-000000000000")
     monkeypatch.chdir(first_root)
-    first_app = ui_server.create_app(settings)
+    first_app = ui_server.create_app(settings, allowed_hosts=("testserver",))
     monkeypatch.chdir(second_root)
-    second_app = ui_server.create_app(settings)
+    second_app = ui_server.create_app(settings, allowed_hosts=("testserver",))
     monkeypatch.chdir(attacker_root)
 
     with TestClient(first_app) as first_client, TestClient(second_app) as second_client:
-        first_response = first_client.get(f"/cases/{case_id}/result.json")
-        second_response = second_client.get(f"/cases/{case_id}/result.json")
+        first_response = first_client.get(f"/cases/{first_case_id}/result.json")
+        second_response = second_client.get(f"/cases/{second_case_id}/result.json")
 
     assert first_app.state.result_artifact_root == first_root / "artifacts" / "results"
     assert second_app.state.result_artifact_root == second_root / "artifacts" / "results"
     assert first_response.status_code == 200
     assert second_response.status_code == 200
-    assert first_response.json()["case_id"] == case_id
-    assert second_response.json()["case_id"] == case_id
+    assert first_response.json()["case_id"] == first_case_id
+    assert second_response.json()["case_id"] == second_case_id

@@ -119,9 +119,7 @@ def _raise_through_named_frames(frame_names: list[str], message: str) -> NoRetur
     definitions: list[str] = []
     next_frame: str | None = None
     for frame_name in reversed(frame_names):
-        body = (
-            "raise ValueError(_message)" if next_frame is None else f"return {next_frame}()"
-        )
+        body = "raise ValueError(_message)" if next_frame is None else f"return {next_frame}()"
         definitions.append(f"def {frame_name}():\n    {body}\n")
         next_frame = frame_name
     exec("\n".join(definitions), namespace)
@@ -188,7 +186,7 @@ def _install_downstream_failure(
     if command in {"root-process", "process"}:
         monkeypatch.setattr(cli, "process_invoice", fail_async)
     elif command == "batch":
-        monkeypatch.setattr(cli, "process_batch", fail_async)
+        monkeypatch.setattr(cli, "_run_durable_cli_batch", fail_async)
     elif command in {"case-status", "review-list", "review-show"}:
 
         class FailingStore:
@@ -228,7 +226,7 @@ def _install_downstream_failure(
         monkeypatch.setitem(
             sys.modules,
             "invoice_agents.ui.server",
-            SimpleNamespace(create_app=lambda _settings: object()),
+            SimpleNamespace(create_app=lambda _settings, **_kwargs: object()),
         )
     elif command == "contract":
         monkeypatch.setattr(cli, "run_live_contracts", fail_async)
@@ -296,7 +294,7 @@ def test_batch_rejects_non_sources_before_settings_admission_or_model_work(
         raise AssertionError("batch/model work started before source validation")
 
     monkeypatch.setattr(cli, "_settings", forbidden_settings)
-    monkeypatch.setattr(cli, "process_batch", forbidden_batch)
+    monkeypatch.setattr(cli, "_run_durable_cli_batch", forbidden_batch)
 
     result = runner.invoke(cli.app, ["batch", "--invoice-dir", str(directory)])
 
@@ -512,7 +510,7 @@ def test_batch_rejects_missing_downstream_results(
     async def no_results(*_args: object, **_kwargs: object) -> list[object]:
         return []
 
-    monkeypatch.setattr(cli, "process_batch", no_results)
+    monkeypatch.setattr(cli, "_run_durable_cli_batch", no_results)
 
     result = runner.invoke(cli.app, ["batch", "--invoice-dir", str(source_dir)])
 
@@ -602,9 +600,7 @@ def test_live_contract_uses_the_exact_authoritative_identity_set_and_sanitized_e
 ) -> None:
     assert compatibility.LIVE_CONTRACT_CHECK_NAMES == EXPECTED_LIVE_CONTRACT_NAMES
     checks = _complete_live_contract_checks()
-    checks[0] = checks[0].model_copy(
-        update={"evidence": f"request finished api_key={SECRET}"}
-    )
+    checks[0] = checks[0].model_copy(update={"evidence": f"request finished api_key={SECRET}"})
 
     async def complete_checks(
         *_args: object,
@@ -720,8 +716,7 @@ def test_standalone_database_cli_rejects_an_unsafe_error_code(
     assert result.exit_code == 1
     assert result.stdout == ""
     assert result.stderr == (
-        "database_operation=migrate status=FAILED "
-        "error_code=DATABASE_ERROR_CONTRACT_INVALID\n"
+        "database_operation=migrate status=FAILED error_code=DATABASE_ERROR_CONTRACT_INVALID\n"
     )
     assert SECRET not in result.output
 

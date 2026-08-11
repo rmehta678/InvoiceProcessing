@@ -304,9 +304,8 @@ class CritiqueFollowUpResponse(StrictModel):
     @field_validator("evidence_event_ids")
     @classmethod
     def evidence_event_ids_are_exact(cls, values: list[str]) -> list[str]:
-        if (
-            len(set(values)) != len(values)
-            or any(not value.startswith("evt_") or not value[4:] for value in values)
+        if len(set(values)) != len(values) or any(
+            not value.startswith("evt_") or not value[4:] for value in values
         ):
             raise ValueError("critique follow-up evidence event IDs must be unique exact IDs")
         return values

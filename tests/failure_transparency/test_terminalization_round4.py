@@ -851,7 +851,7 @@ async def test_round4_registry_detaches_completed_raw_task_and_traceback() -> No
         started_at=datetime.now(UTC),
         task=task,
     )
-    registry = RunRegistry()
+    registry = RunRegistry(global_limit=1)
     registry._runs[handle.case_id] = handle
     with pytest.raises(RuntimeError, match="retained-exception-canary"):
         await task

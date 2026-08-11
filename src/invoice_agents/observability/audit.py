@@ -42,6 +42,7 @@ SENSITIVE_KEYS = frozenset(
         "xai_apikey",
     }
 )
+NUMERIC_USAGE_TOKEN_KEYS = frozenset({"prompt_tokens", "completion_tokens"})
 CREDENTIAL_TEXT_KEY = (
     r"(?:xai[-_]?api[-_]?key|api[-_]?key|authorization|proxy[-_]?authorization|"
     r"client[-_]?secret|secret|set[-_]?cookie|cookie|access[-_]?token|"
@@ -535,12 +536,21 @@ def safe_tool_call_id(value: object) -> str | None:
 
 
 def _is_sensitive_key(value: str) -> bool:
+    """Detect one exact reviewed credential key without matching ordinary words."""
+
     projected = _normalized_key(value)
     return any(
         (identifier_end := _match_detection_identifier(projected, 0, sensitive_key)) is not None
         and identifier_end == len(projected)
         for sensitive_key in SENSITIVE_KEYS
     )
+
+
+def _is_noncanonical_usage_token_key(value: str) -> bool:
+    """Reject aliases or wrappers around the two exact numeric usage keys."""
+
+    projected = _normalized_key(value)
+    return any(usage_key in projected for usage_key in NUMERIC_USAGE_TOKEN_KEYS)
 
 
 def _redact(value: Any, *, depth: int, budget: list[int]) -> Any:
@@ -552,11 +562,22 @@ def _redact(value: Any, *, depth: int, budget: list[int]) -> Any:
         for key, item in value.items():
             raw_key = str(key)
             safe_key = sanitize_text(raw_key)
-            cleaned[safe_key] = (
-                "[REDACTED]"
-                if _is_sensitive_key(raw_key) or _is_sensitive_key(safe_key)
-                else _redact(item, depth=depth + 1, budget=budget)
-            )
+            if (
+                raw_key == safe_key
+                and raw_key in NUMERIC_USAGE_TOKEN_KEYS
+                and type(item) is int
+                and item >= 0
+            ):
+                cleaned[safe_key] = item
+            elif (
+                _is_sensitive_key(raw_key)
+                or _is_sensitive_key(safe_key)
+                or _is_noncanonical_usage_token_key(raw_key)
+                or _is_noncanonical_usage_token_key(safe_key)
+            ):
+                cleaned[safe_key] = "[REDACTED]"
+            else:
+                cleaned[safe_key] = _redact(item, depth=depth + 1, budget=budget)
         return cleaned
     if isinstance(value, str):
         return sanitize_text(value)

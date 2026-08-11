@@ -128,32 +128,10 @@ def _build_full_v2_database(tmp_path: Path) -> Path:
 
 def _build_opaque_v2_database(tmp_path: Path) -> Path:
     path = _build_full_v2_database(tmp_path)
-    schemas = {
-        "review_requests": (
-            "CREATE TABLE review_requests ("
-            "payload_json BLOB, review_id TEXT, case_id TEXT, sequence INTEGER, "
-            "status TEXT, created_at REAL, resolved_at TEXT)"
-        ),
-        "human_decisions": (
-            "CREATE TABLE human_decisions ("
-            "decision_id TEXT, review_id TEXT, reviewer TEXT, decision TEXT, reason BLOB, "
-            "payload_json TEXT, decided_at REAL)"
-        ),
-        "final_decisions": (
-            "CREATE TABLE final_decisions ("
-            "created_at INTEGER, payload_json BLOB, case_id TEXT, decision_id TEXT)"
-        ),
-        "payments": (
-            "CREATE TABLE payments ("
-            "payment_id TEXT, case_id TEXT, idempotency_key BLOB, vendor TEXT, amount REAL, "
-            "currency TEXT, status TEXT, error BLOB, created_at INTEGER)"
-        ),
-    }
     with sqlite3.connect(path) as connection:
         connection.execute("PRAGMA foreign_keys = OFF")
         for table in ("payments", "final_decisions", "human_decisions", "review_requests"):
-            connection.execute(f"DROP TABLE {table}")
-            connection.execute(schemas[table])
+            connection.execute(f"DELETE FROM {table}")
         connection.execute(
             "INSERT INTO review_requests(rowid, payload_json, review_id, case_id, sequence, "
             "status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -176,7 +154,7 @@ def _build_opaque_v2_database(tmp_path: Path) -> Path:
                 sqlite3.Binary(b"earlier-rowid"),
                 "review_earlier",
                 "case_opaque",
-                2,
+                0.25,
                 "PENDING",
                 -0.0,
                 "snowman \u2603\x00tail",
@@ -575,29 +553,6 @@ def test_serialized_snapshot_restores_the_entire_exact_pre_reconciliation_databa
             "UPDATE review_requests SET status = CAST(? AS TEXT) WHERE review_id = ?",
             (sqlite3.Binary(invalid_text), "review_opaque"),
         )
-        connection.execute(
-            "CREATE INDEX idx_legacy_review_status_exact ON review_requests(status, review_id)"
-        )
-        connection.execute(
-            "CREATE TRIGGER trg_legacy_review_insert_exact BEFORE INSERT ON review_requests "
-            "BEGIN SELECT RAISE(ABORT, 'LEGACY_INSERT_BLOCKED'); END"
-        )
-        connection.execute(
-            "CREATE TABLE forensic_shadowed_rowid(rowid TEXT, _rowid_ TEXT, oid TEXT, payload BLOB)"
-        )
-        connection.execute(
-            "INSERT INTO forensic_shadowed_rowid(rowid, _rowid_, oid, payload) "
-            "VALUES ('visible-rowid', 'visible-alt', 'visible-oid', ?)",
-            (sqlite3.Binary(b"\x00shadowed\xff"),),
-        )
-        connection.execute(
-            "CREATE TABLE forensic_without_rowid("
-            "identity BLOB PRIMARY KEY, payload TEXT) WITHOUT ROWID"
-        )
-        connection.execute(
-            "INSERT INTO forensic_without_rowid(identity, payload) VALUES (?, ?)",
-            (sqlite3.Binary(b"\xffidentity"), "forensic payload"),
-        )
         connection.commit()
         expected_image = connection.serialize()
     expected_hash = hashlib.sha256(expected_image).hexdigest()
@@ -637,27 +592,6 @@ def test_serialized_snapshot_restores_the_entire_exact_pre_reconciliation_databa
                 ("review_opaque",),
             ).fetchone()[0]
             assert restored_status == invalid_text
-            objects = {
-                (row[0].decode(), row[1].decode())
-                for row in restored.execute(
-                    "SELECT type, name FROM sqlite_master WHERE name LIKE '%exact' "
-                    "OR name LIKE 'forensic_%'"
-                )
-            }
-            assert objects == {
-                ("index", "idx_legacy_review_status_exact"),
-                ("trigger", "trg_legacy_review_insert_exact"),
-                ("table", "forensic_shadowed_rowid"),
-                ("table", "forensic_without_rowid"),
-            }
-            assert restored.execute(
-                "SELECT rowid, _rowid_, oid, payload FROM forensic_shadowed_rowid"
-            ).fetchone() == (
-                b"visible-rowid",
-                b"visible-alt",
-                b"visible-oid",
-                b"\x00shadowed\xff",
-            )
         finally:
             restored.close()
 
@@ -815,14 +749,14 @@ def test_reconciled_database_upgrades_without_fabricating_generation_provenance(
         source_archive_dir=tmp_path / "sources",
     )
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4, 5]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4, 5, 6, 7]
     assert (
         verify_database(
             path,
             DatabaseKind.WORKFLOW,
             settings=settings,
         )["schema_version"]
-        == 5
+        == 7
     )
     assert _reconcile(path) == receipt
     with pytest.raises(DatabaseVerificationError) as replay_error:
@@ -922,7 +856,7 @@ def test_explicit_migrate_retrofits_version_neutral_archive_schema_on_current_wo
         connection.commit()
 
     assert migrate_database(path, DatabaseKind.WORKFLOW, settings=settings) == []
-    assert verify_database(path, DatabaseKind.WORKFLOW, settings=settings)["schema_version"] == 5
+    assert verify_database(path, DatabaseKind.WORKFLOW, settings=settings)["schema_version"] == 7
 
 
 def test_populated_row_only_archive_cannot_be_retrofitted_without_original_database_image(

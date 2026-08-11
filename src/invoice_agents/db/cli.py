@@ -2,10 +2,10 @@
 
 import re
 from collections.abc import Callable
+from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Annotated
 
-import click
 import typer
 from pydantic import ValidationError
 
@@ -28,6 +28,22 @@ _SANITIZATION_FAILURE_LINE = (
     "category=ORCHESTRATION stop_reason=SANITIZATION_FAILED "
     "message=credential sanitization failed closed"
 )
+_APPLICATION_BOUNDARY_ACTIVE: ContextVar[bool] = ContextVar(
+    "invoice_agents_database_application_boundary_active",
+    default=False,
+)
+
+
+def enter_application_boundary() -> Token[bool]:
+    """Mark database commands as owned by the mounted application's root boundary."""
+
+    return _APPLICATION_BOUNDARY_ACTIVE.set(True)
+
+
+def leave_application_boundary(token: Token[bool]) -> None:
+    """Restore the prior boundary ownership for this invocation context."""
+
+    _APPLICATION_BOUNDARY_ACTIVE.reset(token)
 
 
 def _database_operation_settings(
@@ -86,10 +102,7 @@ def _run_database_operation[OperationResult](
     except Exception:
         typer.echo(_SANITIZATION_FAILURE_LINE, err=True)
         raise typer.Exit(1) from None
-    if (
-        safe_error_code != error_code
-        or _DATABASE_ERROR_CODE.fullmatch(safe_error_code) is None
-    ):
+    if safe_error_code != error_code or _DATABASE_ERROR_CODE.fullmatch(safe_error_code) is None:
         safe_error_code = "DATABASE_ERROR_CONTRACT_INVALID"
     typer.echo(
         f"database_operation={operation_name} status=FAILED error_code={safe_error_code}",
@@ -101,12 +114,7 @@ def _run_database_operation[OperationResult](
 def _is_mounted_application_command() -> bool:
     """Return whether the database app is nested below another command group."""
 
-    context = click.get_current_context(silent=True)
-    return (
-        context is not None
-        and context.parent is not None
-        and context.parent.parent is not None
-    )
+    return _APPLICATION_BOUNDARY_ACTIVE.get()
 
 
 @app.command("migrate")

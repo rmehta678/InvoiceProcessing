@@ -1243,12 +1243,12 @@ def test_finished_duplicate_sse_requires_settings_without_mutating_persisted_sta
     missing_authority = terminal_payload(
         settings.workflow_db,
         attempted.case_id,
-        RunRegistry(),
+        RunRegistry(global_limit=settings.case_concurrency),
     )
     trusted = terminal_payload(
         settings.workflow_db,
         attempted.case_id,
-        RunRegistry(),
+        RunRegistry(global_limit=settings.case_concurrency),
         settings,
     )
 
@@ -1288,7 +1288,7 @@ def test_finished_duplicate_sse_keeps_persisted_contradiction_classification(
     payload = terminal_payload(
         settings.workflow_db,
         attempted.case_id,
-        RunRegistry(),
+        RunRegistry(global_limit=settings.case_concurrency),
         settings,
     )
 
@@ -1343,7 +1343,7 @@ def test_coordinator_recovery_validates_cross_case_duplicate_before_terminal_sse
     missing_authority = terminal_payload(
         settings.workflow_db,
         attempted.case_id,
-        RunRegistry(),
+        RunRegistry(global_limit=settings.case_concurrency),
     )
 
     assert missing_authority is not None
@@ -1353,7 +1353,7 @@ def test_coordinator_recovery_validates_cross_case_duplicate_before_terminal_sse
     awaiting_recovery = terminal_payload(
         settings.workflow_db,
         attempted.case_id,
-        RunRegistry(),
+        RunRegistry(global_limit=settings.case_concurrency),
         settings,
     )
     assert awaiting_recovery is not None
@@ -1375,7 +1375,7 @@ def test_coordinator_recovery_validates_cross_case_duplicate_before_terminal_sse
     payload = terminal_payload(
         settings.workflow_db,
         attempted.case_id,
-        RunRegistry(),
+        RunRegistry(global_limit=settings.case_concurrency),
         settings,
     )
 

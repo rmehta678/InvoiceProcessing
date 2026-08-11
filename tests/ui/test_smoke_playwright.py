@@ -308,9 +308,7 @@ def test_sse_client_deduplicates_exact_decimal_event_ids_without_losing_precisio
                 return
             if self.path == f"/cases/{case_id}/events":
                 with request_lock:
-                    last_event_id_headers.append(
-                        self.headers.get_all("Last-Event-ID", failobj=[])
-                    )
+                    last_event_id_headers.append(self.headers.get_all("Last-Event-ID", failobj=[]))
                     response_number = len(last_event_id_headers)
                 if response_number > 2:
                     self.send_error(409, "terminal must prevent a third SSE request")
@@ -382,20 +380,22 @@ def test_sse_client_deduplicates_exact_decimal_event_ids_without_losing_precisio
         ]
         with request_lock:
             assert last_event_id_headers == [[], ["9007199254740993"]]
-        assert page.evaluate(
-            "JSON.parse('{\"seq\":9007199254740993}').seq === 9007199254740992"
-        )
+        assert page.evaluate("JSON.parse('{\"seq\":9007199254740993}').seq === 9007199254740992")
         assert page.evaluate("window.nativeEventSourceInstances.length") == 1
-        assert page.evaluate(
-            "Object.prototype.toString.call(window.nativeEventSourceInstances[0])"
-        ) == "[object EventSource]"
-        assert page.evaluate(
-            """
+        assert (
+            page.evaluate("Object.prototype.toString.call(window.nativeEventSourceInstances[0])")
+            == "[object EventSource]"
+        )
+        assert (
+            page.evaluate(
+                """
             window.reconnectedEventStates.find(
               (event) => event.id === "9223372036854775807"
             ).readyState
             """
-        ) == 1
+            )
+            == 1
+        )
         assert page.locator("#terminal-host > .terminal-banner").count() == 1
         assert page.locator("#terminal-host").get_by_text("CURSOR_TEST_COMPLETE").count() == 1
         assert page.evaluate("window.terminalBannerEffects") == 1

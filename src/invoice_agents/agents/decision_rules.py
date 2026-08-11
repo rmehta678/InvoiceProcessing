@@ -327,9 +327,7 @@ def _assert_critique_sequence_complete(
             stop_reason="CRITIQUE_RESPONSE_INVALID",
         )
     follow_up_required = bool(
-        first.challenged_findings
-        or first.missing_evidence
-        or first.requested_follow_up
+        first.challenged_findings or first.missing_evidence or first.requested_follow_up
     )
     if len(critiques) == 1:
         if follow_up_required:
@@ -423,10 +421,7 @@ def _assert_critique_follow_up_addressed(
         appearances = sum(
             response.requested_item in findings for findings in outcome_lists.values()
         )
-        if (
-            appearances != 1
-            or response.requested_item not in outcome_lists[response.outcome]
-        ):
+        if appearances != 1 or response.requested_item not in outcome_lists[response.outcome]:
             raise InvoiceAgentsError(
                 ErrorCategory.ORCHESTRATION,
                 "a critique follow-up outcome does not match its exact structured finding list",
@@ -434,9 +429,7 @@ def _assert_critique_follow_up_addressed(
                 stop_reason="CRITIQUE_FOLLOW_UP_OUTCOME_INVALID",
             )
     if second.recommended_disposition is DecisionKind.APPROVE and (
-        second.challenged_findings
-        or second.missing_evidence
-        or second.requested_follow_up
+        second.challenged_findings or second.missing_evidence or second.requested_follow_up
     ):
         raise InvoiceAgentsError(
             ErrorCategory.ORCHESTRATION,
@@ -475,9 +468,7 @@ def validate_final_decision(
     """
 
     if selected is DecisionKind.APPROVE and (
-        critique.challenged_findings
-        or critique.missing_evidence
-        or critique.requested_follow_up
+        critique.challenged_findings or critique.missing_evidence or critique.requested_follow_up
     ):
         raise InvoiceAgentsError(
             ErrorCategory.TOOL,

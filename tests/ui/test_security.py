@@ -398,7 +398,11 @@ def test_explicit_shared_session_secret_survives_application_recreation(
         second.cookies.set(SESSION_COOKIE_NAME, cookie)
         response = second.post(
             "/submit",
-            data={"existing": "missing.txt", "csrf_token": token},
+            data={
+                "submission_id": "submission_security_shared_session",
+                "existing": "missing.txt",
+                "csrf_token": token,
+            },
             headers={"Origin": "https://testserver"},
             follow_redirects=False,
         )
@@ -591,7 +595,11 @@ def test_origin_and_referer_evidence_is_unambiguous_and_exact(
     before = _database_snapshot(settings)
     response = raw_client.post(
         "/submit",
-        data={"existing": "missing.txt", "csrf_token": token},
+        data={
+            "submission_id": "submission_security_origin_evidence",
+            "existing": "missing.txt",
+            "csrf_token": token,
+        },
         headers=headers,
         follow_redirects=False,
     )
@@ -625,7 +633,10 @@ def test_header_only_token_supports_htmx_mutations(raw_client: TestClient) -> No
     token = _rendered_token(raw_client)
     response = raw_client.post(
         "/submit",
-        data={"existing": "missing.txt"},
+        data={
+            "submission_id": "submission_security_header_token",
+            "existing": "missing.txt",
+        },
         headers={"Origin": "http://testserver", "X-CSRF-Token": token},
         follow_redirects=False,
     )
@@ -780,7 +791,11 @@ def test_dns_host_and_origin_case_normalize_together(ui_settings: Settings) -> N
         token = _rendered_token(client)
         response = client.post(
             "/submit",
-            data={"existing": "missing.txt", "csrf_token": token},
+            data={
+                "submission_id": "submission_security_dns_case",
+                "existing": "missing.txt",
+                "csrf_token": token,
+            },
             headers={"Host": "CONSOLE.EXAMPLE", "Origin": "http://CONSOLE.EXAMPLE"},
             follow_redirects=False,
         )
@@ -821,7 +836,11 @@ def test_ipv6_loopback_host_and_origin_are_accepted(settings: Settings) -> None:
         assert page.status_code == 200
         response = client.post(
             "/submit",
-            data={"existing": "missing.txt", "csrf_token": token},
+            data={
+                "submission_id": "submission_security_ipv6_loopback",
+                "existing": "missing.txt",
+                "csrf_token": token,
+            },
             headers={"Host": "[::1]:8787", "Origin": "http://[::1]:8787"},
             follow_redirects=False,
         )

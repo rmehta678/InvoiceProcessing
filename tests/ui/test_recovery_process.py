@@ -6,6 +6,8 @@ import asyncio
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -20,7 +22,7 @@ from pydantic import SecretStr
 
 from invoice_agents import recovery_process, recovery_worker
 from invoice_agents.config import Settings
-from invoice_agents.errors import InvoiceAgentsError
+from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.isolated_process import (
     IsolatedProcessCleanupError,
     IsolatedProcessResult,
@@ -44,6 +46,37 @@ def _scan_at() -> datetime:
     return datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
 
 
+def _run_recovery_worker_main(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    recover: Any,
+) -> bytes:
+    output = io.BytesIO()
+    monkeypatch.setattr(recovery_worker.os, "open", lambda *_args: 41)
+    monkeypatch.setattr(recovery_worker.os, "dup2", lambda *_args: None)
+    monkeypatch.setattr(recovery_worker.os, "close", lambda *_args: None)
+    monkeypatch.setattr(
+        recovery_worker.sys,
+        "stdin",
+        type("Input", (), {"buffer": io.BytesIO(b"request")})(),
+    )
+    monkeypatch.setattr(
+        recovery_worker.sys,
+        "stdout",
+        type("Output", (), {"buffer": output})(),
+    )
+    monkeypatch.setattr(
+        recovery_worker,
+        "decode_recovery_request",
+        lambda _request: (settings, _scan_at()),
+    )
+    monkeypatch.setattr(recovery_worker, "_recover", recover)
+
+    recovery_worker.main()
+
+    return output.getvalue()
+
+
 def _pid_is_absent(process_id: int) -> bool:
     try:
         os.kill(process_id, 0)
@@ -62,10 +95,7 @@ def _bounded_marker_pids(marker: Path) -> tuple[int, int]:
         except (OSError, UnicodeError):
             fields = []
         if len(fields) == 2 and all(
-            value.isascii()
-            and value.isdigit()
-            and int(value) > 0
-            and str(int(value)) == value
+            value.isascii() and value.isdigit() and int(value) > 0 and str(int(value)) == value
             for value in fields
         ):
             return int(fields[0]), int(fields[1])
@@ -194,7 +224,7 @@ def test_recovery_process_uses_only_the_public_isolated_controller(
         cancel_requested=cancellation,
     )
 
-    assert outcome == recovery_process.RecoveryProcessOutcome(True, None)
+    assert outcome == recovery_process.RecoveryProcessOutcome(True, None, None)
     assert len(calls) == 1
     call = calls[0]
     assert set(call) == {
@@ -208,10 +238,109 @@ def test_recovery_process_uses_only_the_public_isolated_controller(
     assert call["cancel_requested"] is cancellation
     command = call["command"]
     assert isinstance(command, list)
-    assert Path(command[0]).resolve(strict=True) == Path(sys.executable).resolve(strict=True)
+    assert command[0] == sys.executable
     assert command[1] == "-I"
     assert Path(command[2]).is_absolute()
     assert Path(command[2]).name == "recovery_worker.py"
+
+
+def test_recovery_worker_command_preserves_virtual_environment_launcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = tmp_path / "venv" / "bin" / "python"
+    launcher.parent.mkdir(parents=True)
+    launcher.symlink_to(Path(sys.executable).resolve(strict=True))
+    monkeypatch.setattr(recovery_process.sys, "executable", os.fspath(launcher))
+
+    command = recovery_process._recovery_worker_command()
+
+    assert command[0] == os.fspath(launcher)
+    assert command[1] == "-I"
+    assert Path(command[2]).resolve(strict=True) == Path(recovery_worker.__file__).resolve(
+        strict=True
+    )
+
+
+def test_recovery_worker_imports_only_its_exact_colocated_package(
+    tmp_path: Path,
+) -> None:
+    """Isolation must not select an unrelated editable checkout of this package."""
+
+    package = tmp_path / "exact-source" / "invoice_agents"
+    database_package = package / "db"
+    database_package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (database_package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "config.py").write_text(
+        "class Settings:\n    pass\n",
+        encoding="utf-8",
+    )
+    (package / "errors.py").write_text(
+        """from enum import StrEnum
+
+class ErrorCategory(StrEnum):
+    ORCHESTRATION = 'ORCHESTRATION'
+
+class InvoiceAgentsError(Exception):
+    def __init__(self, category=ErrorCategory.ORCHESTRATION, stop_reason=None):
+        self.category = category
+        self.stop_reason = stop_reason
+""",
+        encoding="utf-8",
+    )
+    (database_package / "store.py").write_text(
+        """class WorkflowStore:
+    def __init__(self, settings):
+        pass
+
+    def recover_expired_executions(self, *, now):
+        return []
+
+    def unrecovered_execution_case_ids(self, *, checked_at):
+        return []
+""",
+        encoding="utf-8",
+    )
+    (package / "recovery_process.py").write_text(
+        """import json
+from datetime import UTC, datetime
+from invoice_agents.config import Settings
+
+RECOVERY_MAX_MESSAGE_BYTES = 65536
+
+def decode_recovery_request(request):
+    if request != b'exact-request':
+        raise ValueError('wrong request')
+    return Settings(), datetime(2026, 8, 11, tzinfo=UTC)
+
+def encode_recovery_response(response):
+    return json.dumps(response, separators=(',', ':'), sort_keys=True).encode('ascii')
+
+def is_safe_recovery_stop_reason(value):
+    return isinstance(value, str) and value == 'EXECUTION_RECOVERY_FAILED'
+""",
+        encoding="utf-8",
+    )
+    worker = package / "recovery_worker.py"
+    shutil.copyfile(Path(recovery_worker.__file__).resolve(strict=True), worker)
+
+    completed = subprocess.run(
+        [
+            os.fspath(Path(sys.executable).resolve(strict=True)),
+            "-I",
+            "-S",
+            os.fspath(worker.resolve(strict=True)),
+        ],
+        input=b"exact-request",
+        capture_output=True,
+        env=recovery_process.sanitized_worker_environment(),
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == b'{"ok":true}'
+    assert completed.stderr == b""
 
 
 @pytest.mark.parametrize(
@@ -239,7 +368,11 @@ def test_recovery_process_has_an_explicit_supervisor_failure_taxonomy(
         timeout_seconds=1.0,
     )
 
-    assert outcome == recovery_process.RecoveryProcessOutcome(False, expected_code)
+    assert outcome == recovery_process.RecoveryProcessOutcome(
+        False,
+        ErrorCategory.ORCHESTRATION,
+        expected_code,
+    )
 
 
 def test_recovery_process_exposes_unproven_cleanup_as_failure(
@@ -259,38 +392,59 @@ def test_recovery_process_exposes_unproven_cleanup_as_failure(
 
     assert outcome == recovery_process.RecoveryProcessOutcome(
         False,
+        ErrorCategory.ORCHESTRATION,
         "EXECUTION_RECOVERY_WORKER_CLEANUP_FAILED",
     )
 
 
 @pytest.mark.parametrize(
-    ("acknowledged", "error_code"),
+    ("acknowledged", "error_category", "stop_reason"),
     [
-        (True, "EXECUTION_RECOVERY_WORKER_CLEANUP_FAILED"),
-        (False, None),
-        (False, "NOT_ALLOWLISTED"),
-        (1, None),
+        (True, ErrorCategory.ORCHESTRATION, "EXECUTION_RECOVERY_FAILED"),
+        (False, None, "EXECUTION_RECOVERY_FAILED"),
+        (False, ErrorCategory.ORCHESTRATION, None),
+        (False, "ORCHESTRATION", "EXECUTION_RECOVERY_FAILED"),
+        (False, ErrorCategory.ORCHESTRATION, "not_safe"),
+        (False, ErrorCategory.ORCHESTRATION, "A" * 129),
+        (False, ErrorCategory.ORCHESTRATION, "ÉXECUTION_RECOVERY_FAILED"),
+        (1, None, None),
     ],
 )
-def test_recovery_outcome_rejects_contradictory_or_unallowlisted_state(
+def test_recovery_outcome_rejects_contradictory_or_unsafe_state(
     acknowledged: object,
-    error_code: object,
+    error_category: object,
+    stop_reason: object,
 ) -> None:
     with pytest.raises(ValueError):
         recovery_process.RecoveryProcessOutcome(  # type: ignore[arg-type]
             acknowledged,
-            error_code,
+            error_category,
+            stop_reason,
         )
 
 
 @pytest.mark.parametrize(
-    ("response", "acknowledged", "error_code"),
+    ("response", "acknowledged", "error_category", "stop_reason"),
     [
-        (b'{"ok":true}', True, None),
+        (b'{"ok":true}', True, None, None),
         (
-            b'{"error_code":"EXECUTION_RECOVERY_FAILED","ok":false}',
+            b'{"error_category":"ORCHESTRATION","ok":false,'
+            b'"stop_reason":"EXECUTION_RECOVERY_FAILED"}',
             False,
+            ErrorCategory.ORCHESTRATION,
             "EXECUTION_RECOVERY_FAILED",
+        ),
+        (
+            b'{"error_category":"DATABASE","ok":false,"stop_reason":"DATABASE_MISSING"}',
+            False,
+            ErrorCategory.DATABASE,
+            "DATABASE_MISSING",
+        ),
+        (
+            b'{"error_category":"PROVIDER","ok":false,"stop_reason":"FUTURE_VALID_FAILURE_42"}',
+            False,
+            ErrorCategory.PROVIDER,
+            "FUTURE_VALID_FAILURE_42",
         ),
     ],
 )
@@ -299,7 +453,8 @@ def test_recovery_process_accepts_only_canonical_worker_outcomes(
     monkeypatch: pytest.MonkeyPatch,
     response: bytes,
     acknowledged: bool,
-    error_code: str | None,
+    error_category: ErrorCategory | None,
+    stop_reason: str | None,
 ) -> None:
     monkeypatch.setattr(
         recovery_process,
@@ -311,7 +466,92 @@ def test_recovery_process_accepts_only_canonical_worker_outcomes(
         settings=settings,
         scan_at=_scan_at(),
         timeout_seconds=1.0,
-    ) == recovery_process.RecoveryProcessOutcome(acknowledged, error_code)
+    ) == recovery_process.RecoveryProcessOutcome(
+        acknowledged,
+        error_category,
+        stop_reason,
+    )
+
+
+def test_recovery_process_preserves_valid_worker_error_category_and_stop_reason(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        recovery_process,
+        "run_isolated_process",
+        lambda **_kwargs: IsolatedProcessResult(
+            b'{"error_category":"DATABASE","ok":false,"stop_reason":"PERSISTED_RESULT_INVALID"}',
+            None,
+        ),
+    )
+
+    outcome = recovery_process.run_recovery_process(
+        settings=settings,
+        scan_at=_scan_at(),
+        timeout_seconds=1.0,
+    )
+
+    assert outcome == recovery_process.RecoveryProcessOutcome(
+        False,
+        ErrorCategory.DATABASE,
+        "PERSISTED_RESULT_INVALID",
+    )
+
+
+@pytest.mark.parametrize(
+    "reserved_stop_reason",
+    [
+        "EXECUTION_RECOVERY_WORKER_CANCELLED",
+        "EXECUTION_RECOVERY_WORKER_CLEANUP_FAILED",
+        "EXECUTION_RECOVERY_WORKER_CRASHED",
+        "EXECUTION_RECOVERY_WORKER_PROTOCOL_INVALID",
+        "EXECUTION_RECOVERY_WORKER_TIMED_OUT",
+    ],
+)
+@pytest.mark.parametrize("error_category", ["ORCHESTRATION", "DATABASE"])
+def test_recovery_process_rejects_child_forged_controller_outcomes(
+    reserved_stop_reason: str,
+    error_category: str,
+) -> None:
+    response = json.dumps(
+        {
+            "error_category": error_category,
+            "ok": False,
+            "stop_reason": reserved_stop_reason,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    with pytest.raises(ValueError, match="controller-owned"):
+        recovery_process._decode_response(response)
+
+
+@pytest.mark.parametrize(
+    ("category", "stop_reason"),
+    [
+        (ErrorCategory.DATABASE, "PERSISTED_RESULT_INVALID"),
+        (ErrorCategory.ORCHESTRATION, "EXECUTION_RECOVERY_RACE"),
+        (ErrorCategory.PROVIDER, "FUTURE_VALID_FAILURE_42"),
+    ],
+)
+def test_recovery_ui_recreates_exact_validated_domain_failure(
+    category: ErrorCategory,
+    stop_reason: str,
+) -> None:
+    outcome = recovery_process.RecoveryProcessOutcome(
+        False,
+        category,
+        stop_reason,
+    )
+
+    error = recovery_module._outcome_error(outcome)
+
+    assert error.category is category
+    assert error.stop_reason == stop_reason
+    assert error.message == "the isolated execution recovery scan failed"
+    assert error.details is None
 
 
 @pytest.mark.parametrize(
@@ -320,8 +560,10 @@ def test_recovery_process_accepts_only_canonical_worker_outcomes(
         b"",
         b"not-json",
         b'{"ok":true,"unexpected":null}',
-        b'{"error_code":"EXECUTION_RECOVERY_FAILED","ok":true}',
-        b'{"error_code":"NOT_ALLOWLISTED","ok":false}',
+        b'{"error_category":"ORCHESTRATION","ok":true,"stop_reason":"EXECUTION_RECOVERY_FAILED"}',
+        b'{"error_category":"NOT_A_CATEGORY","ok":false,"stop_reason":"EXECUTION_RECOVERY_FAILED"}',
+        b'{"error_category":"DATABASE","ok":false,"stop_reason":"not_safe"}',
+        b'{"error_category":"DATABASE","ok":false}',
         b'{"ok":false,"ok":true}',
         b'{ "ok":true}',
     ],
@@ -345,6 +587,7 @@ def test_recovery_process_rejects_malformed_or_noncanonical_responses(
 
     assert outcome == recovery_process.RecoveryProcessOutcome(
         False,
+        ErrorCategory.ORCHESTRATION,
         "EXECUTION_RECOVERY_WORKER_PROTOCOL_INVALID",
     )
 
@@ -368,6 +611,85 @@ def test_recovery_worker_fails_closed_when_eligible_claims_remain(
     monkeypatch.setattr(recovery_worker, "WorkflowStore", SilentStore)
 
     assert recovery_worker._recover(settings, _scan_at()) is False
+
+
+@pytest.mark.parametrize(
+    ("category", "stop_reason", "expected"),
+    [
+        (
+            ErrorCategory.DATABASE,
+            "EXECUTION_AUTHORITY_CORRUPT",
+            b'{"error_category":"DATABASE","ok":false,"stop_reason":"EXECUTION_AUTHORITY_CORRUPT"}',
+        ),
+        (
+            ErrorCategory.DATABASE,
+            "PERSISTED_RESULT_INVALID",
+            b'{"error_category":"DATABASE","ok":false,"stop_reason":"PERSISTED_RESULT_INVALID"}',
+        ),
+        (
+            ErrorCategory.ORCHESTRATION,
+            "EXECUTION_RECOVERY_RACE",
+            b'{"error_category":"ORCHESTRATION","ok":false,'
+            b'"stop_reason":"EXECUTION_RECOVERY_RACE"}',
+        ),
+    ],
+)
+def test_recovery_worker_preserves_only_exact_audit_safe_error_metadata(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    category: ErrorCategory,
+    stop_reason: str,
+    expected: bytes,
+) -> None:
+    def fail_with_exact_cause(*_args: object) -> bool:
+        raise InvoiceAgentsError(
+            category,
+            "sensitive recovery failure canary",
+            stop_reason=stop_reason,
+            details={"path": "/sensitive/recovery/path"},
+        )
+
+    encoded = _run_recovery_worker_main(monkeypatch, settings, fail_with_exact_cause)
+
+    assert encoded == expected
+    assert b"canary" not in encoded
+    assert b"/sensitive/recovery/path" not in encoded
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        InvoiceAgentsError(
+            ErrorCategory.DATABASE,
+            "missing reason",
+            stop_reason=None,
+        ),
+        InvoiceAgentsError(
+            ErrorCategory.DATABASE,
+            "unsafe reason",
+            stop_reason="unsafe-reason",
+        ),
+        InvoiceAgentsError(  # type: ignore[arg-type]
+            "DATABASE",
+            "non-enum category",
+            stop_reason="PERSISTED_RESULT_INVALID",
+        ),
+    ],
+)
+def test_recovery_worker_marks_invalid_error_metadata_as_protocol_invalid(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    error: InvoiceAgentsError,
+) -> None:
+    def fail_with_invalid_metadata(*_args: object) -> bool:
+        raise error
+
+    encoded = _run_recovery_worker_main(monkeypatch, settings, fail_with_invalid_metadata)
+
+    assert encoded == (
+        b'{"error_category":"ORCHESTRATION","ok":false,'
+        b'"stop_reason":"EXECUTION_RECOVERY_WORKER_PROTOCOL_INVALID"}'
+    )
 
 
 def test_recovery_worker_does_not_retry_response_encoding(
@@ -430,6 +752,7 @@ def test_recovery_process_timeout_returns_only_after_descendant_cleanup(
 
     assert outcome == recovery_process.RecoveryProcessOutcome(
         False,
+        ErrorCategory.ORCHESTRATION,
         "EXECUTION_RECOVERY_WORKER_TIMED_OUT",
     )
     _assert_processes_absent(_bounded_marker_pids(marker))
@@ -458,7 +781,7 @@ async def test_concurrent_coordinators_admit_each_scan_only_after_prior_cleanup(
             if call == 1:
                 first_entered.set()
                 assert release_first.wait(timeout=2)
-            return recovery_process.RecoveryProcessOutcome(True, None)
+            return recovery_process.RecoveryProcessOutcome(True, None, None)
         finally:
             with calls_lock:
                 active -= 1
@@ -516,9 +839,10 @@ async def test_start_cancellation_keeps_reservation_until_cleanup_proof(
             assert cleanup_proven.wait(timeout=2)
             return recovery_process.RecoveryProcessOutcome(
                 False,
+                ErrorCategory.ORCHESTRATION,
                 "EXECUTION_RECOVERY_WORKER_CANCELLED",
             )
-        return recovery_process.RecoveryProcessOutcome(True, None)
+        return recovery_process.RecoveryProcessOutcome(True, None, None)
 
     monkeypatch.setattr(recovery_module, "run_recovery_process", controlled_scan)
     interrupted = RecoveryCoordinator(settings, scan_interval_seconds=3_600)
@@ -543,10 +867,7 @@ async def test_start_cancellation_keeps_reservation_until_cleanup_proof(
             await asyncio.wait_for(interrupted_start, timeout=1)
         with pytest.raises(InvoiceAgentsError) as blocked_error:
             await asyncio.wait_for(blocked_start, timeout=1)
-        assert (
-            blocked_error.value.stop_reason
-            == "EXECUTION_RECOVERY_WORKER_CANCELLED"
-        )
+        assert blocked_error.value.stop_reason == "EXECUTION_RECOVERY_WORKER_CANCELLED"
 
         await asyncio.wait_for(successor.start(), timeout=1)
         assert calls == 2
@@ -573,6 +894,7 @@ async def test_cleanup_ambiguity_poison_blocks_all_later_admission(
         calls += 1
         return recovery_process.RecoveryProcessOutcome(
             False,
+            ErrorCategory.ORCHESTRATION,
             "EXECUTION_RECOVERY_WORKER_CLEANUP_FAILED",
         )
 
@@ -588,6 +910,134 @@ async def test_cleanup_ambiguity_poison_blocks_all_later_admission(
         await successor.start()
     assert successor_error.value.stop_reason == "EXECUTION_RECOVERY_OWNERSHIP_UNRESOLVED"
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_mismatched_cleanup_category_cannot_poison_controller_ownership(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(recovery_module, "_RECOVERY_OWNERSHIP_POISONED", False)
+    monkeypatch.setattr(recovery_module, "_SCAN_RESERVATION", None)
+
+    def mismatched_cleanup(**_kwargs: object) -> recovery_process.RecoveryProcessOutcome:
+        return recovery_process.RecoveryProcessOutcome(
+            False,
+            ErrorCategory.DATABASE,
+            "EXECUTION_RECOVERY_WORKER_CLEANUP_FAILED",
+        )
+
+    monkeypatch.setattr(recovery_module, "run_recovery_process", mismatched_cleanup)
+    coordinator = RecoveryCoordinator(settings, scan_interval_seconds=3_600)
+
+    with pytest.raises(InvoiceAgentsError) as error:
+        await coordinator.start()
+
+    assert error.value.category is ErrorCategory.DATABASE
+    assert error.value.stop_reason == "EXECUTION_RECOVERY_WORKER_CLEANUP_FAILED"
+    assert coordinator.health().ownership_poisoned is False
+
+
+@pytest.mark.asyncio
+async def test_mismatched_cancelled_category_cannot_claim_shutdown_control(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(recovery_module, "_RECOVERY_OWNERSHIP_POISONED", False)
+    monkeypatch.setattr(recovery_module, "_SCAN_RESERVATION", None)
+
+    def mismatched_cancel(**_kwargs: object) -> recovery_process.RecoveryProcessOutcome:
+        return recovery_process.RecoveryProcessOutcome(
+            False,
+            ErrorCategory.DATABASE,
+            "EXECUTION_RECOVERY_WORKER_CANCELLED",
+        )
+
+    monkeypatch.setattr(recovery_module, "run_recovery_process", mismatched_cancel)
+    coordinator = RecoveryCoordinator(settings, scan_interval_seconds=3_600)
+    coordinator._stop_requested.set()
+
+    with pytest.raises(InvoiceAgentsError) as error:
+        await coordinator._recover_once()
+
+    assert error.value.category is ErrorCategory.DATABASE
+    assert error.value.stop_reason == "EXECUTION_RECOVERY_WORKER_CANCELLED"
+
+
+@pytest.mark.asyncio
+async def test_mismatched_cleanup_category_cannot_claim_shared_cleanup_control(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = RecoveryCoordinator(settings, scan_interval_seconds=3_600)
+    reservation = object()
+    outcome = recovery_process.RecoveryProcessOutcome(
+        False,
+        ErrorCategory.DATABASE,
+        "EXECUTION_RECOVERY_WORKER_CLEANUP_FAILED",
+    )
+
+    monkeypatch.setattr(
+        coordinator,
+        "_reserve_scan",
+        lambda _scan_at: (reservation, False),
+    )
+
+    async def shared_scan(_reservation: object) -> recovery_process.RecoveryProcessOutcome:
+        return outcome
+
+    monkeypatch.setattr(coordinator, "_wait_for_shared_scan", shared_scan)
+
+    with pytest.raises(InvoiceAgentsError) as error:
+        await coordinator._recover_once()
+
+    assert error.value.category is ErrorCategory.DATABASE
+    assert error.value.stop_reason == "EXECUTION_RECOVERY_WORKER_CLEANUP_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_mismatched_cancelled_category_cannot_replace_caller_cancellation(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class JoinedThread:
+        def join(self) -> None:
+            return None
+
+        def is_alive(self) -> bool:
+            return False
+
+    outcome: Future[recovery_process.RecoveryProcessOutcome] = Future()
+    reservation = recovery_module._ScanReservation(
+        signature=(settings.workflow_db.resolve(), settings.inventory_db.resolve()),
+        scan_at=_scan_at(),
+        cancellation=ProcessCancellation(),
+        worker=outcome,
+        thread=JoinedThread(),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(recovery_module, "_RECOVERY_OWNERSHIP_POISONED", False)
+    monkeypatch.setattr(recovery_module, "_SCAN_RESERVATION", reservation)
+    coordinator = RecoveryCoordinator(settings, scan_interval_seconds=3_600)
+    coordinator._set_active_reservation(reservation)
+    waiting = asyncio.create_task(coordinator._wait_for_owned_scan(reservation))
+    await asyncio.sleep(0)
+
+    waiting.cancel()
+    await asyncio.sleep(0)
+    assert reservation.cancellation.is_set()
+    outcome.set_result(
+        recovery_process.RecoveryProcessOutcome(
+            False,
+            ErrorCategory.DATABASE,
+            "EXECUTION_RECOVERY_WORKER_CANCELLED",
+        )
+    )
+
+    with pytest.raises(InvoiceAgentsError) as error:
+        await waiting
+
+    assert error.value.category is ErrorCategory.DATABASE
+    assert error.value.stop_reason == "EXECUTION_RECOVERY_WORKER_CANCELLED"
 
 
 @pytest.mark.asyncio
@@ -631,6 +1081,7 @@ def test_thread_start_error_retains_possibly_started_reservation(
         assert cancel_requested.wait(timeout=1)
         return recovery_process.RecoveryProcessOutcome(
             False,
+            ErrorCategory.ORCHESTRATION,
             "EXECUTION_RECOVERY_WORKER_CANCELLED",
         )
 
@@ -664,7 +1115,7 @@ def test_retirement_join_ambiguity_poison_retains_reservation(
             return False
 
     outcome: Future[recovery_process.RecoveryProcessOutcome] = Future()
-    outcome.set_result(recovery_process.RecoveryProcessOutcome(True, None))
+    outcome.set_result(recovery_process.RecoveryProcessOutcome(True, None, None))
     reservation = recovery_module._ScanReservation(
         signature=(settings.workflow_db.resolve(), settings.inventory_db.resolve()),
         scan_at=_scan_at(),
@@ -716,7 +1167,7 @@ async def test_late_worker_failure_precedes_shutdown_cancellation(
         nonlocal calls
         calls += 1
         if calls == 1:
-            return recovery_process.RecoveryProcessOutcome(True, None)
+            return recovery_process.RecoveryProcessOutcome(True, None, None)
         runtime_entered.set()
         deadline = time.monotonic() + 2
         while not cancel_requested.is_set():
@@ -726,6 +1177,7 @@ async def test_late_worker_failure_precedes_shutdown_cancellation(
         assert release_failure.wait(timeout=2)
         return recovery_process.RecoveryProcessOutcome(
             False,
+            ErrorCategory.ORCHESTRATION,
             "EXECUTION_RECOVERY_FAILED",
         )
 

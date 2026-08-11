@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -11,6 +12,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from invoice_agents.config import Settings
+from invoice_agents.errors import ErrorCategory
 from invoice_agents.isolated_process import (
     IsolatedProcessCleanupError,
     ProcessCancellation,
@@ -20,9 +22,8 @@ from invoice_agents.isolated_process import (
 
 RECOVERY_PROTOCOL_VERSION = 1
 RECOVERY_MAX_MESSAGE_BYTES = 65_536
-RECOVERY_ERROR_CODES = frozenset(
+RECOVERY_CONTROLLER_STOP_REASONS = frozenset(
     {
-        "EXECUTION_RECOVERY_FAILED",
         "EXECUTION_RECOVERY_WORKER_CANCELLED",
         "EXECUTION_RECOVERY_WORKER_CLEANUP_FAILED",
         "EXECUTION_RECOVERY_WORKER_CRASHED",
@@ -30,6 +31,7 @@ RECOVERY_ERROR_CODES = frozenset(
         "EXECUTION_RECOVERY_WORKER_TIMED_OUT",
     }
 )
+_SAFE_STOP_REASON = re.compile(r"[A-Z][A-Z0-9_]{0,127}\Z")
 _STORE_FIELDS = frozenset(
     {
         "due_date_tolerance_days",
@@ -45,20 +47,29 @@ _STORE_FIELDS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class RecoveryProcessOutcome:
-    """One allowlisted result observed only after isolated cleanup is proven."""
+    """One validated result observed only after isolated cleanup is proven."""
 
     acknowledged: bool
-    error_code: str | None
+    error_category: ErrorCategory | None
+    stop_reason: str | None
 
     def __post_init__(self) -> None:
         if type(self.acknowledged) is not bool:
             raise ValueError("recovery acknowledgement must be an exact boolean")
         if self.acknowledged:
-            if self.error_code is not None:
-                raise ValueError("acknowledged recovery cannot carry an error code")
+            if self.error_category is not None or self.stop_reason is not None:
+                raise ValueError("acknowledged recovery cannot carry error metadata")
             return
-        if type(self.error_code) is not str or self.error_code not in RECOVERY_ERROR_CODES:
-            raise ValueError("failed recovery must carry one allowlisted error code")
+        if type(self.error_category) is not ErrorCategory:
+            raise ValueError("failed recovery must carry one exact error category")
+        if not is_safe_recovery_stop_reason(self.stop_reason):
+            raise ValueError("failed recovery must carry one safe stop reason")
+
+
+def is_safe_recovery_stop_reason(value: object) -> bool:
+    """Return whether a stop reason is safe for the bounded child protocol."""
+
+    return type(value) is str and _SAFE_STOP_REASON.fullmatch(value) is not None
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -98,9 +109,7 @@ def _store_payload(settings: Settings) -> dict[str, object]:
         "inventory_db": _canonical_database_path(settings.inventory_db),
         "review_threshold_amount": str(settings.review_threshold_amount),
         "review_threshold_currency": settings.review_threshold_currency,
-        "review_threshold_effective_date": (
-            settings.review_threshold_effective_date.isoformat()
-        ),
+        "review_threshold_effective_date": (settings.review_threshold_effective_date.isoformat()),
         "sqlite_journal_mode": settings.sqlite_journal_mode,
         "workflow_db": _canonical_database_path(settings.workflow_db),
     }
@@ -227,11 +236,7 @@ def encode_recovery_response(payload: dict[str, object]) -> bytes:
 
 
 def _decode_response(encoded: bytes) -> RecoveryProcessOutcome:
-    if (
-        type(encoded) is not bytes
-        or not encoded
-        or len(encoded) > RECOVERY_MAX_MESSAGE_BYTES
-    ):
+    if type(encoded) is not bytes or not encoded or len(encoded) > RECOVERY_MAX_MESSAGE_BYTES:
         raise ValueError("invalid recovery response size")
     payload = json.loads(
         encoded.decode("utf-8"),
@@ -249,14 +254,41 @@ def _decode_response(encoded: bytes) -> RecoveryProcessOutcome:
     if type(payload) is not dict or type(payload.get("ok")) is not bool:
         raise ValueError("invalid recovery response shape")
     if payload == {"ok": True}:
-        return RecoveryProcessOutcome(True, None)
-    if payload == {"error_code": "EXECUTION_RECOVERY_FAILED", "ok": False}:
-        return RecoveryProcessOutcome(False, "EXECUTION_RECOVERY_FAILED")
+        return RecoveryProcessOutcome(True, None, None)
+    if (
+        set(payload) == {"error_category", "ok", "stop_reason"}
+        and payload["ok"] is False
+        and type(payload["error_category"]) is str
+        and is_safe_recovery_stop_reason(payload["stop_reason"])
+    ):
+        try:
+            error_category = ErrorCategory(payload["error_category"])
+        except ValueError as exc:
+            raise ValueError("invalid recovery response error category") from exc
+        if payload["stop_reason"] in RECOVERY_CONTROLLER_STOP_REASONS:
+            raise ValueError("child response claimed a controller-owned recovery outcome")
+        return RecoveryProcessOutcome(
+            False,
+            error_category,
+            payload["stop_reason"],
+        )
     raise ValueError("invalid recovery response value")
 
 
 def _recovery_worker_command() -> list[str]:
-    executable = os.fspath(Path(sys.executable).resolve(strict=True))
+    if type(sys.executable) is not str or not sys.executable:
+        raise RuntimeError("recovery worker interpreter path is unavailable")
+    executable_path = Path(sys.executable)
+    if (
+        not executable_path.is_absolute()
+        or not executable_path.is_file()
+        or not os.access(executable_path, os.X_OK)
+    ):
+        raise RuntimeError("recovery worker interpreter path is invalid")
+    # Preserve the exact launcher identity.  Resolving a virtual-environment
+    # symlink selects its base interpreter and silently discards the venv's
+    # dependency environment under ``-I``.
+    executable = os.fspath(executable_path)
     worker = os.fspath(Path(__file__).with_name("recovery_worker.py").resolve(strict=True))
     return [executable, "-I", worker]
 
@@ -283,22 +315,37 @@ def run_recovery_process(
     except IsolatedProcessCleanupError:
         return RecoveryProcessOutcome(
             False,
+            ErrorCategory.ORCHESTRATION,
             "EXECUTION_RECOVERY_WORKER_CLEANUP_FAILED",
         )
     if outcome.failure == "cancelled":
-        return RecoveryProcessOutcome(False, "EXECUTION_RECOVERY_WORKER_CANCELLED")
+        return RecoveryProcessOutcome(
+            False,
+            ErrorCategory.ORCHESTRATION,
+            "EXECUTION_RECOVERY_WORKER_CANCELLED",
+        )
     if outcome.failure == "timeout":
-        return RecoveryProcessOutcome(False, "EXECUTION_RECOVERY_WORKER_TIMED_OUT")
+        return RecoveryProcessOutcome(
+            False,
+            ErrorCategory.ORCHESTRATION,
+            "EXECUTION_RECOVERY_WORKER_TIMED_OUT",
+        )
     if outcome.failure in {"start", "crash"}:
-        return RecoveryProcessOutcome(False, "EXECUTION_RECOVERY_WORKER_CRASHED")
+        return RecoveryProcessOutcome(
+            False,
+            ErrorCategory.ORCHESTRATION,
+            "EXECUTION_RECOVERY_WORKER_CRASHED",
+        )
     if outcome.failure == "protocol" or outcome.response is None:
         return RecoveryProcessOutcome(
             False,
+            ErrorCategory.ORCHESTRATION,
             "EXECUTION_RECOVERY_WORKER_PROTOCOL_INVALID",
         )
     if outcome.failure is not None:
         return RecoveryProcessOutcome(
             False,
+            ErrorCategory.ORCHESTRATION,
             "EXECUTION_RECOVERY_WORKER_PROTOCOL_INVALID",
         )
     try:
@@ -306,5 +353,6 @@ def run_recovery_process(
     except (UnicodeError, json.JSONDecodeError, ValueError):
         return RecoveryProcessOutcome(
             False,
+            ErrorCategory.ORCHESTRATION,
             "EXECUTION_RECOVERY_WORKER_PROTOCOL_INVALID",
         )

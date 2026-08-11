@@ -152,7 +152,9 @@ def _resource_version(resource: Traversable) -> int:
 
 
 def _migration_resource(version: int) -> Traversable:
-    matches = [resource for resource in _workflow_resources() if _resource_version(resource) == version]
+    matches = [
+        resource for resource in _workflow_resources() if _resource_version(resource) == version
+    ]
     assert len(matches) == 1
     return matches[0]
 
@@ -209,8 +211,7 @@ def _finished_case(
 
 def _trigger_definitions(connection: sqlite3.Connection, table: str) -> list[tuple[str, str]]:
     rows = connection.execute(
-        "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? "
-        "ORDER BY name",
+        "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? ORDER BY name",
         (table,),
     ).fetchall()
     definitions = [(str(row["name"]), str(row["sql"])) for row in rows]
@@ -458,19 +459,22 @@ def test_existing_v4_database_upgrades_to_v5_without_inventing_artifact_identity
         path,
         DatabaseKind.WORKFLOW,
         settings=settings,
-    ) == [5]
-    assert verify_database(path, DatabaseKind.WORKFLOW, settings=settings)["schema_version"] == 5
+    ) == [5, 6, 7]
+    assert verify_database(path, DatabaseKind.WORKFLOW, settings=settings)["schema_version"] == 7
     with connect_database(path, read_only=True) as connection:
         assert [
             int(row["version"])
             for row in connection.execute("SELECT version FROM schema_version ORDER BY version")
-        ] == [1, 2, 3, 4, 5]
+        ] == [1, 2, 3, 4, 5, 6, 7]
         history = connection.execute(
             "SELECT version, migration_sha256 FROM schema_migration_history ORDER BY ordinal"
         ).fetchall()
         assert history[3]["migration_sha256"] == MIGRATION_004_SHA256
         assert history[4]["migration_sha256"] == MIGRATION_005_SHA256
-        assert connection.execute("SELECT COUNT(*) FROM result_artifact_bindings").fetchone()[0] == 0
+        assert [int(row["version"]) for row in history] == [1, 2, 3, 4, 5, 6, 7]
+        assert (
+            connection.execute("SELECT COUNT(*) FROM result_artifact_bindings").fetchone()[0] == 0
+        )
     assert WorkflowStore(settings).load_result("case_v4_historical") == historical
 
 
@@ -514,7 +518,7 @@ def test_v5_binding_schema_has_exact_columns_index_foreign_key_and_triggers(
             ).fetchall()
         }
 
-    assert version == 5
+    assert version == 7
     assert table_row is not None
     assert db_core._normalized_sql(str(table_row["sql"])) == db_core._normalized_sql(
         EXPECTED_BINDING_TABLE_SQL
@@ -547,11 +551,8 @@ def test_v5_binding_schema_has_exact_columns_index_foreign_key_and_triggers(
     )
     assert parent_index_columns == ["case_id", "execution_generation"]
     assert set(trigger_sql) == BINDING_TRIGGER_NAMES
-    assert {
-        name: db_core._normalized_sql(sql) for name, sql in trigger_sql.items()
-    } == {
-        name: db_core._normalized_sql(sql)
-        for name, sql in EXPECTED_BINDING_TRIGGER_SQL.items()
+    assert {name: db_core._normalized_sql(sql) for name, sql in trigger_sql.items()} == {
+        name: db_core._normalized_sql(sql) for name, sql in EXPECTED_BINDING_TRIGGER_SQL.items()
     }
 
 
@@ -597,8 +598,9 @@ def test_binding_table_rejects_every_invalid_scalar(
     values = list(_binding_values(claim.case_id, claim.generation))
     values[names.index(field)] = invalid
 
-    with connect_database(settings.workflow_db) as connection, pytest.raises(
-        sqlite3.IntegrityError
+    with (
+        connect_database(settings.workflow_db) as connection,
+        pytest.raises(sqlite3.IntegrityError),
     ):
         _insert_raw_binding(connection, tuple(values))
 
@@ -638,9 +640,12 @@ def test_binding_trigger_rejects_noncanonical_terminal_parent(
     _store, claim, _result = _finished_case(settings, case_id, bind=False)
     _corrupt_case(settings, case_id, assignments, parameters)
 
-    with connect_database(settings.workflow_db) as connection, pytest.raises(
-        sqlite3.IntegrityError,
-        match=PARENT_TRIGGER_ERROR,
+    with (
+        connect_database(settings.workflow_db) as connection,
+        pytest.raises(
+            sqlite3.IntegrityError,
+            match=PARENT_TRIGGER_ERROR,
+        ),
     ):
         _insert_raw_binding(connection, _binding_values(case_id, claim.generation))
 
@@ -667,10 +672,13 @@ def test_binding_composite_foreign_key_rejects_predecessor_and_cascades_case_del
     with connect_database(settings.workflow_db) as connection:
         connection.execute("DELETE FROM cases WHERE case_id = ?", (result.case_id,))
         connection.commit()
-        assert connection.execute(
-            "SELECT COUNT(*) FROM result_artifact_bindings WHERE case_id = ?",
-            (result.case_id,),
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM result_artifact_bindings WHERE case_id = ?",
+                (result.case_id,),
+            ).fetchone()[0]
+            == 0
+        )
     with pytest.raises(InvoiceAgentsError) as excinfo:
         store.load_result_artifact_binding(result.case_id)
     assert excinfo.value.stop_reason == "CASE_NOT_FOUND"
@@ -1001,12 +1009,8 @@ def test_verification_rejects_each_binding_schema_object_mutation(
     statements = {
         "table": "DROP TABLE result_artifact_bindings",
         "parent_index": "DROP INDEX idx_cases_case_generation",
-        "binding_insert_trigger": (
-            "DROP TRIGGER trg_result_artifact_bindings_terminal_insert"
-        ),
-        "binding_update_trigger": (
-            "DROP TRIGGER trg_result_artifact_bindings_terminal_update"
-        ),
+        "binding_insert_trigger": ("DROP TRIGGER trg_result_artifact_bindings_terminal_insert"),
+        "binding_update_trigger": ("DROP TRIGGER trg_result_artifact_bindings_terminal_update"),
         "case_guard_trigger": "DROP TRIGGER trg_cases_result_artifact_binding_guard_update",
     }
     with connect_database(settings.workflow_db) as connection:

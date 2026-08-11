@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import stat
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ from invoice_agents.db.store import ResultArtifactBinding, WorkflowStore
 from invoice_agents.errors import InvoiceAgentsError
 from invoice_agents.models import CaseResult, CaseStatus
 from invoice_agents.source_store import snapshot_source
+from invoice_agents.ui import routes as ui_routes
 from invoice_agents.ui.server import create_app
 
 SOURCE_PATH = Path(__file__).resolve().parents[2] / "data/invoices/invoice_1001.txt"
@@ -234,9 +236,7 @@ def _install_result_directory_substitution(
         if is_final_directory:
             observations.descriptors.append(descriptor)
             observations.events.append("opened-final-directory")
-            observations.descriptor_events.append(
-                (descriptor, len(observations.events) - 1)
-            )
+            observations.descriptor_events.append((descriptor, len(observations.events) - 1))
             if timing == "after-first-directory" and not substituted:
                 substitute()
         return descriptor
@@ -318,6 +318,33 @@ def _assert_directory_capability_attempts(
     assert fstats[first][:2] != fstats[second][:2]
 
 
+def _assert_worker_directory_capability_attempt(
+    observations: _DirectoryCapabilityObservations,
+    *,
+    timing: str,
+) -> None:
+    """The worker holds one descriptor and revalidates its parent relation at EOF."""
+
+    assert observations.attempted_flags
+    assert all(flags & os.O_DIRECTORY for flags in observations.attempted_flags)
+    assert all(flags & os.O_NOFOLLOW for flags in observations.attempted_flags)
+    if timing == "before-first-symlink":
+        assert observations.events[:2] == ["attempt-final-directory", "substituted"]
+        assert observations.descriptors == []
+        return
+    assert observations.events == [
+        "attempt-final-directory",
+        "opened-final-directory",
+        "substituted",
+    ]
+    assert len(observations.descriptors) == 1
+    descriptor = observations.descriptors[0]
+    assert len(observations.production_fstats) == 1
+    observed_descriptor, _device, _inode, file_type = observations.production_fstats[0]
+    assert observed_descriptor == descriptor
+    assert file_type == stat.S_IFDIR
+
+
 @pytest.mark.parametrize(
     "failure_type",
     [OSError, KeyboardInterrupt, SystemExit, asyncio.CancelledError],
@@ -362,7 +389,7 @@ def test_pre_action_binding_failure_restores_exact_prior_artifact(
     assert _rollback_paths(target) == []
     assert set(output.iterdir()) == {target}
     _assert_directory_fsync_after_final_namespace_mutation(events)
-    with TestClient(create_app(settings)) as client:
+    with TestClient(create_app(settings), base_url="http://127.0.0.1:8787") as client:
         response = client.get(f"/cases/{result.case_id}/result.json")
     assert response.status_code == 409
     assert response.json()["stop_reason"] == "RESULT_ARTIFACT_BINDING_UNRESOLVED"
@@ -446,10 +473,11 @@ def test_post_action_binding_fault_uses_exact_independent_readback(
     assert binding.artifact_inode == identity.st_ino
     assert binding.artifact_file_type == stat.S_IFMT(identity.st_mode) == stat.S_IFREG
     assert _rollback_paths(target) == []
-    with TestClient(create_app(settings)) as client:
+    with TestClient(create_app(settings), base_url="http://127.0.0.1:8787") as client:
         response = client.get(f"/cases/{result.case_id}/result.json")
     assert response.status_code == 200
-    assert response.content == payload
+    assert CaseResult.model_validate_json(response.content) == result
+    assert response.content == result.model_dump_json().encode("utf-8")
 
 
 @pytest.mark.parametrize(
@@ -520,7 +548,11 @@ def test_ambiguous_binding_readback_preserves_candidate_and_prior_evidence(
         "load_result_with_artifact_binding",
         original_binding_loader,
     )
-    with TestClient(create_app(settings), raise_server_exceptions=False) as client:
+    with TestClient(
+        create_app(settings),
+        base_url="http://127.0.0.1:8787",
+        raise_server_exceptions=False,
+    ) as client:
         response = client.get(f"/cases/{result.case_id}/result.json")
     assert response.status_code == 409
     assert response.json()["stop_reason"] == "RESULT_ARTIFACT_BINDING_UNRESOLVED"
@@ -551,9 +583,7 @@ def test_binding_absence_plus_filesystem_rollback_fault_preserves_both_evidence_
     ) -> None:
         nonlocal rollback_attempts
         source_path = Path(source) if src_dir_fd is None else output / Path(source)
-        destination_path = (
-            Path(destination) if dst_dir_fd is None else output / Path(destination)
-        )
+        destination_path = Path(destination) if dst_dir_fd is None else output / Path(destination)
         if source_path.name.startswith(f".{target.name}.rollback-"):
             assert destination_path == target
             rollback_attempts += 1
@@ -590,7 +620,7 @@ def test_binding_absence_plus_filesystem_rollback_fault_preserves_both_evidence_
     assert set(output.iterdir()) == {target, rollback[0]}
     assert not target.with_name(f"{target.name}.tmp").exists()
     _assert_directory_fsync_after_final_namespace_mutation(events)
-    with TestClient(create_app(settings)) as client:
+    with TestClient(create_app(settings), base_url="http://127.0.0.1:8787") as client:
         response = client.get(f"/cases/{result.case_id}/result.json")
     assert response.status_code == 409
     assert response.json()["stop_reason"] == "RESULT_ARTIFACT_BINDING_UNRESOLVED"
@@ -647,7 +677,11 @@ def test_mismatched_binding_readback_preserves_both_files_and_fails_closed(
     _assert_directory_fsync_after_final_namespace_mutation(events)
     assert set(output.iterdir()) == {target, rollback[0]}
     assert not target.with_name(f"{target.name}.tmp").exists()
-    with TestClient(create_app(settings), raise_server_exceptions=False) as client:
+    with TestClient(
+        create_app(settings),
+        base_url="http://127.0.0.1:8787",
+        raise_server_exceptions=False,
+    ) as client:
         response = client.get(f"/cases/{result.case_id}/result.json")
     assert response.status_code == 409
     assert response.json()["stop_reason"] == "RESULT_ARTIFACT_BINDING_UNRESOLVED"
@@ -708,7 +742,7 @@ def test_publication_rejects_result_directory_entry_substitution_before_binding(
     "timing",
     ["before-first-symlink", "after-first-directory"],
 )
-def test_route_rejects_result_directory_entry_substitution_before_serving(
+def test_result_worker_and_route_reject_directory_entry_substitution_before_serving(
     timing: str,
     settings: Settings,
     tmp_path: Path,
@@ -722,7 +756,7 @@ def test_route_rejects_result_directory_entry_substitution_before_serving(
     unintended = tmp_path / "unintended-results"
     unintended.mkdir()
     unintended_target = unintended / target.name
-    os.link(target, unintended_target)
+    unintended_target.write_bytes(payload)
     unintended_identity = unintended.stat()
     intended_inventory = _directory_inventory(intended)
     unintended_inventory = _directory_inventory(unintended)
@@ -737,7 +771,16 @@ def test_route_rejects_result_directory_entry_substitution_before_serving(
         timing=timing,
     )
 
-    with TestClient(create_app(settings)) as client:
+    monkeypatch.setattr(ui_routes, "_RESULT_ARTIFACT_WORKER_BINDING", original_binding)
+    if timing == "before-first-symlink":
+        with pytest.raises(OSError) as excinfo:
+            ui_routes._read_bounded_regular_file(target.absolute())
+        assert excinfo.value.errno in {errno.ELOOP, errno.ENOTDIR}
+    else:
+        with pytest.raises(ValueError, match="parent changed"):
+            ui_routes._read_bounded_regular_file(target.absolute())
+
+    with TestClient(create_app(settings), base_url="http://127.0.0.1:8787") as client:
         response = client.get(f"/cases/{result.case_id}/result.json")
 
     assert response.status_code == 409
@@ -747,7 +790,7 @@ def test_route_rejects_result_directory_entry_substitution_before_serving(
         "stop_reason": "RESULT_ARTIFACT_BINDING_UNRESOLVED",
     }
     assert response.content != payload
-    _assert_directory_capability_attempts(observations, timing=timing)
+    _assert_worker_directory_capability_attempt(observations, timing=timing)
     assert store.load_result_artifact_binding(result.case_id) == original_binding
     substituted_directory = unintended if timing == "before-first-symlink" else intended
     substituted_identity = substituted_directory.stat()
@@ -819,7 +862,7 @@ def test_publication_revalidates_named_directory_after_candidate_fsync_before_bi
     assert _directory_inventory(displaced) == intended_inventory
 
 
-def test_route_revalidates_named_directory_after_artifact_eof_before_serving(
+def test_result_worker_and_route_revalidate_named_directory_after_artifact_eof(
     settings: Settings,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -833,7 +876,7 @@ def test_route_revalidates_named_directory_after_artifact_eof_before_serving(
     unintended = tmp_path / "unintended-results"
     unintended.mkdir()
     unintended_target = unintended / target.name
-    os.link(target, unintended_target)
+    unintended_target.write_bytes(payload)
     intended_inventory = _directory_inventory(intended)
     unintended_inventory = _directory_inventory(unintended)
     displaced = tmp_path / "artifacts" / "displaced-results"
@@ -869,7 +912,11 @@ def test_route_revalidates_named_directory_after_artifact_eof_before_serving(
 
     monkeypatch.setattr(os, "read", substitute_after_artifact_eof)
 
-    with TestClient(create_app(settings)) as client:
+    monkeypatch.setattr(ui_routes, "_RESULT_ARTIFACT_WORKER_BINDING", original_binding)
+    with pytest.raises(ValueError, match="parent changed"):
+        ui_routes._read_bounded_regular_file(target.absolute())
+
+    with TestClient(create_app(settings), base_url="http://127.0.0.1:8787") as client:
         response = client.get(f"/cases/{result.case_id}/result.json")
 
     assert substituted
@@ -880,7 +927,7 @@ def test_route_revalidates_named_directory_after_artifact_eof_before_serving(
         "stop_reason": "RESULT_ARTIFACT_BINDING_UNRESOLVED",
     }
     assert response.content != payload
-    _assert_directory_capability_attempts(
+    _assert_worker_directory_capability_attempt(
         observations,
         timing="after-first-directory",
     )

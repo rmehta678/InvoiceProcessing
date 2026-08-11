@@ -31,9 +31,7 @@ from invoice_agents.source_store import verified_source_path
 RELATIVE_DATE = re.compile(r"\b(today|tomorrow|yesterday|next\s+\w+|last\s+\w+)\b", re.I)
 INTEGER_VALUE = r"(?:[0-9O]{1,3}(?:,[0-9O]{3})+|[0-9O]+)"
 MONEY_VALUE = rf"(?:[-+]?[$€]?|[$€][-+]?)?{INTEGER_VALUE}(?:\.[0-9O]{{1,2}})?"
-MONEY_TOKEN = re.compile(
-    rf"^{MONEY_VALUE}$", re.I
-)
+MONEY_TOKEN = re.compile(rf"^{MONEY_VALUE}$", re.I)
 SENSITIVE_EVIDENCE = re.compile(
     r"(?:api[_-]?key|authorization|bearer|cookie|password|secret|token)", re.I
 )
@@ -338,12 +336,15 @@ def _parse_tax_rate_label(
                 "raw_value": safe_evidence_excerpt(label),
             },
         )
-    return _parse_complete_decimal(
-        wrapper.group("value"),
-        "declared tax rate",
-        source,
-        locator=locator,
-    )[0] / 100
+    return (
+        _parse_complete_decimal(
+            wrapper.group("value"),
+            "declared tax rate",
+            source,
+            locator=locator,
+        )[0]
+        / 100
+    )
 
 
 def _is_tax_label(label: str) -> bool:
@@ -693,15 +694,11 @@ def _extract_textual(
             raw, field, source, locator=f"{locator_prefix}:{line_number}"
         )
 
-    subtotal, subtotal_note = total_value(
-        r"^\s*Subtotal\s*:\s*(?P<value>.+)$", "declared subtotal"
-    )
+    subtotal, subtotal_note = total_value(r"^\s*Subtotal\s*:\s*(?P<value>.+)$", "declared subtotal")
     tax, tax_note = total_value(
         r"^\s*(?:Tax(?:\s*\([^)]*\))?|Sales\s+Tax)\s*:\s*(?P<value>.+)$", "declared tax"
     )
-    shipping, shipping_note = total_value(
-        r"^\s*Shipping\s*:\s*(?P<value>.+)$", "declared fee"
-    )
+    shipping, shipping_note = total_value(r"^\s*Shipping\s*:\s*(?P<value>.+)$", "declared fee")
     total, total_note = total_value(
         r"^\s*(?:Total\s+Amount|Grand\s+Total|TOTAL|Total|Amt)\s*:\s*(?P<value>.+)$",
         "declared total",
@@ -876,7 +873,9 @@ def _extract_csv(source: SourceArtifact) -> ExtractedInvoice:
                 field = "declared tax"
             elif label.startswith("total"):
                 field = "declared total"
-            amount = _parse_complete_decimal(raw_value, field, source, locator=f"row:{row_index}")[0]
+            amount = _parse_complete_decimal(raw_value, field, source, locator=f"row:{row_index}")[
+                0
+            ]
             if label.startswith("subtotal"):
                 totals["subtotal"] = amount
             elif is_tax_label:

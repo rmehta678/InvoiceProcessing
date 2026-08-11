@@ -288,9 +288,7 @@ def test_required_trigger_contract_discovers_every_packaged_workflow_migration()
         for resource in root.iterdir()
         if core_module.re.fullmatch(r"[0-9]{3}_[A-Za-z0-9_]+\.sql", resource.name)
     ]
-    scripts.append(
-        root.joinpath("legacy_authorization_archive.sql").read_text(encoding="utf-8")
-    )
+    scripts.append(root.joinpath("legacy_authorization_archive.sql").read_text(encoding="utf-8"))
     packaged_names = {
         match.group(1)
         for script in scripts
@@ -370,7 +368,7 @@ def test_workflow_manifest_accepts_harmless_trigger_formatting(settings: Setting
             DatabaseKind.WORKFLOW,
             settings=settings,
         )["schema_version"]
-        == 5
+        == 7
     )
 
 
@@ -379,7 +377,7 @@ def test_ensure_databases_creates_seeds_and_is_repeatable(tmp_path: Path) -> Non
     workflow = tmp_path / "workflow.db"
     settings = Settings(inventory_db=inventory, workflow_db=workflow)
     first = ensure_databases(settings)
-    assert first == {"inventory": [1], "workflow": [1, 2, 3, 4, 5]}
+    assert first == {"inventory": [1], "workflow": [1, 2, 3, 4, 5, 6, 7]}
     assert verify_database(inventory, DatabaseKind.INVENTORY)["integrity"] == "ok"
     assert verify_database(workflow, DatabaseKind.WORKFLOW, settings=settings)["integrity"] == "ok"
     second = ensure_databases(settings)
@@ -488,8 +486,7 @@ def test_inventory_manifest_rejects_changed_index_definition(
     with connect_database(settings.inventory_db) as connection:
         connection.execute("DROP INDEX idx_item_aliases_sku")
         connection.execute(
-            "CREATE INDEX idx_item_aliases_sku ON item_aliases(sku DESC) "
-            "WHERE source <> ''"
+            "CREATE INDEX idx_item_aliases_sku ON item_aliases(sku DESC) WHERE source <> ''"
         )
         connection.commit()
 
@@ -569,7 +566,7 @@ def test_workflow_verify_cli_requires_explicit_inventory_context(tmp_path: Path)
     assert missing_context.exit_code == 2
     assert "--inventory-db is required" in missing_context.stderr
     assert verified.exit_code == 0
-    assert "'schema_version': 5" in verified.stdout
+    assert "'schema_version': 7" in verified.stdout
 
 
 @pytest.mark.parametrize("journal_mode", ["PERSIST", "TRUNCATE", "WAL"])
@@ -647,7 +644,36 @@ def test_workflow_migrate_cli_binds_legacy_v3_retrofit_to_inventory_context(
         inventory_db=tmp_path / "inventory.db",
         workflow_db=tmp_path / "workflow.db",
     )
-    ensure_databases(settings)
+    migrate_database(settings.inventory_db, DatabaseKind.INVENTORY)
+    workflow_resources = core_module._migration_resources(DatabaseKind.WORKFLOW)
+    workflow_hashes = core_module._migration_hashes(workflow_resources)
+    applied_at = "2026-08-09T12:00:00+00:00"
+    with connect_database(settings.workflow_db) as connection:
+        connection.executescript(workflow_resources[0].read_text(encoding="utf-8"))
+        connection.execute(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO schema_version(version, applied_at) VALUES (1, ?)",
+            (applied_at,),
+        )
+        connection.executescript(workflow_resources[1].read_text(encoding="utf-8"))
+        connection.execute(
+            "INSERT INTO schema_version(version, applied_at) VALUES (2, ?)",
+            (applied_at,),
+        )
+        core_module._install_legacy_archive_schema(connection)
+        connection.executescript(workflow_resources[2].read_text(encoding="utf-8"))
+        connection.execute(
+            "INSERT INTO schema_version(version, applied_at) VALUES (3, ?)",
+            (applied_at,),
+        )
+        connection.executemany(
+            "INSERT INTO schema_migration_history("
+            "ordinal, version, migration_sha256, applied_at) VALUES (?, ?, ?, ?)",
+            [(version, version, workflow_hashes[version], applied_at) for version in (1, 2, 3)],
+        )
+        connection.commit()
     with connect_database(settings.workflow_db) as connection:
         for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'trigger' "
@@ -655,14 +681,6 @@ def test_workflow_migrate_cli_binds_legacy_v3_retrofit_to_inventory_context(
         ).fetchall():
             connection.execute(f'DROP TRIGGER "{row["name"]}"')
         connection.execute("DROP TABLE schema_migration_history")
-        connection.execute("DROP TRIGGER trg_cases_result_artifact_binding_guard_update")
-        connection.execute("DROP TRIGGER trg_result_artifact_bindings_terminal_insert")
-        connection.execute("DROP TRIGGER trg_result_artifact_bindings_terminal_update")
-        connection.execute("DROP TABLE result_artifact_bindings")
-        connection.execute("DROP INDEX idx_cases_case_generation")
-        connection.execute("DROP TRIGGER trg_cases_execution_token_grammar_insert")
-        connection.execute("DROP TRIGGER trg_cases_execution_token_grammar_update")
-        connection.execute("DELETE FROM schema_version WHERE version IN (4, 5)")
         connection.commit()
     base = [
         "migrate",
@@ -681,7 +699,7 @@ def test_workflow_migrate_cli_binds_legacy_v3_retrofit_to_inventory_context(
     assert missing_context.exit_code == 1
     assert "error_code=DATABASE_AUTHORIZATION_CONTEXT_REQUIRED" in missing_context.stderr
     assert migrated.exit_code == 0
-    assert "applied=[4, 5]" in migrated.stdout
+    assert "applied=[4, 5, 6, 7]" in migrated.stdout
 
 
 def test_workflow_verification_validates_attached_inventory_schema_in_same_snapshot(

@@ -59,8 +59,12 @@ async def test_round3_single_same_tick_cancel_has_durability_owner(
         raise AssertionError("unreachable")
 
     monkeypatch.setattr(ui_runs, "run_prepared_case", forbidden_runner)
-    registry = RunRegistry()
-    outcome = await registry.start_process(invoice_dir / "invoice_1001.txt", settings)
+    registry = RunRegistry(global_limit=settings.case_concurrency)
+    outcome = await registry.start_process(
+        invoice_dir / "invoice_1001.txt",
+        settings,
+        submission_id="submission_round3_single_same_tick_cancel",
+    )
     assert isinstance(outcome, str)
     handle = registry.handle(outcome)
     assert handle is not None and handle.task is not None
@@ -305,7 +309,7 @@ async def test_round3_registry_never_stores_raw_exception_text() -> None:
     with pytest.raises(RuntimeError, match="xai-secret-canary"):
         await task
 
-    RunRegistry()._finish(handle, None)
+    RunRegistry(global_limit=1)._finish(handle, None)
 
     assert handle.error == "UNEXPECTED_RUNTIME_ERROR"
     assert canary not in (handle.error or "")
@@ -821,12 +825,13 @@ async def test_round3_ui_registry_rejects_invalid_concurrency_before_mutation(
     settings: Settings,
     invalid_concurrency: object,
 ) -> None:
-    registry = RunRegistry()
+    registry = RunRegistry(global_limit=settings.case_concurrency)
     with pytest.raises(ValueError, match="concurrency"):
         await registry.start_batch(
             [invoice_dir / "invoice_1001.txt"],
             settings,
             invalid_concurrency,  # type: ignore[arg-type]
+            submission_id="submission_round3_invalid_concurrency",
         )
     assert registry._batches == {}
     assert registry._runs == {}
@@ -875,8 +880,12 @@ async def test_round3_cancellation_resistant_single_child_is_fenced_before_owner
 
     monkeypatch.setattr(ui_runs, "run_prepared_case", resistant_runner)
     monkeypatch.setattr(ui_runs, "DURABILITY_DEADLINE_SECONDS", 0.02)
-    registry = RunRegistry()
-    case_id = await registry.start_process(invoice_dir / "invoice_1001.txt", settings)
+    registry = RunRegistry(global_limit=settings.case_concurrency)
+    case_id = await registry.start_process(
+        invoice_dir / "invoice_1001.txt",
+        settings,
+        submission_id="submission_round3_resistant_single",
+    )
     assert isinstance(case_id, str)
     handle = registry.handle(case_id)
     assert handle is not None and handle.task is not None

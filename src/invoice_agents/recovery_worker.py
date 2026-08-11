@@ -5,18 +5,37 @@ from __future__ import annotations
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
 
-from invoice_agents.config import Settings
-from invoice_agents.db.store import WorkflowStore
-from invoice_agents.recovery_process import (
+# ``-I`` intentionally excludes the script directory and ignores PYTHONPATH.
+# Bind imports to the exact package tree containing the trusted worker path so
+# an unrelated editable checkout cannot supply a different recovery protocol.
+_SOURCE_ROOT = Path(__file__).resolve(strict=True).parents[1]
+sys.path.insert(0, os.fspath(_SOURCE_ROOT))
+
+from invoice_agents.config import Settings  # noqa: E402
+from invoice_agents.db.store import WorkflowStore  # noqa: E402
+from invoice_agents.errors import ErrorCategory, InvoiceAgentsError  # noqa: E402
+from invoice_agents.recovery_process import (  # noqa: E402
     RECOVERY_MAX_MESSAGE_BYTES,
     decode_recovery_request,
     encode_recovery_response,
+    is_safe_recovery_stop_reason,
 )
 
 
-def _failure() -> dict[str, object]:
-    return {"error_code": "EXECUTION_RECOVERY_FAILED", "ok": False}
+def _failure(
+    error_category: object = ErrorCategory.ORCHESTRATION,
+    stop_reason: object = "EXECUTION_RECOVERY_FAILED",
+) -> dict[str, object]:
+    if type(error_category) is not ErrorCategory or not is_safe_recovery_stop_reason(stop_reason):
+        error_category = ErrorCategory.ORCHESTRATION
+        stop_reason = "EXECUTION_RECOVERY_WORKER_PROTOCOL_INVALID"
+    return {
+        "error_category": error_category.value,
+        "ok": False,
+        "stop_reason": stop_reason,
+    }
 
 
 def _recover(settings: Settings, scan_at: datetime) -> bool:
@@ -36,9 +55,9 @@ def main() -> None:
     request = sys.stdin.buffer.read(RECOVERY_MAX_MESSAGE_BYTES + 1)
     try:
         settings, scan_at = decode_recovery_request(request)
-        response: dict[str, object] = (
-            {"ok": True} if _recover(settings, scan_at) else _failure()
-        )
+        response: dict[str, object] = {"ok": True} if _recover(settings, scan_at) else _failure()
+    except InvoiceAgentsError as exc:
+        response = _failure(exc.category, exc.stop_reason)
     except BaseException:
         response = _failure()
     encoded = encode_recovery_response(response)

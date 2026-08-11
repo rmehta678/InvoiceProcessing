@@ -998,9 +998,7 @@ class _StartupOwner:
             self._record_error(exc)
         finally:
             while (
-                self.native_child_owned
-                and self.native_process is not None
-                and self.worker is None
+                self.native_child_owned and self.native_process is not None and self.worker is None
             ):
                 try:
                     self.retain_native_cleanup_session(self.native_process)

@@ -761,9 +761,7 @@ def test_recursive_metadata_decode_failure_is_generic() -> None:
     recursive_json = b"[" * 10_000 + b"]" * 10_000
 
     with pytest.raises(SourceEvidenceError) as excinfo:
-        pdf_worker()._decode_worker_message(
-            "extract", recursive_json, expected_page=None
-        )
+        pdf_worker()._decode_worker_message("extract", recursive_json, expected_page=None)
 
     assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
     assert excinfo.value.message == "PDF worker failed"

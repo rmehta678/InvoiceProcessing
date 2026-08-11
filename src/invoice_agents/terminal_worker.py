@@ -82,8 +82,8 @@ def main() -> None:
     request = sys.stdin.buffer.read(TERMINAL_WORKER_MAX_MESSAGE_BYTES + 1)
     response_claim: Any | None = None
     try:
-        mode, settings, claim, started_at, result, worker_error_code = (
-            decode_terminal_request(request)
+        mode, settings, claim, started_at, result, worker_error_code = decode_terminal_request(
+            request
         )
         response_claim = claim
         from invoice_agents.db.store import WorkflowStore

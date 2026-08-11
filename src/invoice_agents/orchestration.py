@@ -794,7 +794,9 @@ async def _close_claimed_client(execution: _ClaimedExecution) -> _CleanupOutcome
             control_exception=(
                 boundary_control
                 if boundary_control is not None
-                else close_failure if not isinstance(close_failure, Exception) else None
+                else close_failure
+                if not isinstance(close_failure, Exception)
+                else None
             ),
         )
     return _CleanupOutcome()
@@ -2216,10 +2218,7 @@ def _write_result_for_generation(
                 )
                 setattr(unresolved_error, _PUBLICATION_PRESERVE_EVIDENCE, True)
                 raise unresolved_error from None
-            exact_parent = (
-                observed_result == result
-                and observed_generation == execution_generation
-            )
+            exact_parent = observed_result == result and observed_generation == execution_generation
             if exact_parent and observed_binding == binding:
                 return failure if _is_process_control(failure) else None
             if exact_parent and observed_binding is None:
@@ -2227,9 +2226,7 @@ def _write_result_for_generation(
             if _is_process_control(failure):
                 setattr(failure, _PUBLICATION_PRESERVE_EVIDENCE, True)
                 raise _clear_exception_chain(failure) from None
-            unresolved_error = _publication_failure(
-                "RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED"
-            )
+            unresolved_error = _publication_failure("RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED")
             setattr(unresolved_error, _PUBLICATION_PRESERVE_EVIDENCE, True)
             raise unresolved_error from None
         return None
@@ -2309,9 +2306,7 @@ def _atomic_publish_locked(
     target: Path,
     payload: bytes,
     *,
-    bind_published_candidate: (
-        Callable[[_PublicationReceipt], BaseException | None] | None
-    ) = None,
+    bind_published_candidate: (Callable[[_PublicationReceipt], BaseException | None] | None) = None,
 ) -> _PublicationReceipt:
     """Publish bytes durably or restore the exact prior namespace durably.
 
@@ -2379,30 +2374,22 @@ def _atomic_publish_locked(
             directory_descriptors.append(descriptor)
             opened = os.fstat(descriptor)
         except OSError:
-            raise _publication_failure(
-                "ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED"
-            ) from None
+            raise _publication_failure("ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED") from None
         if not stat.S_ISDIR(opened.st_mode):
-            raise _publication_failure(
-                "ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED"
-            ) from None
+            raise _publication_failure("ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED") from None
         opened_identity = (opened.st_dev, opened.st_ino)
         if (
             publication_directory_identity is None
             or opened_identity != publication_directory_identity
         ):
-            raise _publication_failure(
-                "ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED"
-            ) from None
+            raise _publication_failure("ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED") from None
         return descriptor
 
     try:
         try:
             classified_directory = os.lstat(target.parent)
             if not stat.S_ISDIR(classified_directory.st_mode):
-                raise _publication_failure(
-                    "ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED"
-                ) from None
+                raise _publication_failure("ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED") from None
             publication_directory_identity = (
                 classified_directory.st_dev,
                 classified_directory.st_ino,
@@ -2414,9 +2401,7 @@ def _atomic_publish_locked(
             for _ in range(2):
                 acquire_publication_directory()
         except OSError:
-            capture(
-                _publication_failure("ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED")
-            )
+            capture(_publication_failure("ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED"))
         except BaseException as exc:
             capture(exc)
 
@@ -2437,10 +2422,7 @@ def _atomic_publish_locked(
                     offset += written
                 os.fsync(file_descriptor)
                 candidate_identity = identity_tuple(os.fstat(file_descriptor))
-                if (
-                    candidate_identity[2] != stat.S_IFREG
-                    or candidate_identity[3] != len(payload)
-                ):
+                if candidate_identity[2] != stat.S_IFREG or candidate_identity[3] != len(payload):
                     raise _publication_failure(
                         "ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED"
                     ) from None
@@ -2516,16 +2498,13 @@ def _atomic_publish_locked(
                         artifact_size_bytes=candidate_identity[3],
                     )
                     deferred_control = bind_published_candidate(receipt)
-                    if deferred_control is not None and not _is_process_control(
-                        deferred_control
-                    ):
+                    if deferred_control is not None and not _is_process_control(deferred_control):
                         raise TypeError("binding callback returned a non-control failure")
                     binding_proven = True
                     preserve_publication_evidence = True
             except BaseException as exc:
                 preserve_publication_evidence = (
-                    binding_proven
-                    or getattr(exc, _PUBLICATION_PRESERVE_EVIDENCE, False) is True
+                    binding_proven or getattr(exc, _PUBLICATION_PRESERVE_EVIDENCE, False) is True
                 )
                 remaining_temporary = lstat_entry(temporary.name)
                 if temporary_present and remaining_temporary is None:

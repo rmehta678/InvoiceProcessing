@@ -189,7 +189,7 @@ def _successful_model(
 
 
 def test_workflow_v6_installs_durable_admission_schema(settings: Settings) -> None:
-    """Renumbering Task 11 as v5 would overwrite Task 9's immutable migration."""
+    """Task 11 remains v6 when later immutable workflow migrations are installed."""
 
     with connect_database(settings.workflow_db, read_only=True) as connection:
         versions = tuple(
@@ -264,7 +264,7 @@ def test_workflow_v6_installs_durable_admission_schema(settings: Settings) -> No
                     )
                 )
 
-    assert versions == (1, 2, 3, 4, 5, 6)
+    assert versions == (1, 2, 3, 4, 5, 6, 7)
     assert {
         "submission_requests",
         "source_run_claims",
@@ -980,6 +980,24 @@ async def test_source_case_claim_and_target_admission_roll_back_together(
         _write_distinct_invoice(tmp_path / f"atomic-{index}.txt", f"ATOMIC-{index}")
         for index in range(source_count)
     ]
+    # The intentional non-manifest trigger belongs only to this transaction
+    # fault fixture. Stage first so the isolated preparation worker still
+    # verifies the unmodified packaged schema, then replay those exact immutable
+    # staging envelopes through admission after the trigger is installed.
+    staged_sources = [
+        await ui_runs._prepare_claimed_for_launch(source, settings) for source in sources
+    ]
+    assert all(not isinstance(staged, CaseResult) for staged in staged_sources)
+    staged_by_path = {
+        staged.submitted_path: staged
+        for staged in staged_sources
+        if not isinstance(staged, CaseResult)
+    }
+
+    async def prepared_before_fault(path: Path, selected: Settings):
+        assert selected is settings
+        return staged_by_path[path.resolve()]
+
     prerequisite = (
         f"(SELECT COUNT(*) FROM source_artifacts) = {source_count} "
         f"AND (SELECT COUNT(*) FROM cases WHERE execution_state = 'RUNNING') = {source_count} "
@@ -987,32 +1005,16 @@ async def test_source_case_claim_and_target_admission_roll_back_together(
     )
     if fault_table == "batches":
         prerequisite += " AND (SELECT COUNT(*) FROM submission_requests) = 1"
-    trigger_calls: list[str] = []
-    real_connect = store_module.connect_database
-
-    def fail_exact_late_insert() -> int:
-        trigger_calls.append(fault_table)
-        raise sqlite3.IntegrityError(f"test late {fault_table} admission fault")
-
-    @contextmanager
-    def fault_observing_connect(path: Path, *, read_only: bool = False):
-        with real_connect(path, read_only=read_only) as selected_connection:
-            if not read_only:
-                selected_connection.create_function(
-                    "test_late_admission_fault",
-                    0,
-                    fail_exact_late_insert,
-                )
-            yield selected_connection
-
     with connect_database(settings.workflow_db) as connection:
         connection.executescript(
             f"""
             CREATE TRIGGER test_abort_late_admission
             BEFORE INSERT ON {fault_table}
-            WHEN {prerequisite}
             BEGIN
-                SELECT test_late_admission_fault();
+                SELECT RAISE(ABORT, 'TEST_LATE_ADMISSION_FAULT')
+                WHERE {prerequisite};
+                SELECT RAISE(ABORT, 'TEST_ADMISSION_PREREQUISITE_INVALID')
+                WHERE NOT ({prerequisite});
             END;
             """
         )
@@ -1021,9 +1023,9 @@ async def test_source_case_claim_and_target_admission_roll_back_together(
     async def forbidden_model(*_args: object, **_kwargs: object) -> CaseResult:
         raise AssertionError("failed admission reached the model boundary")
 
-    monkeypatch.setattr(store_module, "connect_database", fault_observing_connect)
+    monkeypatch.setattr(ui_runs, "_prepare_claimed_for_launch", prepared_before_fault)
     monkeypatch.setattr(ui_runs, "run_prepared_case", forbidden_model)
-    with pytest.raises((InvoiceAgentsError, sqlite3.DatabaseError)):
+    with pytest.raises(sqlite3.IntegrityError, match="TEST_LATE_ADMISSION_FAULT"):
         registry = RunRegistry(global_limit=2)
         if fault_table == "submission_requests":
             await registry.start_process(
@@ -1038,8 +1040,6 @@ async def test_source_case_claim_and_target_admission_roll_back_together(
                 concurrency=2,
                 submission_id="submission_atomic_batch_failure",
             )
-    assert trigger_calls == [fault_table]
-
     with connect_database(settings.workflow_db, read_only=True) as connection:
         counts = {
             table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
@@ -1592,7 +1592,10 @@ async def test_completed_batch_and_entries_rehydrate_from_storage(
         f"/batches/{batch.batch_id}"
     )
 
-    with TestClient(create_app(settings)) as restarted:
+    with TestClient(
+        create_app(settings),
+        base_url="http://localhost:8787",
+    ) as restarted:
         response = restarted.get(f"/batches/{batch.batch_id}")
     assert response.status_code == 200
     assert all(path.name in response.text for path in paths)
@@ -1607,39 +1610,23 @@ async def test_recovered_single_source_is_reconciled_before_ordinary_reuse(
     """Task 9 recovery must not leave Task 11 source admission permanently active."""
 
     source = _write_distinct_invoice(tmp_path / "recovered-single.txt", "RECOVERED-SINGLE")
-    calls: list[str] = []
-
-    async def interrupted_model(
-        case_id: str,
-        started_at: datetime,
-        _selected: Settings,
-        *,
-        claim: ExecutionClaim | None = None,
-    ) -> CaseResult:
-        assert claim is not None
-        calls.append(case_id)
-        return CaseResult(
-            case_id=case_id,
-            source_id=WorkflowStore(settings).load_authoritative_case_source_id(claim),
-            status=CaseStatus.SUCCEEDED,
-            stop_reason="STALE_WORKER_RETURNED",
-            started_at=started_at,
-            finished_at=datetime.now(UTC),
-        )
-
-    monkeypatch.setattr(ui_runs, "run_prepared_case", interrupted_model)
-    first_registry = RunRegistry(global_limit=1)
-    original = await first_registry.start_process(
-        source,
-        settings,
-        submission_id="submission_recovered_single_original",
+    staged = await ui_runs._prepare_claimed_for_launch(source, settings)
+    assert not isinstance(staged, CaseResult)
+    store = WorkflowStore(settings)
+    admission = store.claim_submission(
+        "submission_recovered_single_original",
+        "single",
+        (staged,),
     )
-    assert isinstance(original, str)
-    original_handle = first_registry.handle(original)
-    assert original_handle is not None and original_handle.task is not None
-    with pytest.raises(InvoiceAgentsError) as unresolved:
-        await asyncio.shield(original_handle.task)
-    assert unresolved.value.stop_reason == "TERMINAL_DURABILITY_UNRESOLVED"
+    admitted = admission.cases[0]
+    assert admitted.claim is not None
+    original = admitted.case_id
+    store.mark_admission_running(original)
+
+    async def forbidden_model(*_args: object, **_kwargs: object) -> CaseResult:
+        raise AssertionError("recovered source reuse reached the model boundary")
+
+    monkeypatch.setattr(ui_runs, "run_prepared_case", forbidden_model)
 
     with connect_database(settings.workflow_db) as connection:
         connection.execute(
@@ -1649,13 +1636,14 @@ async def test_recovered_single_source_is_reconciled_before_ordinary_reuse(
         connection.commit()
     assert WorkflowStore(settings).recover_expired_executions() == [original]
 
-    reused = await RunRegistry(global_limit=1).start_process(
+    restarted_registry = RunRegistry(global_limit=1)
+    reused = await restarted_registry.start_process(
         source,
         settings,
         submission_id="submission_recovered_single_reuse",
     )
     assert reused == original
-    assert calls == [original]
+    assert restarted_registry.handle(original) is None
     assert _case_count(settings) == 1
     with connect_database(settings.workflow_db, read_only=True) as connection:
         claim = connection.execute(
@@ -1670,52 +1658,25 @@ async def test_recovered_single_source_is_reconciled_before_ordinary_reuse(
 async def test_expired_batch_entry_rehydrates_as_failed_after_recovery(
     settings: Settings,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A restarted batch must not poll forever after Task 9 recovers its orphan."""
 
     source = _write_distinct_invoice(tmp_path / "interrupted.txt", "INTERRUPTED-1")
-
-    async def interrupted_model(
-        case_id: str,
-        started_at: datetime,
-        selected: Settings,
-        *,
-        claim: ExecutionClaim | None = None,
-    ) -> CaseResult:
-        del selected, claim
-        return CaseResult(
-            case_id=case_id,
-            source_id=WorkflowStore(settings).load_case_source_id(case_id),
-            status=CaseStatus.SUCCEEDED,
-            stop_reason="STALE_WORKER_RETURNED",
-            started_at=started_at,
-            finished_at=datetime.now(UTC),
-        )
-
-    monkeypatch.setattr(ui_runs, "run_prepared_case", interrupted_model)
-    old_registry = RunRegistry(global_limit=1)
-    batch = await old_registry.start_batch(
-        [source],
-        settings,
+    staged = await ui_runs._prepare_claimed_for_launch(source, settings)
+    assert not isinstance(staged, CaseResult)
+    store = WorkflowStore(settings)
+    admission = store.claim_submission(
+        "submission_interrupted_batch",
+        "batch",
+        (staged,),
         concurrency=1,
-        submission_id="submission_interrupted_batch",
     )
-    original_task = batch.task
-    assert original_task is not None
-    with pytest.raises(InvoiceAgentsError) as unresolved:
-        async with asyncio.timeout(10):
-            await asyncio.shield(original_task)
-    assert unresolved.value.stop_reason == "TERMINAL_DURABILITY_UNRESOLVED"
-    turn_completed = asyncio.Event()
-    asyncio.get_running_loop().call_soon(turn_completed.set)
-    await _await_event(turn_completed)
-    assert original_task.done()
-    assert not any(
-        batch.batch_id in task.get_name() and not task.done() for task in asyncio.all_tasks()
-    )
-
-    case_id = batch.entries[0].case_id
+    assert admission.batch_id is not None
+    batch_id = admission.batch_id
+    admitted = admission.cases[0]
+    assert admitted.claim is not None
+    case_id = admitted.case_id
+    store.mark_admission_running(case_id)
     with connect_database(settings.workflow_db) as connection:
         connection.execute(
             "UPDATE cases SET lease_expires_at = ? WHERE case_id = ?",
@@ -1725,28 +1686,30 @@ async def test_expired_batch_entry_rehydrates_as_failed_after_recovery(
 
     with connect_database(settings.workflow_db, read_only=True) as connection:
         before_batch = connection.execute(
-            "SELECT state FROM batches WHERE batch_id = ?", (batch.batch_id,)
+            "SELECT state FROM batches WHERE batch_id = ?", (batch_id,)
         ).fetchone()
         before_entry = connection.execute(
             "SELECT state FROM batch_entries WHERE batch_id = ? AND case_id = ?",
-            (batch.batch_id, case_id),
+            (batch_id, case_id),
         ).fetchone()
     assert before_batch is not None and before_batch["state"] == "running"
     assert before_entry is not None and before_entry["state"] == "running"
     assert WorkflowStore(settings).load_result(case_id) is None
 
     restarted_app = create_app(settings)
-    assert restarted_app.state.registry is not old_registry
-    with TestClient(restarted_app) as restarted:
-        response = restarted.get(f"/batches/{batch.batch_id}/rows")
+    with TestClient(
+        restarted_app,
+        base_url="http://localhost:8787",
+    ) as restarted:
+        response = restarted.get(f"/batches/{batch_id}/rows")
 
     with connect_database(settings.workflow_db, read_only=True) as connection:
         batch_row = connection.execute(
-            "SELECT state FROM batches WHERE batch_id = ?", (batch.batch_id,)
+            "SELECT state FROM batches WHERE batch_id = ?", (batch_id,)
         ).fetchone()
         entry_row = connection.execute(
             "SELECT state FROM batch_entries WHERE batch_id = ? AND case_id = ?",
-            (batch.batch_id, case_id),
+            (batch_id, case_id),
         ).fetchone()
     result = WorkflowStore(settings).load_result(case_id)
     assert result is not None and result.stop_reason == "ORPHANED_EXECUTION"

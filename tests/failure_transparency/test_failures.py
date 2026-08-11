@@ -252,7 +252,7 @@ def test_round1_payment_errors_share_one_sanitized_db_artifact_ui_cli_contract(
     assert loaded.errors[-1].message == "Cookie: [REDACTED]"
     assert loaded.payment.model_dump(exclude={"error"}) == original_payment_facts
 
-    with TestClient(create_app(settings)) as client:
+    with TestClient(create_app(settings), base_url="http://127.0.0.1:8787") as client:
         response = client.get(f"/cases/{case_id}")
     assert response.status_code == 200
     assert "Cookie: [REDACTED]" in response.text

@@ -18,7 +18,7 @@ from invoice_agents import orchestration
 from invoice_agents.config import Settings
 from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
-from invoice_agents.errors import InvoiceAgentsError
+from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.isolated_process import ProcessCancellation
 from invoice_agents.models import CaseResult, CaseStatus
 from invoice_agents.recovery_process import RecoveryProcessOutcome
@@ -154,7 +154,7 @@ async def test_concurrent_coordinators_serialize_one_process_wide_scan_reservati
         entered.set()
         try:
             assert release.wait(timeout=2)
-            return RecoveryProcessOutcome(True, None)
+            return RecoveryProcessOutcome(True, None, None)
         finally:
             with calls_lock:
                 active -= 1
@@ -221,7 +221,7 @@ async def test_lifespan_coordinator_recovers_post_startup_expiry_and_sse_only_ob
         stream = sse.case_event_stream(
             settings.workflow_db,
             expired_case,
-            RunRegistry(),
+            RunRegistry(global_limit=settings.case_concurrency),
             after_seq=1_000_000,
             settings=settings,
             recovery_coordinator=coordinator,
@@ -480,7 +480,7 @@ async def test_runtime_recovery_failure_is_health_failing_and_never_fakes_termin
             stream = sse.case_event_stream(
                 settings.workflow_db,
                 case_id,
-                RunRegistry(),
+                RunRegistry(global_limit=settings.case_concurrency),
                 after_seq=1_000_000,
                 settings=settings,
                 recovery_coordinator=coordinator,
@@ -488,7 +488,11 @@ async def test_runtime_recovery_failure_is_health_failing_and_never_fakes_termin
             stream_event = asyncio.create_task(anext(stream))
 
             def failed_recovery(**_kwargs: object) -> RecoveryProcessOutcome:
-                return RecoveryProcessOutcome(False, "EXECUTION_RECOVERY_FAILED")
+                return RecoveryProcessOutcome(
+                    False,
+                    ErrorCategory.ORCHESTRATION,
+                    "EXECUTION_RECOVERY_FAILED",
+                )
 
             monkeypatch.setattr(recovery_module, "run_recovery_process", failed_recovery)
             completed_before = coordinator.completed_scans
@@ -506,7 +510,7 @@ async def test_runtime_recovery_failure_is_health_failing_and_never_fakes_termin
             payload = sse.terminal_payload(
                 settings.workflow_db,
                 case_id,
-                RunRegistry(),
+                RunRegistry(global_limit=settings.case_concurrency),
                 settings,
                 recovery_coordinator=coordinator,
             )
@@ -575,7 +579,7 @@ async def test_terminal_snapshot_flushes_recovery_audit_before_terminal_event(
     stream = sse.case_event_stream(
         settings.workflow_db,
         case_id,
-        RunRegistry(),
+        RunRegistry(global_limit=settings.case_concurrency),
         after_seq=after_seq,
         settings=settings,
     )
@@ -631,7 +635,7 @@ def test_untrusted_terminal_snapshots_are_explicitly_nonterminal(
     payload = sse.terminal_payload(
         settings.workflow_db,
         case_id,
-        RunRegistry(),
+        RunRegistry(global_limit=settings.case_concurrency),
         settings,
     )
 
@@ -677,6 +681,7 @@ async def test_shutdown_cancellation_drains_the_owned_scan_before_propagating(
         assert release.wait(timeout=2)
         return RecoveryProcessOutcome(
             False,
+            ErrorCategory.ORCHESTRATION,
             "EXECUTION_RECOVERY_WORKER_CANCELLED",
         )
 

@@ -60,7 +60,7 @@ def test_unicode_split_and_continued_credentials_never_reach_ui_or_cli(
     )
     store.finish_case(result, claim)
 
-    with TestClient(create_app(settings)) as client:
+    with TestClient(create_app(settings), base_url="http://127.0.0.1") as client:
         ui_output = client.get(f"/cases/{case_id}").text
     cli_stream = io.StringIO()
     monkeypatch.setattr(

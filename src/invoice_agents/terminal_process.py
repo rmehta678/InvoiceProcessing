@@ -184,8 +184,7 @@ def _publish_cleanup_poison_until_proven() -> BaseException | None:
     def preserve(error: BaseException) -> None:
         nonlocal retained_control
         if retained_control is None or (
-            isinstance(retained_control, Exception)
-            and not isinstance(error, Exception)
+            isinstance(retained_control, Exception) and not isinstance(error, Exception)
         ):
             retained_control = error
 
@@ -219,8 +218,7 @@ def _finalize_terminal_cleanup_envelope(
     def preserve(error: BaseException) -> None:
         nonlocal retained_control
         if retained_control is None or (
-            isinstance(retained_control, Exception)
-            and not isinstance(error, Exception)
+            isinstance(retained_control, Exception) and not isinstance(error, Exception)
         ):
             retained_control = error
 
@@ -315,9 +313,7 @@ def _select_classification_error(
 ) -> BaseException:
     """Preserve first failure unless later process control has higher precedence."""
 
-    if prior is None or (
-        isinstance(prior, Exception) and not isinstance(later, Exception)
-    ):
+    if prior is None or (isinstance(prior, Exception) and not isinstance(later, Exception)):
         return later
     return prior
 
@@ -519,11 +515,7 @@ def decode_terminal_request(
         started_at = None
         result = None
     else:
-        if (
-            raw_started is not None
-            or type(raw_result) is not dict
-            or worker_error_code is not None
-        ):
+        if raw_started is not None or type(raw_result) is not dict or worker_error_code is not None:
             raise ValueError("invalid finish worker payload")
         started_at = None
         # Pydantic's strict Python mode rejects JSON datetime/enum strings even
@@ -577,9 +569,7 @@ def _read_response(worker: Any, *, deadline: float) -> bytes:
         _remaining_response_time(deadline)
         while True:
             remaining = _remaining_response_time(deadline)
-            selected = selector.select(
-                min(remaining, _TERMINAL_WORKER_POLL_SECONDS)
-            )
+            selected = selector.select(min(remaining, _TERMINAL_WORKER_POLL_SECONDS))
             _remaining_response_time(deadline)
             if not selected:
                 watcher_exited = watcher.wait(0)
@@ -667,9 +657,7 @@ def _decode_response(
     raw_result = payload["result"]
     raw_error_code = payload["error_code"]
     if payload["ok"]:
-        if raw_error_code is not None or (
-            raw_result is not None and type(raw_result) is not dict
-        ):
+        if raw_error_code is not None or (raw_result is not None and type(raw_result) is not dict):
             raise ValueError("invalid terminal worker success response")
     elif raw_result is not None or (
         type(raw_error_code) is not str or raw_error_code not in _TERMINAL_ERROR_CODES
@@ -713,8 +701,10 @@ def _decode_response(
         )
     else:
         raise ValueError("invalid terminal evidence state")
-    if result is not None and evidence_result is not None and (
-        result.case_id != evidence_result.case_id
+    if (
+        result is not None
+        and evidence_result is not None
+        and (result.case_id != evidence_result.case_id)
     ):
         raise ValueError("terminal result and evidence identities conflict")
     return TerminalProcessOutcome(
@@ -790,9 +780,7 @@ def _run_terminal_process_owned_state(
                 )
             if classified is not None:
                 process_id = getattr(process, "pid", None)
-                native_child = classified or (
-                    type(process_id) is int and process_id > 0
-                )
+                native_child = classified or (type(process_id) is int and process_id > 0)
                 classification_completed = True
             else:
                 process_id = getattr(process, "pid", None)
@@ -832,9 +820,7 @@ def _run_terminal_process_owned_state(
         except TimeoutError:
             response_failure = "timeout"
         except (OSError, UnicodeError, ValueError):
-            response_failure = (
-                "timeout" if time.monotonic() >= operation_deadline else "protocol"
-            )
+            response_failure = "timeout" if time.monotonic() >= operation_deadline else "protocol"
         except BaseException as exc:
             if isinstance(exc, Exception) and time.monotonic() >= operation_deadline:
                 response_failure = "timeout"
@@ -951,8 +937,7 @@ def run_terminal_process(
         def preserve_cleanup_control(error: BaseException) -> None:
             nonlocal retained_cleanup_control
             if retained_cleanup_control is None or (
-                isinstance(retained_cleanup_control, Exception)
-                and not isinstance(error, Exception)
+                isinstance(retained_cleanup_control, Exception) and not isinstance(error, Exception)
             ):
                 retained_cleanup_control = error
 

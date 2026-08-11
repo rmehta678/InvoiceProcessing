@@ -169,9 +169,7 @@ def test_workflow_v7_installs_exact_critique_cycle_schema(settings: Settings) ->
         }
         index_columns = tuple(
             str(row[2])
-            for row in connection.execute(
-                "PRAGMA index_info(idx_critique_results_case_cycle)"
-            )
+            for row in connection.execute("PRAGMA index_info(idx_critique_results_case_cycle)")
         )
 
     assert resources[-1] == "007_critique_cycles.sql"
@@ -427,16 +425,20 @@ def test_v7_upgrade_rolls_back_an_equal_latest_legacy_critique_ambiguity(
     assert excinfo.value.stop_reason == "LEGACY_CRITIQUE_HISTORY_AMBIGUOUS"
     assert path.read_bytes() == before
     with connect_database(path, read_only=True) as connection:
-        assert connection.execute(
-            "SELECT MAX(version) FROM schema_version"
-        ).fetchone()[0] == 6
-        assert connection.execute(
-            "SELECT COUNT(*) FROM critique_results WHERE case_id = 'case_legacy_critique_tie'"
-        ).fetchone()[0] == 2
-        assert connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'legacy_critique_history'"
-        ).fetchone() is None
+        assert connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 6
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM critique_results WHERE case_id = 'case_legacy_critique_tie'"
+            ).fetchone()[0]
+            == 2
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'legacy_critique_history'"
+            ).fetchone()
+            is None
+        )
 
 
 def test_legacy_payload_and_default_relational_columns_remain_cycle_one(
@@ -794,9 +796,7 @@ def test_cycle_two_rejects_specialist_events_without_exact_relational_provenance
                         evidence_id,
                         evidence_case_id,
                         datetime.now(UTC).isoformat(),
-                        0
-                        if evidence_boundary == "stale-generation"
-                        else claim.generation,
+                        0 if evidence_boundary == "stale-generation" else claim.generation,
                         datetime.now(UTC).isoformat(),
                     ),
                 )
@@ -870,9 +870,7 @@ def test_cycle_two_accepts_exact_persisted_specialist_provenance(
             cycle=2,
             responds_to_critique_id=first_id,
             supported_findings=[requested_item],
-            follow_up_responses=[
-                _follow_up_response(requested_item, "SUPPORTED", event_id)
-            ],
+            follow_up_responses=[_follow_up_response(requested_item, "SUPPORTED", event_id)],
         ),
         claim,
     )
@@ -918,11 +916,7 @@ def test_cycle_two_rejects_fabricated_direct_critic_event_provenance(
             if provenance_boundary == "wrong-agent"
             else "independent_critic_agent"
         ),
-        db_evidence_id=(
-            "ident_fabricated"
-            if provenance_boundary == "unexpected-db-id"
-            else None
-        ),
+        db_evidence_id=("ident_fabricated" if provenance_boundary == "unexpected-db-id" else None),
     )
 
     with pytest.raises(InvoiceAgentsError) as excinfo:
@@ -975,9 +969,7 @@ def test_schema_rejects_follow_up_event_without_exact_type_specific_provenance(
             cycle=2,
             responds_to_critique_id=first_id,
             supported_findings=[requested_item],
-            follow_up_responses=[
-                _follow_up_response(requested_item, "SUPPORTED", valid_event_id)
-            ],
+            follow_up_responses=[_follow_up_response(requested_item, "SUPPORTED", valid_event_id)],
         ),
         claim,
     )
@@ -1048,16 +1040,13 @@ def test_schema_rejects_cycle_two_that_bypasses_application_transition_fencing(
     first_id = store.save_critique(
         claim.case_id,
         _critique(
-            requested_follow_up=(
-                [] if transition_boundary == "clean-parent" else [requested_item]
-            )
+            requested_follow_up=([] if transition_boundary == "clean-parent" else [requested_item])
         ),
         claim,
     )
     with connect_database(settings.workflow_db, read_only=True) as connection:
         parent = connection.execute(
-            "SELECT created_at, execution_generation FROM critique_results "
-            "WHERE critique_id = ?",
+            "SELECT created_at, execution_generation FROM critique_results WHERE critique_id = ?",
             (first_id,),
         ).fetchone()
     assert parent is not None
@@ -1111,8 +1100,7 @@ def test_schema_rejects_cycle_two_with_lexically_later_but_older_timestamp(
     )
     with connect_database(settings.workflow_db, read_only=True) as connection:
         parent = connection.execute(
-            "SELECT created_at, execution_generation FROM critique_results "
-            "WHERE critique_id = ?",
+            "SELECT created_at, execution_generation FROM critique_results WHERE critique_id = ?",
             (parent_id,),
         ).fetchone()
     assert parent is not None
@@ -1135,11 +1123,7 @@ def test_schema_rejects_cycle_two_with_lexically_later_but_older_timestamp(
         child_id,
         claim.case_id,
         child.model_dump_json(),
-        (
-            lexically_later_but_older
-            if sql_operation == "insert"
-            else datetime.now(UTC).isoformat()
-        ),
+        (lexically_later_but_older if sql_operation == "insert" else datetime.now(UTC).isoformat()),
         int(parent["execution_generation"]),
         parent_id,
     )
@@ -1216,10 +1200,13 @@ def test_bound_critique_follow_up_events_are_immutable(
             connection.execute(mutation_sql, (evidence_event_id,))
         connection.rollback()
     with connect_database(settings.workflow_db, read_only=True) as connection:
-        assert connection.execute(
-            "SELECT 1 FROM events WHERE event_id = ?",
-            (evidence_event_id,),
-        ).fetchone() is not None
+        assert (
+            connection.execute(
+                "SELECT 1 FROM events WHERE event_id = ?",
+                (evidence_event_id,),
+            ).fetchone()
+            is not None
+        )
 
 
 @pytest.mark.parametrize(
@@ -1611,9 +1598,7 @@ def test_concurrent_cycle_two_writers_commit_exactly_one_response(
             child_result.close()
 
     assert sorted(status for status, _detail in outcomes) == ["error", "saved"]
-    assert [detail for status, detail in outcomes if status == "error"] == [
-        "CRITIQUE_CYCLE_LIMIT"
-    ]
+    assert [detail for status, detail in outcomes if status == "error"] == ["CRITIQUE_CYCLE_LIMIT"]
     assert [item.cycle for item in store.list_critiques(claim.case_id)] == [1, 2]
 
 

@@ -220,9 +220,7 @@ def test_round9_terminal_post_native_spawn_control_reaps_reserved_process_before
             captured = captured_sessions[0]
             assert captured.cleaned
             watcher = captured.exit_watcher
-            assert watcher is None or (
-                watcher._kqueue is None and watcher._pidfd is None
-            )
+            assert watcher is None or (watcher._kqueue is None and watcher._pidfd is None)
     finally:
         for process in spawned:
             if process.poll() is None:

@@ -52,18 +52,32 @@ def _ownership_unresolved_error() -> InvoiceAgentsError:
 def _validate_process_outcome(value: object) -> RecoveryProcessOutcome:
     if type(value) is not RecoveryProcessOutcome:
         raise TypeError("recovery controller returned an invalid outcome type")
-    return RecoveryProcessOutcome(value.acknowledged, value.error_code)
+    return RecoveryProcessOutcome(
+        value.acknowledged,
+        value.error_category,
+        value.stop_reason,
+    )
 
 
 def _outcome_error(outcome: RecoveryProcessOutcome) -> InvoiceAgentsError:
     validated = _validate_process_outcome(outcome)
-    if validated.acknowledged or validated.error_code is None:
+    if validated.acknowledged or validated.error_category is None or validated.stop_reason is None:
         raise ValueError("acknowledged recovery does not carry a failure")
     return InvoiceAgentsError(
-        ErrorCategory.ORCHESTRATION,
+        validated.error_category,
         "the isolated execution recovery scan failed",
-        stop_reason=validated.error_code,
+        stop_reason=validated.stop_reason,
     )
+
+
+def _is_controller_outcome(outcome: RecoveryProcessOutcome, stop_reason: str) -> bool:
+    return (
+        outcome.error_category is ErrorCategory.ORCHESTRATION and outcome.stop_reason == stop_reason
+    )
+
+
+def _is_controller_error(error: InvoiceAgentsError, stop_reason: str) -> bool:
+    return error.category is ErrorCategory.ORCHESTRATION and error.stop_reason == stop_reason
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,9 +172,7 @@ class RecoveryCoordinator:
             if _RECOVERY_OWNERSHIP_POISONED:
                 raise _ownership_unresolved_error()
             with self._state_lock:
-                state: RecoveryState = (
-                    "stopping" if self._state == "stopping" else "running"
-                )
+                state: RecoveryState = "stopping" if self._state == "stopping" else "running"
                 self._state = state
                 self._failure = None
                 self._completed_scans += 1
@@ -211,7 +223,10 @@ class RecoveryCoordinator:
                     future.set_exception(exc)
                     return
                 with _RESERVATION_LOCK:
-                    if outcome.error_code == "EXECUTION_RECOVERY_WORKER_CLEANUP_FAILED":
+                    if _is_controller_outcome(
+                        outcome,
+                        "EXECUTION_RECOVERY_WORKER_CLEANUP_FAILED",
+                    ):
                         _RECOVERY_OWNERSHIP_POISONED = True
                 future.set_result(outcome)
 
@@ -297,9 +312,9 @@ class RecoveryCoordinator:
             self._retire_completed_reservation(reservation)
             self._set_active_reservation(None)
         if not outcome.acknowledged:
-            if (
-                cancellation is not None
-                and outcome.error_code == "EXECUTION_RECOVERY_WORKER_CANCELLED"
+            if cancellation is not None and _is_controller_outcome(
+                outcome,
+                "EXECUTION_RECOVERY_WORKER_CANCELLED",
             ):
                 raise cancellation
             raise _outcome_error(outcome)
@@ -337,9 +352,9 @@ class RecoveryCoordinator:
                 try:
                     outcome = await self._wait_for_owned_scan(reservation)
                 except InvoiceAgentsError as exc:
-                    if (
-                        self._stop_requested.is_set()
-                        and exc.stop_reason == "EXECUTION_RECOVERY_WORKER_CANCELLED"
+                    if self._stop_requested.is_set() and _is_controller_error(
+                        exc,
+                        "EXECUTION_RECOVERY_WORKER_CANCELLED",
                     ):
                         return
                     raise
@@ -350,7 +365,10 @@ class RecoveryCoordinator:
 
             outcome = await self._wait_for_shared_scan(reservation)
             if not outcome.acknowledged:
-                if outcome.error_code == "EXECUTION_RECOVERY_WORKER_CLEANUP_FAILED":
+                if _is_controller_outcome(
+                    outcome,
+                    "EXECUTION_RECOVERY_WORKER_CLEANUP_FAILED",
+                ):
                     raise _ownership_unresolved_error()
                 raise _outcome_error(outcome)
             if reservation.signature != signature:

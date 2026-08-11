@@ -115,7 +115,7 @@ def test_dashboard_empty_state(client: TestClient) -> None:
     assert response.status_code == 200
     assert "No cases yet" in response.text
     assert "invoice-agents process" in response.text
-    assert "schema v5, integrity ok" in response.text
+    assert "schema v7, integrity ok" in response.text
 
 
 def test_dashboard_lists_stored_case(client: TestClient, settings: Settings) -> None:
@@ -306,8 +306,7 @@ def test_case_result_json_propagates_persisted_corruption_to_error_boundary(
                 connection.execute(f'DROP TRIGGER "{trigger["name"]}"')
             if corruption == "authority":
                 connection.execute(
-                    "UPDATE cases SET execution_token = 'exec_not_canonical' "
-                    "WHERE case_id = ?",
+                    "UPDATE cases SET execution_token = 'exec_not_canonical' WHERE case_id = ?",
                     (case_id,),
                 )
             else:
@@ -474,9 +473,7 @@ def test_switching_authorizing_decisions_uses_distinct_blocker_control_names(
         "ESTABLISH_MAPPING",
         "SUPERSEDE_REVISION",
     }
-    one_name_per_decision = {
-        decision: set(names) for decision, names in names_by_decision.items()
-    }
+    one_name_per_decision = {decision: set(names) for decision, names in names_by_decision.items()}
     assert all(len(names) == 1 for names in one_name_per_decision.values())
     assert len({next(iter(names)) for names in one_name_per_decision.values()}) == 3
 
@@ -488,9 +485,7 @@ def test_blocker_controls_render_disabled_except_for_selected_decision(
     initial = client.get(f"/reviews/{review.review_id}")
     initial_controls = BlockerAuthorizationControls()
     initial_controls.feed(initial.text)
-    assert all(
-        all(disabled) for disabled in initial_controls.disabled_by_decision.values()
-    )
+    assert all(all(disabled) for disabled in initial_controls.disabled_by_decision.values())
 
     rerender = client.post(
         f"/reviews/{review.review_id}/decision",
@@ -539,9 +534,7 @@ def test_authorizing_decision_records_selected_blocker_ids(
     client: TestClient, settings: Settings
 ) -> None:
     _, review = make_pending_review_case(settings)
-    blocker_ids = [
-        entry["blocker_id"] for entry in review.evidence_bundle["blocking_evidence"]
-    ]
+    blocker_ids = [entry["blocker_id"] for entry in review.evidence_bundle["blocking_evidence"]]
     assert blocker_ids
     detail = client.get(f"/reviews/{review.review_id}")
     selected_field = blocker_control_names(detail.text)["APPROVE"][0]
@@ -565,9 +558,7 @@ def test_inactive_blocker_selections_cannot_complete_selected_decision_authoriza
     client: TestClient, settings: Settings
 ) -> None:
     case_id, review = make_pending_review_case(settings)
-    blocker_ids = [
-        entry["blocker_id"] for entry in review.evidence_bundle["blocking_evidence"]
-    ]
+    blocker_ids = [entry["blocker_id"] for entry in review.evidence_bundle["blocking_evidence"]]
     assert blocker_ids
     selected_ids = blocker_ids[:-1]
     detail = client.get(f"/reviews/{review.review_id}")
@@ -635,9 +626,12 @@ def test_mapping_fields_submitted_with_reject_reach_service_and_are_rejected(
     assert "mappings are permitted only for ESTABLISH_MAPPING" in response.text
     assert WorkflowStore(settings.workflow_db).load_review(review.review_id) == before
     with connect_database(settings.inventory_db, read_only=True) as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM item_aliases WHERE alias_normalized = ?", ("widgetabulk",)
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM item_aliases WHERE alias_normalized = ?", ("widgetabulk",)
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_mapping_dropdown_is_only_a_hint_and_unknown_raw_evidence_is_rejected(
@@ -870,6 +864,13 @@ def test_submit_upload_lands_in_uploads_dir(
     case_id = response.headers["location"].split("/")[2]
     header = queries.case_header(settings.workflow_db, case_id)
     assert header is not None
+    wait_for(lambda: calls == [case_id])
+    wait_for(
+        lambda: (
+            (result := WorkflowStore(settings.workflow_db).load_result(case_id)) is not None
+            and result.stop_reason == "STUB_RUN_RECORDED"
+        )
+    )
 
 
 def test_submit_rejects_upload_one_byte_over_limit_without_partial_file(

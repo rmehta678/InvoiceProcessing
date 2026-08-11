@@ -168,7 +168,7 @@ def test_round6_sse_never_publishes_success_from_corrupt_relational_finish(
     payload = terminal_payload(
         settings.workflow_db,
         case_id,
-        RunRegistry(),
+        RunRegistry(global_limit=settings.case_concurrency),
         settings=settings,
     )
 

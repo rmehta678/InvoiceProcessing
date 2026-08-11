@@ -420,10 +420,19 @@ def _reject_excessive_result_nesting(value: str) -> None:
 
 
 def _result_artifact_worker_command() -> list[str]:
-    executable = os.fspath(Path(sys.executable).resolve(strict=True))
-    worker = os.fspath(
-        Path(__file__).with_name("result_artifact_worker.py").resolve(strict=True)
-    )
+    executable_path = Path(sys.executable)
+    if (
+        not executable_path.is_absolute()
+        or executable_path.anchor != os.sep
+        or not executable_path.is_file()
+        or not os.access(executable_path, os.X_OK)
+    ):
+        raise ValueError("active result-artifact interpreter is not executable")
+    # Preserve the active virtual-environment entry point. Resolving this symlink
+    # selects the base interpreter, and ``-I`` then correctly excludes the
+    # environment that contains the worker's application dependencies.
+    executable = os.fspath(executable_path)
+    worker = os.fspath(Path(__file__).with_name("result_artifact_worker.py").resolve(strict=True))
     return [executable, "-I", worker]
 
 
@@ -499,10 +508,7 @@ def _decode_result_artifact_worker_request(encoded: bytes) -> Path:
         raise ValueError("invalid result artifact worker case binding")
     if type(generation) is not int or generation < 0:
         raise ValueError("invalid result artifact worker generation binding")
-    if (
-        type(artifact_sha256) is not str
-        or re.fullmatch(r"[0-9a-f]{64}", artifact_sha256) is None
-    ):
+    if type(artifact_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", artifact_sha256) is None:
         raise ValueError("invalid result artifact worker digest binding")
     if type(artifact_device) is not int or artifact_device < 0:
         raise ValueError("invalid result artifact worker device binding")
@@ -553,9 +559,7 @@ def _read_bounded_regular_file_isolated(
 
     if cancel_requested is not None and type(cancel_requested) is not ProcessCancellation:
         raise ValueError("invalid result artifact cancellation owner")
-    cancellation = (
-        ProcessCancellation() if cancel_requested is None else cancel_requested
-    )
+    cancellation = ProcessCancellation() if cancel_requested is None else cancel_requested
     with _RESULT_ARTIFACT_PROCESS_LOCK:
         if _RESULT_ARTIFACT_OWNERSHIP_POISONED:
             raise _ResultArtifactWorkerError("RESULT_ARTIFACT_OWNERSHIP_UNRESOLVED")
@@ -570,9 +574,7 @@ def _read_bounded_regular_file_isolated(
             )
         except IsolatedProcessCleanupError:
             _RESULT_ARTIFACT_OWNERSHIP_POISONED = True
-            raise _ResultArtifactWorkerError(
-                "RESULT_ARTIFACT_WORKER_CLEANUP_FAILED"
-            ) from None
+            raise _ResultArtifactWorkerError("RESULT_ARTIFACT_WORKER_CLEANUP_FAILED") from None
     if type(outcome) is not IsolatedProcessResult:
         raise _ResultArtifactWorkerError("RESULT_ARTIFACT_WORKER_PROTOCOL_INVALID")
     if outcome.failure == "cancelled":
@@ -752,7 +754,7 @@ def case_result_json(request: Request, case_id: str) -> Response:
             return _not_found(request, exc.message, exc.stop_reason)
         if exc.stop_reason == "RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED":
             return _artifact_binding_durability_conflict(case_id)
-        return _invalid_result_artifact(request, case_id)
+        raise
     if result is not None and result.stop_reason == "RESULT_ARTIFACT_DURABILITY_UNRESOLVED":
         return JSONResponse(
             status_code=409,

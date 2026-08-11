@@ -72,6 +72,8 @@ def _workflow_resources() -> list[Any]:
         "003_execution_fencing.sql",
         "004_execution_token_grammar.sql",
         "005_result_artifact_bindings.sql",
+        "006_durable_admission.sql",
+        "007_critique_cycles.sql",
     ]
     return resources
 
@@ -306,7 +308,7 @@ def test_round6_public_v3_migration_reconciles_exact_historical_recovery_token(
     before = _case_row(path)
     assert before["execution_token"] == _LEGACY_TOKEN
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [4, 5]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [4, 5, 6, 7]
 
     after = _case_row(path)
     assert after == {**before, "execution_token": _CANONICAL_TOKEN}
@@ -318,7 +320,7 @@ def test_round6_public_v3_migration_reconciles_exact_historical_recovery_token(
             for row in connection.execute(
                 "SELECT version FROM schema_version ORDER BY version"
             ).fetchall()
-        ] == [1, 2, 3, 4, 5]
+        ] == [1, 2, 3, 4, 5, 6, 7]
         history_row = connection.execute(
             "SELECT ordinal, migration_sha256 FROM schema_migration_history WHERE version = 4"
         ).fetchone()
@@ -412,7 +414,7 @@ def test_round6_v4_insert_and_update_triggers_enforce_exact_exec_token_grammar(
 
     path = tmp_path / "workflow-v4-trigger-grammar.db"
     _build_exact_v3_recovery_database(path)
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [4, 5]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [4, 5, 6, 7]
     malformed_tokens = (
         "exec_short",
         f"exec_{'a' * 31}",

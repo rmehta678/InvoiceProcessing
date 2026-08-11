@@ -10,6 +10,7 @@ import os
 import sqlite3
 import struct
 import sys
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -377,7 +378,7 @@ async def test_round5_completed_public_registry_has_no_execution_claim(
         return expected
 
     monkeypatch.setattr(ui_runs, "_inspect_claim_durability", durable)
-    registry = RunRegistry()
+    registry = RunRegistry(global_limit=settings.case_concurrency)
     handle = await registry._launch(
         case_id,
         "process",
@@ -399,18 +400,18 @@ async def test_round5_completed_public_registry_has_no_execution_claim(
 
 @pytest.mark.asyncio
 async def test_round5_public_batch_nested_entries_logs_templates_and_sse_hide_claims(
+    invoice_dir: Path,
     settings: Settings,
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Every public batch/display surface is claim-free while private owners execute."""
 
     started_at = datetime.now(UTC)
-    paths = [tmp_path / "one.txt", tmp_path / "two.txt"]
+    paths = [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"]
     claims = {
         path: ExecutionClaim(
-            f"case_round5_{path.stem}",
+            f"case_{character * 32}",
             f"exec_{character * 32}",
             1,
             started_at + timedelta(minutes=1),
@@ -418,9 +419,20 @@ async def test_round5_public_batch_nested_entries_logs_templates_and_sse_hide_cl
         for path, character in zip(paths, ("e", "f"), strict=True)
     }
 
-    async def prepare(path: Path, _settings: Settings) -> tuple[str, datetime, ExecutionClaim]:
+    claims_by_case = {claim.case_id: claim for claim in claims.values()}
+    real_prepare = ui_runs._prepare_claimed_for_launch
+
+    async def prepare(path: Path, _settings: Settings) -> object:
         claim = claims[path]
-        return claim.case_id, started_at, claim
+        staged = await real_prepare(path, _settings)
+        assert not isinstance(staged, CaseResult)
+        return replace(
+            staged,
+            case_id=claim.case_id,
+            started_at=started_at,
+            execution_token=claim.token,
+            lease_expires_at=claim.expires_at,
+        )
 
     async def run(
         case_id: str,
@@ -429,27 +441,28 @@ async def test_round5_public_batch_nested_entries_logs_templates_and_sse_hide_cl
         *,
         claim: ExecutionClaim,
     ) -> CaseResult:
-        assert claim == claims[next(path for path in paths if path.stem in case_id)]
-        return CaseResult(
+        assert claim == claims_by_case[case_id]
+        store = WorkflowStore(_settings)
+        result = CaseResult(
             case_id=case_id,
-            source_id=None,
+            source_id=store.load_authoritative_case_source_id(claim),
             status=CaseStatus.INCOMPLETE,
             stop_reason="ROUND5_BATCH_LOCAL",
             started_at=selected_start,
             finished_at=selected_start,
         )
-
-    async def durable(
-        selected_claims: list[tuple[str, datetime, ExecutionClaim]],
-        _settings: Settings,
-    ) -> dict[str, BaseException | None]:
-        return {case_id: None for case_id, _started, _claim in selected_claims}
+        store.finish_case(result, claim)
+        return result
 
     monkeypatch.setattr(ui_runs, "_prepare_claimed_for_launch", prepare)
     monkeypatch.setattr(ui_runs, "run_prepared_case", run)
-    monkeypatch.setattr(ui_runs, "_inspect_claim_durability", durable)
-    registry = RunRegistry()
-    batch = await registry.start_batch(paths, settings, concurrency=2)
+    registry = RunRegistry(global_limit=settings.case_concurrency)
+    batch = await registry.start_batch(
+        paths,
+        settings,
+        concurrency=2,
+        submission_id="submission_round5_public_batch",
+    )
     public_while_running = repr(batch) + repr(batch.entries) + repr(registry._runs)
     for claim in claims.values():
         assert claim.token not in public_while_running
@@ -532,7 +545,7 @@ async def test_round5_public_handle_cannot_authorize_finished_result_update(
         store.finish_case(result, claim)
         return result
 
-    registry = RunRegistry()
+    registry = RunRegistry(global_limit=settings.case_concurrency)
     handle = await registry._launch(
         case_id,
         "process",

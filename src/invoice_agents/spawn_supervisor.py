@@ -554,7 +554,9 @@ def _run() -> int:
                         _lifetime_descriptor,
                         *worker_descriptors,
                     }:
-                        raise RuntimeError("worker bootstrap gate descriptors were not role separated")
+                        raise RuntimeError(
+                            "worker bootstrap gate descriptors were not role separated"
+                        )
                     worker_process = cast(
                         "subprocess.Popen[bytes]",
                         subprocess.Popen.__new__(subprocess.Popen),
@@ -586,10 +588,7 @@ def _run() -> int:
                 except BaseException as exc:
                     launch_error = exc
                     if worker_process is not None:
-                        if (
-                            worker_initialization_completed
-                            and not worker_classification_completed
-                        ):
+                        if worker_initialization_completed and not worker_classification_completed:
                             # Successful Popen initialization is positive ownership
                             # evidence even when classification itself is interrupted.
                             worker_native_child = True
@@ -728,11 +727,7 @@ def _run() -> int:
     except BaseException:
         return_code = _PROTOCOL_FAILURE
     finally:
-        if (
-            worker_process is not None
-            and worker_native_child
-            and worker_process.returncode is None
-        ):
+        if worker_process is not None and worker_native_child and worker_process.returncode is None:
             try:
                 _terminate_owned_worker_preserving_error(
                     worker_process.pid,

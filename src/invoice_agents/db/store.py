@@ -3861,11 +3861,12 @@ class WorkflowStore:
         if type(raw) is not str:
             return None
         try:
-            return json.loads(
+            parsed: object = json.loads(
                 raw,
                 object_pairs_hook=_strict_json_object,
                 parse_constant=_reject_json_constant,
             )
+            return parsed
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
 
@@ -4192,10 +4193,7 @@ class WorkflowStore:
 
         with connect_database(self.path, read_only=True) as connection:
             records = self._critique_records(connection, case_id)
-        return [
-            (critique_id, critique)
-            for critique_id, critique, _generation in records
-        ]
+        return [(critique_id, critique) for critique_id, critique, _generation in records]
 
     def load_critique(self, case_id: str) -> Critique:
         critiques = self.list_critiques(case_id)
@@ -5329,8 +5327,7 @@ class WorkflowStore:
                 stop_reason="RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED",
             ) from None
         exact_parent = (
-            observed_result == result
-            and observed_generation == binding.execution_generation
+            observed_result == result and observed_generation == binding.execution_generation
         )
         if exact_parent and observed_binding == binding:
             if not isinstance(selected_failure, Exception):

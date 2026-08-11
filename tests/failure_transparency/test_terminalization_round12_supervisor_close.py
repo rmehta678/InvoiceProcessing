@@ -437,7 +437,9 @@ def test_round12_supervisor_parent_never_explicitly_closes_lifetime_descriptor(
 
     assert raised.value.code == 0
     assert launch_calls == [73]
-    assert [descriptor for descriptor in close_attempts if descriptor in _ROLE_DESCRIPTORS.values()] == [
+    assert [
+        descriptor for descriptor in close_attempts if descriptor in _ROLE_DESCRIPTORS.values()
+    ] == [
         _ROLE_DESCRIPTORS["owner"],
         _ROLE_DESCRIPTORS["control"],
         _WORKER_DESCRIPTOR,
@@ -3527,10 +3529,52 @@ def test_round18_bootstrap_gate_close_uncertainty_fails_before_target_exec(
 @pytest.mark.parametrize(
     "arguments",
     [
-        ["worker_bootstrap.py", "--ready-fd", "03", "--start-fd", "5", "--supervisor-sid", "7", "--", "worker"],
-        ["worker_bootstrap.py", "--ready-fd", "3", "--start-fd", "3", "--supervisor-sid", "7", "--", "worker"],
-        ["worker_bootstrap.py", "--ready-fd", "3", "--start-fd", "5", "--supervisor-sid", "07", "--", "worker"],
-        ["worker_bootstrap.py", "--ready-fd", "3", "--start-fd", "5", "--supervisor-sid", "7", "--worker-fd", "3", "--", "worker"],
+        [
+            "worker_bootstrap.py",
+            "--ready-fd",
+            "03",
+            "--start-fd",
+            "5",
+            "--supervisor-sid",
+            "7",
+            "--",
+            "worker",
+        ],
+        [
+            "worker_bootstrap.py",
+            "--ready-fd",
+            "3",
+            "--start-fd",
+            "3",
+            "--supervisor-sid",
+            "7",
+            "--",
+            "worker",
+        ],
+        [
+            "worker_bootstrap.py",
+            "--ready-fd",
+            "3",
+            "--start-fd",
+            "5",
+            "--supervisor-sid",
+            "07",
+            "--",
+            "worker",
+        ],
+        [
+            "worker_bootstrap.py",
+            "--ready-fd",
+            "3",
+            "--start-fd",
+            "5",
+            "--supervisor-sid",
+            "7",
+            "--worker-fd",
+            "3",
+            "--",
+            "worker",
+        ],
     ],
 )
 def test_round18_bootstrap_argv_rejects_noncanonical_or_duplicate_roles(

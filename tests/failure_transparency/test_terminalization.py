@@ -33,6 +33,8 @@ from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.hitl.service import record_human_decision
 from invoice_agents.models import CaseResult, CaseStatus, ErrorRecord, HumanDecisionKind
+from invoice_agents.recovery_process import RecoveryProcessOutcome
+from invoice_agents.ui import recovery as recovery_module
 from invoice_agents.ui import runs as ui_runs
 from invoice_agents.ui import sse
 from invoice_agents.ui.runs import RunRegistry
@@ -85,6 +87,12 @@ def _exercise_child_side_lifecycle_seams(monkeypatch: pytest.MonkeyPatch) -> Non
     ) -> tuple[str, datetime, ExecutionClaim] | CaseResult:
         return orchestration.prepare_claimed_invoice(path, settings)
 
+    async def stage_in_worker_body(
+        path: Path,
+        settings: Settings,
+    ) -> object:
+        return await orchestration.stage_claimed_invoice_async(path, settings)
+
     monkeypatch.setattr(
         orchestration,
         "prepare_claimed_invoice_async",
@@ -92,8 +100,8 @@ def _exercise_child_side_lifecycle_seams(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     monkeypatch.setattr(
         ui_runs,
-        "prepare_claimed_invoice_async",
-        prepare_in_worker_body,
+        "_prepare_claimed_for_launch",
+        stage_in_worker_body,
     )
 
 
@@ -936,8 +944,7 @@ def test_terminal_uncertain_session_failure_still_cleans_owned_native_child(
         assert stop_calls == 1
         assert len(spawned) == 1
         assert (
-            spawned[0].poll() is not None
-            or terminal_process._worker_resource_cleanup_is_poisoned()
+            spawned[0].poll() is not None or terminal_process._worker_resource_cleanup_is_poisoned()
         )
     finally:
         for process in spawned:
@@ -1143,8 +1150,7 @@ def test_terminal_cleanup_reservation_control_reaps_before_reraise(
         assert raised.value is injected
         assert len(spawned) == 1
         assert (
-            spawned[0].poll() is not None
-            or terminal_process._worker_resource_cleanup_is_poisoned()
+            spawned[0].poll() is not None or terminal_process._worker_resource_cleanup_is_poisoned()
         )
     finally:
         for process in spawned:
@@ -1212,8 +1218,7 @@ def test_terminal_cleanup_control_retries_until_reaped_before_reraise(
         assert stop_calls >= 2
         assert len(spawned) == 1
         assert (
-            spawned[0].poll() is not None
-            or terminal_process._worker_resource_cleanup_is_poisoned()
+            spawned[0].poll() is not None or terminal_process._worker_resource_cleanup_is_poisoned()
         )
     finally:
         for process in spawned:
@@ -1346,8 +1351,7 @@ def test_terminal_cleanup_binding_control_reaps_or_poisons_before_reraise(
         assert bind_calls >= 2
         assert len(spawned) == 1
         assert (
-            spawned[0].poll() is not None
-            or terminal_process._worker_resource_cleanup_is_poisoned()
+            spawned[0].poll() is not None or terminal_process._worker_resource_cleanup_is_poisoned()
         )
     finally:
         for process in spawned:
@@ -1575,8 +1579,7 @@ def test_terminal_finalizer_owned_stop_control_is_contained(
         assert raised.value is injected
         assert len(spawned) == 1
         assert (
-            spawned[0].poll() is not None
-            or terminal_process._worker_resource_cleanup_is_poisoned()
+            spawned[0].poll() is not None or terminal_process._worker_resource_cleanup_is_poisoned()
         )
     finally:
         for process in spawned:
@@ -2313,11 +2316,9 @@ def test_terminal_classifier_deadline_bounds_repeated_process_control(
     monkeypatch.setattr(terminal_process.time, "monotonic", lambda: next(clock))
     monkeypatch.setattr(terminal_process.time, "sleep", lambda _seconds: None)
 
-    native_child, classification_error = (
-        terminal_process._classify_reserved_terminal_process_until(  # type: ignore[attr-defined]
-            object(),
-            deadline=1.02,
-        )
+    native_child, classification_error = terminal_process._classify_reserved_terminal_process_until(  # type: ignore[attr-defined]
+        object(),
+        deadline=1.02,
     )
 
     assert native_child is None
@@ -2744,9 +2745,7 @@ def test_atomic_publication_fault_preserves_seeded_final_bytes(
         dst_dir_fd: int | None = None,
     ) -> None:
         nonlocal candidate_replaced
-        source_path = _resolve_dirfd_test_path(
-            source, dir_fd=src_dir_fd, directory=output
-        )
+        source_path = _resolve_dirfd_test_path(source, dir_fd=src_dir_fd, directory=output)
         destination_path = _resolve_dirfd_test_path(
             destination, dir_fd=dst_dir_fd, directory=output
         )
@@ -2936,9 +2935,7 @@ def test_post_replace_fault_restores_target_absence_when_no_prior_record_exists(
         dst_dir_fd: int | None = None,
     ) -> None:
         nonlocal candidate_replaced
-        source_path = _resolve_dirfd_test_path(
-            source, dir_fd=src_dir_fd, directory=output
-        )
+        source_path = _resolve_dirfd_test_path(source, dir_fd=src_dir_fd, directory=output)
         destination_path = _resolve_dirfd_test_path(
             destination, dir_fd=dst_dir_fd, directory=output
         )
@@ -3010,9 +3007,7 @@ def test_seeded_target_replace_failure_preserves_prior_bytes_without_residue(
         dst_dir_fd: int | None = None,
     ) -> None:
         nonlocal replace_attempts
-        source_path = _resolve_dirfd_test_path(
-            source, dir_fd=src_dir_fd, directory=output
-        )
+        source_path = _resolve_dirfd_test_path(source, dir_fd=src_dir_fd, directory=output)
         destination_path = _resolve_dirfd_test_path(
             destination, dir_fd=dst_dir_fd, directory=output
         )
@@ -3098,9 +3093,7 @@ def test_rollback_directory_sync_failure_is_explicitly_durability_unresolved(
         dst_dir_fd: int | None = None,
     ) -> None:
         nonlocal candidate_replaced, rollback_replaced
-        source_path = _resolve_dirfd_test_path(
-            source, dir_fd=src_dir_fd, directory=output
-        )
+        source_path = _resolve_dirfd_test_path(source, dir_fd=src_dir_fd, directory=output)
         destination_path = _resolve_dirfd_test_path(
             destination, dir_fd=dst_dir_fd, directory=output
         )
@@ -3229,9 +3222,7 @@ def test_post_replace_rollback_closes_every_acquired_descriptor_exactly_once(
         dst_dir_fd: int | None = None,
     ) -> None:
         nonlocal candidate_replaced, rollback_replaced
-        source_path = _resolve_dirfd_test_path(
-            source, dir_fd=src_dir_fd, directory=output
-        )
+        source_path = _resolve_dirfd_test_path(source, dir_fd=src_dir_fd, directory=output)
         destination_path = _resolve_dirfd_test_path(
             destination, dir_fd=dst_dir_fd, directory=output
         )
@@ -3358,9 +3349,7 @@ def test_post_replace_rollback_control_is_reraised_after_durable_containment(
         dst_dir_fd: int | None = None,
     ) -> None:
         nonlocal candidate_replaced, rollback_replaced
-        source_path = _resolve_dirfd_test_path(
-            source, dir_fd=src_dir_fd, directory=output
-        )
+        source_path = _resolve_dirfd_test_path(source, dir_fd=src_dir_fd, directory=output)
         destination_path = _resolve_dirfd_test_path(
             destination, dir_fd=dst_dir_fd, directory=output
         )
@@ -3502,9 +3491,7 @@ def test_earliest_post_replace_control_survives_later_rollback_control_and_uncer
         dst_dir_fd: int | None = None,
     ) -> None:
         nonlocal candidate_replaced, rollback_replaced, rollback_control_faults
-        source_path = _resolve_dirfd_test_path(
-            source, dir_fd=src_dir_fd, directory=output
-        )
+        source_path = _resolve_dirfd_test_path(source, dir_fd=src_dir_fd, directory=output)
         destination_path = _resolve_dirfd_test_path(
             destination, dir_fd=dst_dir_fd, directory=output
         )
@@ -4445,9 +4432,7 @@ def test_atomic_publication_serializes_same_target_transactions(
             src_dir_fd=src_dir_fd,
             dst_dir_fd=dst_dir_fd,
         )
-        destination_path = (
-            Path(destination) if dst_dir_fd is None else output / Path(destination)
-        )
+        destination_path = Path(destination) if dst_dir_fd is None else output / Path(destination)
         if destination_path == target and current_thread().name == "first-publisher":
             first_replaced.set()
 
@@ -4607,7 +4592,11 @@ def test_terminal_payload_is_observational_for_an_expired_execution(
         connection.commit()
     before = settings.workflow_db.read_bytes()
 
-    payload = terminal_payload(settings.workflow_db, case_id, RunRegistry())
+    payload = terminal_payload(
+        settings.workflow_db,
+        case_id,
+        RunRegistry(global_limit=settings.case_concurrency),
+    )
 
     assert settings.workflow_db.read_bytes() == before
     assert payload is not None
@@ -4649,11 +4638,21 @@ async def test_sse_active_lease_emits_heartbeat_and_closes_promptly(
     WorkflowStore(settings).claim_case_execution(
         case_id, frozenset({CaseStatus.INCOMPLETE}), lease_seconds=60
     )
-    assert terminal_payload(settings.workflow_db, case_id, RunRegistry()) is None
+    assert (
+        terminal_payload(
+            settings.workflow_db,
+            case_id,
+            RunRegistry(global_limit=settings.case_concurrency),
+        )
+        is None
+    )
     monkeypatch.setattr(sse, "POLL_SECONDS", 0.005)
     monkeypatch.setattr(sse, "HEARTBEAT_SECONDS", 0.01, raising=False)
     stream = sse.case_event_stream(
-        settings.workflow_db, case_id, RunRegistry(), after_seq=1_000_000
+        settings.workflow_db,
+        case_id,
+        RunRegistry(global_limit=settings.case_concurrency),
+        after_seq=1_000_000,
     )
 
     event = await asyncio.wait_for(anext(stream), timeout=0.2)
@@ -4685,8 +4684,12 @@ async def test_ui_single_launch_hands_off_durable_claim_before_return(
         raise AssertionError("unreachable run return")
 
     monkeypatch.setattr(ui_runs, "run_prepared_case", block_run)
-    registry = RunRegistry()
-    outcome = await registry.start_process(invoice_dir / "invoice_1001.txt", settings)
+    registry = RunRegistry(global_limit=settings.case_concurrency)
+    outcome = await registry.start_process(
+        invoice_dir / "invoice_1001.txt",
+        settings,
+        submission_id="submission_ui_single_handoff",
+    )
     assert isinstance(outcome, str)
     lease_was_durable = WorkflowStore(settings).has_valid_execution_lease(outcome)
     handle = registry.handle(outcome)
@@ -4725,7 +4728,7 @@ async def test_ui_resume_claims_before_scheduling(
         raise AssertionError("unreachable resume return")
 
     monkeypatch.setattr(ui_runs, "resume_case", block_resume)
-    registry = RunRegistry()
+    registry = RunRegistry(global_limit=settings.case_concurrency)
     handle = await registry.start_resume(case_id, settings)
     lease_was_durable = WorkflowStore(settings).has_valid_execution_lease(case_id)
     assert handle.task is not None
@@ -4765,11 +4768,12 @@ async def test_ui_batch_retains_each_claim_while_entries_are_queued(
         raise AssertionError("unreachable batch return")
 
     monkeypatch.setattr(ui_runs, "run_prepared_case", block_run)
-    registry = RunRegistry()
+    registry = RunRegistry(global_limit=settings.case_concurrency)
     batch = await registry.start_batch(
         [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
         settings,
         concurrency=2,
+        submission_id="submission_ui_batch_claim_queue",
     )
     prepared_case_ids = [entry.case_id for entry in batch.entries if entry.prepared]
     durable_before_schedule = [
@@ -4813,7 +4817,6 @@ async def test_core_process_entrypoints_retain_claims_until_each_run_starts(
         *,
         claim: ExecutionClaim | None = None,
     ) -> CaseResult:
-        del started_at
         store = WorkflowStore(selected_settings)
         observed.append((case_id, claim, store.has_valid_execution_lease(case_id)))
         if len(observed) > 1 and not queued_authorities:
@@ -4823,16 +4826,17 @@ async def test_core_process_entrypoints_retain_claims_until_each_run_starts(
                 for row in _nonterminal_authority_rows(selected_settings)
                 if row["case_id"] not in prior_case_ids
             )
-        if claim is not None:
-            store.release_case_execution(claim)
-        return CaseResult(
+        assert claim is not None
+        result = CaseResult(
             case_id=case_id,
             source_id=store.load_case_source_id(case_id),
             status=CaseStatus.INCOMPLETE,
             stop_reason="CAPTURED_EXECUTION",
-            started_at=datetime.now(UTC),
+            started_at=started_at,
             finished_at=datetime.now(UTC),
         )
+        store.finish_case(result, claim)
+        return result
 
     monkeypatch.setattr(orchestration, "run_prepared_case", capture_run)
 
@@ -4978,7 +4982,11 @@ def test_sse_active_resume_lease_hides_stale_human_review_result(
     assert previous is not None and previous.status is CaseStatus.NEEDS_HUMAN
     store.claim_case_execution(case_id, frozenset({CaseStatus.NEEDS_HUMAN}), lease_seconds=60)
 
-    payload = terminal_payload(settings.workflow_db, case_id, RunRegistry())
+    payload = terminal_payload(
+        settings.workflow_db,
+        case_id,
+        RunRegistry(global_limit=settings.case_concurrency),
+    )
 
     assert payload is None
 
@@ -5037,7 +5045,11 @@ def test_sse_never_emits_result_observed_before_concurrent_finish(
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         writer = executor.submit(finish_concurrently)
-        payload = terminal_payload(settings.workflow_db, case_id, RunRegistry())
+        payload = terminal_payload(
+            settings.workflow_db,
+            case_id,
+            RunRegistry(global_limit=settings.case_concurrency),
+        )
         writer.result(timeout=1)
 
     assert payload is not None
@@ -5076,7 +5088,11 @@ def test_terminal_payload_never_invokes_recovery(
         forbidden_request_recovery,
     )
 
-    payload = terminal_payload(settings.workflow_db, case_id, RunRegistry())
+    payload = terminal_payload(
+        settings.workflow_db,
+        case_id,
+        RunRegistry(global_limit=settings.case_concurrency),
+    )
 
     assert recovery_calls == []
     assert payload is not None
@@ -5416,7 +5432,11 @@ def test_terminal_payload_reports_corrupt_persisted_result_explicitly(
         )
         connection.commit()
 
-    payload = terminal_payload(settings.workflow_db, case_id, RunRegistry())
+    payload = terminal_payload(
+        settings.workflow_db,
+        case_id,
+        RunRegistry(global_limit=settings.case_concurrency),
+    )
 
     assert payload is not None
     assert payload["status"] == "UNAVAILABLE"
@@ -5431,15 +5451,17 @@ def test_startup_runs_recovery_and_propagates_failure(
 ) -> None:
     calls: list[Path] = []
 
-    def fail_recovery(self: WorkflowStore, **_kwargs: object) -> list[str]:
-        calls.append(self.path)
-        raise InvoiceAgentsError(
-            ErrorCategory.DATABASE,
-            "safe startup recovery sentinel",
-            stop_reason="EXECUTION_RECOVERY_FAILED",
+    def fail_recovery(**kwargs: object) -> RecoveryProcessOutcome:
+        selected_settings = kwargs["settings"]
+        assert isinstance(selected_settings, Settings)
+        calls.append(selected_settings.workflow_db.resolve())
+        return RecoveryProcessOutcome(
+            False,
+            ErrorCategory.ORCHESTRATION,
+            "EXECUTION_RECOVERY_FAILED",
         )
 
-    monkeypatch.setattr(WorkflowStore, "recover_expired_executions", fail_recovery, raising=False)
+    monkeypatch.setattr(recovery_module, "run_recovery_process", fail_recovery)
 
     with pytest.raises(InvoiceAgentsError) as error, TestClient(create_app(settings)):
         pass
@@ -5916,7 +5938,7 @@ async def _assert_terminal_stream_is_reconciled(
     stream = sse.case_event_stream(
         settings.workflow_db,
         case_id,
-        RunRegistry(),
+        RunRegistry(global_limit=settings.case_concurrency),
         settings=settings,
     )
 
@@ -5935,6 +5957,7 @@ async def _assert_terminal_stream_is_reconciled(
         "status": str(expected.status),
         "stop_reason": expected.stop_reason,
         "run_error": None,
+        "recovery_verified": True,
     }
     assert json.loads(str(terminal_events[0].data)) == terminal_payload_data
     assert (
@@ -5982,7 +6005,7 @@ async def _assert_terminal_result_views_are_identical(
         expected=expected,
         forbidden_candidate_stop=forbidden_candidate_stop,
     )
-    with TestClient(create_app(settings)) as client:
+    with TestClient(create_app(settings), base_url="http://127.0.0.1:8787") as client:
         response = client.get(f"/cases/{case_id}/result.json")
     assert response.status_code == 200
     assert CaseResult.model_validate(response.json()) == expected
@@ -6084,9 +6107,7 @@ async def test_result_route_never_serves_candidate_before_directory_durability(
             src_dir_fd=src_dir_fd,
             dst_dir_fd=dst_dir_fd,
         )
-        destination_path = (
-            Path(destination) if dst_dir_fd is None else output / Path(destination)
-        )
+        destination_path = Path(destination) if dst_dir_fd is None else output / Path(destination)
         if destination_path == target:
             candidate_replaced.set()
 
@@ -6134,7 +6155,7 @@ async def test_result_route_never_serves_candidate_before_directory_durability(
             command = command_receiver.recv()
             if command != "fetch":
                 raise AssertionError("invalid route probe command")
-            with TestClient(create_app(settings)) as client:
+            with TestClient(create_app(settings), base_url="http://127.0.0.1:8787") as client:
                 response = client.get(f"/cases/{case_id}/result.json")
             response_sender.send(("response", response.status_code, response.json()))
         except BaseException as exc:
@@ -6195,7 +6216,7 @@ async def test_result_route_never_serves_candidate_before_directory_durability(
         payload,
         stored_during_publication,
     )
-    with TestClient(create_app(settings)) as client:
+    with TestClient(create_app(settings), base_url="http://127.0.0.1:8787") as client:
         response_after_durability = client.get(f"/cases/{case_id}/result.json")
     assert response_after_durability.status_code == 200
     assert CaseResult.model_validate(response_after_durability.json()) == result
@@ -6220,7 +6241,7 @@ async def test_result_route_conflicts_when_durable_artifact_binding_is_not_exact
     )
     target = tmp_path / "artifacts" / "results" / f"{case_id}.json"
     published_bytes = target.read_bytes()
-    with TestClient(create_app(settings)) as client:
+    with TestClient(create_app(settings), base_url="http://127.0.0.1:8787") as client:
         assert client.get(f"/cases/{case_id}/result.json").status_code == 200
 
     if mutation == "absent":
@@ -6232,7 +6253,7 @@ async def test_result_route_conflicts_when_durable_artifact_binding_is_not_exact
         replacement.write_bytes(published_bytes)
         os.replace(replacement, target)
 
-    with TestClient(create_app(settings)) as client:
+    with TestClient(create_app(settings), base_url="http://127.0.0.1:8787") as client:
         response = client.get(f"/cases/{case_id}/result.json")
     _assert_artifact_binding_conflict(response.status_code, response.json(), result)
 
@@ -6316,7 +6337,7 @@ async def test_new_terminal_database_generation_cannot_advertise_seeded_prior_ar
         prior_identity.st_dev,
         prior_identity.st_ino,
     )
-    with TestClient(create_app(settings)) as client:
+    with TestClient(create_app(settings), base_url="http://127.0.0.1:8787") as client:
         response = client.get(f"/cases/{case_id}/result.json")
     _assert_artifact_binding_conflict(response.status_code, response.json(), second)
 
@@ -6521,7 +6542,7 @@ async def test_unproven_post_replace_rollback_is_explicit_and_not_advertised(
         expected=result,
         forbidden_candidate_stop="MAX_MESSAGES_EXHAUSTED",
     )
-    with TestClient(create_app(settings)) as client:
+    with TestClient(create_app(settings), base_url="http://127.0.0.1:8787") as client:
         response = client.get(f"/cases/{case_id}/result.json")
     assert response.status_code == 409
     assert response.json() == {
@@ -7429,9 +7450,7 @@ async def test_cancel_unstarted_reconciliation_drains_repeated_cancellation_befo
     recovery = tmp_path / "artifacts" / "results" / f"{case_id}.recovery.json"
     payload = json.loads(recovery.read_text(encoding="utf-8"))
     assert payload["case_result"]["stop_reason"] == "TERMINAL_PERSISTENCE_FAILED"
-    assert payload["terminal_persistence_error"]["stop_reason"] == (
-        "TERMINAL_PERSISTENCE_FAILED"
-    )
+    assert payload["terminal_persistence_error"]["stop_reason"] == ("TERMINAL_PERSISTENCE_FAILED")
     assert store.load_result(case_id) is None
 
 
@@ -7492,21 +7511,19 @@ async def test_ui_batch_cancellation_terminalizes_queued_exact_claims_before_ret
 
     started = asyncio.Event()
 
-    class BlockingTeam:
-        async def run_stream(self, task: object) -> AsyncIterator[object]:
-            del task
-            started.set()
-            await asyncio.Event().wait()
-            yield  # pragma: no cover - makes this an async generator
+    async def blocking_run(*_args: object, **_kwargs: object) -> CaseResult:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable batch run return")
 
-    monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: _ClosingClient())
-    monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: BlockingTeam())
+    monkeypatch.setattr(ui_runs, "run_prepared_case", blocking_run)
     monkeypatch.chdir(tmp_path)
-    registry = RunRegistry()
+    registry = RunRegistry(global_limit=settings.case_concurrency)
     batch = await registry.start_batch(
         [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
         settings,
         concurrency=1,
+        submission_id="submission_ui_batch_cancel_queued",
     )
     assert batch.task is not None
     await asyncio.wait_for(started.wait(), timeout=0.5)
@@ -7540,47 +7557,39 @@ async def test_ui_batch_cancellation_terminalizes_queued_exact_claims_before_ret
 
 
 @pytest.mark.asyncio
-async def test_ui_batch_cancel_during_preparation_accounts_for_owned_async_claim(
+async def test_ui_batch_cancel_during_staging_precedes_durable_admission(
     invoice_dir: Path,
     settings: Settings,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Cancellation cannot abandon a claim owned by the async prep boundary."""
+    """Cancellation during staging cannot create a submission, case, or claim."""
 
     second_started = asyncio.Event()
-    prepared: list[tuple[str, datetime, ExecutionClaim]] = []
+    staged_paths: list[Path] = []
     calls = 0
 
     async def controlled_prepare(path: Path, selected_settings: Settings) -> object:
         nonlocal calls
         calls += 1
-        outcome = orchestration.prepare_claimed_invoice(path, selected_settings)
-        if isinstance(outcome, tuple):
-            prepared.append(outcome)
         if calls == 2:
             second_started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                assert isinstance(outcome, tuple)
-                await orchestration._durably_cancel_unstarted_claim(
-                    outcome[0],
-                    outcome[1],
-                    selected_settings,
-                    outcome[2],
-                )
-                raise
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable staging return")
+        outcome = await orchestration.stage_claimed_invoice_async(path, selected_settings)
+        assert not isinstance(outcome, CaseResult)
+        staged_paths.append(path)
         return outcome
 
-    monkeypatch.setattr(ui_runs, "prepare_claimed_invoice_async", controlled_prepare)
+    monkeypatch.setattr(ui_runs, "_prepare_claimed_for_launch", controlled_prepare)
     monkeypatch.chdir(tmp_path)
-    registry = RunRegistry()
+    registry = RunRegistry(global_limit=settings.case_concurrency)
     start_task = asyncio.create_task(
         registry.start_batch(
             [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
             settings,
             concurrency=1,
+            submission_id="submission_ui_batch_cancel_staging",
         )
     )
     await asyncio.wait_for(second_started.wait(), timeout=1)
@@ -7589,19 +7598,22 @@ async def test_ui_batch_cancel_during_preparation_accounts_for_owned_async_claim
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(start_task, timeout=2)
 
-    assert len(prepared) == 2
-    store = WorkflowStore(settings)
-    for case_id, _started_at, _claim in prepared:
-        result = store.load_result(case_id)
-        assert result is not None
-        assert result.status is CaseStatus.INCOMPLETE
-        assert result.stop_reason == "CANCELLED"
-        with connect_database(settings.workflow_db, read_only=True) as connection:
-            authority = connection.execute(
-                "SELECT execution_state, lease_expires_at FROM cases WHERE case_id = ?",
-                (case_id,),
+    assert staged_paths == [invoice_dir / "invoice_1001.txt"]
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        durable_counts = tuple(
+            connection.execute(
+                "SELECT "
+                "(SELECT COUNT(*) FROM submission_requests), "
+                "(SELECT COUNT(*) FROM cases), "
+                "(SELECT COUNT(*) FROM source_run_claims), "
+                "(SELECT COUNT(*) FROM batches), "
+                "(SELECT COUNT(*) FROM batch_entries)"
             ).fetchone()
-        assert tuple(authority) == ("FINISHED", None)
+        )
+    assert durable_counts == (0, 0, 0, 0, 0)
+    assert registry._runs == {}
+    assert registry._batches == {}
+    assert registry._lifecycle_owners == {}
 
 
 @pytest.mark.asyncio
@@ -7615,21 +7627,19 @@ async def test_ui_batch_repeated_cancellation_drains_active_and_queued_claims(
 
     started = asyncio.Event()
 
-    class BlockingTeam:
-        async def run_stream(self, task: object) -> AsyncIterator[object]:
-            del task
-            started.set()
-            await asyncio.Event().wait()
-            yield  # pragma: no cover - makes this an async generator
+    async def blocking_run(*_args: object, **_kwargs: object) -> CaseResult:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable batch run return")
 
-    monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: _ClosingClient())
-    monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: BlockingTeam())
+    monkeypatch.setattr(ui_runs, "run_prepared_case", blocking_run)
     monkeypatch.chdir(tmp_path)
-    registry = RunRegistry()
+    registry = RunRegistry(global_limit=settings.case_concurrency)
     batch = await registry.start_batch(
         [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
         settings,
         concurrency=1,
+        submission_id="submission_ui_batch_repeated_cancel",
     )
     assert batch.task is not None
     await asyncio.wait_for(started.wait(), timeout=0.5)
@@ -7669,21 +7679,36 @@ async def test_ui_batch_cancellation_racing_child_completion_is_terminal(
     release = asyncio.Event()
     started = asyncio.Event()
 
-    class CompletingTeam(_MaxMessagesTeam):
-        async def run_stream(self, task: object) -> AsyncIterator[object]:
-            del task
-            started.set()
-            await release.wait()
-            yield TaskResult(messages=[], stop_reason="maximum number of messages")
+    async def completing_run(
+        case_id: str,
+        started_at: datetime,
+        selected_settings: Settings,
+        *,
+        claim: ExecutionClaim | None = None,
+    ) -> CaseResult:
+        started.set()
+        await release.wait()
+        assert claim is not None
+        store = WorkflowStore(selected_settings)
+        result = CaseResult(
+            case_id=case_id,
+            source_id=store.load_case_source_id(case_id),
+            status=CaseStatus.INCOMPLETE,
+            stop_reason="MAX_MESSAGES_EXHAUSTED",
+            started_at=started_at,
+            finished_at=datetime.now(UTC),
+        )
+        store.finish_case(result, claim)
+        return result
 
-    monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: _ClosingClient())
-    monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: CompletingTeam())
+    monkeypatch.setattr(ui_runs, "run_prepared_case", completing_run)
     monkeypatch.chdir(tmp_path)
-    registry = RunRegistry()
+    registry = RunRegistry(global_limit=settings.case_concurrency)
     batch = await registry.start_batch(
         [invoice_dir / "invoice_1001.txt"],
         settings,
         concurrency=1,
+        submission_id="submission_ui_batch_cancel_completion_race",
     )
     assert batch.task is not None
     await asyncio.wait_for(started.wait(), timeout=0.5)
@@ -7737,21 +7762,19 @@ async def test_ui_batch_cancel_surfaces_active_terminal_recovery_failure(
 
     started = asyncio.Event()
 
-    class BlockingTeam:
-        async def run_stream(self, task: object) -> AsyncIterator[object]:
-            del task
-            started.set()
-            await asyncio.Event().wait()
-            yield  # pragma: no cover - makes this an async generator
+    async def blocking_run(*_args: object, **_kwargs: object) -> CaseResult:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable batch run return")
 
-    monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: _ClosingClient())
-    monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: BlockingTeam())
+    monkeypatch.setattr(ui_runs, "run_prepared_case", blocking_run)
     monkeypatch.chdir(tmp_path)
-    registry = RunRegistry()
+    registry = RunRegistry(global_limit=settings.case_concurrency)
     batch = await registry.start_batch(
         [invoice_dir / "invoice_1001.txt"],
         settings,
         concurrency=1,
+        submission_id="submission_ui_batch_cancel_recovery_failure",
     )
     assert batch.task is not None
     await asyncio.wait_for(started.wait(), timeout=0.5)
@@ -7787,29 +7810,30 @@ async def test_ui_batch_cancel_publishes_recovery_for_active_and_queued_claims(
 
     started = asyncio.Event()
 
-    class BlockingTeam:
-        async def run_stream(self, task: object) -> AsyncIterator[object]:
-            del task
-            started.set()
-            await asyncio.Event().wait()
-            yield  # pragma: no cover - makes this an async generator
+    async def blocking_run(*_args: object, **_kwargs: object) -> CaseResult:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable batch run return")
 
-    monkeypatch.setattr(orchestration, "create_model_client", lambda _settings: _ClosingClient())
-    monkeypatch.setattr(orchestration, "build_team", lambda _context, _client: BlockingTeam())
+    monkeypatch.setattr(ui_runs, "run_prepared_case", blocking_run)
     monkeypatch.chdir(tmp_path)
-    registry = RunRegistry()
+    registry = RunRegistry(global_limit=settings.case_concurrency)
     batch = await registry.start_batch(
         [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
         settings,
         concurrency=1,
+        submission_id="submission_ui_batch_cancel_recovery_publish",
     )
     assert batch.task is not None
     await asyncio.wait_for(started.wait(), timeout=0.5)
     monkeypatch.setattr(orchestration, "run_terminal_process", _failed_terminal_worker)
 
     batch.task.cancel()
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(InvoiceAgentsError) as excinfo:
         await asyncio.wait_for(batch.task, timeout=1.0)
+    assert excinfo.value.stop_reason == "PERSISTED_SUBMISSION_INVALID"
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
 
     for entry in batch.entries:
         recovery = tmp_path / "artifacts" / "results" / f"{entry.case_id}.recovery.json"
@@ -7822,7 +7846,7 @@ async def test_ui_batch_cancel_publishes_recovery_for_active_and_queued_claims(
         assert payload["case_result"]["errors"][-1] == payload["terminal_persistence_error"]
         assert not recovery.with_name(f"{entry.case_id}.json").exists()
         handle = registry.handle(entry.case_id)
-        assert handle is not None and handle.state == "done"
+        assert handle is not None and handle.state == "unresolved"
 
 
 @pytest.mark.asyncio
@@ -7959,11 +7983,12 @@ async def test_ui_batch_same_tick_cancellation_has_installed_drain_ownership(
     """A returned batch task is not cancellable before every claim has an owner."""
 
     monkeypatch.chdir(tmp_path)
-    registry = RunRegistry()
+    registry = RunRegistry(global_limit=settings.case_concurrency)
     batch = await registry.start_batch(
         [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
         settings,
         concurrency=1,
+        submission_id="submission_ui_batch_same_tick_cancel",
     )
     assert batch.task is not None
 
@@ -8050,12 +8075,13 @@ async def test_ui_start_batch_cancellation_during_startup_handshake_accounts_all
 
     monkeypatch.setattr(RunRegistry, "_run_batch", delayed_run_batch)
     monkeypatch.chdir(tmp_path)
-    registry = RunRegistry()
+    registry = RunRegistry(global_limit=settings.case_concurrency)
     startup = asyncio.create_task(
         registry.start_batch(
             [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
             settings,
             concurrency=1,
+            submission_id="submission_ui_batch_startup_cancel",
         )
     )
     await asyncio.wait_for(handshake_entered.wait(), timeout=1)
@@ -8101,23 +8127,25 @@ async def test_ui_batch_recovery_failure_precedes_ordinary_child_failure(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("recovery publication sentinel")),
     )
     drained: list[object] = []
-    original_select = orchestration._select_drained_failure
+    original_select = ui_runs._select_admission_drained_failure
 
     def capture_selection(
         primary: BaseException,
         outcomes: list[object],
         durability: dict[str, BaseException | None],
+        admission_failures: list[BaseException],
     ) -> BaseException:
         drained.extend(outcomes)
-        return original_select(primary, outcomes, durability)
+        return original_select(primary, outcomes, durability, admission_failures)
 
-    monkeypatch.setattr(ui_runs, "_select_drained_failure", capture_selection)
+    monkeypatch.setattr(ui_runs, "_select_admission_drained_failure", capture_selection)
     monkeypatch.chdir(tmp_path)
-    registry = RunRegistry()
+    registry = RunRegistry(global_limit=settings.case_concurrency)
     batch = await registry.start_batch(
         [invoice_dir / "invoice_1001.txt", invoice_dir / "invoice_1002.txt"],
         settings,
         concurrency=1,
+        submission_id="submission_ui_batch_recovery_precedence",
     )
     assert batch.task is not None
 
@@ -8297,8 +8325,13 @@ async def test_ui_batch_timeout_starts_no_late_recovery_and_leaves_handle_unreso
     monkeypatch.setattr(orchestration, "DURABILITY_DEADLINE_SECONDS", 0.03)
     monkeypatch.setattr(ui_runs, "DURABILITY_DEADLINE_SECONDS", 0.03)
     monkeypatch.chdir(tmp_path)
-    registry = RunRegistry()
-    batch = await registry.start_batch([invoice_dir / "invoice_1001.txt"], settings, concurrency=1)
+    registry = RunRegistry(global_limit=settings.case_concurrency)
+    batch = await registry.start_batch(
+        [invoice_dir / "invoice_1001.txt"],
+        settings,
+        concurrency=1,
+        submission_id="submission_ui_batch_timeout",
+    )
     assert batch.task is not None
     await asyncio.wait_for(runner_started.wait(), timeout=1)
     batch.task.cancel()

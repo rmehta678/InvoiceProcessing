@@ -366,6 +366,7 @@ def _append_follow_up_relation_after_authorization(
     settings: Settings,
     case_id: str,
     child_id: str,
+    claim: ExecutionClaim,
     *,
     drop_immutability_trigger: bool,
 ) -> str:
@@ -416,6 +417,7 @@ def test_schema_rejects_follow_up_relation_append_after_final_or_paid(
             settings,
             case_id,
             child_id,
+            claim,
             drop_immutability_trigger=False,
         )
 
@@ -432,6 +434,7 @@ def test_payment_authorization_rejects_appended_follow_up_when_trigger_is_droppe
         settings,
         case_id,
         child_id,
+        claim,
         drop_immutability_trigger=True,
     )
 
@@ -456,6 +459,7 @@ def test_paid_ledger_validation_rejects_appended_follow_up_when_trigger_is_dropp
         settings,
         case_id,
         child_id,
+        claim,
         drop_immutability_trigger=True,
     )
     with connect_database(settings.workflow_db, read_only=True) as connection:
@@ -2412,7 +2416,7 @@ def test_mapping_review_authorizes_only_its_exact_recomputed_successor_and_payme
             DatabaseKind.WORKFLOW,
             settings=settings,
         )["schema_version"]
-        == 5
+        == 7
     )
     with connect_database(settings.inventory_db, read_only=True) as connection:
         alias = connection.execute(
@@ -3108,13 +3112,13 @@ def test_migration_003_rolls_back_and_is_retryable_after_mid_migration_failure(
         )
         connection.commit()
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4, 5]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4, 5, 6, 7]
     inventory = tmp_path / "inventory-atomic.db"
     migrate_database(inventory, DatabaseKind.INVENTORY)
     seed_inventory(inventory)
     audit_settings = Settings(workflow_db=path, inventory_db=inventory)
     assert (
-        verify_database(path, DatabaseKind.WORKFLOW, settings=audit_settings)["schema_version"] == 5
+        verify_database(path, DatabaseKind.WORKFLOW, settings=audit_settings)["schema_version"] == 7
     )
     with real_connect(path, read_only=True) as connection:
         identity_columns = {
@@ -3339,13 +3343,13 @@ def test_migration_003_rejects_unanchored_legacy_authorization_atomically_and_re
         confirmed=True,
     )
     assert receipt.record_count == 1 + int(include_payment)
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4, 5]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4, 5, 6, 7]
     inventory = tmp_path / "inventory-legacy-authorization.db"
     migrate_database(inventory, DatabaseKind.INVENTORY)
     seed_inventory(inventory)
     audit_settings = Settings(workflow_db=path, inventory_db=inventory)
     assert (
-        verify_database(path, DatabaseKind.WORKFLOW, settings=audit_settings)["schema_version"] == 5
+        verify_database(path, DatabaseKind.WORKFLOW, settings=audit_settings)["schema_version"] == 7
     )
 
 
@@ -3370,7 +3374,7 @@ def test_workflow_preflight_rejects_unanchored_v3_authorization_rows(
             DatabaseKind.WORKFLOW,
             settings=settings,
         )["schema_version"]
-        == 5
+        == 7
     )
 
     trigger_name = "trg_validated_evidence_snapshots_delete"
@@ -3496,7 +3500,7 @@ def test_workflow_preflight_accepts_complete_review_bound_payment_authorization(
         settings=settings,
     )
 
-    assert report["schema_version"] == 5
+    assert report["schema_version"] == 7
 
 
 def test_workflow_v3_verification_requires_explicit_settings_context(

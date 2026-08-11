@@ -394,11 +394,7 @@ def _strict_canonical_utc_micros(value: object) -> int | None:
     ):
         return None
     delta = parsed - datetime(1970, 1, 1, tzinfo=UTC)
-    return (
-        delta.days * 86_400_000_000
-        + delta.seconds * 1_000_000
-        + delta.microseconds
-    )
+    return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
 
 
 def _strict_critic_follow_up_payload(
@@ -438,15 +434,20 @@ def _strict_critic_follow_up_payload(
     if type(payload) is not dict:
         return 0
     if event_type == "tool.critic_line_recompute":
-        if set(payload) != {
-            "execution_generation",
-            "quantity",
-            "unit_price",
-            "extended_total",
-        } or any(
-            type(payload[key]) is not str
-            for key in ("quantity", "unit_price", "extended_total")
-        ) or payload["execution_generation"] != execution_generation:
+        if (
+            set(payload)
+            != {
+                "execution_generation",
+                "quantity",
+                "unit_price",
+                "extended_total",
+            }
+            or any(
+                type(payload[key]) is not str
+                for key in ("quantity", "unit_price", "extended_total")
+            )
+            or payload["execution_generation"] != execution_generation
+        ):
             return 0
         from invoice_agents.tools.comparison import recompute_line_extension
 
@@ -657,8 +658,7 @@ def _is_sqlite_owned_autoindex(
     matching_indexes = [
         row
         for row in connection.execute(
-            f"PRAGMA {_quote_identifier(schema)}.index_list("
-            f"{_quote_identifier(entry.table_name)})"
+            f"PRAGMA {_quote_identifier(schema)}.index_list({_quote_identifier(entry.table_name)})"
         ).fetchall()
         if row["name"] == entry.name
     ]
@@ -752,8 +752,7 @@ def _is_sqlite_runtime_table(
     columns = tuple(
         tuple(row)
         for row in connection.execute(
-            f"PRAGMA {_quote_identifier(schema)}.table_xinfo("
-            f"{_quote_identifier(entry.name)})"
+            f"PRAGMA {_quote_identifier(schema)}.table_xinfo({_quote_identifier(entry.name)})"
         ).fetchall()
     )
     if columns != expected_columns:
@@ -1101,9 +1100,8 @@ def _inspect_workflow_version_neutral_contract(
             _expected_workflow_schema_manifest(
                 history,
                 include_durable_history=False,
-                include_archive=False,
             ),
-            allow_partial_empty_archive=False,
+            allow_partial_empty_archive=True,
         )
         return WorkflowVersionNeutralState(
             applies=False,
@@ -1239,8 +1237,7 @@ def _preflight_existing_migration_history(
         history_snapshot = _migration_history_snapshot(connection)
         schema_version_exists = bool(
             connection.execute(
-                "SELECT 1 FROM sqlite_master "
-                "WHERE type = 'table' AND name = 'schema_version'"
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'"
             ).fetchone()
         )
         if kind is DatabaseKind.INVENTORY and (history or schema_version_exists):
@@ -1607,8 +1604,7 @@ def _table_schema_manifest(
 ) -> TableSchemaManifest:
     quoted_schema = _quote_identifier(schema)
     table_row = connection.execute(
-        f"SELECT sql FROM {quoted_schema}.sqlite_master "
-        "WHERE type = 'table' AND name = ?",
+        f"SELECT sql FROM {quoted_schema}.sqlite_master WHERE type = 'table' AND name = ?",
         (table,),
     ).fetchone()
     if table_row is None or table_row["sql"] is None:
@@ -1644,14 +1640,11 @@ def _table_schema_manifest(
         ).fetchall()
     )
     indexes: list[SchemaIndexManifest] = []
-    for row in connection.execute(
-        f"PRAGMA {quoted_schema}.index_list({quoted_table})"
-    ).fetchall():
+    for row in connection.execute(f"PRAGMA {quoted_schema}.index_list({quoted_table})").fetchall():
         index_name = str(row["name"])
         quoted_index = _quote_identifier(index_name)
         index_sql_row = connection.execute(
-            f"SELECT sql FROM {quoted_schema}.sqlite_master "
-            "WHERE type = 'index' AND name = ?",
+            f"SELECT sql FROM {quoted_schema}.sqlite_master WHERE type = 'index' AND name = ?",
             (index_name,),
         ).fetchone()
         index_sql = (
@@ -1753,10 +1746,13 @@ def _expected_workflow_schema_manifest(
             if version not in selected_versions:
                 continue
             reference.executescript(resource.read_text(encoding="utf-8"))
-        if not include_durable_history and reference.execute(
-            "SELECT 1 FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'schema_migration_history'"
-        ).fetchone():
+        if (
+            not include_durable_history
+            and reference.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'schema_migration_history'"
+            ).fetchone()
+        ):
             reference.execute("DROP TABLE schema_migration_history")
         if include_archive:
             reference.executescript(
@@ -1903,8 +1899,7 @@ def _verify_schema_manifest(
         archived_rows = sum(
             int(
                 connection.execute(
-                    f"SELECT COUNT(*) FROM {_quote_identifier(schema)}."
-                    f"{_quote_identifier(table)}"
+                    f"SELECT COUNT(*) FROM {_quote_identifier(schema)}.{_quote_identifier(table)}"
                 ).fetchone()[0]
             )
             for table in actual_archive_tables

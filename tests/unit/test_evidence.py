@@ -64,11 +64,7 @@ def write_text_invoice(
     ]
     if notes_column:
         lines.append("Item Qty Unit Price Amount Notes")
-    lines.extend(
-        (
-            f"WidgetA qty: {quantity} unit price: {unit_price} {declared_line_total}{note}",
-        )
-    )
+    lines.extend((f"WidgetA qty: {quantity} unit price: {unit_price} {declared_line_total}{note}",))
     lines.extend(document_fields)
     lines.append(f"Total: {total}")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -165,9 +161,7 @@ def test_declared_total_rejects_trailing_content(raw: str, tmp_path: Path) -> No
         ("declared line total", "100.00 USD extra"),
     ],
 )
-def test_line_numeric_field_rejects_trailing_content(
-    field: str, raw: str, tmp_path: Path
-) -> None:
+def test_line_numeric_field_rejects_trailing_content(field: str, raw: str, tmp_path: Path) -> None:
     values = {
         "quantity": "2",
         "unit_price": "$50.00",
@@ -458,7 +452,18 @@ def test_row_oriented_csv_tax_rate_rejects_malformed_content(tmp_path: Path) -> 
                 "Line Total",
             ]
         )
-        writer.writerow(["INV-4242", "Numeric Supplies", "2026-01-15", "2026-02-01", "WidgetA", "2", "$50.00", "$100.00"])
+        writer.writerow(
+            [
+                "INV-4242",
+                "Numeric Supplies",
+                "2026-01-15",
+                "2026-02-01",
+                "WidgetA",
+                "2",
+                "$50.00",
+                "$100.00",
+            ]
+        )
         writer.writerow(["", "", "", "", "", "", "Tax (0BAD%)", "$0.00"])
         writer.writerow(["", "", "", "", "", "", "Total", "$100.00"])
     source = snapshot_source(path, tmp_path / "sources", 10_485_760)
@@ -489,7 +494,18 @@ def test_row_oriented_csv_tax_rate_rejects_malformed_wrapper(tmp_path: Path) -> 
                 "Line Total",
             ]
         )
-        writer.writerow(["INV-4242", "Numeric Supplies", "2026-01-15", "2026-02-01", "WidgetA", "2", "$50.00", "$100.00"])
+        writer.writerow(
+            [
+                "INV-4242",
+                "Numeric Supplies",
+                "2026-01-15",
+                "2026-02-01",
+                "WidgetA",
+                "2",
+                "$50.00",
+                "$100.00",
+            ]
+        )
         writer.writerow(["", "", "", "", "", "", "Tax (10%oops)", "$10.00"])
         writer.writerow(["", "", "", "", "", "", "Total", "$110.00"])
     source = snapshot_source(path, tmp_path / "sources", 10_485_760)
@@ -520,7 +536,18 @@ def test_row_oriented_csv_tax_rate_preserves_unparenthesized_label(tmp_path: Pat
                 "Line Total",
             ]
         )
-        writer.writerow(["INV-4242", "Numeric Supplies", "2026-01-15", "2026-02-01", "WidgetA", "2", "$50.00", "$100.00"])
+        writer.writerow(
+            [
+                "INV-4242",
+                "Numeric Supplies",
+                "2026-01-15",
+                "2026-02-01",
+                "WidgetA",
+                "2",
+                "$50.00",
+                "$100.00",
+            ]
+        )
         writer.writerow(["", "", "", "", "", "", "Tax 10%", "$10.00"])
         writer.writerow(["", "", "", "", "", "", "Total", "$110.00"])
     source = snapshot_source(path, tmp_path / "sources", 10_485_760)
@@ -545,7 +572,9 @@ def test_row_oriented_csv_tax_rate_rejects_malformed_wrapper_without_amount(
     assert excinfo.value.details["raw_value"] == "Tax (10%oops)"
 
 
-def test_row_oriented_csv_tax_rate_does_not_overwrite_valid_rate_with_bare_tax(tmp_path: Path) -> None:
+def test_row_oriented_csv_tax_rate_does_not_overwrite_valid_rate_with_bare_tax(
+    tmp_path: Path,
+) -> None:
     source = write_row_oriented_tax_csv(
         tmp_path,
         (("Tax 10%", "$10.00"), ("Tax", "$0.00")),

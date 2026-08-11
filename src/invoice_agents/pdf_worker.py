@@ -59,9 +59,8 @@ class _ExtractionWireBuilder:
         _append_bounded_utf8(self.text, page_text, max_bytes=self.max_bytes)
         text_bytes = len(self.text) - page_start
         descriptor = (
-            (b"," if self.page_descriptors else b"")
-            + f'{{"page":{page_number},"text_bytes":{text_bytes}}}'.encode("ascii")
-        )
+            b"," if self.page_descriptors else b""
+        ) + f'{{"page":{page_number},"text_bytes":{text_bytes}}}'.encode("ascii")
         if self._metadata_size_with(descriptor) > METADATA_MAX_BYTES:
             raise _ResultTooLarge
         self.page_descriptors.extend(descriptor)
@@ -70,9 +69,7 @@ class _ExtractionWireBuilder:
     def build(self) -> _WireMessage:
         metadata = bytearray(b'{"ok":true,"result":{"pages":[')
         metadata.extend(self.page_descriptors)
-        metadata.extend(
-            f'],"extractor":"pypdf","page_count":{self.page_count}}}}}'.encode("ascii")
-        )
+        metadata.extend(f'],"extractor":"pypdf","page_count":{self.page_count}}}}}'.encode("ascii"))
         message = _WireMessage(metadata=metadata, text=self.text)
         if len(metadata) > METADATA_MAX_BYTES or message.payload_bytes > self.max_bytes:
             raise _ResultTooLarge
@@ -205,10 +202,7 @@ def _append_bounded_utf8(
     for start in range(0, len(source), TEXT_ENCODE_CHARS):
         encoded_chunk = source[start : start + TEXT_ENCODE_CHARS].encode("utf-8")
         if (
-            WIRE_HEADER_BYTES
-            + METADATA_MAX_BYTES
-            + len(destination)
-            + len(encoded_chunk)
+            WIRE_HEADER_BYTES + METADATA_MAX_BYTES + len(destination) + len(encoded_chunk)
             > max_bytes
         ):
             raise _ResultTooLarge
@@ -519,11 +513,7 @@ def _split_wire_message(
         raise _worker_failed()
     (metadata_length,) = struct.unpack("!I", view[:WIRE_HEADER_BYTES])
     metadata_end = WIRE_HEADER_BYTES + metadata_length
-    if (
-        metadata_length < 1
-        or metadata_length > METADATA_MAX_BYTES
-        or metadata_end > len(view)
-    ):
+    if metadata_length < 1 or metadata_length > METADATA_MAX_BYTES or metadata_end > len(view):
         raise _worker_failed()
     return view[WIRE_HEADER_BYTES:metadata_end], view[metadata_end:]
 
@@ -796,9 +786,7 @@ def inspect_pdf_in_worker(source: SourceArtifact, timeout_seconds: float) -> int
     return page_count
 
 
-def extract_pdf_in_worker(
-    source: SourceArtifact, timeout_seconds: float
-) -> dict[str, object]:
+def extract_pdf_in_worker(source: SourceArtifact, timeout_seconds: float) -> dict[str, object]:
     """Extract JSON-safe PDF page text in a bounded spawned worker."""
 
     return _run_worker("extract", source, timeout_seconds)
@@ -814,7 +802,9 @@ def render_pdf_page_in_worker(
 
     resolved = target.resolve()
     resolved.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".pdf-render-", suffix=".png", dir=resolved.parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".pdf-render-", suffix=".png", dir=resolved.parent
+    )
     os.close(descriptor)
     temporary = Path(temporary_name)
     temporary.unlink()

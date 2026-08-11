@@ -4,8 +4,16 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
-from invoice_agents.ui.routes import (
+_WORKER_PATH = Path(__file__).resolve(strict=True)
+_PACKAGE_ROOT = _WORKER_PATH.parents[2]
+_COLOCATED_ROUTES = _PACKAGE_ROOT / "invoice_agents" / "ui" / "routes.py"
+if _COLOCATED_ROUTES.resolve(strict=True) != _WORKER_PATH.with_name("routes.py"):
+    raise RuntimeError("result-artifact worker source binding is invalid")
+sys.path.insert(0, os.fspath(_PACKAGE_ROOT))
+
+from invoice_agents.ui.routes import (  # noqa: E402
     _RESULT_ARTIFACT_INVALID,
     _RESULT_ARTIFACT_MISSING,
     _RESULT_ARTIFACT_OK,

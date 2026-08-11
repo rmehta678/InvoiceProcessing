@@ -44,6 +44,7 @@ def _status_error(
     message: str,
     status_code: int = 400,
     request_id: str = "req-contract-safe",
+    error_fields: dict[str, str] | None = None,
 ) -> openai.BadRequestError:
     request = httpx.Request("POST", REQUEST_URL)
     response = httpx.Response(
@@ -54,7 +55,13 @@ def _status_error(
     return openai.BadRequestError(
         message,
         response=response,
-        body={"error": {"message": message, "credential": SECRET}},
+        body={
+            "error": {
+                "message": message,
+                "credential": SECRET,
+                **(error_fields or {}),
+            }
+        },
     )
 
 
@@ -76,19 +83,42 @@ def _install_direct_client(
 async def test_invalid_key_contract_evidence_excludes_exception_and_provider_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    error = _status_error(message=f"Incorrect API key provided: api_key={SECRET}")
+    error = _status_error(
+        message=f"Incorrect API key provided: api_key={SECRET}",
+        error_fields={
+            "type": "authentication_error",
+            "code": "incorrect_api_key",
+        },
+    )
     _install_direct_client(monkeypatch, error=error)
 
     check = await compatibility._live_invalid_key_rejection()
 
     assert check.passed is True
     assert check.evidence == (
+        "category=AUTHENTICATION_REJECTION; status=400; provider_request_id=req-contract-safe"
+    )
+    assert SECRET not in check.evidence
+    assert "Incorrect API key" not in check.evidence
+    assert "body=" not in check.evidence
+
+
+@pytest.mark.asyncio
+async def test_invalid_key_prose_without_structured_authentication_fields_is_not_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = _status_error(message=f"Incorrect API key provided: api_key={SECRET}")
+    _install_direct_client(monkeypatch, error=error)
+
+    check = await compatibility._live_invalid_key_rejection()
+
+    assert check.passed is False
+    assert check.evidence == (
         "exception_type=BadRequestError; status=400; category=PROVIDER; "
         "stop_reason=PROVIDER_REQUEST_FAILED; provider_request_id=req-contract-safe"
     )
     assert SECRET not in check.evidence
     assert "Incorrect API key" not in check.evidence
-    assert "body=" not in check.evidence
 
 
 @pytest.mark.asyncio
@@ -116,19 +146,43 @@ async def test_provider_metadata_sanitizer_failure_is_explicit_and_suppresses_ra
 async def test_structured_rejection_evidence_excludes_exception_and_provider_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    error = _status_error(message=f"Schema validation failed: api_key={SECRET}")
+    error = _status_error(
+        message=f"Schema validation failed: api_key={SECRET}",
+        error_fields={
+            "type": "invalid_request_error",
+            "code": "invalid_json_schema",
+            "param": "response_format.json_schema",
+        },
+    )
     _install_direct_client(monkeypatch, error=error)
 
     check = await compatibility._structured_output_rejection_live(_settings())
 
     assert check.passed is True
     assert check.evidence == (
+        "category=SCHEMA_REJECTION; status=400; provider_request_id=req-contract-safe"
+    )
+    assert SECRET not in check.evidence
+    assert "Schema validation failed" not in check.evidence
+    assert "body=" not in check.evidence
+
+
+@pytest.mark.asyncio
+async def test_schema_rejection_prose_without_exact_machine_fields_is_not_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = _status_error(message=f"Schema validation failed: api_key={SECRET}")
+    _install_direct_client(monkeypatch, error=error)
+
+    check = await compatibility._structured_output_rejection_live(_settings())
+
+    assert check.passed is False
+    assert check.evidence == (
         "exception_type=BadRequestError; status=400; category=PROVIDER; "
         "stop_reason=PROVIDER_REQUEST_FAILED; provider_request_id=req-contract-safe"
     )
     assert SECRET not in check.evidence
     assert "Schema validation failed" not in check.evidence
-    assert "body=" not in check.evidence
 
 
 @pytest.mark.asyncio
@@ -165,6 +219,8 @@ async def test_structured_acceptance_does_not_echo_provider_content(
     check = await compatibility._structured_output_rejection_live(_settings())
 
     assert check.passed is False
-    assert check.evidence == "provider accepted invalid response schema; content_present=true"
+    assert check.evidence == (
+        "category=PROVIDER; status=UNEXPECTED_ACCEPT; provider_request_id=<absent>"
+    )
     assert SECRET not in check.evidence
     assert "raw provider body" not in check.evidence

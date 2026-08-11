@@ -27,6 +27,7 @@ from invoice_agents.config import (
     serialize_ui_origin,
 )
 from invoice_agents.db.cli import app as db_app
+from invoice_agents.db.cli import enter_application_boundary, leave_application_boundary
 from invoice_agents.db.core import ensure_databases
 from invoice_agents.db.store import WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
@@ -173,6 +174,7 @@ class _OperationalBoundaryGroup(TyperGroup):
 
     def invoke(self, ctx: Any) -> Any:
         debug_token = _CLI_DEBUG.set(bool(ctx.params.get("debug", False)))
+        database_boundary_token = enter_application_boundary()
         try:
             try:
                 return super().invoke(ctx)
@@ -181,6 +183,7 @@ class _OperationalBoundaryGroup(TyperGroup):
             except Exception as exc:
                 _print_operational_error(exc)
         finally:
+            leave_application_boundary(database_boundary_token)
             _CLI_DEBUG.reset(debug_token)
 
 
@@ -615,13 +618,6 @@ def ui_command(
             console.print(
                 _safe_cli_text(f"{kind} database ready ({state}), verified"), markup=False
             )
-    console.print(
-        _safe_cli_text(
-            f"Galatiq invoice console on {serialize_ui_origin('http', bind_host, port)} "
-            "(Ctrl+C stops it)"
-        ),
-        markup=False,
-    )
     uvicorn.run(
         create_app(
             settings,
@@ -631,6 +627,12 @@ def ui_command(
         host=bind_host,
         port=port,
         log_level="warning",
+    )
+    console.print(
+        _safe_cli_text(
+            f"Galatiq invoice console served on {serialize_ui_origin('http', bind_host, port)}"
+        ),
+        markup=False,
     )
 
 

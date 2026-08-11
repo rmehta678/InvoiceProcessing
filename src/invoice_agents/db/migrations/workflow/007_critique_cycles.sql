@@ -103,6 +103,12 @@ SELECT
 FROM legacy_critique_history
 WHERE migration_role = 'PROMOTED_CYCLE_ONE';
 
+-- This trigger is owned by validated_evidence_snapshots, so SQLite does not
+-- remove it when critique_results is dropped.  Remove it before the table
+-- swap; otherwise ALTER TABLE reparses the stale trigger against the missing
+-- table and aborts every supported pre-v7 upgrade.
+DROP TRIGGER trg_validated_evidence_snapshots_insert;
+
 DROP TABLE critique_results;
 ALTER TABLE critique_results_v7 RENAME TO critique_results;
 
@@ -384,8 +390,6 @@ WHEN EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'AUTHORIZATION_EVIDENCE_IMMUTABLE');
 END;
-
-DROP TRIGGER trg_validated_evidence_snapshots_insert;
 
 CREATE TRIGGER trg_validated_evidence_snapshots_insert
 BEFORE INSERT ON validated_evidence_snapshots

@@ -274,11 +274,9 @@ def build_team(
                 or parent["missing_evidence"]
                 or parent["requested_follow_up"]
             ):
-                eligible_follow_up_evidence = (
-                    context.store.list_current_critique_follow_up_events(
-                        context.claim,
-                        str(parent["critique_id"]),
-                    )
+                eligible_follow_up_evidence = context.store.list_current_critique_follow_up_events(
+                    context.claim,
+                    str(parent["critique_id"]),
                 )
         return {
             "invoice": invoice.model_dump(mode="json"),
