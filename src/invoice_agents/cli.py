@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import sqlite3
+import traceback
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any, NoReturn
 from uuid import uuid4
 
 import typer
+from click import ClickException
 from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
+from typer.core import TyperGroup
 
 from invoice_agents.compatibility import run_live_contracts
 from invoice_agents.config import (
@@ -39,8 +45,136 @@ from invoice_agents.orchestration import (
 )
 from invoice_agents.ui.runs import RunRegistry
 
+SUPPORTED_INVOICE_SUFFIXES = frozenset({".txt", ".json", ".csv", ".xml", ".pdf"})
+OPERATIONAL_MESSAGE_MAX_CHARACTERS = 512
+DEBUG_STACK_MAX_FRAMES = 8
+DEBUG_STACK_MAX_CHARACTERS = 512
+DEBUG_NAME_MAX_CHARACTERS = 128
+DEBUG_STACK_SEPARATOR = " -> "
+DEBUG_STACK_TRUNCATION_MARKER = "…[TRUNCATED]"
+
+_CLI_DEBUG: ContextVar[bool] = ContextVar("invoice_agents_cli_debug", default=False)
+_ASSIGNMENT_KEY = re.compile(r"\b[A-Za-z_][A-Za-z0-9_-]*\s*=")
+_POSIX_PATH = re.compile(r"(?<![A-Za-z0-9_])/(?:[^/\s]+/)*[^\s]*")
+_WINDOWS_PATH = re.compile(r"(?i)(?<![A-Za-z0-9_])[A-Z]:\\(?:[^\\\s]+\\)*[^\s]*")
+_SAFE_DEBUG_NAME_CHARACTER = re.compile(r"[^A-Za-z0-9_.<>-]")
+_OPERATIONAL_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+
+
+def _safe_operational_message(value: str) -> str:
+    """Return one bounded, redacted line without paths or nested output fields."""
+
+    safe = sanitize_text(value)
+    safe = _WINDOWS_PATH.sub("[PATH_REDACTED]", safe)
+    safe = _POSIX_PATH.sub("[PATH_REDACTED]", safe)
+    safe = _ASSIGNMENT_KEY.sub("", safe)
+    rendered = " ".join(safe.split()) or "operation failed"
+    if len(rendered) <= OPERATIONAL_MESSAGE_MAX_CHARACTERS:
+        return rendered
+    visible = OPERATIONAL_MESSAGE_MAX_CHARACTERS - len(DEBUG_STACK_TRUNCATION_MARKER)
+    return f"{rendered[:visible]}{DEBUG_STACK_TRUNCATION_MARKER}"
+
+
+def _safe_debug_name(value: str) -> str:
+    safe = _SAFE_DEBUG_NAME_CHARACTER.sub("_", sanitize_text(value))
+    return safe[:DEBUG_NAME_MAX_CHARACTERS]
+
+
+def _debug_stack(exc: BaseException) -> str:
+    frames = traceback.extract_tb(exc.__traceback__)
+    names = [_safe_debug_name(frame.name) for frame in frames[-DEBUG_STACK_MAX_FRAMES:]]
+    rendered = DEBUG_STACK_SEPARATOR.join(names)
+    if len(rendered) <= DEBUG_STACK_MAX_CHARACTERS:
+        return rendered
+    visible = DEBUG_STACK_MAX_CHARACTERS - len(DEBUG_STACK_TRUNCATION_MARKER)
+    return f"{rendered[:visible]}{DEBUG_STACK_TRUNCATION_MARKER}"
+
+
+def _print_operational_error(exc: BaseException) -> NoReturn:
+    """Print one safe operational failure and terminate with exit code 1."""
+
+    if not isinstance(exc, Exception):
+        raise exc
+    if isinstance(exc, InvoiceAgentsError):
+        contract_is_valid = (
+            type(exc.category) is ErrorCategory
+            and type(exc.stop_reason) is str
+            and _OPERATIONAL_CODE.fullmatch(exc.stop_reason) is not None
+            and type(exc.message) is str
+        )
+        if contract_is_valid:
+            category = exc.category
+            stop_reason = exc.stop_reason
+            message = _safe_operational_message(exc.message)
+            unexpected = False
+        else:
+            category = ErrorCategory.ORCHESTRATION
+            stop_reason = "OPERATIONAL_ERROR_CONTRACT_INVALID"
+            message = _safe_operational_message(
+                "application error violated the operational error contract"
+            )
+            unexpected = True
+    elif isinstance(exc, sqlite3.Error):
+        category = ErrorCategory.DATABASE
+        stop_reason = "DATABASE_OPERATION_FAILED"
+        message = _safe_operational_message(str(exc))
+        unexpected = False
+    elif isinstance(exc, OSError):
+        category = ErrorCategory.SOURCE
+        stop_reason = "FILESYSTEM_OPERATION_FAILED"
+        message = _safe_operational_message(str(exc))
+        unexpected = False
+    else:
+        category = ErrorCategory.ORCHESTRATION
+        stop_reason = "UNEXPECTED_ERROR"
+        message = _safe_operational_message("unexpected application error")
+        unexpected = True
+
+    error_console.print(
+        f"category={category.value} stop_reason={stop_reason} message={message}",
+        style="red",
+        markup=False,
+        soft_wrap=True,
+    )
+    if unexpected and _CLI_DEBUG.get():
+        error_console.print(
+            f"debug_exception_type={_safe_debug_name(type(exc).__name__)}",
+            markup=False,
+            soft_wrap=True,
+        )
+        error_console.print(
+            f"debug_exception_message={_safe_operational_message(str(exc))}",
+            markup=False,
+            soft_wrap=True,
+        )
+        error_console.print(
+            f"debug_stack={_debug_stack(exc)}",
+            markup=False,
+            soft_wrap=True,
+        )
+    raise typer.Exit(1) from None
+
+
+class _OperationalBoundaryGroup(TyperGroup):
+    """Apply one exception boundary to the callback and every mounted command."""
+
+    def invoke(self, ctx: Any) -> Any:
+        debug_token = _CLI_DEBUG.set(bool(ctx.params.get("debug", False)))
+        try:
+            try:
+                return super().invoke(ctx)
+            except (typer.Exit, ClickException):
+                raise
+            except Exception as exc:
+                _print_operational_error(exc)
+        finally:
+            _CLI_DEBUG.reset(debug_token)
+
+
 console = Console()
+error_console = Console(stderr=True)
 app = typer.Typer(
+    cls=_OperationalBoundaryGroup,
     no_args_is_help=True,
     invoke_without_command=True,
     help="Auditable AutoGen/Grok invoice processing.",
@@ -123,11 +257,20 @@ def root_callback(
             "--invoice_path", "--invoice-path", help="README-compatible single source path"
         ),
     ] = None,
+    debug: Annotated[
+        bool,
+        typer.Option(
+            "--debug",
+            help="Print bounded exception type and stack-frame names for unexpected errors",
+        ),
+    ] = False,
 ) -> None:
     """Support ``python main.py --invoice_path=...`` as well as named commands."""
 
+    del debug
     if ctx.invoked_subcommand is None and invoice_path is not None:
-        result = asyncio.run(process_invoice(invoice_path, _settings()))
+        source = _supported_invoice_path(invoice_path)
+        result = asyncio.run(process_invoice(source, _settings()))
         _print_result(result)
         _exit_for(result)
 
@@ -139,15 +282,49 @@ def process_command(
 ) -> None:
     """Process one invoice through a fresh AutoGen Swarm."""
 
+    source = _supported_invoice_path(invoice_path)
     result = asyncio.run(
         process_invoice(
-            invoice_path,
+            source,
             _settings(),
             force_reprocess=force_reprocess,
         )
     )
     _print_result(result)
     _exit_for(result)
+
+
+def _supported_invoice_path(path: Path) -> Path:
+    if not path.is_file():
+        raise InvoiceAgentsError(
+            ErrorCategory.SOURCE,
+            "invoice source does not exist or is not a regular file",
+            stop_reason="SOURCE_NOT_FOUND",
+        )
+    return path
+
+
+def _supported_invoice_paths(directory: Path) -> list[Path]:
+    """Return sorted supported regular files or fail before workflow admission."""
+
+    if not directory.is_dir():
+        raise InvoiceAgentsError(
+            ErrorCategory.SOURCE,
+            "source directory is unavailable; pass --invoice-dir PATH",
+            stop_reason="SOURCE_DIRECTORY_MISSING",
+        )
+    paths = sorted(
+        path
+        for path in directory.iterdir()
+        if path.is_file() and path.suffix.lower() in SUPPORTED_INVOICE_SUFFIXES
+    )
+    if not paths:
+        raise InvoiceAgentsError(
+            ErrorCategory.SOURCE,
+            "source directory contains no supported invoice files",
+            stop_reason="SOURCE_DIRECTORY_EMPTY",
+        )
+    return paths
 
 
 @app.command("batch")
@@ -159,20 +336,15 @@ def batch_command(
 ) -> None:
     """Process all supported files with per-case status and bounded concurrency."""
 
-    if not invoice_dir.is_dir():
-        console.print(
-            "SOURCE_DIRECTORY_MISSING: source-repository demo corpus is unavailable; "
-            "pass --invoice-dir PATH",
-            style="red",
-        )
-        raise typer.Exit(1)
-    paths = sorted(
-        path
-        for path in invoice_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in {".txt", ".json", ".csv", ".xml", ".pdf"}
-    )
+    paths = _supported_invoice_paths(invoice_dir)
     settings = _settings()
     results = asyncio.run(_run_durable_cli_batch(paths, settings, concurrency))
+    if not results or len(results) != len(paths):
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "batch processing did not return exactly one result per admitted source",
+            stop_reason="BATCH_RESULT_CARDINALITY_INVALID",
+        )
     table = Table("Case", "Source", "Status", "Stop reason", "Decision", "Payment")
     for result in results:
         table.add_row(
@@ -240,12 +412,11 @@ def case_status(case_id: str) -> None:
 
     result = WorkflowStore(_settings().workflow_db).load_result(case_id)
     if result is None:
-        console.print(
-            _safe_cli_text(f"case {case_id} has no terminal result"),
-            style="yellow",
-            markup=False,
+        raise InvoiceAgentsError(
+            ErrorCategory.SOURCE,
+            "case has no terminal result",
+            stop_reason="CASE_NOT_FOUND",
         )
-        raise typer.Exit(1)
     console.print_json(_safe_json(result.model_dump(mode="json")))
 
 
@@ -273,6 +444,12 @@ def review_show(review_id: str) -> None:
     """Show the full review evidence package and exact questions."""
 
     review = WorkflowStore(_settings().workflow_db).load_review(review_id)
+    if review is None:
+        raise InvoiceAgentsError(
+            ErrorCategory.SOURCE,
+            "review does not exist",
+            stop_reason="REVIEW_NOT_FOUND",
+        )
     console.print_json(_safe_json(review.model_dump(mode="json")))
 
 
@@ -305,21 +482,17 @@ def review_decide(
     """Record an attributable decision; mappings use ``raw item=SKU``."""
 
     settings = _settings()
-    try:
-        review = record_human_decision(
-            review_id,
-            reviewer,
-            decision,
-            reason,
-            WorkflowStore(settings),
-            settings.inventory_db,
-            mappings=_parse_mapping(mapping or []),
-            superseded_case_id=superseded_case_id,
-            addressed_blocker_ids=address_blocker or [],
-        )
-    except InvoiceAgentsError as exc:
-        console.print(sanitize_text(str(exc)), style="red", markup=False)
-        raise typer.Exit(1) from exc
+    review = record_human_decision(
+        review_id,
+        reviewer,
+        decision,
+        reason,
+        WorkflowStore(settings),
+        settings.inventory_db,
+        mappings=_parse_mapping(mapping or []),
+        superseded_case_id=superseded_case_id,
+        addressed_blocker_ids=address_blocker or [],
+    )
     console.print(
         _safe_cli_text(
             f"review={review.review_id} status={review.status} decision_recorded={decision}"
@@ -332,18 +505,11 @@ def review_decide(
 def review_resume(case_id: str) -> None:
     """Resume a stopped team after a persisted human decision."""
 
-    try:
-        settings = _settings()
-        claim = claim_resumable_case(case_id, settings)
-        result = asyncio.run(resume_case(case_id, settings, claim=claim))
-    except InvoiceAgentsError as exc:
-        console.print(sanitize_text(str(exc)), style="red", markup=False)
-        raise typer.Exit(1) from exc
+    settings = _settings()
+    claim = claim_resumable_case(case_id, settings)
+    result = asyncio.run(resume_case(case_id, settings, claim=claim))
     _print_result(result)
     _exit_for(result)
-
-
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 @app.command("ui")
@@ -370,51 +536,51 @@ def ui_command(
     try:
         bind_host = normalize_ui_host(host)
     except ValueError as exc:
-        console.print(f"invalid UI bind host: {host!r}", style="red")
-        raise typer.Exit(1) from exc
+        raise InvoiceAgentsError(
+            ErrorCategory.CONFIGURATION,
+            "invalid UI bind host; use one exact bare host without a scheme or port",
+            stop_reason="UI_BIND_HOST_INVALID",
+        ) from exc
     is_loopback = is_ui_loopback_host(bind_host)
     if not is_loopback and not allow_remote:
-        console.print(
-            _safe_cli_text(
-                f"refusing to bind {bind_host}: the console has no authentication and is "
-                "localhost-only by design. Add auth before any remote exposure, or pass "
-                "--allow-remote-i-understand to accept the risk explicitly."
-            ),
-            style="red",
-            markup=False,
+        raise InvoiceAgentsError(
+            ErrorCategory.CONFIGURATION,
+            f"refusing to bind {bind_host}: the console has no authentication and is "
+            "localhost-only by design; pass --allow-remote-i-understand only after "
+            "explicitly accepting the risk",
+            stop_reason="UI_REMOTE_BIND_REQUIRES_ACKNOWLEDGEMENT",
         )
-        raise typer.Exit(1)
     try:
         settings = _settings()
     except ValidationError as exc:
         if any("ui_allowed_hosts" in error["loc"] for error in exc.errors()):
-            console.print(
+            raise InvoiceAgentsError(
+                ErrorCategory.CONFIGURATION,
                 "invalid UI allowed host configuration; use exact bare host names without "
                 "wildcards, ports, or schemes",
-                style="red",
-            )
-            raise typer.Exit(1) from exc
+                stop_reason="UI_ALLOWED_HOSTS_INVALID",
+            ) from exc
         if any("ui_session_secret" in error["loc"] for error in exc.errors()):
-            console.print(
+            raise InvoiceAgentsError(
+                ErrorCategory.CONFIGURATION,
                 "invalid INVOICE_UI_SESSION_SECRET; configure at least 32 random bytes",
-                style="red",
-            )
-            raise typer.Exit(1) from exc
+                stop_reason="UI_SESSION_SECRET_INVALID",
+            ) from exc
         raise
     if not is_loopback and not settings.ui_allowed_hosts:
-        console.print(
+        raise InvoiceAgentsError(
+            ErrorCategory.CONFIGURATION,
             "remote binding also requires an explicit INVOICE_UI_ALLOWED_HOSTS JSON list "
             "of exact browser host names",
-            style="red",
+            stop_reason="UI_ALLOWED_HOSTS_REQUIRED",
         )
-        raise typer.Exit(1)
     if not is_loopback and settings.ui_session_secret is None:
-        console.print(
+        raise InvoiceAgentsError(
+            ErrorCategory.CONFIGURATION,
             "remote binding requires INVOICE_UI_SESSION_SECRET so every worker and restart "
             "uses the same explicit random session key",
-            style="red",
+            stop_reason="UI_SESSION_SECRET_REQUIRED",
         )
-        raise typer.Exit(1)
     configured_hosts = (bind_host,) if is_loopback else settings.ui_allowed_hosts
     configured_origins = tuple(
         serialize_ui_origin("http", allowed_host, port) for allowed_host in configured_hosts
@@ -424,25 +590,13 @@ def ui_command(
 
         from invoice_agents.ui.server import create_app
     except ImportError as exc:
-        console.print(
-            sanitize_text(
-                f"the web console requires the 'ui' extra ({exc}); "
-                "install it with: uv sync --extra ui"
-            ),
-            style="red",
-            markup=False,
-        )
-        raise typer.Exit(1) from exc
+        raise InvoiceAgentsError(
+            ErrorCategory.CONFIGURATION,
+            f"the web console requires the ui extra ({exc}); install it with uv sync --extra ui",
+            stop_reason="UI_DEPENDENCY_MISSING",
+        ) from exc
     if init_db:
-        try:
-            applied = ensure_databases(settings)
-        except InvoiceAgentsError as exc:
-            console.print(
-                sanitize_text(f"database setup failed [{exc.stop_reason}]: {exc.message}"),
-                style="red",
-                markup=False,
-            )
-            raise typer.Exit(1) from exc
+        applied = ensure_databases(settings)
         for kind, versions in applied.items():
             state = f"applied migrations {versions}" if versions else "already migrated"
             console.print(
@@ -477,6 +631,12 @@ def contract_command(
         console.print("live contracts NOT RUN; pass --live to call xAI", style="yellow")
         raise typer.Exit(2)
     checks = asyncio.run(run_live_contracts(_settings()))
+    if not checks:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "live contract execution returned no compatibility evidence",
+            stop_reason="CONTRACT_EVIDENCE_MISSING",
+        )
     table = Table("Contract", "Result", "Evidence")
     for check in checks:
         table.add_row(

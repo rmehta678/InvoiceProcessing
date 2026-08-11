@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import re
+import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
@@ -23,6 +26,8 @@ def test_ui_refuses_non_loopback_host_without_flag() -> None:
         monkeypatch.setattr("uvicorn.run", forbidden_run)
         result = runner.invoke(app, ["ui", "--host", "0.0.0.0"])
     assert result.exit_code == 1
+    assert "category=CONFIGURATION" in result.output
+    assert "stop_reason=UI_REMOTE_BIND_REQUIRES_ACKNOWLEDGEMENT" in result.output
     assert "allow-remote-i-understand" in result.output
     assert "no authentication" in result.output
     assert server_calls == 0
@@ -187,3 +192,52 @@ def test_ui_no_init_db_skips_database_setup(
     assert result.exit_code == 0
     assert not (tmp_path / "inventory.db").exists()
     assert not (tmp_path / "workflow.db").exists()
+
+
+def test_ui_database_setup_failure_uses_the_shared_sanitized_cli_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "sk-proj-ui-database-secret"
+    raw_path = str((tmp_path / "private-customer-workflow.db").resolve())
+    monkeypatch.setattr(
+        "invoice_agents.cli._settings",
+        lambda: SimpleNamespace(workflow_db=tmp_path / "workflow.db"),
+    )
+
+    def fail_setup(_settings: object) -> None:
+        raise sqlite3.OperationalError(f"api_key={secret} at {raw_path}")
+
+    monkeypatch.setattr("invoice_agents.cli.ensure_databases", fail_setup)
+
+    result = runner.invoke(app, ["ui"])
+
+    assert result.exit_code == 1
+    lines = result.output.splitlines()
+    assert len(lines) == 1, result.output
+    line = lines[0]
+    match = re.fullmatch(
+        r"category=([A-Z_]+) stop_reason=([A-Z0-9_]+) message=(.+)",
+        line,
+    )
+    assert match is not None, result.output
+    category, stop_reason, message = match.groups()
+    assert category == "DATABASE"
+    assert stop_reason == "DATABASE_OPERATION_FAILED"
+    assert re.search(r"\b[A-Za-z_][A-Za-z0-9_-]*=", message) is None, result.output
+    for forbidden_field in (
+        "debug=",
+        "debug_stack=",
+        "exception=",
+        "exception_type=",
+        "stack=",
+        "traceback=",
+        "details=",
+        "source=",
+        "source_path=",
+        "path=",
+    ):
+        assert forbidden_field not in line, result.output
+    assert "[REDACTED]" in line
+    assert secret not in result.output
+    assert raw_path not in result.output
+    assert "Traceback (most recent call last)" not in result.output

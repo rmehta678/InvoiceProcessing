@@ -1,9 +1,11 @@
 """CLI for explicit inventory and workflow database lifecycle operations."""
 
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated
 
+import click
 import typer
 from pydantic import ValidationError
 
@@ -18,8 +20,10 @@ from invoice_agents.db.core import (
     verify_database,
 )
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
+from invoice_agents.observability.audit import sanitize_text
 
 app = typer.Typer(no_args_is_help=True, help="Explicit SQLite setup and verification.")
+_DATABASE_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 
 
 def _database_operation_settings(
@@ -61,14 +65,40 @@ def _run_database_operation[OperationResult](
     try:
         return operation()
     except InvoiceAgentsError as exc:
-        error_code = exc.stop_reason or "DATABASE_OPERATION_FAILED"
+        if _is_mounted_application_command():
+            raise
+        error_code = (
+            exc.stop_reason
+            if type(exc.stop_reason) is str
+            and _DATABASE_ERROR_CODE.fullmatch(exc.stop_reason) is not None
+            else "DATABASE_ERROR_CONTRACT_INVALID"
+        )
     except Exception:
+        if _is_mounted_application_command():
+            raise
         error_code = "DATABASE_OPERATION_FAILED"
+    safe_error_code = sanitize_text(error_code)
+    if (
+        safe_error_code != error_code
+        or _DATABASE_ERROR_CODE.fullmatch(safe_error_code) is None
+    ):
+        safe_error_code = "DATABASE_ERROR_CONTRACT_INVALID"
     typer.echo(
-        f"database_operation={operation_name} status=FAILED error_code={error_code}",
+        f"database_operation={operation_name} status=FAILED error_code={safe_error_code}",
         err=True,
     )
     raise typer.Exit(1) from None
+
+
+def _is_mounted_application_command() -> bool:
+    """Return whether the database app is nested below another command group."""
+
+    context = click.get_current_context(silent=True)
+    return (
+        context is not None
+        and context.parent is not None
+        and context.parent.parent is not None
+    )
 
 
 @app.command("migrate")
