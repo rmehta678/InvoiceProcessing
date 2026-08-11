@@ -298,6 +298,32 @@ def _send(
     _send_wire_message(connection, message)
 
 
+def _send_render(
+    connection: Connection,
+    *,
+    page: int,
+    png_bytes: bytes,
+    max_bytes: int,
+) -> None:
+    """Send one rendered image as bounded binary data, never as a filesystem path."""
+
+    digest = hashlib.sha256(png_bytes).hexdigest()
+    metadata = _metadata_bytes(
+        {
+            "ok": True,
+            "result": {
+                "page": page,
+                "sha256": digest,
+                "renderer": "PyMuPDF",
+            },
+        }
+    )
+    message = _WireMessage(metadata=metadata, text=bytearray(png_bytes))
+    if message.payload_bytes > max_bytes or len(png_bytes) > REVIEW_PAGE_HARD_MAX_BYTES:
+        raise _ResultTooLarge
+    _send_wire_message(connection, message)
+
+
 def _send_wire_message(connection: Connection, message: _WireMessage) -> None:
     """Write one already-bounded wire message without concatenating its buffers."""
 
@@ -344,7 +370,6 @@ def _worker_main(
     source_payload: dict[str, object],
     pdf_policy_payload: dict[str, object],
     page: int | None,
-    render_target: str | None,
 ) -> None:
     """Run one PDF operation and reduce unexpected failures to a generic envelope."""
 
@@ -426,8 +451,8 @@ def _worker_main(
                 )
             return
 
-        if page is None or render_target is None:
-            raise ValueError("render operation requires a page and target")
+        if page is None:
+            raise ValueError("render operation requires a page")
         import fitz
 
         document = fitz.open(stream=source_bytes, filetype="pdf")
@@ -454,22 +479,14 @@ def _worker_main(
                 )
                 return
             pixmap = document[page - 1].get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-            pixmap.save(render_target)
+            png_bytes = pixmap.tobytes("png")
         finally:
             document.close()
-        rendered = Path(render_target)
-        digest = hashlib.sha256(rendered.read_bytes()).hexdigest()
-        _send(
+        _send_render(
             connection,
-            {
-                "ok": True,
-                "result": {
-                    "page": page,
-                    "sha256": digest,
-                    "renderer": "PyMuPDF",
-                },
-            },
-            policy.pdf_worker_result_max_bytes,
+            page=page,
+            png_bytes=png_bytes,
+            max_bytes=policy.pdf_worker_result_max_bytes,
         )
     except SourceEvidenceError as error:
         if policy is not None:
@@ -740,20 +757,23 @@ def _decode_worker_message(
                 "page_count": page_count,
             }
         elif operation == "render":
-            if len(text_payload) != 0:
-                raise ValueError("render result included text")
             if set(result) != {"page", "sha256", "renderer"}:
                 raise ValueError("invalid render metadata")
             digest = result["sha256"]
             if (
-                not _is_int(result["page"])
+                len(text_payload) < 8
+                or len(text_payload) > REVIEW_PAGE_HARD_MAX_BYTES
+                or bytes(text_payload[:8]) != b"\x89PNG\r\n\x1a\n"
+                or not _is_int(result["page"])
                 or result["page"] != expected_page
                 or not isinstance(digest, str)
                 or len(digest) != 64
                 or any(character not in "0123456789abcdef" for character in digest)
                 or result["renderer"] != "PyMuPDF"
+                or hashlib.sha256(text_payload).hexdigest() != digest
             ):
                 raise ValueError("invalid render result")
+            result = {**result, "png_bytes": bytes(text_payload)}
         else:
             raise ValueError("unknown worker operation")
         check_deadline()
@@ -774,7 +794,6 @@ def _run_worker(
     pdf_policy: PdfPolicy,
     *,
     page: int | None = None,
-    render_target: Path | None = None,
 ) -> dict[str, object]:
     if source.source_format != "pdf":
         raise SourceEvidenceError(
@@ -793,7 +812,6 @@ def _run_worker(
             cast(dict[str, object], source.model_dump(mode="json")),
             cast(dict[str, object], pdf_policy.model_dump()),
             page,
-            str(render_target) if render_target is not None else None,
         ),
         name=f"invoice-pdf-{operation}",
     )
@@ -926,9 +944,65 @@ def _open_render_parent(
         raise
 
 
+def _preferred_render_failure(
+    primary: BaseException | None,
+    cleanup_failures: list[BaseException],
+) -> BaseException | None:
+    if primary is not None and not isinstance(primary, Exception):
+        return primary
+    for failure in cleanup_failures:
+        if not isinstance(failure, Exception):
+            return failure
+    return primary if primary is not None else next(iter(cleanup_failures), None)
+
+
+def _close_render_descriptors_once(descriptors: list[int]) -> list[BaseException]:
+    failures: list[BaseException] = []
+    while descriptors:
+        descriptor = descriptors.pop()
+        try:
+            os.close(descriptor)
+        except BaseException as exc:
+            failures.append(exc)
+    return failures
+
+
+def _cleanup_render_names_once(
+    parent_descriptor: int,
+    owned_names: list[str],
+    candidate_identity: tuple[int, int, int, int] | None,
+) -> list[BaseException]:
+    failures: list[BaseException] = []
+    while owned_names:
+        name = owned_names.pop()
+        try:
+            observed = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if (
+                candidate_identity is not None
+                and _render_identity(observed)[:3] == candidate_identity[:3]
+            ):
+                os.unlink(name, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            continue
+        except BaseException as exc:
+            failures.append(exc)
+    return failures
+
+
+def _write_all_to_descriptor(descriptor: int, content: bytes) -> None:
+    view = memoryview(content)
+    written = 0
+    while written < len(view):
+        count = os.write(descriptor, view[written:])
+        if count < 1:
+            raise ValueError("render candidate write did not make progress")
+        written += count
+
+
 def _publish_verified_render(
     target: Path,
     temporary_name: str,
+    png_bytes: bytes,
     child_digest: str,
     *,
     max_bytes: int,
@@ -940,32 +1014,40 @@ def _publish_verified_render(
     parent_descriptor = descriptors[-1]
     artifact_descriptor: int | None = None
     candidate_identity: tuple[int, int, int, int] | None = None
+    owned_names: list[str] = []
+    primary: BaseException | None = None
     try:
-        namespace = os.stat(
-            temporary_name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
         if (
-            not stat.S_ISREG(namespace.st_mode)
-            or namespace.st_nlink != 1
-            or not 0 < namespace.st_size <= min(max_bytes, REVIEW_PAGE_HARD_MAX_BYTES)
+            not isinstance(png_bytes, bytes)
+            or not png_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+            or not 0 < len(png_bytes) <= min(max_bytes, REVIEW_PAGE_HARD_MAX_BYTES)
+            or hashlib.sha256(png_bytes).hexdigest() != child_digest
         ):
-            raise ValueError("render candidate namespace is invalid")
-        file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+            raise ValueError("render worker bytes are invalid")
+        _validate_render_parent_relationships(relationships)
+        for name in (target.name, temporary_name):
+            try:
+                os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise ValueError("render publication namespace is not empty")
+        file_flags = (
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        )
         artifact_descriptor = os.open(
             temporary_name,
             file_flags,
+            0o600,
             dir_fd=parent_descriptor,
         )
+        owned_names.append(temporary_name)
         opened = os.fstat(artifact_descriptor)
         candidate_identity = _render_identity(opened)
-        if (
-            candidate_identity != _render_identity(namespace)
-            or candidate_identity[2] != stat.S_IFREG
-            or opened.st_nlink != 1
-        ):
-            raise ValueError("opened render candidate is invalid")
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or opened.st_size != 0:
+            raise ValueError("new render candidate descriptor is invalid")
+        _write_all_to_descriptor(artifact_descriptor, png_bytes)
+        os.fsync(artifact_descriptor)
+        os.lseek(artifact_descriptor, 0, os.SEEK_SET)
         digest = hashlib.sha256()
         observed_size = 0
         while True:
@@ -973,32 +1055,28 @@ def _publish_verified_render(
             if not chunk:
                 break
             observed_size += len(chunk)
-            if observed_size > candidate_identity[3]:
+            if observed_size > len(png_bytes):
                 raise ValueError("render candidate exceeded its exact size")
             digest.update(chunk)
         final_opened = os.fstat(artifact_descriptor)
+        candidate_identity = _render_identity(final_opened)
         final_namespace = os.stat(
             temporary_name,
             dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
         if (
-            observed_size != candidate_identity[3]
+            observed_size != len(png_bytes)
+            or candidate_identity[2] != stat.S_IFREG
+            or candidate_identity[3] != len(png_bytes)
             or digest.hexdigest() != child_digest
-            or _render_identity(final_opened) != candidate_identity
             or _render_identity(final_namespace) != candidate_identity
             or final_opened.st_nlink != 1
             or final_namespace.st_nlink != 1
         ):
             raise ValueError("render candidate changed during verification")
-        os.fsync(artifact_descriptor)
         _validate_render_parent_relationships(relationships)
-        try:
-            os.stat(target.name, dir_fd=parent_descriptor, follow_symlinks=False)
-        except FileNotFoundError:
-            pass
-        else:
-            raise ValueError("render publication target already exists")
+        owned_names.append(target.name)
         os.link(
             temporary_name,
             target.name,
@@ -1022,6 +1100,7 @@ def _publish_verified_render(
             or linked_opened.st_nlink != 2
         ):
             raise ValueError("render publication did not bind the verified candidate")
+        owned_names.remove(temporary_name)
         os.unlink(temporary_name, dir_fd=parent_descriptor)
         final_namespace = os.stat(
             target.name,
@@ -1038,24 +1117,58 @@ def _publish_verified_render(
             raise ValueError("render publication final binding is invalid")
         _validate_render_parent_relationships(relationships)
         os.fsync(parent_descriptor)
-        return candidate_identity
-    except BaseException:
-        if candidate_identity is not None:
-            for name in (target.name, temporary_name):
-                with contextlib.suppress(BaseException):
-                    observed = os.stat(
-                        name,
-                        dir_fd=parent_descriptor,
-                        follow_symlinks=False,
-                    )
-                    if _render_identity(observed) == candidate_identity:
-                        os.unlink(name, dir_fd=parent_descriptor)
-        raise
-    finally:
-        if artifact_descriptor is not None:
-            os.close(artifact_descriptor)
-        for descriptor in reversed(descriptors):
-            os.close(descriptor)
+    except BaseException as exc:
+        primary = exc
+
+    cleanup_failures: list[BaseException] = []
+    if primary is not None:
+        cleanup_failures.extend(
+            _cleanup_render_names_once(
+                parent_descriptor,
+                owned_names,
+                candidate_identity,
+            )
+        )
+    artifact_descriptors = [artifact_descriptor] if artifact_descriptor is not None else []
+    cleanup_failures.extend(_close_render_descriptors_once(artifact_descriptors))
+    if primary is not None:
+        cleanup_failures.extend(_close_render_descriptors_once(descriptors))
+    else:
+        parent_owner = descriptors.pop()
+        cleanup_failures.extend(_close_render_descriptors_once(descriptors))
+        if cleanup_failures:
+            cleanup_failures.extend(
+                _cleanup_render_names_once(
+                    parent_owner,
+                    owned_names,
+                    candidate_identity,
+                )
+            )
+        parent_failures = _close_render_descriptors_once([parent_owner])
+        if parent_failures and not cleanup_failures:
+            cleanup_failures.extend(
+                _cleanup_render_names_once(
+                    parent_owner,
+                    owned_names,
+                    candidate_identity,
+                )
+            )
+        cleanup_failures.extend(parent_failures)
+    if primary is None and cleanup_failures and owned_names:
+        cleanup_failures.extend(
+            _cleanup_render_names_once(
+                parent_descriptor,
+                owned_names,
+                candidate_identity,
+            )
+        )
+    selected = _preferred_render_failure(primary, cleanup_failures)
+    if selected is not None:
+        raise selected
+    if candidate_identity is None:
+        raise ValueError("render publication identity is missing")
+    owned_names.clear()
+    return candidate_identity
 
 
 def render_pdf_page_in_worker(
@@ -1068,7 +1181,9 @@ def render_pdf_page_in_worker(
 
     resolved = Path(os.path.abspath(target))
     temporary = resolved.with_name(f".pdf-render-{uuid4().hex}.png")
-    publication_descriptors: list[int] | None = None
+    publication_descriptors: list[int] = []
+    primary: BaseException | None = None
+    response: dict[str, object] | None = None
     try:
         resolved.parent.mkdir(parents=True, exist_ok=True)
         publication_descriptors, relationships = _open_render_parent(resolved)
@@ -1077,22 +1192,23 @@ def render_pdf_page_in_worker(
             source,
             pdf_policy,
             page=page,
-            render_target=temporary,
         )
         digest = result["sha256"]
-        if not isinstance(digest, str):
-            raise ValueError("render worker digest is invalid")
+        png_bytes = result.get("png_bytes")
+        if not isinstance(digest, str) or not isinstance(png_bytes, bytes):
+            raise ValueError("render worker result is invalid")
         owned_descriptors = publication_descriptors
-        publication_descriptors = None
+        publication_descriptors = []
         identity = _publish_verified_render(
             resolved,
             temporary.name,
+            png_bytes,
             digest,
             max_bytes=pdf_policy.pdf_worker_result_max_bytes,
             descriptors=owned_descriptors,
             relationships=relationships,
         )
-        return {
+        response = {
             "path": str(resolved),
             "page": result["page"],
             "sha256": digest,
@@ -1102,18 +1218,25 @@ def render_pdf_page_in_worker(
             "file_type": identity[2],
             "size_bytes": identity[3],
         }
-    except SourceEvidenceError:
-        raise
-    except Exception:
+    except BaseException as exc:
+        primary = exc
+
+    cleanup_failures = _close_render_descriptors_once(publication_descriptors)
+    selected = _preferred_render_failure(primary, cleanup_failures)
+    if selected is not None:
+        if isinstance(selected, SourceEvidenceError):
+            raise selected
+        if not isinstance(selected, Exception):
+            raise selected
         raise SourceEvidenceError(
             ErrorCategory.SOURCE,
             "rendered review page publication failed validation",
             stop_reason="REVIEW_PAGE_PUBLICATION_INVALID",
         ) from None
-    finally:
-        if publication_descriptors:
-            with contextlib.suppress(OSError):
-                os.unlink(temporary.name, dir_fd=publication_descriptors[-1])
-            for descriptor in reversed(publication_descriptors):
-                with contextlib.suppress(OSError):
-                    os.close(descriptor)
+    if response is None:
+        raise SourceEvidenceError(
+            ErrorCategory.SOURCE,
+            "rendered review page publication failed validation",
+            stop_reason="REVIEW_PAGE_PUBLICATION_INVALID",
+        )
+    return response

@@ -134,7 +134,6 @@ def test_child_wire_policy_applies_exact_resource_and_result_limits(
             source.model_dump(mode="json"),
             active_pdf_policy.model_dump(),
             None,
-            None,
         )
         encoded = _receive_bounded_message(
             parent,
@@ -175,7 +174,6 @@ def test_parent_worker_request_contains_only_the_exact_active_pdf_policy(
         source_payload: object,
         policy_payload: object,
         page: object,
-        render_target: object,
     ) -> None:
         captured.update(
             {
@@ -183,7 +181,6 @@ def test_parent_worker_request_contains_only_the_exact_active_pdf_policy(
                 "source": source_payload,
                 "policy": policy_payload,
                 "page": page,
-                "render_target": render_target,
             }
         )
         assert isinstance(policy_payload, dict)
@@ -227,7 +224,6 @@ def test_parent_worker_request_contains_only_the_exact_active_pdf_policy(
         "source": source.model_dump(mode="json"),
         "policy": active_pdf_policy.model_dump(),
         "page": None,
-        "render_target": None,
     }
 
 

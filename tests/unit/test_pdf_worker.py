@@ -10,6 +10,7 @@ import stat
 import struct
 import time
 import tracemalloc
+from collections import Counter
 from datetime import UTC, datetime
 from importlib import import_module
 from multiprocessing.connection import Connection
@@ -745,7 +746,7 @@ def test_pdf_worker_renders_page_to_real_png(tmp_path: Path) -> None:
     assert not [path for path in tmp_path.iterdir() if path.name.startswith(".pdf-render-")]
 
 
-def test_pdf_parent_rejects_candidate_mutated_after_child_digest_before_binding(
+def test_pdf_parent_rejects_worker_bytes_that_do_not_match_child_digest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -757,23 +758,24 @@ def test_pdf_parent_rejects_candidate_mutated_after_child_digest_before_binding(
     forged_bytes = b"\x89PNG\r\n\x1a\nforged-after-child-digest"
     worker_module = pdf_worker()
 
-    def mutate_after_child_digest(
+    def return_mismatched_worker_bytes(
         operation: str,
         _source: SourceArtifact,
         _pdf_policy: object,
         *,
         page: int | None = None,
-        render_target: Path | None = None,
     ) -> dict[str, object]:
         assert operation == "render"
         assert page == 1
-        assert render_target is not None
-        render_target.write_bytes(child_bytes)
         child_digest = hashlib.sha256(child_bytes).hexdigest()
-        render_target.write_bytes(forged_bytes)
-        return {"page": page, "sha256": child_digest, "renderer": "PyMuPDF"}
+        return {
+            "page": page,
+            "sha256": child_digest,
+            "renderer": "PyMuPDF",
+            "png_bytes": forged_bytes,
+        }
 
-    monkeypatch.setattr(worker_module, "_run_worker", mutate_after_child_digest)
+    monkeypatch.setattr(worker_module, "_run_worker", return_mismatched_worker_bytes)
 
     with pytest.raises(SourceEvidenceError) as excinfo:
         worker_module.render_pdf_page_in_worker(
@@ -824,16 +826,14 @@ def test_pdf_parent_rejects_render_candidate_over_configured_byte_bound(
         _pdf_policy: object,
         *,
         page: int | None = None,
-        render_target: Path | None = None,
     ) -> dict[str, object]:
         assert operation == "render"
         assert page == 1
-        assert render_target is not None
-        render_target.write_bytes(oversized)
         return {
             "page": page,
             "sha256": hashlib.sha256(oversized).hexdigest(),
             "renderer": "PyMuPDF",
+            "png_bytes": oversized,
         }
 
     monkeypatch.setattr(worker_module, "_run_worker", render_oversized_candidate)
@@ -867,17 +867,18 @@ def test_pdf_parent_rejects_render_directory_swap_after_child_digest(
         _pdf_policy: object,
         *,
         page: int | None = None,
-        render_target: Path | None = None,
     ) -> dict[str, object]:
         assert operation == "render"
         assert page == 1
-        assert render_target is not None
-        render_target.write_bytes(child_bytes)
         digest = hashlib.sha256(child_bytes).hexdigest()
         review_dir.rename(displaced)
         review_dir.mkdir()
-        render_target.write_bytes(child_bytes)
-        return {"page": page, "sha256": digest, "renderer": "PyMuPDF"}
+        return {
+            "page": page,
+            "sha256": digest,
+            "renderer": "PyMuPDF",
+            "png_bytes": child_bytes,
+        }
 
     monkeypatch.setattr(worker_module, "_run_worker", swap_parent_after_child_digest)
 
@@ -892,6 +893,217 @@ def test_pdf_parent_rejects_render_directory_swap_after_child_digest(
     assert excinfo.value.stop_reason == "REVIEW_PAGE_PUBLICATION_INVALID"
     assert not target.exists()
     assert not (displaced / target.name).exists()
+
+
+def test_pdf_child_has_no_path_capability_when_parent_is_swapped_before_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = content_addressed_pdf(DATA_DIR / "invoice_1011.pdf", tmp_path / "sources", 1)
+    review_dir = tmp_path / "artifacts" / "reviews" / "rev_prewrite_parent_swap"
+    target = review_dir / "rendered.png"
+    displaced = review_dir.with_name("displaced-prewrite-review")
+    worker_module = pdf_worker()
+    child_bytes = b"\x89PNG\r\n\x1a\ncapability-owned-render"
+
+    def swap_before_child_write(
+        operation: str,
+        _source: SourceArtifact,
+        _pdf_policy: object,
+        *,
+        page: int | None = None,
+        **legacy_path_capability: object,
+    ) -> dict[str, object]:
+        assert operation == "render"
+        assert page == 1
+        review_dir.rename(displaced)
+        review_dir.mkdir()
+        render_target = legacy_path_capability.get("render_target")
+        if render_target is not None:
+            Path(str(render_target)).write_bytes(child_bytes)
+        return {
+            "page": page,
+            "sha256": hashlib.sha256(child_bytes).hexdigest(),
+            "renderer": "PyMuPDF",
+            "png_bytes": child_bytes,
+        }
+
+    monkeypatch.setattr(worker_module, "_run_worker", swap_before_child_write)
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        worker_module.render_pdf_page_in_worker(
+            source,
+            page=1,
+            target=target,
+            pdf_policy=pdf_policy(),
+        )
+
+    assert excinfo.value.stop_reason == "REVIEW_PAGE_PUBLICATION_INVALID"
+    for directory in (review_dir, displaced):
+        assert not (directory / target.name).exists()
+        assert not list(directory.glob(".pdf-render-*"))
+
+
+def test_render_cleanup_preserves_primary_control_and_attempts_every_owned_resource_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = content_addressed_pdf(DATA_DIR / "invoice_1011.pdf", tmp_path / "sources", 1)
+    target = tmp_path / "reviews" / "rev_cleanup" / "rendered.png"
+    worker_module = pdf_worker()
+    child_bytes = b"\x89PNG\r\n\x1a\ncleanup-owned-render"
+    opened: list[int] = []
+    close_attempts: list[int] = []
+    unlink_attempts: list[str] = []
+    installed_open = os.open
+    installed_close = os.close
+    installed_unlink = os.unlink
+    injected = KeyboardInterrupt("render publication interrupted after candidate creation")
+
+    def render_bytes(
+        operation: str,
+        _source: SourceArtifact,
+        _pdf_policy: object,
+        *,
+        page: int | None = None,
+        **legacy_path_capability: object,
+    ) -> dict[str, object]:
+        assert operation == "render"
+        assert page == 1
+        render_target = legacy_path_capability.get("render_target")
+        if render_target is not None:
+            Path(str(render_target)).write_bytes(child_bytes)
+        return {
+            "page": page,
+            "sha256": hashlib.sha256(child_bytes).hexdigest(),
+            "renderer": "PyMuPDF",
+            "png_bytes": child_bytes,
+        }
+
+    def track_open(*args: object, **kwargs: object) -> int:
+        descriptor = installed_open(*args, **kwargs)  # type: ignore[arg-type]
+        opened.append(descriptor)
+        return descriptor
+
+    close_fault_injected = False
+
+    def fault_one_close(descriptor: int) -> None:
+        nonlocal close_fault_injected
+        if descriptor not in opened:
+            installed_close(descriptor)
+            return
+        close_attempts.append(descriptor)
+        installed_close(descriptor)
+        if not close_fault_injected:
+            close_fault_injected = True
+            raise OSError("injected owned descriptor close failure")
+
+    unlink_fault_injected = False
+
+    def fault_one_unlink(path: object, *args: object, **kwargs: object) -> None:
+        nonlocal unlink_fault_injected
+        name = os.fspath(path)
+        if isinstance(name, bytes):
+            name = os.fsdecode(name)
+        if not name.startswith(".pdf-render-"):
+            installed_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+            return
+        unlink_attempts.append(name)
+        installed_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+        if not unlink_fault_injected:
+            unlink_fault_injected = True
+            raise OSError("injected owned candidate unlink failure")
+
+    monkeypatch.setattr(worker_module, "_run_worker", render_bytes)
+    monkeypatch.setattr(worker_module.os, "open", track_open)
+    monkeypatch.setattr(worker_module.os, "close", fault_one_close)
+    monkeypatch.setattr(worker_module.os, "unlink", fault_one_unlink)
+
+    def interrupt_link(*_args: object, **_kwargs: object) -> None:
+        raise injected
+
+    monkeypatch.setattr(worker_module.os, "link", interrupt_link)
+
+    with pytest.raises(KeyboardInterrupt) as excinfo:
+        worker_module.render_pdf_page_in_worker(
+            source,
+            page=1,
+            target=target,
+            pdf_policy=pdf_policy(),
+        )
+
+    assert excinfo.value is injected
+    assert Counter(close_attempts) == Counter({descriptor: 1 for descriptor in opened})
+    assert len(unlink_attempts) == 1
+    assert not target.exists()
+    assert not list(target.parent.glob(".pdf-render-*"))
+
+
+@pytest.mark.parametrize("fault_ordinal", [0, 1], ids=["artifact", "directory"])
+def test_render_close_fault_rolls_back_published_name_and_closes_every_descriptor_once(
+    fault_ordinal: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = content_addressed_pdf(DATA_DIR / "invoice_1011.pdf", tmp_path / "sources", 1)
+    target = tmp_path / "reviews" / "rev_close_fault" / "rendered.png"
+    worker_module = pdf_worker()
+    png_bytes = b"\x89PNG\r\n\x1a\nclose-fault-render"
+    opened: list[int] = []
+    close_attempts: list[int] = []
+    installed_open = os.open
+    installed_close = os.close
+
+    def render_bytes(
+        operation: str,
+        _source: SourceArtifact,
+        _pdf_policy: object,
+        *,
+        page: int | None = None,
+    ) -> dict[str, object]:
+        assert operation == "render"
+        return {
+            "page": page,
+            "sha256": hashlib.sha256(png_bytes).hexdigest(),
+            "renderer": "PyMuPDF",
+            "png_bytes": png_bytes,
+        }
+
+    def track_open(*args: object, **kwargs: object) -> int:
+        descriptor = installed_open(*args, **kwargs)  # type: ignore[arg-type]
+        opened.append(descriptor)
+        return descriptor
+
+    tracked_close_ordinal = 0
+
+    def fault_selected_close(descriptor: int) -> None:
+        nonlocal tracked_close_ordinal
+        if descriptor not in opened:
+            installed_close(descriptor)
+            return
+        close_attempts.append(descriptor)
+        installed_close(descriptor)
+        current = tracked_close_ordinal
+        tracked_close_ordinal += 1
+        if current == fault_ordinal:
+            raise OSError(f"injected close failure {fault_ordinal}")
+
+    monkeypatch.setattr(worker_module, "_run_worker", render_bytes)
+    monkeypatch.setattr(worker_module.os, "open", track_open)
+    monkeypatch.setattr(worker_module.os, "close", fault_selected_close)
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        worker_module.render_pdf_page_in_worker(
+            source,
+            page=1,
+            target=target,
+            pdf_policy=pdf_policy(),
+        )
+
+    assert excinfo.value.stop_reason == "REVIEW_PAGE_PUBLICATION_INVALID"
+    assert Counter(close_attempts) == Counter({descriptor: 1 for descriptor in opened})
+    assert not target.exists()
+    assert not list(target.parent.glob(".pdf-render-*"))
 
 
 def test_pdf_child_renders_the_same_bytes_that_passed_verification(

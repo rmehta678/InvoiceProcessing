@@ -27,10 +27,57 @@ REVIEW_PAGE_FIELDS = frozenset(
         "size_bytes",
     }
 )
+LEGACY_REVIEW_PAGE_FIELDS = frozenset({"path", "page", "sha256", "renderer"})
 
 
 class ReviewPageEvidenceError(ValueError):
     """A review-page binding or its exact filesystem evidence is invalid."""
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyReviewPageBinding:
+    """Pre-c461 page metadata that is readable but cannot authorize new state."""
+
+    path: Path
+    page: int
+    sha256: str
+    renderer: str
+
+    @classmethod
+    def from_payload(
+        cls,
+        raw: object,
+        *,
+        review_id: str,
+        source_id: str,
+        expected_page: int,
+    ) -> LegacyReviewPageBinding:
+        if not isinstance(raw, Mapping) or set(raw) != LEGACY_REVIEW_PAGE_FIELDS:
+            raise ReviewPageEvidenceError("legacy review page binding has an invalid shape")
+        raw_path = raw.get("path")
+        raw_page = raw.get("page")
+        raw_sha256 = raw.get("sha256")
+        raw_renderer = raw.get("renderer")
+        if (
+            type(raw_path) is not str
+            or type(raw_page) is not int
+            or type(raw_sha256) is not str
+            or type(raw_renderer) is not str
+        ):
+            raise ReviewPageEvidenceError("legacy review page binding has invalid field types")
+        path = Path(raw_path)
+        if (
+            raw_page != expected_page
+            or not path.is_absolute()
+            or path.name != f"{source_id}-page-{expected_page}.png"
+            or path.parent.name != review_id
+            or path.parent.parent.name != "reviews"
+            or raw_renderer != "PyMuPDF"
+            or len(raw_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in raw_sha256)
+        ):
+            raise ReviewPageEvidenceError("legacy review page binding is not canonical")
+        return cls(path=path, page=raw_page, sha256=raw_sha256, renderer=raw_renderer)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +151,30 @@ class ReviewPageBinding:
             file_type=raw_file_type,
             size_bytes=raw_size,
         )
+
+
+def parse_review_page_binding(
+    raw: object,
+    *,
+    review_id: str,
+    source_id: str,
+    expected_page: int,
+) -> ReviewPageBinding | LegacyReviewPageBinding:
+    """Parse only the exact modern or pre-c461 persisted metadata contract."""
+
+    if isinstance(raw, Mapping) and set(raw) == REVIEW_PAGE_FIELDS:
+        return ReviewPageBinding.from_payload(
+            raw,
+            review_id=review_id,
+            source_id=source_id,
+            expected_page=expected_page,
+        )
+    return LegacyReviewPageBinding.from_payload(
+        raw,
+        review_id=review_id,
+        source_id=source_id,
+        expected_page=expected_page,
+    )
 
 
 def _identity(value: os.stat_result) -> tuple[int, int, int, int]:

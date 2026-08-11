@@ -27,7 +27,7 @@ from invoice_agents.models import (
     ToolStatus,
     critic_disagreement_reason,
 )
-from invoice_agents.review_artifact import ReviewPageBinding, ReviewPageEvidenceError
+from invoice_agents.review_artifact import ReviewPageEvidenceError, parse_review_page_binding
 
 SNAPSHOT_DIGEST_DOMAIN = b"galatiq.invoice-agents/evidence-snapshot\x00"
 SNAPSHOT_DIGEST_VERSION = 1
@@ -400,7 +400,7 @@ def validate_review_snapshot(review: ReviewRequest, snapshot: EvidenceSnapshot) 
         rendered_pages_valid = True
         for raw_page, page_number in zip(raw_pages, expected_page_numbers, strict=True):
             try:
-                ReviewPageBinding.from_payload(
+                parse_review_page_binding(
                     raw_page,
                     review_id=review.review_id,
                     source_id=invoice.source.source_id,

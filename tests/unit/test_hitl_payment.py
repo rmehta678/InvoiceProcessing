@@ -277,6 +277,39 @@ def persisted_decision_state(
     return aliases, decisions, tuple(row) if row is not None else None
 
 
+def persist_legacy_rendered_page_shape(
+    settings: Settings,
+    review_id: str,
+) -> ReviewRequest:
+    """Replace only modern rendered-page identity fields with the pre-c461 shape."""
+
+    with connect_database(settings.workflow_db) as connection:
+        row = connection.execute(
+            "SELECT status, payload_json FROM review_requests WHERE review_id = ?",
+            (review_id,),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(str(row["payload_json"]))
+        pages = payload["evidence_bundle"]["rendered_pages"]
+        assert pages
+        payload["evidence_bundle"]["rendered_pages"] = [
+            {key: page[key] for key in ("path", "page", "sha256", "renderer")} for page in pages
+        ]
+        resolved = row["status"] == "RESOLVED"
+        if resolved:
+            connection.execute("DROP TRIGGER trg_resolved_review_immutable_update")
+        connection.execute(
+            "UPDATE review_requests SET payload_json = ? WHERE review_id = ?",
+            (json.dumps(payload), review_id),
+        )
+        if resolved:
+            connection.execute(REQUIRED_WORKFLOW_TRIGGERS["trg_resolved_review_immutable_update"])
+        connection.commit()
+    stored = WorkflowStore(settings).load_review(review_id)
+    assert stored is not None
+    return stored
+
+
 def mapping(raw_item: str, sku: str = "SKU-WIDGET-A") -> CanonicalMapping:
     return CanonicalMapping(raw_item=raw_item, sku=sku, basis="human_decision")
 
@@ -306,6 +339,135 @@ def test_review_request_and_human_decision_are_persisted(
     assert resolved.human_decision is not None
     assert resolved.human_decision.reviewer == "vp@example.com"
     assert resolved.agent_recommendation is DecisionKind.HOLD
+
+
+def test_pending_legacy_rendered_pages_allow_reject_without_alias_or_payment(
+    invoice_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    review = pending_review(
+        invoice_dir / "invoice_1011.pdf",
+        "case_legacy_reject",
+        settings,
+    )
+    persist_legacy_rendered_page_shape(settings, review.review_id)
+
+    resolved = record_human_decision(
+        review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.REJECT,
+        "the legacy package is readable but does not authorize payment",
+        WorkflowStore(settings),
+        settings.inventory_db,
+    )
+
+    assert resolved.status == "RESOLVED"
+    assert resolved.human_decision is not None
+    assert resolved.human_decision.decision is HumanDecisionKind.REJECT
+    with connect_database(settings.inventory_db, read_only=True) as inventory:
+        assert inventory.execute("SELECT COUNT(*) FROM item_aliases").fetchone()[0] == 0
+    with connect_database(settings.workflow_db, read_only=True) as workflow:
+        assert workflow.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 0
+
+
+def test_pending_legacy_rendered_pages_reject_approve_without_mutation(
+    invoice_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    review = pending_review(
+        invoice_dir / "invoice_1011.pdf",
+        "case_legacy_approve",
+        settings,
+    )
+    legacy = persist_legacy_rendered_page_shape(settings, review.review_id)
+    before = persisted_decision_state(
+        settings.workflow_db,
+        settings.inventory_db,
+        review.review_id,
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        record_human_decision(
+            review.review_id,
+            "reviewer@example.com",
+            HumanDecisionKind.APPROVE,
+            "legacy path metadata cannot establish immutable bytes",
+            WorkflowStore(settings),
+            settings.inventory_db,
+            addressed_blocker_ids=[
+                str(item["blocker_id"]) for item in legacy.evidence_bundle["blocking_evidence"]
+            ],
+        )
+
+    assert excinfo.value.stop_reason == "EVIDENCE_SNAPSHOT_INVALID"
+    assert (
+        persisted_decision_state(
+            settings.workflow_db,
+            settings.inventory_db,
+            review.review_id,
+        )
+        == before
+    )
+
+
+def test_resolved_legacy_authorization_is_replay_readable_but_cannot_create_final(
+    invoice_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    store = WorkflowStore(settings)
+    invoice = load(invoice_dir, "invoice_1011.pdf", settings.source_archive_dir)
+    case_id = "case_resolved_legacy_authorization"
+    persist_case(store, case_id, invoice)
+    claim = record_payment_evidence(
+        store,
+        case_id,
+        invoice,
+        settings,
+        authorize_review=True,
+    )
+    review = store.load_case_review(case_id)
+    assert review is not None and review.human_decision is not None
+    legacy = persist_legacy_rendered_page_shape(settings, review.review_id)
+    before = persisted_decision_state(
+        settings.workflow_db,
+        settings.inventory_db,
+        review.review_id,
+    )
+
+    replayed = record_human_decision(
+        review.review_id,
+        review.human_decision.reviewer,
+        review.human_decision.decision,
+        review.human_decision.reason,
+        store,
+        settings.inventory_db,
+        addressed_blocker_ids=review.human_decision.addressed_blocker_ids,
+    )
+
+    assert replayed == legacy
+    assert (
+        persisted_decision_state(
+            settings.workflow_db,
+            settings.inventory_db,
+            review.review_id,
+        )
+        == before
+    )
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        approve_final(store, case_id, claim)
+    assert excinfo.value.stop_reason == "EVIDENCE_SNAPSHOT_INVALID"
+    with connect_database(settings.workflow_db, read_only=True) as workflow:
+        assert workflow.execute("SELECT COUNT(*) FROM final_decisions").fetchone()[0] == 0
+        assert workflow.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 0
 
 
 def test_authorizing_decision_rejects_mutated_rendered_page_without_state_mutation(

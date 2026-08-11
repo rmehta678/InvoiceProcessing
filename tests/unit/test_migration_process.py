@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import selectors
 import signal
 import sqlite3
 import subprocess
@@ -277,7 +278,7 @@ def _setpgrp_worker_command(
     return [sys.executable, "-c", worker_script]
 
 
-def _build_large_v2_workflow(path: Path) -> None:
+def _build_v2_workflow(path: Path) -> None:
     resources = core_module._migration_resources(DatabaseKind.WORKFLOW)
     with sqlite3.connect(path) as connection:
         connection.executescript(resources[0].read_text(encoding="utf-8"))
@@ -295,13 +296,13 @@ def _build_large_v2_workflow(path: Path) -> None:
             ("2026-08-09T12:00:00+00:00",),
         )
         connection.execute(
-            "WITH RECURSIVE sequence(value) AS ("
-            # Keep the real rollback journal observable without making the
-            # lock-ownership assertion depend on full-suite machine load.
-            "VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < 500000"
-            ") INSERT INTO cases(case_id, status, started_at, updated_at) "
-            "SELECT printf('case_%09d', value), 'INCOMPLETE', ?, ? FROM sequence",
-            ("2026-08-09T12:00:00+00:00", "2026-08-09T12:00:00+00:00"),
+            "INSERT INTO cases(case_id, status, started_at, updated_at) VALUES (?, ?, ?, ?)",
+            (
+                f"case_{'a' * 32}",
+                "INCOMPLETE",
+                "2026-08-09T12:00:00+00:00",
+                "2026-08-09T12:00:00+00:00",
+            ),
         )
         connection.commit()
 
@@ -332,6 +333,54 @@ finally:
     return completed.stdout.strip()
 
 
+def _migration_worker_with_lock_barrier(
+    ready_fifo: Path,
+    release_fifo: Path,
+) -> list[str]:
+    """Pause the real worker immediately after its first acquired SQLite write lock."""
+
+    script = f"""
+import contextlib
+from invoice_agents.db import core, migration_worker
+
+ready_fifo = {str(ready_fifo)!r}
+release_fifo = {str(release_fifo)!r}
+real_connect = core.connect_database
+barrier_used = False
+
+class BarrierConnection:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+    def execute(self, sql, parameters=()):
+        global barrier_used
+        cursor = self.connection.execute(sql, parameters)
+        if sql.strip().upper() == "BEGIN IMMEDIATE" and not barrier_used:
+            barrier_used = True
+            with open(ready_fifo, "wb", buffering=0) as ready:
+                ready.write(b"1")
+            with open(release_fifo, "rb", buffering=0) as release:
+                if release.read(1) != b"1":
+                    raise RuntimeError("migration lock barrier closed without release")
+        return cursor
+
+@contextlib.contextmanager
+def barrier_connect(path, *, read_only=False):
+    with real_connect(path, read_only=read_only) as connection:
+        if read_only:
+            yield connection
+        else:
+            yield BarrierConnection(connection)
+
+core.connect_database = barrier_connect
+migration_worker.main()
+"""
+    return [sys.executable, "-c", script]
+
+
 def test_public_migration_does_not_execute_migration_internals_in_caller_process(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -349,9 +398,22 @@ def test_public_migration_does_not_execute_migration_internals_in_caller_process
 
 def test_parent_descriptor_close_cannot_release_spawned_worker_transaction_lock(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = tmp_path / "process-owned-lock.db"
-    _build_large_v2_workflow(target)
+    _build_v2_workflow(target)
+    ready_fifo = tmp_path / "migration-lock-ready.fifo"
+    release_fifo = tmp_path / "migration-lock-release.fifo"
+    os.mkfifo(ready_fifo, 0o600)
+    os.mkfifo(release_fifo, 0o600)
+    fifo_flags = os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW
+    ready_descriptor = os.open(ready_fifo, fifo_flags)
+    release_descriptor = os.open(release_fifo, fifo_flags)
+    monkeypatch.setattr(
+        migration_process,
+        "_worker_command",
+        lambda: _migration_worker_with_lock_barrier(ready_fifo, release_fifo),
+    )
     applied: list[list[int]] = []
     failures: list[BaseException] = []
 
@@ -363,22 +425,34 @@ def test_parent_descriptor_close_cannot_release_spawned_worker_transaction_lock(
 
     migration_thread = threading.Thread(target=migrate, name="public-migration-caller")
     migration_thread.start()
-    deadline = time.monotonic() + 15
-    transaction_journal: Path | None = None
-    while time.monotonic() < deadline and migration_thread.is_alive():
-        journals = list(tmp_path.glob(".invoice-db-maintenance-*/source-*.db-journal"))
-        if journals:
-            transaction_journal = journals[0]
-            break
-        time.sleep(0.001)
-    assert transaction_journal is not None
-    assert migration_thread.is_alive()
-
-    unrelated_descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
-    os.close(unrelated_descriptor)
-    first_writer = _rival_create_table(target)
+    barrier_events: list[tuple[selectors.SelectorKey, int]] = []
+    barrier_receipt = b""
+    first_writer = ""
+    probe_failure: BaseException | None = None
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(ready_descriptor, selectors.EVENT_READ)
+            barrier_events = selector.select(15)
+        if barrier_events:
+            barrier_receipt = os.read(ready_descriptor, 1)
+            if barrier_receipt == b"1":
+                assert migration_thread.is_alive()
+                unrelated_descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+                os.close(unrelated_descriptor)
+                first_writer = _rival_create_table(target)
+    except BaseException as exc:
+        probe_failure = exc
+    finally:
+        release_bytes = os.write(release_descriptor, b"1")
+        os.close(ready_descriptor)
+        os.close(release_descriptor)
 
     migration_thread.join(timeout=20)
+    if probe_failure is not None:
+        raise probe_failure
+    assert barrier_events, "migration worker did not acquire its SQLite write lock"
+    assert barrier_receipt == b"1"
+    assert release_bytes == 1
     assert not migration_thread.is_alive()
     assert failures == []
     assert applied == [[3, 4, 5, 6, 7]]

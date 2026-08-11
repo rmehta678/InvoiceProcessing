@@ -944,8 +944,25 @@ def _validate_mapping_review_snapshots(
             inventory_schema=inventory_schema,
         )
         validate_review_snapshot(authorization.review, review_snapshot)
+        _validate_authorizing_review_page_evidence(authorization.review)
         if authorization.evidence_snapshot_digest != review_snapshot.digest:
             raise EvidenceSnapshotError("mapping review digest does not match review-time evidence")
+
+
+def _validate_authorizing_review_page_evidence(review: ReviewRequest) -> None:
+    """Require modern immutable page identity whenever review state grants authority."""
+
+    from invoice_agents.agents.decision_rules import AUTHORIZING_HUMAN_DECISIONS
+
+    human = review.human_decision
+    if human is None or human.decision not in AUTHORIZING_HUMAN_DECISIONS:
+        return
+    try:
+        validate_review_page_evidence(review)
+    except ReviewPageEvidenceError as exc:
+        raise EvidenceSnapshotError(
+            "authorizing review lacks exact rendered-page evidence"
+        ) from exc
 
 
 def validate_review_authorization_snapshot(
@@ -1016,6 +1033,7 @@ def validate_review_authorization_snapshot(
                 )
         except InvoiceAgentsError as exc:
             raise EvidenceSnapshotError(str(exc)) from exc
+    _validate_authorizing_review_page_evidence(review)
     return matches[0]
 
 
@@ -1056,6 +1074,7 @@ def load_authorization_evidence_snapshot(
         and review_authorization.review.review_id not in mapping_review_ids
     ):
         validate_review_snapshot(review_authorization.review, current)
+        _validate_authorizing_review_page_evidence(review_authorization.review)
         if review_authorization.evidence_snapshot_digest != current.digest:
             raise EvidenceSnapshotError("review digest does not match current evidence")
     _validate_mapping_successor(
