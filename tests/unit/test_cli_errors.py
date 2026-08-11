@@ -13,7 +13,7 @@ import pytest
 from click.testing import Result
 from typer.testing import CliRunner
 
-from invoice_agents import cli
+from invoice_agents import cli, compatibility
 from invoice_agents.db import cli as database_cli
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import CaseStatus
@@ -33,6 +33,22 @@ DEBUG_STACK_MAX_CHARACTERS = 512
 OPERATIONAL_MESSAGE_MAX_CHARACTERS = 512
 DEBUG_STACK_SEPARATOR = " -> "
 DEBUG_STACK_TRUNCATION_MARKER = "…[TRUNCATED]"
+SANITIZATION_FAILURE_LINE = (
+    "category=ORCHESTRATION stop_reason=SANITIZATION_FAILED "
+    "message=credential sanitization failed closed\n"
+)
+EXPECTED_LIVE_CONTRACT_NAMES = (
+    "authentication_basic_completion",
+    "typed_tool_and_structured_output",
+    "sequential_tool_iterations_parallel_disabled",
+    "swarm_handoff_and_agent_names",
+    "handoff_stop_save_load_human_resume",
+    "tool_exception_visibility",
+    "server_echoed_model_identity",
+    "live_invalid_key_rejection",
+    "telemetry_span_and_usage_capture",
+    "structured_output_rejection_live",
+)
 
 
 def _assert_concise_failure(
@@ -450,26 +466,38 @@ def test_invalid_application_error_contract_fails_closed_without_raw_fields(
     )
 
 
-@pytest.mark.parametrize(
-    "error",
-    [
-        InvoiceAgentsError(
-            ErrorCategory.PROVIDER,
-            "provider failed",
-            stop_reason="PROVIDER_FAILED",
-        ),
-        ValueError("unexpected failure"),
-    ],
-)
-def test_sanitizer_contract_failure_has_no_unsanitized_fallback(
+def test_root_sanitizer_failure_is_one_explicit_fail_closed_boundary(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    error: Exception,
 ) -> None:
-    failure = RuntimeError("sanitizer contract unavailable")
-    monkeypatch.setattr(cli, "sanitize_text", lambda _value: (_ for _ in ()).throw(failure))
+    source = tmp_path / "invoice.txt"
+    source.write_text("invoice", encoding="utf-8")
+    raw_original = f"raw provider body api_key={SECRET} at {RAW_PATH}"
+    sanitizer_failure = f"sanitizer crashed around api_key={SECRET}"
 
-    with pytest.raises(RuntimeError, match="sanitizer contract unavailable"):
-        cli._print_operational_error(error)
+    def fail_settings() -> NoReturn:
+        raise InvoiceAgentsError(
+            ErrorCategory.PROVIDER,
+            raw_original,
+            stop_reason="PROVIDER_REJECTED",
+        )
+
+    def fail_sanitizer(_value: str) -> NoReturn:
+        raise RuntimeError(sanitizer_failure)
+
+    monkeypatch.setattr(cli, "_settings", fail_settings)
+    monkeypatch.setattr(cli, "sanitize_text", fail_sanitizer)
+
+    result = runner.invoke(cli.app, ["process", "--invoice-path", str(source)])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == SANITIZATION_FAILURE_LINE
+    assert raw_original not in result.output
+    assert sanitizer_failure not in result.output
+    assert SECRET not in result.output
+    assert RAW_PATH not in result.output
+    assert "Traceback" not in result.output
 
 
 def test_batch_rejects_missing_downstream_results(
@@ -512,6 +540,115 @@ def test_live_contract_requires_nonempty_evidence(
         category=ErrorCategory.ORCHESTRATION,
         stop_reason="CONTRACT_EVIDENCE_MISSING",
     )
+
+
+def _complete_live_contract_checks() -> list[compatibility.ContractCheck]:
+    return [
+        compatibility.ContractCheck(
+            name=name,
+            passed=True,
+            evidence=f"evidence for {name}",
+        )
+        for name in EXPECTED_LIVE_CONTRACT_NAMES
+    ]
+
+
+@pytest.mark.parametrize(
+    "invalidity",
+    ["partial", "duplicate", "blank-evidence", "oversized-evidence", "wrong-shape", "wrong-bool"],
+)
+def test_live_contract_rejects_incomplete_or_malformed_evidence_before_rendering_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    invalidity: str,
+) -> None:
+    checks: list[object] = list(_complete_live_contract_checks())
+    if invalidity == "partial":
+        checks.pop()
+    elif invalidity == "duplicate":
+        checks[-1] = checks[0]
+    elif invalidity == "blank-evidence":
+        checks[0] = checks[0].model_copy(update={"evidence": " \n\t "})
+    elif invalidity == "oversized-evidence":
+        checks[0] = checks[0].model_copy(update={"evidence": "x" * 513})
+    elif invalidity == "wrong-shape":
+        checks[0] = SimpleNamespace(
+            name=EXPECTED_LIVE_CONTRACT_NAMES[0],
+            passed=True,
+            evidence="structurally similar but not a ContractCheck",
+        )
+    elif invalidity == "wrong-bool":
+        object.__setattr__(checks[0], "passed", 1)
+    else:  # pragma: no cover - the parameter list is closed.
+        raise AssertionError(f"unknown invalidity {invalidity}")
+
+    async def invalid_checks(*_args: object, **_kwargs: object) -> list[object]:
+        return checks
+
+    monkeypatch.setattr(cli, "_settings", lambda: object())
+    monkeypatch.setattr(cli, "run_live_contracts", invalid_checks)
+
+    result = runner.invoke(cli.app, ["contract", "--live"])
+
+    _assert_concise_failure(
+        result,
+        category=ErrorCategory.ORCHESTRATION,
+        stop_reason="CONTRACT_EVIDENCE_INVALID",
+    )
+    assert "PASS" not in result.output
+
+
+def test_live_contract_uses_the_exact_authoritative_identity_set_and_sanitized_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert compatibility.LIVE_CONTRACT_CHECK_NAMES == EXPECTED_LIVE_CONTRACT_NAMES
+    checks = _complete_live_contract_checks()
+    checks[0] = checks[0].model_copy(
+        update={"evidence": f"request finished api_key={SECRET}"}
+    )
+
+    async def complete_checks(
+        *_args: object,
+        **_kwargs: object,
+    ) -> list[compatibility.ContractCheck]:
+        return checks
+
+    monkeypatch.setattr(cli, "_settings", lambda: object())
+    monkeypatch.setattr(cli, "run_live_contracts", complete_checks)
+
+    result = runner.invoke(cli.app, ["contract", "--live"])
+
+    assert result.exit_code == 0
+    assert SECRET not in result.output
+    assert "[REDACTED]" in result.output
+    assert result.output.count("PASS") == len(EXPECTED_LIVE_CONTRACT_NAMES)
+
+
+def test_live_contract_sanitizer_failure_is_explicit_and_never_renders_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checks = _complete_live_contract_checks()
+
+    async def complete_checks(
+        *_args: object,
+        **_kwargs: object,
+    ) -> list[compatibility.ContractCheck]:
+        return checks
+
+    def fail_sanitizer(_value: str) -> NoReturn:
+        raise RuntimeError(f"sanitizer crashed api_key={SECRET}")
+
+    monkeypatch.setattr(cli, "_settings", lambda: object())
+    monkeypatch.setattr(cli, "run_live_contracts", complete_checks)
+    monkeypatch.setattr(compatibility, "sanitize_text", fail_sanitizer)
+
+    result = runner.invoke(cli.app, ["contract", "--live"])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == SANITIZATION_FAILURE_LINE
+    assert SECRET not in result.output
+    assert "Traceback" not in result.output
+    assert "PASS" not in result.output
 
 
 def _database_arguments(tmp_path: Path, operation: str) -> list[str]:
@@ -589,21 +726,62 @@ def test_standalone_database_cli_rejects_an_unsafe_error_code(
     assert SECRET not in result.output
 
 
-def test_standalone_database_cli_has_no_sanitizer_fallback(
+def test_standalone_database_cli_sanitizer_failure_is_explicit_and_fail_closed(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    failure = RuntimeError("sanitizer contract unavailable")
+    original = sqlite3.OperationalError(f"database failed api_key={SECRET}")
+
+    def fail(*_args: object, **_kwargs: object) -> NoReturn:
+        raise original
+
+    def fail_sanitizer(_value: str) -> NoReturn:
+        raise RuntimeError(f"sanitizer crashed api_key={SECRET}")
+
+    monkeypatch.setattr(database_cli, "migrate_database", fail)
     monkeypatch.setattr(
         database_cli,
         "sanitize_text",
-        lambda _value: (_ for _ in ()).throw(failure),
+        fail_sanitizer,
     )
 
-    with pytest.raises(RuntimeError, match="sanitizer contract unavailable"):
-        database_cli._run_database_operation(
-            "verify",
-            lambda: (_ for _ in ()).throw(sqlite3.OperationalError("failed")),
-        )
+    result = runner.invoke(
+        database_cli.app,
+        ["migrate", "--db", str(tmp_path / "sanitizer.db"), "--kind", "inventory"],
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == SANITIZATION_FAILURE_LINE
+    assert SECRET not in result.output
+    assert str(original) not in result.output
+    assert "Traceback" not in result.output
+
+
+def test_mounted_database_sanitizer_failure_uses_the_root_fail_closed_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = sqlite3.OperationalError(f"database failed api_key={SECRET} at {RAW_PATH}")
+
+    def fail(*_args: object, **_kwargs: object) -> NoReturn:
+        raise original
+
+    def fail_sanitizer(_value: str) -> NoReturn:
+        raise RuntimeError(f"sanitizer crashed api_key={SECRET}")
+
+    monkeypatch.setattr(database_cli, "migrate_database", fail)
+    monkeypatch.setattr(cli, "sanitize_text", fail_sanitizer)
+
+    result = runner.invoke(cli.app, _database_arguments(tmp_path, "migrate"))
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == SANITIZATION_FAILURE_LINE
+    assert SECRET not in result.output
+    assert RAW_PATH not in result.output
+    assert str(original) not in result.output
+    assert "Traceback" not in result.output
 
 
 def _raise_unexpected() -> NoReturn:

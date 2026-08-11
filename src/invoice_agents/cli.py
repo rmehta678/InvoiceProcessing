@@ -19,7 +19,7 @@ from rich.console import Console
 from rich.table import Table
 from typer.core import TyperGroup
 
-from invoice_agents.compatibility import run_live_contracts
+from invoice_agents.compatibility import run_live_contracts, validated_live_contract_evidence
 from invoice_agents.config import (
     Settings,
     is_ui_loopback_host,
@@ -52,6 +52,10 @@ DEBUG_STACK_MAX_CHARACTERS = 512
 DEBUG_NAME_MAX_CHARACTERS = 128
 DEBUG_STACK_SEPARATOR = " -> "
 DEBUG_STACK_TRUNCATION_MARKER = "…[TRUNCATED]"
+SANITIZATION_FAILURE_LINE = (
+    "category=ORCHESTRATION stop_reason=SANITIZATION_FAILED "
+    "message=credential sanitization failed closed"
+)
 
 _CLI_DEBUG: ContextVar[bool] = ContextVar("invoice_agents_cli_debug", default=False)
 _ASSIGNMENT_KEY = re.compile(r"\b[A-Za-z_][A-Za-z0-9_-]*\s*=")
@@ -61,10 +65,20 @@ _SAFE_DEBUG_NAME_CHARACTER = re.compile(r"[^A-Za-z0-9_.<>-]")
 _OPERATIONAL_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 
 
+def _sanitized_cli_text(value: str) -> str:
+    """Sanitize text or expose that the sanitizer itself failed, never the input."""
+
+    try:
+        return sanitize_text(value)
+    except Exception:
+        error_console.print(SANITIZATION_FAILURE_LINE, markup=False, soft_wrap=True)
+        raise typer.Exit(1) from None
+
+
 def _safe_operational_message(value: str) -> str:
     """Return one bounded, redacted line without paths or nested output fields."""
 
-    safe = sanitize_text(value)
+    safe = _sanitized_cli_text(value)
     safe = _WINDOWS_PATH.sub("[PATH_REDACTED]", safe)
     safe = _POSIX_PATH.sub("[PATH_REDACTED]", safe)
     safe = _ASSIGNMENT_KEY.sub("", safe)
@@ -76,7 +90,7 @@ def _safe_operational_message(value: str) -> str:
 
 
 def _safe_debug_name(value: str) -> str:
-    safe = _SAFE_DEBUG_NAME_CHARACTER.sub("_", sanitize_text(value))
+    safe = _SAFE_DEBUG_NAME_CHARACTER.sub("_", _sanitized_cli_text(value))
     return safe[:DEBUG_NAME_MAX_CHARACTERS]
 
 
@@ -130,25 +144,24 @@ def _print_operational_error(exc: BaseException) -> NoReturn:
         message = _safe_operational_message("unexpected application error")
         unexpected = True
 
+    debug_lines: list[str] = []
+    if unexpected and _CLI_DEBUG.get():
+        debug_lines.extend(
+            (
+                f"debug_exception_type={_safe_debug_name(type(exc).__name__)}",
+                f"debug_exception_message={_safe_operational_message(str(exc))}",
+                f"debug_stack={_debug_stack(exc)}",
+            )
+        )
     error_console.print(
         f"category={category.value} stop_reason={stop_reason} message={message}",
         style="red",
         markup=False,
         soft_wrap=True,
     )
-    if unexpected and _CLI_DEBUG.get():
+    for debug_line in debug_lines:
         error_console.print(
-            f"debug_exception_type={_safe_debug_name(type(exc).__name__)}",
-            markup=False,
-            soft_wrap=True,
-        )
-        error_console.print(
-            f"debug_exception_message={_safe_operational_message(str(exc))}",
-            markup=False,
-            soft_wrap=True,
-        )
-        error_console.print(
-            f"debug_stack={_debug_stack(exc)}",
+            debug_line,
             markup=False,
             soft_wrap=True,
         )
@@ -193,7 +206,7 @@ def _settings() -> Settings:
 
 
 def _safe_cli_text(value: object) -> str:
-    return sanitize_text(str(value))
+    return _sanitized_cli_text(str(value))
 
 
 def _safe_json(value: object) -> str:
@@ -630,13 +643,7 @@ def contract_command(
     if not live:
         console.print("live contracts NOT RUN; pass --live to call xAI", style="yellow")
         raise typer.Exit(2)
-    checks = asyncio.run(run_live_contracts(_settings()))
-    if not checks:
-        raise InvoiceAgentsError(
-            ErrorCategory.ORCHESTRATION,
-            "live contract execution returned no compatibility evidence",
-            stop_reason="CONTRACT_EVIDENCE_MISSING",
-        )
+    checks = validated_live_contract_evidence(asyncio.run(run_live_contracts(_settings())))
     table = Table("Contract", "Result", "Evidence")
     for check in checks:
         table.add_row(

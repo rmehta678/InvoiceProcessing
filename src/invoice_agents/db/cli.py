@@ -24,6 +24,10 @@ from invoice_agents.observability.audit import sanitize_text
 
 app = typer.Typer(no_args_is_help=True, help="Explicit SQLite setup and verification.")
 _DATABASE_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+_SANITIZATION_FAILURE_LINE = (
+    "category=ORCHESTRATION stop_reason=SANITIZATION_FAILED "
+    "message=credential sanitization failed closed"
+)
 
 
 def _database_operation_settings(
@@ -77,7 +81,11 @@ def _run_database_operation[OperationResult](
         if _is_mounted_application_command():
             raise
         error_code = "DATABASE_OPERATION_FAILED"
-    safe_error_code = sanitize_text(error_code)
+    try:
+        safe_error_code = sanitize_text(error_code)
+    except Exception:
+        typer.echo(_SANITIZATION_FAILURE_LINE, err=True)
+        raise typer.Exit(1) from None
     if (
         safe_error_code != error_code
         or _DATABASE_ERROR_CODE.fullmatch(safe_error_code) is None

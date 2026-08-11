@@ -28,8 +28,13 @@ from pydantic import BaseModel, ConfigDict
 from invoice_agents.agents.team import create_model_client
 from invoice_agents.config import XAI_BASE_URL, XAI_MODEL, Settings
 from invoice_agents.db.core import DatabaseKind, migrate_database
+from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import UsageSummary
-from invoice_agents.observability.audit import AuditRecorder, safe_provider_request_id
+from invoice_agents.observability.audit import (
+    AuditRecorder,
+    safe_provider_request_id,
+    sanitize_text,
+)
 from invoice_agents.orchestration import _error_record
 
 
@@ -52,7 +57,7 @@ def _stable_evidence(category: str, status: str | int, request_id: object = None
     """Encode only bounded contract classifications, never provider-controlled prose."""
 
     validated_request_id = safe_provider_request_id(request_id)
-    return (
+    return _sanitized_contract_text(
         f"category={category}; status={status}; provider_request_id="
         f"{validated_request_id or '<absent>'}"
     )
@@ -93,9 +98,9 @@ def _is_explicit_authentication_rejection(exc: BaseException) -> bool:
 
 def _is_explicit_schema_rejection(exc: BaseException) -> bool:
     if (
-        not isinstance(exc, (openai.BadRequestError, openai.UnprocessableEntityError))
+        not isinstance(exc, openai.BadRequestError)
         or isinstance(exc, (openai.AuthenticationError, openai.RateLimitError))
-        or exc.status_code not in {400, 422}
+        or exc.status_code != 400
     ):
         return False
     error_type = _structured_error_field(exc, "type")
@@ -105,6 +110,113 @@ def _is_explicit_schema_rejection(exc: BaseException) -> bool:
         error_type == "invalid_request_error"
         and code in {"invalid_json_schema", "unsupported_json_schema"}
         and param in {"json_schema", "response_format", "response_format.json_schema"}
+    )
+
+
+LIVE_CONTRACT_CHECK_NAMES: tuple[str, ...] = (
+    "authentication_basic_completion",
+    "typed_tool_and_structured_output",
+    "sequential_tool_iterations_parallel_disabled",
+    "swarm_handoff_and_agent_names",
+    "handoff_stop_save_load_human_resume",
+    "tool_exception_visibility",
+    "server_echoed_model_identity",
+    "live_invalid_key_rejection",
+    "telemetry_span_and_usage_capture",
+    "structured_output_rejection_live",
+)
+LIVE_CONTRACT_EVIDENCE_MAX_CHARACTERS = 512
+(
+    _AUTHENTICATION_BASIC_COMPLETION,
+    _TYPED_TOOL_AND_STRUCTURED_OUTPUT,
+    _SEQUENTIAL_TOOL_ITERATIONS_PARALLEL_DISABLED,
+    _SWARM_HANDOFF_AND_AGENT_NAMES,
+    _HANDOFF_STOP_SAVE_LOAD_HUMAN_RESUME,
+    _TOOL_EXCEPTION_VISIBILITY,
+    _SERVER_ECHOED_MODEL_IDENTITY,
+    _LIVE_INVALID_KEY_REJECTION,
+    _TELEMETRY_SPAN_AND_USAGE_CAPTURE,
+    _STRUCTURED_OUTPUT_REJECTION_LIVE,
+) = LIVE_CONTRACT_CHECK_NAMES
+
+
+def _sanitized_contract_text(value: str) -> str:
+    try:
+        return sanitize_text(value)
+    except Exception:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "credential sanitization failed closed",
+            stop_reason="SANITIZATION_FAILED",
+        ) from None
+
+
+def validated_live_contract_evidence(checks: object) -> list[ContractCheck]:
+    """Return one complete, canonical, sanitized live-contract matrix or fail closed."""
+
+    if type(checks) is not list:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "live contract evidence is incomplete or invalid",
+            stop_reason="CONTRACT_EVIDENCE_INVALID",
+        )
+    if not checks:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "live contract execution returned no compatibility evidence",
+            stop_reason="CONTRACT_EVIDENCE_MISSING",
+        )
+    if len(checks) != len(LIVE_CONTRACT_CHECK_NAMES):
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "live contract evidence is incomplete or invalid",
+            stop_reason="CONTRACT_EVIDENCE_INVALID",
+        )
+    by_name: dict[str, ContractCheck] = {}
+    for check in checks:
+        if (
+            type(check) is not ContractCheck
+            or type(check.name) is not str
+            or type(check.passed) is not bool
+            or type(check.evidence) is not str
+            or check.name not in LIVE_CONTRACT_CHECK_NAMES
+            or check.name in by_name
+        ):
+            raise InvoiceAgentsError(
+                ErrorCategory.ORCHESTRATION,
+                "live contract evidence is incomplete or invalid",
+                stop_reason="CONTRACT_EVIDENCE_INVALID",
+            )
+        safe_evidence = " ".join(_sanitized_contract_text(check.evidence).split())
+        if not safe_evidence or len(safe_evidence) > LIVE_CONTRACT_EVIDENCE_MAX_CHARACTERS:
+            raise InvoiceAgentsError(
+                ErrorCategory.ORCHESTRATION,
+                "live contract evidence is incomplete or invalid",
+                stop_reason="CONTRACT_EVIDENCE_INVALID",
+            )
+        by_name[check.name] = check.model_copy(update={"evidence": safe_evidence})
+    if set(by_name) != set(LIVE_CONTRACT_CHECK_NAMES):
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "live contract evidence is incomplete or invalid",
+            stop_reason="CONTRACT_EVIDENCE_INVALID",
+        )
+    return [by_name[name] for name in LIVE_CONTRACT_CHECK_NAMES]
+
+
+def _safe_live_error_metadata(exc: BaseException) -> str:
+    """Describe a live failure without retaining its message or provider response body."""
+
+    record = _error_record(exc)
+    raw_status = getattr(exc, "status_code", None)
+    status = str(raw_status) if type(raw_status) is int else "<absent>"
+    request_id = safe_provider_request_id(record.provider_request_id) or safe_provider_request_id(
+        getattr(exc, "request_id", None)
+    )
+    return _sanitized_contract_text(
+        f"exception_type={type(exc).__name__}; status={status}; category={record.category}; "
+        f"stop_reason={record.stop_reason or '<absent>'}; "
+        f"provider_request_id={request_id or '<absent>'}"
     )
 
 
@@ -119,7 +231,7 @@ async def run_live_contracts(settings: Settings) -> list[ContractCheck]:
         )
         checks.append(
             ContractCheck(
-                name="authentication_basic_completion",
+                name=_AUTHENTICATION_BASIC_COMPLETION,
                 passed=bool(basic.content) and basic.finish_reason is not None,
                 evidence=_stable_evidence(
                     "MODEL_COMPLETION",
@@ -180,7 +292,7 @@ async def run_live_contracts(settings: Settings) -> list[ContractCheck]:
         structured_ok = bool(structured_messages) and structured_messages[-1].content.result == 42
         checks.append(
             ContractCheck(
-                name="typed_tool_and_structured_output",
+                name=_TYPED_TOOL_AND_STRUCTURED_OUTPUT,
                 passed=tool_result_seen and structured_ok and calls == [(19, 23)],
                 evidence=(
                     f"tool_calls={calls}; tool_result_event={tool_result_seen}; "
@@ -211,7 +323,7 @@ async def run_live_contracts(settings: Settings) -> list[ContractCheck]:
         await sequential_agent.run(task="Run both stateful tool steps in order.")
         checks.append(
             ContractCheck(
-                name="sequential_tool_iterations_parallel_disabled",
+                name=_SEQUENTIAL_TOOL_ITERATIONS_PARALLEL_DISABLED,
                 passed=sequence == [1, 2],
                 evidence=f"observed_sequence={sequence}",
             )
@@ -253,7 +365,7 @@ async def run_live_contracts(settings: Settings) -> list[ContractCheck]:
         )
         checks.append(
             ContractCheck(
-                name="swarm_handoff_and_agent_names",
+                name=_SWARM_HANDOFF_AND_AGENT_NAMES,
                 passed=handoff_seen,
                 evidence=(
                     f"handoff_seen={handoff_seen}; include_name_in_message=false; "
@@ -312,7 +424,7 @@ async def run_live_contracts(settings: Settings) -> list[ContractCheck]:
         )
         checks.append(
             ContractCheck(
-                name="handoff_stop_save_load_human_resume",
+                name=_HANDOFF_STOP_SAVE_LOAD_HUMAN_RESUME,
                 passed=(
                     "human_reviewer" in str(first_stop.stop_reason)
                     and bool(saved)
@@ -352,7 +464,7 @@ async def run_live_contracts(settings: Settings) -> list[ContractCheck]:
         )
         checks.append(
             ContractCheck(
-                name="tool_exception_visibility",
+                name=_TOOL_EXCEPTION_VISIBILITY,
                 passed="compatibility-tool-sentinel" in error_text,
                 evidence=f"error_event_count={len(error_events)}; sentinel_retained={'compatibility-tool-sentinel' in error_text}",
             )
@@ -364,7 +476,7 @@ async def run_live_contracts(settings: Settings) -> list[ContractCheck]:
         checks.append(await _structured_output_rejection_live(settings))
     finally:
         await client.close()
-    return checks
+    return validated_live_contract_evidence(checks)
 
 
 async def _server_echoed_model_identity(settings: Settings) -> ContractCheck:
@@ -384,7 +496,7 @@ async def _server_echoed_model_identity(settings: Settings) -> ContractCheck:
         echoed = completion.model or ""
         matched = echoed.startswith("grok-4.5")
         return ContractCheck(
-            name="server_echoed_model_identity",
+            name=_SERVER_ECHOED_MODEL_IDENTITY,
             passed=matched,
             evidence=_stable_evidence(
                 "MODEL_IDENTITY",
@@ -418,7 +530,7 @@ async def _live_invalid_key_rejection() -> ContractCheck:
             messages=[{"role": "user", "content": "This request must be rejected."}],
         )
         return ContractCheck(
-            name="live_invalid_key_rejection",
+            name=_LIVE_INVALID_KEY_REJECTION,
             passed=False,
             evidence=_stable_evidence("AUTHENTICATION", "UNEXPECTED_ACCEPT"),
         )
@@ -426,23 +538,23 @@ async def _live_invalid_key_rejection() -> ContractCheck:
         record = _error_record(exc)
         rejected_as_bad_credential = _is_explicit_authentication_rejection(exc)
         return ContractCheck(
-            name="live_invalid_key_rejection",
+            name=_LIVE_INVALID_KEY_REJECTION,
             passed=rejected_as_bad_credential,
-            evidence=_stable_evidence(
-                "AUTHENTICATION_REJECTION" if rejected_as_bad_credential else str(record.category),
-                exc.status_code,
-                record.provider_request_id or safe_provider_request_id(exc.request_id),
+            evidence=(
+                _stable_evidence(
+                    "AUTHENTICATION_REJECTION",
+                    exc.status_code,
+                    record.provider_request_id or safe_provider_request_id(exc.request_id),
+                )
+                if rejected_as_bad_credential
+                else _safe_live_error_metadata(exc)
             ),
         )
     except openai.OpenAIError as exc:
         return ContractCheck(
-            name="live_invalid_key_rejection",
+            name=_LIVE_INVALID_KEY_REJECTION,
             passed=False,
-            evidence=_stable_evidence(
-                "OPENAI_ERROR",
-                "NO_HTTP_STATUS",
-                safe_provider_request_id(getattr(exc, "request_id", None)),
-            ),
+            evidence=_safe_live_error_metadata(exc),
         )
     finally:
         await invalid.close()
@@ -495,7 +607,7 @@ async def _telemetry_span_and_usage_capture(client: Any) -> ContractCheck:
             and (span.attributes or {}).get("invoice.agent") == "telemetry_probe_agent"
         ]
         return ContractCheck(
-            name="telemetry_span_and_usage_capture",
+            name=_TELEMETRY_SPAN_AND_USAGE_CAPTURE,
             passed=bool(attributed) and usage.prompt_tokens > 0 and usage.model_calls > 0,
             evidence=(
                 f"spans_total={len(spans)}; spans_with_case_and_agent={len(attributed)}; "
@@ -529,23 +641,32 @@ async def _structured_output_rejection_live(settings: Settings) -> ContractCheck
             },
         )
         return ContractCheck(
-            name="structured_output_rejection_live",
+            name=_STRUCTURED_OUTPUT_REJECTION_LIVE,
             passed=False,
             evidence=_stable_evidence("PROVIDER", "UNEXPECTED_ACCEPT"),
         )
-    except openai.APIError as exc:
-        status = getattr(exc, "status_code", None)
+    except openai.APIStatusError as exc:
         record = _error_record(exc)
         explicitly_rejected = _is_explicit_schema_rejection(exc)
         return ContractCheck(
-            name="structured_output_rejection_live",
+            name=_STRUCTURED_OUTPUT_REJECTION_LIVE,
             passed=explicitly_rejected,
-            evidence=_stable_evidence(
-                "SCHEMA_REJECTION" if explicitly_rejected else str(record.category),
-                status if type(status) is int else "ERROR",
-                record.provider_request_id
-                or safe_provider_request_id(getattr(exc, "request_id", None)),
+            evidence=(
+                _stable_evidence(
+                    "SCHEMA_REJECTION",
+                    exc.status_code,
+                    record.provider_request_id
+                    or safe_provider_request_id(getattr(exc, "request_id", None)),
+                )
+                if explicitly_rejected
+                else _safe_live_error_metadata(exc)
             ),
+        )
+    except openai.OpenAIError as exc:
+        return ContractCheck(
+            name=_STRUCTURED_OUTPUT_REJECTION_LIVE,
+            passed=False,
+            evidence=_safe_live_error_metadata(exc),
         )
     finally:
         await direct.close()
