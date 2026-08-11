@@ -224,3 +224,4 @@ __marimo__/
 *.db-shm
 *.db-wal
 artifacts/
+Docs
