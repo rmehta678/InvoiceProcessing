@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import codecs
 import contextlib
+import errno
 import hashlib
 import json
+import logging
 import multiprocessing
 import os
 import resource
@@ -15,6 +17,7 @@ import struct
 import subprocess
 import sys
 import time
+import warnings
 from dataclasses import dataclass, field
 from io import BytesIO
 from multiprocessing.connection import Connection
@@ -39,9 +42,44 @@ SOURCE_FAILURE_MESSAGES = {
     "SOURCE_HASH_MISMATCH": "source snapshot identity mismatch",
     "SOURCE_READ_FAILED": "source snapshot could not be read",
 }
+LOGGER = logging.getLogger(__name__)
 _OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 _STAT_SUPPORTS_DIR_FD = os.stat in os.supports_dir_fd
 _STAT_SUPPORTS_NOFOLLOW = os.stat in os.supports_follow_symlinks
+
+
+@dataclass(frozen=True, slots=True)
+class _PublishedRender:
+    identity: tuple[int, int, int, int]
+    close_diagnostic: BaseException | None = None
+
+
+class RenderedPageResult(dict[str, object]):
+    """Eight-field render binding plus any proved post-close diagnostic."""
+
+    publication_diagnostic: BaseException | None
+
+    def __init__(
+        self,
+        values: dict[str, object],
+        *,
+        publication_diagnostic: BaseException | None = None,
+    ) -> None:
+        super().__init__(values)
+        self.publication_diagnostic = publication_diagnostic
+
+
+class RenderPublicationCloseWarning(RuntimeWarning):
+    """A verified artifact survived a capability close-after-close diagnostic."""
+
+    diagnostic: BaseException
+
+    def __init__(self, diagnostic: BaseException) -> None:
+        self.diagnostic = diagnostic
+        super().__init__(
+            "verified render publication returned after the final directory capability "
+            f"reported a post-close {type(diagnostic).__name__} diagnostic"
+        )
 
 
 @dataclass(slots=True)
@@ -989,6 +1027,22 @@ def _cleanup_render_names_once(
     return failures
 
 
+def _validate_bound_render(
+    parent_descriptor: int,
+    target_name: str,
+    candidate_identity: tuple[int, int, int, int] | None,
+) -> None:
+    if candidate_identity is None:
+        raise ValueError("render publication identity is missing")
+    observed = os.stat(target_name, dir_fd=parent_descriptor, follow_symlinks=False)
+    if (
+        _render_identity(observed) != candidate_identity
+        or not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+    ):
+        raise ValueError("render publication final binding is invalid")
+
+
 def _write_all_to_descriptor(descriptor: int, content: bytes) -> None:
     view = memoryview(content)
     written = 0
@@ -1008,11 +1062,12 @@ def _publish_verified_render(
     max_bytes: int,
     descriptors: list[int],
     relationships: list[tuple[int, str, os.stat_result]],
-) -> tuple[int, int, int, int]:
+) -> _PublishedRender:
     if not descriptors:
         raise ValueError("render publication parent descriptor is missing")
     parent_descriptor = descriptors[-1]
     rollback_descriptor: int | None = None
+    rollback_identity: tuple[int, int] | None = None
     artifact_descriptor: int | None = None
     candidate_identity: tuple[int, int, int, int] | None = None
     owned_names: list[str] = []
@@ -1027,6 +1082,7 @@ def _publish_verified_render(
             or not stat.S_ISDIR(rollback_opened.st_mode)
         ):
             raise ValueError("render rollback capability is not the exact parent")
+        rollback_identity = (rollback_opened.st_dev, rollback_opened.st_ino)
         if (
             not isinstance(png_bytes, bytes)
             or not png_bytes.startswith(b"\x89PNG\r\n\x1a\n")
@@ -1131,7 +1187,19 @@ def _publish_verified_render(
         primary = exc
 
     cleanup_failures: list[BaseException] = []
-    rollback_owner = rollback_descriptor if rollback_descriptor is not None else parent_descriptor
+    rollback_owner = (
+        rollback_descriptor
+        if rollback_descriptor is not None and rollback_identity is not None
+        else parent_descriptor
+    )
+    binding_revalidated = False
+    if primary is None:
+        try:
+            _validate_render_parent_relationships(relationships)
+            _validate_bound_render(rollback_owner, target.name, candidate_identity)
+            binding_revalidated = True
+        except BaseException as exc:
+            primary = exc
     if primary is not None:
         cleanup_failures.extend(
             _cleanup_render_names_once(
@@ -1151,15 +1219,72 @@ def _publish_verified_render(
                 candidate_identity,
             )
         )
-    rollback_descriptors = [rollback_descriptor] if rollback_descriptor is not None else []
-    cleanup_failures.extend(_close_render_descriptors_once(rollback_descriptors))
+    if primary is None and not cleanup_failures:
+        try:
+            _validate_bound_render(rollback_owner, target.name, candidate_identity)
+            binding_revalidated = True
+        except BaseException as exc:
+            primary = exc
+            cleanup_failures.extend(
+                _cleanup_render_names_once(
+                    rollback_owner,
+                    owned_names,
+                    candidate_identity,
+                )
+            )
+
+    close_diagnostic: BaseException | None = None
+    if rollback_descriptor is not None:
+        try:
+            os.close(rollback_descriptor)
+        except BaseException as exc:
+            descriptor_definitively_closed = False
+            descriptor_still_bound = False
+            try:
+                observed_rollback = os.fstat(rollback_descriptor)
+                descriptor_still_bound = (
+                    rollback_identity is not None
+                    and observed_rollback.st_dev == rollback_identity[0]
+                    and observed_rollback.st_ino == rollback_identity[1]
+                    and stat.S_ISDIR(observed_rollback.st_mode)
+                )
+                if not descriptor_still_bound:
+                    cleanup_failures.append(
+                        ValueError("render rollback capability changed after close failure")
+                    )
+            except OSError as probe:
+                if probe.errno == errno.EBADF:
+                    descriptor_definitively_closed = True
+                else:
+                    cleanup_failures.append(probe)
+            except BaseException as probe:
+                cleanup_failures.append(probe)
+
+            if (
+                primary is None
+                and not cleanup_failures
+                and binding_revalidated
+                and descriptor_definitively_closed
+            ):
+                close_diagnostic = exc
+                owned_names.clear()
+            else:
+                if descriptor_still_bound and owned_names:
+                    cleanup_failures.extend(
+                        _cleanup_render_names_once(
+                            rollback_descriptor,
+                            owned_names,
+                            candidate_identity,
+                        )
+                    )
+                cleanup_failures.append(exc)
     selected = _preferred_render_failure(primary, cleanup_failures)
     if selected is not None:
         raise selected
     if candidate_identity is None:
         raise ValueError("render publication identity is missing")
     owned_names.clear()
-    return candidate_identity
+    return _PublishedRender(candidate_identity, close_diagnostic)
 
 
 def render_pdf_page_in_worker(
@@ -1167,14 +1292,14 @@ def render_pdf_page_in_worker(
     page: int,
     target: Path,
     pdf_policy: PdfPolicy,
-) -> dict[str, object]:
+) -> RenderedPageResult:
     """Render a page in a child and atomically publish only a completed PNG."""
 
     resolved = Path(os.path.abspath(target))
     temporary = resolved.with_name(f".pdf-render-{uuid4().hex}.png")
     publication_descriptors: list[int] = []
     primary: BaseException | None = None
-    response: dict[str, object] | None = None
+    response: RenderedPageResult | None = None
     try:
         resolved.parent.mkdir(parents=True, exist_ok=True)
         publication_descriptors, relationships = _open_render_parent(resolved)
@@ -1190,7 +1315,7 @@ def render_pdf_page_in_worker(
             raise ValueError("render worker result is invalid")
         owned_descriptors = publication_descriptors
         publication_descriptors = []
-        identity = _publish_verified_render(
+        publication = _publish_verified_render(
             resolved,
             temporary.name,
             png_bytes,
@@ -1199,16 +1324,20 @@ def render_pdf_page_in_worker(
             descriptors=owned_descriptors,
             relationships=relationships,
         )
-        response = {
-            "path": str(resolved),
-            "page": result["page"],
-            "sha256": digest,
-            "renderer": result["renderer"],
-            "device": identity[0],
-            "inode": identity[1],
-            "file_type": identity[2],
-            "size_bytes": identity[3],
-        }
+        identity = publication.identity
+        response = RenderedPageResult(
+            {
+                "path": str(resolved),
+                "page": result["page"],
+                "sha256": digest,
+                "renderer": result["renderer"],
+                "device": identity[0],
+                "inode": identity[1],
+                "file_type": identity[2],
+                "size_bytes": identity[3],
+            },
+            publication_diagnostic=publication.close_diagnostic,
+        )
     except BaseException as exc:
         primary = exc
 
@@ -1230,4 +1359,14 @@ def render_pdf_page_in_worker(
             "rendered review page publication failed validation",
             stop_reason="REVIEW_PAGE_PUBLICATION_INVALID",
         )
+    if response.publication_diagnostic is not None:
+        LOGGER.warning(
+            "render_publication_close_diagnostic diagnostic_type=%s",
+            type(response.publication_diagnostic).__name__,
+        )
+        warning = RenderPublicationCloseWarning(response.publication_diagnostic)
+        # A warnings-as-errors policy must not turn a proved bound artifact into
+        # an unbound failure; the diagnostic remains on the returned result.
+        with contextlib.suppress(RenderPublicationCloseWarning):
+            warnings.warn(warning, stacklevel=2)
     return response

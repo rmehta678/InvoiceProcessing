@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import multiprocessing
 import os
 import stat
 import struct
 import time
 import tracemalloc
+import warnings
 from collections import Counter
 from datetime import UTC, datetime
 from importlib import import_module
@@ -1227,6 +1229,160 @@ def test_rollback_capability_close_fault_cannot_mask_primary_control(
     assert rollback_close_injected
     assert Counter(close_attempts) == Counter({descriptor: 1 for descriptor in owned_descriptors})
     assert not target.exists()
+    assert not list(target.parent.glob(".pdf-render-*"))
+
+
+def test_final_capability_close_after_close_returns_bound_artifact_with_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_module = pdf_worker()
+    target = tmp_path / "reviews" / "rev_final_close" / "rendered.png"
+    target.parent.mkdir(parents=True)
+    descriptors, relationships = worker_module._open_render_parent(target)
+    owned_descriptors = list(descriptors)
+    close_attempts: list[int] = []
+    png_bytes = b"\x89PNG\r\n\x1a\nfinal-capability-close-render"
+    installed_open = os.open
+    installed_close = os.close
+    installed_dup = os.dup
+    injected = OSError("final rollback capability closed before reporting failure")
+    rollback_descriptor: int | None = None
+
+    def track_candidate_open(*args: object, **kwargs: object) -> int:
+        descriptor = installed_open(*args, **kwargs)  # type: ignore[arg-type]
+        owned_descriptors.append(descriptor)
+        return descriptor
+
+    def track_rollback_dup(descriptor: int) -> int:
+        nonlocal rollback_descriptor
+        rollback_descriptor = installed_dup(descriptor)
+        owned_descriptors.append(rollback_descriptor)
+        return rollback_descriptor
+
+    def close_final_capability_then_raise(descriptor: int) -> None:
+        if descriptor in owned_descriptors:
+            close_attempts.append(descriptor)
+        installed_close(descriptor)
+        if descriptor == rollback_descriptor:
+            raise injected
+
+    monkeypatch.setattr(worker_module.os, "open", track_candidate_open)
+    monkeypatch.setattr(worker_module.os, "dup", track_rollback_dup)
+    monkeypatch.setattr(worker_module.os, "close", close_final_capability_then_raise)
+
+    publication = worker_module._publish_verified_render(
+        target,
+        ".pdf-render-final-close.png",
+        png_bytes,
+        hashlib.sha256(png_bytes).hexdigest(),
+        max_bytes=4_194_304,
+        descriptors=descriptors,
+        relationships=relationships,
+    )
+
+    assert publication.close_diagnostic is injected
+    target_identity = target.stat()
+    assert publication.identity == (
+        target_identity.st_dev,
+        target_identity.st_ino,
+        stat.S_IFMT(target_identity.st_mode),
+        target_identity.st_size,
+    )
+    assert target.read_bytes() == png_bytes
+    assert target_identity.st_nlink == 1
+    assert Counter(close_attempts) == Counter({descriptor: 1 for descriptor in owned_descriptors})
+    assert not list(target.parent.glob(".pdf-render-*"))
+
+
+@pytest.mark.parametrize(
+    "warning_action",
+    ["always", "error"],
+    ids=["normal-policy", "warnings-as-errors"],
+)
+def test_public_render_reports_final_close_diagnostic_without_unbinding_artifact(
+    warning_action: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    source = content_addressed_pdf(DATA_DIR / "invoice_1011.pdf", tmp_path / "sources", 1)
+    target = tmp_path / "reviews" / "rev_public_final_close" / "rendered.png"
+    worker_module = pdf_worker()
+    png_bytes = b"\x89PNG\r\n\x1a\npublic-final-close-render"
+    installed_close = os.close
+    installed_dup = os.dup
+    injected = OSError("public final capability close diagnostic")
+    rollback_descriptor: int | None = None
+
+    def render_bytes(
+        operation: str,
+        _source: SourceArtifact,
+        _pdf_policy: object,
+        *,
+        page: int | None = None,
+    ) -> dict[str, object]:
+        assert operation == "render"
+        return {
+            "page": page,
+            "sha256": hashlib.sha256(png_bytes).hexdigest(),
+            "renderer": "PyMuPDF",
+            "png_bytes": png_bytes,
+        }
+
+    def track_rollback_dup(descriptor: int) -> int:
+        nonlocal rollback_descriptor
+        rollback_descriptor = installed_dup(descriptor)
+        return rollback_descriptor
+
+    def close_final_capability_then_raise(descriptor: int) -> None:
+        installed_close(descriptor)
+        if descriptor == rollback_descriptor:
+            raise injected
+
+    monkeypatch.setattr(worker_module, "_run_worker", render_bytes)
+    monkeypatch.setattr(worker_module.os, "dup", track_rollback_dup)
+    monkeypatch.setattr(worker_module.os, "close", close_final_capability_then_raise)
+    caplog.set_level(logging.WARNING, logger=worker_module.__name__)
+
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter(warning_action, worker_module.RenderPublicationCloseWarning)
+        result = worker_module.render_pdf_page_in_worker(
+            source,
+            page=1,
+            target=target,
+            pdf_policy=pdf_policy(),
+        )
+
+    if warning_action == "always":
+        assert len(captured) == 1
+        assert captured[0].message.diagnostic is injected
+    else:
+        assert captured == []
+    diagnostic_records = [
+        record
+        for record in caplog.records
+        if record.name == worker_module.__name__
+        and record.getMessage().startswith("render_publication_close_diagnostic")
+    ]
+    assert [record.getMessage() for record in diagnostic_records] == [
+        "render_publication_close_diagnostic diagnostic_type=OSError"
+    ]
+    assert str(injected) not in caplog.text
+    assert isinstance(result, worker_module.RenderedPageResult)
+    assert result.publication_diagnostic is injected
+    assert set(result) == {
+        "path",
+        "page",
+        "sha256",
+        "renderer",
+        "device",
+        "inode",
+        "file_type",
+        "size_bytes",
+    }
+    assert result["inode"] == target.stat().st_ino
+    assert result["sha256"] == hashlib.sha256(target.read_bytes()).hexdigest()
     assert not list(target.parent.glob(".pdf-render-*"))
 
 

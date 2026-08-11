@@ -310,6 +310,31 @@ def persist_legacy_rendered_page_shape(
     return stored
 
 
+def persist_forged_review_source(
+    settings: Settings,
+    review_id: str,
+    changes: dict[str, Any],
+) -> ReviewRequest:
+    with connect_database(settings.workflow_db) as connection:
+        row = connection.execute(
+            "SELECT payload_json FROM review_requests WHERE review_id = ?",
+            (review_id,),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(str(row["payload_json"]))
+        payload["source"].update(changes)
+        connection.execute("DROP TRIGGER trg_resolved_review_immutable_update")
+        connection.execute(
+            "UPDATE review_requests SET payload_json = ? WHERE review_id = ?",
+            (json.dumps(payload), review_id),
+        )
+        connection.execute(REQUIRED_WORKFLOW_TRIGGERS["trg_resolved_review_immutable_update"])
+        connection.commit()
+    stored = WorkflowStore(settings).load_review(review_id)
+    assert stored is not None
+    return stored
+
+
 def generation_promotion_state(
     workflow_db: Path,
     case_id: str,
@@ -578,6 +603,73 @@ def test_legacy_pdf_review_cannot_promote_evidence_to_a_fresh_generation(
             store.promote_predecessor_extraction(claim)
 
     assert excinfo.value.stop_reason == "EVIDENCE_PROVENANCE_INVALID"
+    assert (
+        generation_promotion_state(
+            settings.workflow_db,
+            case_id,
+            claim.generation,
+            review.review_id,
+        )
+        == before
+    )
+
+
+@pytest.mark.parametrize(
+    ("forgery", "changes"),
+    [
+        ("format", {"source_format": "txt", "page_count": None}),
+        ("page-count", {"page_count": None}),
+        ("source-id", {"source_id": "src_" + "f" * 64}),
+        ("path", {"canonical_path": "/forged/review-source.pdf"}),
+    ],
+)
+def test_extraction_promotion_binds_review_source_to_authoritative_pdf_extraction(
+    forgery: str,
+    changes: dict[str, Any],
+    invoice_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    case_id = f"case_review_source_forgery_{forgery.replace('-', '_')}"
+    store = WorkflowStore(settings)
+    review = pending_review(
+        invoice_dir / "invoice_1011.pdf",
+        case_id,
+        settings,
+    )
+    persist_legacy_rendered_page_shape(settings, review.review_id)
+    resolved = record_human_decision(
+        review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.REJECT,
+        "legacy review source cannot grant promotion authority",
+        store,
+        settings.inventory_db,
+    )
+    assert resolved.status == "RESOLVED"
+    persist_forged_review_source(settings, review.review_id, changes)
+    claim = store.claim_case_execution(
+        case_id,
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+    before = generation_promotion_state(
+        settings.workflow_db,
+        case_id,
+        claim.generation,
+        review.review_id,
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.promote_predecessor_extraction(claim)
+
+    assert excinfo.value.stop_reason == "EVIDENCE_PROVENANCE_INVALID"
+    assert excinfo.value.details == {
+        "execution_generation": claim.generation,
+        "reason": "predecessor review source does not match authoritative extraction source",
+    }
     assert (
         generation_promotion_state(
             settings.workflow_db,

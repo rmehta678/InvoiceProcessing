@@ -965,10 +965,17 @@ def _validate_authorizing_review_page_evidence(review: ReviewRequest) -> None:
         ) from exc
 
 
-def _validate_review_page_promotion_authority(review: ReviewRequest) -> None:
+def _validate_review_page_promotion_authority(
+    review: ReviewRequest,
+    authoritative_source: SourceArtifact,
+) -> None:
     """Require modern PDF page identity before creating any successor evidence."""
 
-    if review.source.source_format != "pdf":
+    if review.source != authoritative_source:
+        raise EvidenceSnapshotError(
+            "predecessor review source does not match authoritative extraction source"
+        )
+    if authoritative_source.source_format != "pdf":
         return
     try:
         validate_review_page_evidence(review)
@@ -4343,7 +4350,10 @@ class WorkflowStore:
                         # promotion creates fresh evidence authority, so a PDF review must
                         # first prove modern descriptor-backed rendered-page identity,
                         # independent of its human decision kind.
-                        _validate_review_page_promotion_authority(predecessor_review)
+                        _validate_review_page_promotion_authority(
+                            predecessor_review,
+                            snapshot.invoice.source,
+                        )
                 except (EvidenceSnapshotError, ValueError) as exc:
                     self._raise_evidence_provenance(claim, str(exc))
                 next_version = (
@@ -4431,18 +4441,6 @@ class WorkflowStore:
                 if predecessor < 1:
                     self._raise_evidence_provenance(claim, "no predecessor generation exists")
                 self._reject_future_evidence(connection, claim)
-                try:
-                    predecessor_review_authorization = load_authoritative_review_authorization(
-                        connection,
-                        claim.case_id,
-                        predecessor,
-                    )
-                    if predecessor_review_authorization is not None:
-                        _validate_review_page_promotion_authority(
-                            predecessor_review_authorization.review
-                        )
-                except EvidenceSnapshotError as exc:
-                    self._raise_evidence_provenance(claim, str(exc))
                 row = connection.execute(
                     "SELECT payload_json FROM extractions WHERE case_id = ? "
                     "AND execution_generation = ? ORDER BY version DESC LIMIT 1",
@@ -4453,6 +4451,19 @@ class WorkflowStore:
                         claim, f"predecessor generation {predecessor} has no extraction"
                     )
                 invoice = self._validate_case_invoice(connection, claim, row["payload_json"])
+                try:
+                    predecessor_review_authorization = load_authoritative_review_authorization(
+                        connection,
+                        claim.case_id,
+                        predecessor,
+                    )
+                    if predecessor_review_authorization is not None:
+                        _validate_review_page_promotion_authority(
+                            predecessor_review_authorization.review,
+                            invoice.source,
+                        )
+                except EvidenceSnapshotError as exc:
+                    self._raise_evidence_provenance(claim, str(exc))
                 next_version = (
                     int(
                         connection.execute(
