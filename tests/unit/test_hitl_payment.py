@@ -310,6 +310,45 @@ def persist_legacy_rendered_page_shape(
     return stored
 
 
+def generation_promotion_state(
+    workflow_db: Path,
+    case_id: str,
+    generation: int,
+    review_id: str,
+) -> tuple[int, int, int, int, str, str]:
+    with connect_database(workflow_db, read_only=True) as connection:
+        extraction_count = connection.execute(
+            "SELECT COUNT(*) FROM extractions WHERE case_id = ? AND execution_generation = ?",
+            (case_id, generation),
+        ).fetchone()[0]
+        identity_count = connection.execute(
+            "SELECT COUNT(*) FROM identity_results WHERE case_id = ? AND execution_generation = ?",
+            (case_id, generation),
+        ).fetchone()[0]
+        comparison_count = connection.execute(
+            "SELECT COUNT(*) FROM comparison_results WHERE case_id = ? "
+            "AND execution_generation = ?",
+            (case_id, generation),
+        ).fetchone()[0]
+        critique_count = connection.execute(
+            "SELECT COUNT(*) FROM critique_results WHERE case_id = ? AND execution_generation = ?",
+            (case_id, generation),
+        ).fetchone()[0]
+        review = connection.execute(
+            "SELECT execution_generation, payload_json FROM review_requests WHERE review_id = ?",
+            (review_id,),
+        ).fetchone()
+    assert review is not None
+    return (
+        int(extraction_count),
+        int(identity_count),
+        int(comparison_count),
+        int(critique_count),
+        str(review["execution_generation"]),
+        str(review["payload_json"]),
+    )
+
+
 def mapping(raw_item: str, sku: str = "SKU-WIDGET-A") -> CanonicalMapping:
     return CanonicalMapping(raw_item=raw_item, sku=sku, basis="human_decision")
 
@@ -468,6 +507,86 @@ def test_resolved_legacy_authorization_is_replay_readable_but_cannot_create_fina
     with connect_database(settings.workflow_db, read_only=True) as workflow:
         assert workflow.execute("SELECT COUNT(*) FROM final_decisions").fetchone()[0] == 0
         assert workflow.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "legacy_decision",
+    [HumanDecisionKind.APPROVE, HumanDecisionKind.REJECT],
+    ids=["approve", "reject"],
+)
+@pytest.mark.parametrize(
+    "promotion_kind",
+    ["complete-evidence", "extraction-only"],
+)
+def test_legacy_pdf_review_cannot_promote_evidence_to_a_fresh_generation(
+    promotion_kind: str,
+    legacy_decision: HumanDecisionKind,
+    invoice_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    case_id = f"case_legacy_adoption_{legacy_decision.value.casefold()}"
+    store = WorkflowStore(settings)
+    review = pending_review(
+        invoice_dir / "invoice_1011.pdf",
+        case_id,
+        settings,
+    )
+    if legacy_decision is HumanDecisionKind.APPROVE:
+        resolved = record_human_decision(
+            review.review_id,
+            "reviewer@example.com",
+            legacy_decision,
+            "the original modern review was approved",
+            store,
+            settings.inventory_db,
+            addressed_blocker_ids=[
+                str(item["blocker_id"]) for item in review.evidence_bundle["blocking_evidence"]
+            ],
+        )
+        assert resolved.status == "RESOLVED"
+        persist_legacy_rendered_page_shape(settings, review.review_id)
+    else:
+        persist_legacy_rendered_page_shape(settings, review.review_id)
+        resolved = record_human_decision(
+            review.review_id,
+            "reviewer@example.com",
+            legacy_decision,
+            "the legacy package is rejected without granting authority",
+            store,
+            settings.inventory_db,
+        )
+        assert resolved.status == "RESOLVED"
+    claim = store.claim_case_execution(
+        case_id,
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+    before = generation_promotion_state(
+        settings.workflow_db,
+        case_id,
+        claim.generation,
+        review.review_id,
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        if promotion_kind == "complete-evidence":
+            store.adopt_latest_evidence(claim)
+        else:
+            store.promote_predecessor_extraction(claim)
+
+    assert excinfo.value.stop_reason == "EVIDENCE_PROVENANCE_INVALID"
+    assert (
+        generation_promotion_state(
+            settings.workflow_db,
+            case_id,
+            claim.generation,
+            review.review_id,
+        )
+        == before
+    )
 
 
 def test_authorizing_decision_rejects_mutated_rendered_page_without_state_mutation(

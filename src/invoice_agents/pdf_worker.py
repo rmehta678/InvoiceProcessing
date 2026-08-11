@@ -1012,11 +1012,21 @@ def _publish_verified_render(
     if not descriptors:
         raise ValueError("render publication parent descriptor is missing")
     parent_descriptor = descriptors[-1]
+    rollback_descriptor: int | None = None
     artifact_descriptor: int | None = None
     candidate_identity: tuple[int, int, int, int] | None = None
     owned_names: list[str] = []
     primary: BaseException | None = None
     try:
+        rollback_descriptor = os.dup(parent_descriptor)
+        parent_opened = os.fstat(parent_descriptor)
+        rollback_opened = os.fstat(rollback_descriptor)
+        if (
+            parent_opened.st_dev != rollback_opened.st_dev
+            or parent_opened.st_ino != rollback_opened.st_ino
+            or not stat.S_ISDIR(rollback_opened.st_mode)
+        ):
+            raise ValueError("render rollback capability is not the exact parent")
         if (
             not isinstance(png_bytes, bytes)
             or not png_bytes.startswith(b"\x89PNG\r\n\x1a\n")
@@ -1121,47 +1131,28 @@ def _publish_verified_render(
         primary = exc
 
     cleanup_failures: list[BaseException] = []
+    rollback_owner = rollback_descriptor if rollback_descriptor is not None else parent_descriptor
     if primary is not None:
         cleanup_failures.extend(
             _cleanup_render_names_once(
-                parent_descriptor,
+                rollback_owner,
                 owned_names,
                 candidate_identity,
             )
         )
     artifact_descriptors = [artifact_descriptor] if artifact_descriptor is not None else []
     cleanup_failures.extend(_close_render_descriptors_once(artifact_descriptors))
-    if primary is not None:
-        cleanup_failures.extend(_close_render_descriptors_once(descriptors))
-    else:
-        parent_owner = descriptors.pop()
-        cleanup_failures.extend(_close_render_descriptors_once(descriptors))
-        if cleanup_failures:
-            cleanup_failures.extend(
-                _cleanup_render_names_once(
-                    parent_owner,
-                    owned_names,
-                    candidate_identity,
-                )
-            )
-        parent_failures = _close_render_descriptors_once([parent_owner])
-        if parent_failures and not cleanup_failures:
-            cleanup_failures.extend(
-                _cleanup_render_names_once(
-                    parent_owner,
-                    owned_names,
-                    candidate_identity,
-                )
-            )
-        cleanup_failures.extend(parent_failures)
+    cleanup_failures.extend(_close_render_descriptors_once(descriptors))
     if primary is None and cleanup_failures and owned_names:
         cleanup_failures.extend(
             _cleanup_render_names_once(
-                parent_descriptor,
+                rollback_owner,
                 owned_names,
                 candidate_identity,
             )
         )
+    rollback_descriptors = [rollback_descriptor] if rollback_descriptor is not None else []
+    cleanup_failures.extend(_close_render_descriptors_once(rollback_descriptors))
     selected = _preferred_render_failure(primary, cleanup_failures)
     if selected is not None:
         raise selected

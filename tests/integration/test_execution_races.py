@@ -300,6 +300,82 @@ def test_completed_critique_remains_authoritative_across_normal_human_review_res
     assert anchor["critique_disposition"] == "APPROVE"
 
 
+def test_legacy_pdf_review_may_finalize_reject_in_same_generation_without_promotion(
+    settings: Settings,
+) -> None:
+    case_id = "case_legacy_same_generation_reject"
+    store = _persist_case(
+        settings,
+        case_id,
+        Path("data/invoices/invoice_1011.pdf"),
+    )
+    claim = store.claim_case_execution(
+        case_id,
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+    store.adopt_latest_evidence(claim)
+    invoice = store.load_current_extraction(claim)
+    risk = RiskAssessment.model_validate(store.load_current_comparison(claim, "risk"))
+    critique = store.load_current_critique(claim)
+    review = create_review_request(
+        case_id,
+        invoice,
+        risk,
+        critique,
+        DecisionKind.HOLD,
+        ["legacy review may only terminate without granting fresh authority"],
+        store,
+        claim,
+        extra_reasons=["legacy review may only terminate without granting fresh authority"],
+    )
+    payload = review.model_dump(mode="json")
+    pages = payload["evidence_bundle"]["rendered_pages"]
+    assert pages
+    payload["evidence_bundle"]["rendered_pages"] = [
+        {key: page[key] for key in ("path", "page", "sha256", "renderer")} for page in pages
+    ]
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "UPDATE review_requests SET payload_json = ? WHERE review_id = ?",
+            (json.dumps(payload), review.review_id),
+        )
+        connection.commit()
+    resolved = record_human_decision(
+        review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.REJECT,
+        "legacy evidence is rejected without promotion or payment authority",
+        store,
+        settings.inventory_db,
+    )
+    assert resolved.human_decision is not None
+
+    store.save_final_decision(
+        case_id,
+        FinalDecision(
+            decision=DecisionKind.REJECT,
+            reasons=["legacy evidence cannot authorize approval"],
+            evidence=[reference for line in invoice.lines for reference in line.evidence[:1]],
+            critic_disposition=critique.recommended_disposition,
+            human_outcome=resolved.human_decision,
+            payment_eligible=False,
+        ),
+        claim,
+    )
+
+    final = store.load_current_final_decision(claim)
+    assert final is not None and final.decision is DecisionKind.REJECT
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        stored_review = connection.execute(
+            "SELECT execution_generation FROM review_requests WHERE review_id = ?",
+            (review.review_id,),
+        ).fetchone()
+        assert stored_review is not None
+        assert int(stored_review["execution_generation"]) == claim.generation
+        assert connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 0
+
+
 def _persist_approved_follow_up_case(
     settings: Settings,
     case_id: str,

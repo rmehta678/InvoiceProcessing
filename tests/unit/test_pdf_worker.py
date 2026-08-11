@@ -1106,6 +1106,130 @@ def test_render_close_fault_rolls_back_published_name_and_closes_every_descripto
     assert not list(target.parent.glob(".pdf-render-*"))
 
 
+def test_parent_close_that_succeeds_then_raises_uses_live_rollback_capability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_module = pdf_worker()
+    target = tmp_path / "reviews" / "rev_parent_close" / "rendered.png"
+    target.parent.mkdir(parents=True)
+    descriptors, relationships = worker_module._open_render_parent(target)
+    parent_owner = descriptors[-1]
+    owned_descriptors = list(descriptors)
+    close_attempts: list[int] = []
+    png_bytes = b"\x89PNG\r\n\x1a\nparent-close-render"
+    installed_open = os.open
+    installed_close = os.close
+    installed_dup = os.dup
+    injected = OSError("parent close completed before reporting failure")
+
+    def track_candidate_open(*args: object, **kwargs: object) -> int:
+        descriptor = installed_open(*args, **kwargs)  # type: ignore[arg-type]
+        owned_descriptors.append(descriptor)
+        return descriptor
+
+    def track_rollback_dup(descriptor: int) -> int:
+        duplicate = installed_dup(descriptor)
+        owned_descriptors.append(duplicate)
+        return duplicate
+
+    def close_parent_then_raise(descriptor: int) -> None:
+        if descriptor in owned_descriptors:
+            close_attempts.append(descriptor)
+        installed_close(descriptor)
+        if descriptor == parent_owner:
+            raise injected
+
+    monkeypatch.setattr(worker_module.os, "open", track_candidate_open)
+    monkeypatch.setattr(worker_module.os, "dup", track_rollback_dup)
+    monkeypatch.setattr(worker_module.os, "close", close_parent_then_raise)
+
+    with pytest.raises(BaseException) as excinfo:
+        worker_module._publish_verified_render(
+            target,
+            ".pdf-render-parent-close.png",
+            png_bytes,
+            hashlib.sha256(png_bytes).hexdigest(),
+            max_bytes=4_194_304,
+            descriptors=descriptors,
+            relationships=relationships,
+        )
+
+    assert excinfo.value is injected
+    assert Counter(close_attempts) == Counter({descriptor: 1 for descriptor in owned_descriptors})
+    assert not target.exists()
+    assert not list(target.parent.glob(".pdf-render-*"))
+
+
+def test_rollback_capability_close_fault_cannot_mask_primary_control(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_module = pdf_worker()
+    target = tmp_path / "reviews" / "rev_rollback_close" / "rendered.png"
+    target.parent.mkdir(parents=True)
+    descriptors, relationships = worker_module._open_render_parent(target)
+    parent_owner = descriptors[-1]
+    owned_descriptors = list(descriptors)
+    close_attempts: list[int] = []
+    png_bytes = b"\x89PNG\r\n\x1a\nrollback-close-render"
+    installed_open = os.open
+    installed_close = os.close
+    installed_dup = os.dup
+    installed_fsync = os.fsync
+    primary = KeyboardInterrupt("publication interrupted after binding")
+    rollback_close = OSError("rollback capability close failed after closing")
+    rollback_descriptor: int | None = None
+    rollback_close_injected = False
+
+    def track_candidate_open(*args: object, **kwargs: object) -> int:
+        descriptor = installed_open(*args, **kwargs)  # type: ignore[arg-type]
+        owned_descriptors.append(descriptor)
+        return descriptor
+
+    def track_rollback_dup(descriptor: int) -> int:
+        nonlocal rollback_descriptor
+        rollback_descriptor = installed_dup(descriptor)
+        owned_descriptors.append(rollback_descriptor)
+        return rollback_descriptor
+
+    def close_rollback_then_raise(descriptor: int) -> None:
+        nonlocal rollback_close_injected
+        if descriptor in owned_descriptors:
+            close_attempts.append(descriptor)
+        installed_close(descriptor)
+        if descriptor == rollback_descriptor:
+            rollback_close_injected = True
+            raise rollback_close
+
+    def interrupt_parent_fsync(descriptor: int) -> None:
+        if descriptor == parent_owner:
+            raise primary
+        installed_fsync(descriptor)
+
+    monkeypatch.setattr(worker_module.os, "open", track_candidate_open)
+    monkeypatch.setattr(worker_module.os, "dup", track_rollback_dup)
+    monkeypatch.setattr(worker_module.os, "close", close_rollback_then_raise)
+    monkeypatch.setattr(worker_module.os, "fsync", interrupt_parent_fsync)
+
+    with pytest.raises(KeyboardInterrupt) as excinfo:
+        worker_module._publish_verified_render(
+            target,
+            ".pdf-render-rollback-close.png",
+            png_bytes,
+            hashlib.sha256(png_bytes).hexdigest(),
+            max_bytes=4_194_304,
+            descriptors=descriptors,
+            relationships=relationships,
+        )
+
+    assert excinfo.value is primary
+    assert rollback_close_injected
+    assert Counter(close_attempts) == Counter({descriptor: 1 for descriptor in owned_descriptors})
+    assert not target.exists()
+    assert not list(target.parent.glob(".pdf-render-*"))
+
+
 def test_pdf_child_renders_the_same_bytes_that_passed_verification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

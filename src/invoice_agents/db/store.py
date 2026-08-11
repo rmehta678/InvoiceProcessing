@@ -965,6 +965,19 @@ def _validate_authorizing_review_page_evidence(review: ReviewRequest) -> None:
         ) from exc
 
 
+def _validate_review_page_promotion_authority(review: ReviewRequest) -> None:
+    """Require modern PDF page identity before creating any successor evidence."""
+
+    if review.source.source_format != "pdf":
+        return
+    try:
+        validate_review_page_evidence(review)
+    except ReviewPageEvidenceError as exc:
+        raise EvidenceSnapshotError(
+            "PDF review cannot authorize fresh evidence promotion without exact rendered pages"
+        ) from exc
+
+
 def validate_review_authorization_snapshot(
     connection: sqlite3.Connection,
     authorization: ReviewAuthorization,
@@ -4314,7 +4327,24 @@ class WorkflowStore:
                         self._snapshot_settings(),
                         excluded_alias_sources=_review_alias_sources(predecessor_review),
                     )
-                except EvidenceSnapshotError as exc:
+                    if predecessor_review_authorization is not None:
+                        predecessor_review = predecessor_review_authorization.review
+                        validate_review_snapshot(predecessor_review, snapshot)
+                        if (
+                            predecessor_review_authorization.evidence_snapshot_digest
+                            != snapshot.digest
+                        ):
+                            self._raise_evidence_provenance(
+                                claim,
+                                "predecessor review snapshot digest does not match evidence",
+                            )
+                        # Exact legacy rows remain readable and may record or finalize a
+                        # non-authorizing rejection in their existing generation. Any
+                        # promotion creates fresh evidence authority, so a PDF review must
+                        # first prove modern descriptor-backed rendered-page identity,
+                        # independent of its human decision kind.
+                        _validate_review_page_promotion_authority(predecessor_review)
+                except (EvidenceSnapshotError, ValueError) as exc:
                     self._raise_evidence_provenance(claim, str(exc))
                 next_version = (
                     int(
@@ -4367,19 +4397,14 @@ class WorkflowStore:
                         ),
                     )
                 if predecessor_review_authorization is not None:
-                    try:
-                        predecessor_review = predecessor_review_authorization.review
-                        validate_review_snapshot(predecessor_review, snapshot)
-                    except (EvidenceSnapshotError, ValueError) as exc:
-                        self._raise_evidence_provenance(claim, str(exc))
-                    if predecessor_review_authorization.evidence_snapshot_digest != snapshot.digest:
-                        self._raise_evidence_provenance(
-                            claim, "predecessor review snapshot digest does not match evidence"
-                        )
                     updated = connection.execute(
                         "UPDATE review_requests SET execution_generation = ? "
                         "WHERE review_id = ? AND execution_generation = ?",
-                        (claim.generation, predecessor_review.review_id, predecessor),
+                        (
+                            claim.generation,
+                            predecessor_review_authorization.review.review_id,
+                            predecessor,
+                        ),
                     )
                     if updated.rowcount != 1:
                         self._raise_evidence_provenance(
@@ -4406,6 +4431,18 @@ class WorkflowStore:
                 if predecessor < 1:
                     self._raise_evidence_provenance(claim, "no predecessor generation exists")
                 self._reject_future_evidence(connection, claim)
+                try:
+                    predecessor_review_authorization = load_authoritative_review_authorization(
+                        connection,
+                        claim.case_id,
+                        predecessor,
+                    )
+                    if predecessor_review_authorization is not None:
+                        _validate_review_page_promotion_authority(
+                            predecessor_review_authorization.review
+                        )
+                except EvidenceSnapshotError as exc:
+                    self._raise_evidence_provenance(claim, str(exc))
                 row = connection.execute(
                     "SELECT payload_json FROM extractions WHERE case_id = ? "
                     "AND execution_generation = ? ORDER BY version DESC LIMIT 1",
