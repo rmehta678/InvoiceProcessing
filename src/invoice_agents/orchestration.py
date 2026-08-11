@@ -38,6 +38,7 @@ from invoice_agents.db.store import (
     CaseExecutionSnapshot,
     ExecutionClaim,
     ResultArtifactBinding,
+    StagedInvoiceAdmission,
     WorkflowStore,
     parse_canonical_utc,
     validate_execution_claim,
@@ -3576,18 +3577,129 @@ async def prepare_claimed_invoice_async(
     )
 
 
-async def process_invoice(path: Path, settings: Settings) -> CaseResult:
-    """Preflight, prepare, and process one source artifact."""
+async def stage_claimed_invoice_async(
+    path: Path,
+    settings: Settings,
+) -> StagedInvoiceAdmission | CaseResult:
+    """Build immutable pre-model evidence for one atomic admission transaction.
 
-    prepared = await prepare_claimed_invoice_async(path, settings)
-    if isinstance(prepared, CaseResult):
-        return prepared
-    return await run_prepared_case(
-        prepared[0],
-        prepared[1],
-        settings,
-        claim=prepared[2],
+    Staging deliberately does not write workflow rows or issue database authority. The
+    caller must pass the returned payload to ``WorkflowStore.claim_submission``, which
+    commits the source, extraction, case, execution claim, and idempotency records as one
+    transaction. Cancellation can therefore leave an immutable source snapshot, but it
+    cannot leave an unowned case execution claim.
+    """
+
+    started_at = _now()
+    source_id: str | None = None
+    try:
+        await asyncio.to_thread(preflight, settings)
+        submitted_path = path.resolve()
+        source = await asyncio.to_thread(
+            snapshot_source,
+            path,
+            settings.source_archive_dir,
+            settings.source_max_bytes,
+        )
+        source_id = source.source_id
+        invoice = await asyncio.to_thread(extract_invoice_evidence, source)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        result = _failed_result(f"case_{uuid4().hex}", source_id, started_at, exc)
+        _write_result(result)
+        return result
+    return StagedInvoiceAdmission(
+        submitted_path=submitted_path,
+        source=source,
+        invoice=invoice,
+        case_id=f"case_{uuid4().hex}",
+        started_at=started_at,
+        execution_token=f"exec_{uuid4().hex}",
+        lease_expires_at=_now() + timedelta(seconds=EXECUTION_LEASE_SECONDS),
     )
+
+
+async def process_invoice(
+    path: Path,
+    settings: Settings,
+    *,
+    force_reprocess: bool = False,
+) -> CaseResult:
+    """Atomically admit, reuse, or deliberately reprocess one source artifact."""
+
+    if type(force_reprocess) is not bool:
+        raise ValueError("force_reprocess must be an exact boolean")
+    staged = await stage_claimed_invoice_async(path, settings)
+    if isinstance(staged, CaseResult):
+        return staged
+    store = WorkflowStore(settings)
+    admission = store.claim_submission(
+        f"submission_cli_{uuid4().hex}",
+        "single",
+        (staged,),
+        force_reprocess=force_reprocess,
+    )
+    admitted = admission.cases[0]
+    if admitted.claim is None:
+        existing = store.load_result(admitted.case_id)
+        if existing is None:
+            raise InvoiceAgentsError(
+                ErrorCategory.ORCHESTRATION,
+                "the immutable source already has an active execution",
+                case_id=admitted.case_id,
+                stop_reason="SOURCE_RUN_ALREADY_ACTIVE",
+            ) from None
+        return existing
+
+    claim = admitted.claim
+    authority = [(admitted.case_id, admitted.started_at, claim)]
+    try:
+        # Keep this short transition synchronous: cancellation must not detach an
+        # unknown admission-state commit immediately before paid model work.
+        store.mark_admission_running(admitted.case_id)
+        result = await run_prepared_case(
+            admitted.case_id,
+            admitted.started_at,
+            settings,
+            claim=claim,
+        )
+    except BaseException as primary_failure:
+        outcomes: list[object] = []
+        durability = await _inspect_claim_durability(authority, settings)
+        if durability[admitted.case_id] is not None:
+            try:
+                await _durably_cancel_unstarted_claim(
+                    admitted.case_id,
+                    admitted.started_at,
+                    settings,
+                    claim,
+                )
+            except BaseException as terminal_failure:
+                outcomes.append(terminal_failure)
+            durability = await _inspect_claim_durability(authority, settings)
+
+        admission_failure: BaseException | None = None
+        if durability[admitted.case_id] is None:
+            try:
+                store.mark_admission_terminal(admitted.case_id)
+            except BaseException as exc:
+                admission_failure = exc
+        selected = _select_drained_failure(primary_failure, outcomes, durability)
+        if admission_failure is not None and selected is primary_failure:
+            selected = admission_failure
+        selected.__cause__ = None
+        selected.__context__ = None
+        raise selected from None
+
+    durability = await _inspect_claim_durability(authority, settings)
+    durability_failure = durability[admitted.case_id]
+    if durability_failure is not None:
+        durability_failure.__cause__ = None
+        durability_failure.__context__ = None
+        raise durability_failure from None
+    store.mark_admission_terminal(admitted.case_id)
+    return result
 
 
 async def _await_task_despite_cancellation[ResultT](

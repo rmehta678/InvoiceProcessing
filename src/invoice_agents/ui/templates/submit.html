@@ -13,6 +13,7 @@
   <h2>Process invoices</h2>
   <form method="post" action="/submit" enctype="multipart/form-data">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="submission_id" value="{{ single_submission_id }}">
     <fieldset {% if not preflight.ok %}disabled{% endif %}>
       <legend>Pick one or more existing files under <span class="mono">{{ invoice_dir }}</span></legend>
       {% if files %}
@@ -55,6 +56,7 @@
   <h2>Run batch</h2>
   <form method="post" action="/batch">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="submission_id" value="{{ batch_submission_id }}">
     <fieldset {% if not preflight.ok %}disabled{% endif %}>
       <legend>All {{ files|length }} supported files in <span class="mono">{{ invoice_dir }}</span></legend>
       <label class="inline">Concurrency

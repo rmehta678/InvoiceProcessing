@@ -6,6 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 from typing import Annotated
+from uuid import uuid4
 
 import typer
 from pydantic import ValidationError
@@ -22,7 +23,7 @@ from invoice_agents.config import (
 from invoice_agents.db.cli import app as db_app
 from invoice_agents.db.core import ensure_databases
 from invoice_agents.db.store import WorkflowStore
-from invoice_agents.errors import InvoiceAgentsError
+from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.hitl.service import record_human_decision
 from invoice_agents.models import (
     CanonicalMapping,
@@ -33,10 +34,10 @@ from invoice_agents.models import (
 from invoice_agents.observability.audit import configure_logging, redact, sanitize_text
 from invoice_agents.orchestration import (
     claim_resumable_case,
-    process_batch,
     process_invoice,
     resume_case,
 )
+from invoice_agents.ui.runs import RunRegistry
 
 console = Console()
 app = typer.Typer(
@@ -134,10 +135,17 @@ def root_callback(
 @app.command("process")
 def process_command(
     invoice_path: Annotated[Path, typer.Option("--invoice-path", exists=False)],
+    force_reprocess: Annotated[bool, typer.Option("--force-reprocess")] = False,
 ) -> None:
     """Process one invoice through a fresh AutoGen Swarm."""
 
-    result = asyncio.run(process_invoice(invoice_path, _settings()))
+    result = asyncio.run(
+        process_invoice(
+            invoice_path,
+            _settings(),
+            force_reprocess=force_reprocess,
+        )
+    )
     _print_result(result)
     _exit_for(result)
 
@@ -163,7 +171,8 @@ def batch_command(
         for path in invoice_dir.iterdir()
         if path.is_file() and path.suffix.lower() in {".txt", ".json", ".csv", ".xml", ".pdf"}
     )
-    results = asyncio.run(process_batch(paths, _settings(), concurrency))
+    settings = _settings()
+    results = asyncio.run(_run_durable_cli_batch(paths, settings, concurrency))
     table = Table("Case", "Source", "Status", "Stop reason", "Decision", "Payment")
     for result in results:
         table.add_row(
@@ -186,6 +195,43 @@ def batch_command(
         raise typer.Exit(1)
     if pending:
         raise typer.Exit(2)
+
+
+async def _run_durable_cli_batch(
+    paths: list[Path],
+    settings: Settings,
+    concurrency: int | None,
+) -> list[CaseResult]:
+    """Run one CLI batch through the shared durable admission implementation."""
+
+    registry = RunRegistry(global_limit=settings.case_concurrency)
+    batch = await registry.start_batch(
+        paths,
+        settings,
+        concurrency,
+        submission_id=f"submission_cli_batch_{uuid4().hex}",
+    )
+    task = batch.task
+    if task is not None:
+        await task
+    persisted = WorkflowStore(settings).load_batch(batch.batch_id)
+    if persisted is None:
+        raise InvoiceAgentsError(
+            ErrorCategory.DATABASE,
+            "durable CLI batch disappeared after admission",
+            stop_reason="PERSISTED_SUBMISSION_INVALID",
+        ) from None
+    results: list[CaseResult] = []
+    for entry in persisted.entries:
+        if entry.result is None:
+            raise InvoiceAgentsError(
+                ErrorCategory.ORCHESTRATION,
+                "CLI batch reuses a source whose authoritative execution is still active",
+                case_id=entry.case_id,
+                stop_reason="SOURCE_RUN_ALREADY_ACTIVE",
+            ) from None
+        results.append(entry.result)
+    return results
 
 
 @case_app.command("status")

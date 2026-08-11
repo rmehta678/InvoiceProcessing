@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Never, TypeVar, cast
+from typing import Any, Literal, Never, TypeVar, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, TypeAdapter
@@ -51,6 +52,9 @@ _DATETIME_WIRE_TYPE = datetime
 _DATETIME_ADAPTER = TypeAdapter(datetime)
 _REQUESTED_EXECUTION_TOKEN = re.compile(r"^exec_[0-9a-f]{32}$")
 _ARTIFACT_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SUBMISSION_REQUEST_ID = re.compile(r"^submission_[A-Za-z0-9][A-Za-z0-9_-]{0,126}$")
+_CASE_LIVE_TARGET = re.compile(r"^/cases/(case_[0-9a-f]{32})/live$")
+_BATCH_TARGET = re.compile(r"^/batches/(batch_[0-9a-f]{24})$")
 _STORED_FINISHED_AT_OMITTED = object()
 
 
@@ -111,6 +115,63 @@ class ExecutionClaim:
 
 
 @dataclass(frozen=True, slots=True)
+class StagedInvoiceAdmission:
+    """One fully inspected source payload that has not mutated workflow SQLite."""
+
+    submitted_path: Path
+    source: SourceArtifact
+    invoice: ExtractedInvoice
+    case_id: str
+    started_at: datetime
+    execution_token: str
+    lease_expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AdmittedCase:
+    """Durable case admission; ``claim`` exists only for newly authorized work."""
+
+    source_id: str
+    source_path: Path
+    case_id: str
+    started_at: datetime
+    state: Literal["queued", "running", "done", "failed"]
+    claim: ExecutionClaim | None
+
+
+@dataclass(frozen=True, slots=True)
+class SubmissionAdmission:
+    """The exact durable redirect and cases bound to one submission request."""
+
+    request_id: str
+    created_at: datetime
+    kind: Literal["single", "batch"]
+    fingerprint: str
+    redirect_target: str
+    cases: tuple[AdmittedCase, ...]
+    batch_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedBatchEntry:
+    source_id: str
+    source_path: Path
+    case_id: str
+    started_at: datetime
+    state: Literal["queued", "running", "done", "failed"]
+    result: CaseResult | None
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedBatch:
+    batch_id: str
+    created_at: datetime
+    concurrency: int
+    state: Literal["queued", "running", "done", "failed"]
+    entries: tuple[PersistedBatchEntry, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class CaseExecutionSnapshot:
     """One authoritative cases-row view for SSE terminal/lease decisions."""
 
@@ -158,6 +219,18 @@ class ValidatedEvidenceFacts:
 
 def now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def submission_fingerprint(kind: Literal["single", "batch"], source_ids: tuple[str, ...]) -> str:
+    """Hash the exact request kind and ordered immutable source identities."""
+
+    canonical = json.dumps(
+        {"kind": kind, "source_ids": list(source_ids)},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def parse_canonical_utc(value: object) -> datetime | None:
@@ -1361,6 +1434,1060 @@ class WorkflowStore:
                     case_id=claim.case_id,
                     stop_reason="PERSISTED_RESULT_INVALID",
                 ) from None
+
+    @staticmethod
+    def _raise_admission_invalid(message: str, *, case_id: str | None = None) -> Never:
+        raise InvoiceAgentsError(
+            ErrorCategory.DATABASE,
+            message,
+            case_id=case_id,
+            stop_reason="PERSISTED_SUBMISSION_INVALID",
+        ) from None
+
+    @classmethod
+    def _validate_staged_admission(cls, staged: StagedInvoiceAdmission) -> ExecutionClaim:
+        if type(staged) is not StagedInvoiceAdmission:
+            raise TypeError("admission requires an exact staged payload")
+        claim = validate_execution_claim(
+            ExecutionClaim(
+                staged.case_id,
+                staged.execution_token,
+                1,
+                staged.lease_expires_at,
+            ),
+            expected_case_id=staged.case_id,
+        )
+        encoded_start = staged.started_at.isoformat() if type(staged.started_at) is datetime else ""
+        checked_at = datetime.now(UTC)
+        if (
+            _runtime_utc_datetime(staged.started_at) is None
+            or parse_canonical_utc(encoded_start) != staged.started_at
+            or staged.started_at > checked_at
+            or claim.expires_at <= checked_at
+            or claim.expires_at <= staged.started_at
+            or not staged.submitted_path.is_absolute()
+            or staged.invoice.source != staged.source
+        ):
+            raise ValueError("staged admission payload is not canonical")
+        return claim
+
+    @staticmethod
+    def _insert_source_in_transaction(
+        connection: sqlite3.Connection,
+        source: SourceArtifact,
+        created_at: str,
+    ) -> None:
+        existing = connection.execute(
+            "SELECT canonical_path, source_hash, source_format, size_bytes, modified_at, "
+            "metadata_json FROM source_artifacts WHERE source_id = ?",
+            (source.source_id,),
+        ).fetchone()
+        expected = (
+            str(source.canonical_path),
+            source.sha256,
+            source.source_format,
+            source.size_bytes,
+            source.modified_at.isoformat(),
+            source.model_dump_json(),
+        )
+        if existing is not None:
+            if tuple(existing[index] for index in range(6)) != expected:
+                raise InvoiceAgentsError(
+                    ErrorCategory.DATABASE,
+                    f"source artifact {source.source_id} is immutable and conflicts",
+                    stop_reason="SOURCE_ARTIFACT_IMMUTABLE",
+                )
+            return
+        connection.execute(
+            "INSERT INTO source_artifacts("
+            "source_id, canonical_path, source_hash, source_format, size_bytes, "
+            "modified_at, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (source.source_id, *expected, created_at),
+        )
+
+    @classmethod
+    def _stored_case_admission_state(
+        cls,
+        connection: sqlite3.Connection,
+        case_id: str,
+        expected_source_id: str,
+    ) -> tuple[Literal["running", "done", "failed"], datetime, CaseResult | None]:
+        row = connection.execute(
+            "SELECT case_id, source_id, status, stop_reason, result_json, started_at, "
+            "finished_at, execution_token, execution_generation, execution_state, "
+            "lease_expires_at FROM cases WHERE case_id = ?",
+            (case_id,),
+        ).fetchone()
+        if row is None or row["source_id"] != expected_source_id:
+            cls._raise_admission_invalid(
+                "source run claim does not identify its authoritative case",
+                case_id=case_id,
+            )
+        assert row is not None
+        started_at = parse_canonical_utc(row["started_at"])
+        if started_at is None or not cls._authority_tuple_is_valid(row):
+            cls._raise_admission_invalid(
+                "source run claim references invalid case authority",
+                case_id=case_id,
+            )
+        if row["execution_state"] == "RUNNING":
+            return "running", started_at, None
+        if row["execution_state"] != "FINISHED":
+            cls._raise_admission_invalid(
+                "source run claim references a non-running nonterminal case",
+                case_id=case_id,
+            )
+        result = cls._decode_terminal_result_row(row)
+        state: Literal["done", "failed"] = (
+            "failed" if result.status in {CaseStatus.FAILED, CaseStatus.INCOMPLETE} else "done"
+        )
+        return state, started_at, result
+
+    @classmethod
+    def _validated_exact_source_run_claim(
+        cls,
+        connection: sqlite3.Connection,
+        source_id: str,
+        case_id: str,
+        authoritative_state: Literal["running", "done", "failed"],
+        started_at: datetime,
+        result: CaseResult | None,
+    ) -> Literal["queued", "running", "done", "failed"]:
+        """Validate the current source authority before honoring an idempotent target."""
+
+        row = connection.execute(
+            "SELECT source_id, case_id, state, claimed_at, released_at "
+            "FROM source_run_claims WHERE source_id = ?",
+            (source_id,),
+        ).fetchone()
+        if row is None or row["source_id"] != source_id or row["case_id"] != case_id:
+            cls._raise_admission_invalid(
+                "submission source authority is missing or references another case",
+                case_id=case_id,
+            )
+        assert row is not None
+        checked_at = datetime.now(UTC)
+        claimed_at = parse_canonical_utc(row["claimed_at"])
+        if claimed_at is None or claimed_at < started_at or claimed_at > checked_at:
+            cls._raise_admission_invalid(
+                "submission source claim time is not canonical",
+                case_id=case_id,
+            )
+        claim_state = str(row["state"])
+        if authoritative_state == "running":
+            if claim_state not in {"queued", "running"} or row["released_at"] is not None:
+                cls._raise_admission_invalid(
+                    "active submission source claim is not exact",
+                    case_id=case_id,
+                )
+            return cast(Literal["queued", "running"], claim_state)
+        released_at = parse_canonical_utc(row["released_at"])
+        if (
+            claim_state != authoritative_state
+            or result is None
+            or released_at is None
+            or released_at < claimed_at
+            or released_at < result.finished_at
+            or released_at > checked_at
+        ):
+            cls._raise_admission_invalid(
+                "terminal submission source claim is not exact",
+                case_id=case_id,
+            )
+        return claim_state
+
+    @classmethod
+    def _validated_source_run_claim_for_target(
+        cls,
+        connection: sqlite3.Connection,
+        source_id: str,
+        target_case_id: str,
+        target_state: Literal["running", "done", "failed"],
+        target_started_at: datetime,
+        target_result: CaseResult | None,
+    ) -> tuple[Literal["queued", "running", "done", "failed"], bool]:
+        """Validate a current or legitimately superseded submission target.
+
+        The boolean is true only for the explicit Task 9 orphan-recovery state:
+        the case is terminal but its still-exact active admission mirror has not
+        yet been advanced.  Callers with write authority may reconcile that one
+        state; every other disagreement is corruption.
+        """
+
+        row = connection.execute(
+            "SELECT case_id, state FROM source_run_claims WHERE source_id = ?",
+            (source_id,),
+        ).fetchone()
+        if row is None:
+            cls._raise_admission_invalid(
+                "submission source authority is missing",
+                case_id=target_case_id,
+            )
+        assert row is not None
+        current_case_id = str(row["case_id"])
+        if current_case_id == target_case_id:
+            if (
+                target_state in {"done", "failed"}
+                and row["state"] in {"queued", "running"}
+                and target_result is not None
+                and target_result.stop_reason == "ORPHANED_EXECUTION"
+            ):
+                active_state = cls._validated_exact_source_run_claim(
+                    connection,
+                    source_id,
+                    target_case_id,
+                    "running",
+                    target_started_at,
+                    None,
+                )
+                return active_state, True
+            return (
+                cls._validated_exact_source_run_claim(
+                    connection,
+                    source_id,
+                    target_case_id,
+                    target_state,
+                    target_started_at,
+                    target_result,
+                ),
+                False,
+            )
+
+        if target_state not in {"done", "failed"} or target_result is None:
+            cls._raise_admission_invalid(
+                "active submission target was superseded",
+                case_id=target_case_id,
+            )
+        current_state, current_started_at, current_result = cls._stored_case_admission_state(
+            connection,
+            current_case_id,
+            source_id,
+        )
+        if current_started_at < target_result.finished_at:
+            cls._raise_admission_invalid(
+                "source run authority does not follow its historical submission target",
+                case_id=target_case_id,
+            )
+        cls._validated_exact_source_run_claim(
+            connection,
+            source_id,
+            current_case_id,
+            current_state,
+            current_started_at,
+            current_result,
+        )
+        return target_state, False
+
+    @classmethod
+    def _reconcile_recovered_source_admission(
+        cls,
+        connection: sqlite3.Connection,
+        source_id: str,
+        case_id: str,
+        state: Literal["done", "failed"],
+        started_at: datetime,
+        result: CaseResult,
+    ) -> None:
+        """Mirror one exact Task 9 orphan terminal inside admission ownership."""
+
+        released_at = now_iso()
+        released_at_clock = parse_canonical_utc(released_at)
+        if released_at_clock is None or released_at_clock < result.finished_at:
+            cls._raise_admission_invalid(
+                "recovered source admission timestamp is not monotonic",
+                case_id=case_id,
+            )
+        claim = connection.execute(
+            "SELECT state FROM source_run_claims WHERE source_id = ? AND case_id = ?",
+            (source_id, case_id),
+        ).fetchone()
+        if claim is None or claim["state"] not in {"queued", "running"}:
+            cls._raise_admission_invalid(
+                "recovered source admission is not exact",
+                case_id=case_id,
+            )
+        batch_ids = cls._require_exact_case_batch_mirrors(
+            connection,
+            case_id,
+            str(claim["state"]),
+        )
+        updated_claim = connection.execute(
+            "UPDATE source_run_claims SET state = ?, released_at = ? "
+            "WHERE source_id = ? AND case_id = ? "
+            "AND state IN ('queued', 'running') AND released_at IS NULL",
+            (state, released_at, source_id, case_id),
+        )
+        updated_entries = connection.execute(
+            "UPDATE batch_entries SET state = ? WHERE case_id = ? "
+            "AND state IN ('queued', 'running')",
+            (state, case_id),
+        )
+        if updated_claim.rowcount != 1 or updated_entries.rowcount != len(batch_ids):
+            cls._raise_admission_invalid(
+                "recovered admission transition was not exact",
+                case_id=case_id,
+            )
+        for batch_id in batch_ids:
+            cls._recompute_batch_state(connection, batch_id)
+        cls._validated_exact_source_run_claim(
+            connection,
+            source_id,
+            case_id,
+            state,
+            started_at,
+            result,
+        )
+
+    @staticmethod
+    def _derived_batch_state(
+        states: tuple[str, ...],
+    ) -> Literal["running", "done", "failed"]:
+        if not states or any(
+            state not in {"queued", "running", "done", "failed"} for state in states
+        ):
+            WorkflowStore._raise_admission_invalid("durable batch has invalid entries")
+        return (
+            "running"
+            if any(state in {"queued", "running"} for state in states)
+            else "failed"
+            if any(state == "failed" for state in states)
+            else "done"
+        )
+
+    @classmethod
+    def _require_exact_case_batch_mirrors(
+        cls,
+        connection: sqlite3.Connection,
+        case_id: str,
+        expected_entry_state: str,
+    ) -> tuple[str, ...]:
+        """Prove every batch mirror before an authorized state transition."""
+
+        rows = connection.execute(
+            "SELECT batch_id, state FROM batch_entries WHERE case_id = ? ORDER BY batch_id",
+            (case_id,),
+        ).fetchall()
+        batch_ids = tuple(str(row["batch_id"]) for row in rows)
+        if len(set(batch_ids)) != len(batch_ids) or any(
+            row["state"] != expected_entry_state for row in rows
+        ):
+            cls._raise_admission_invalid(
+                "batch entry disagrees with its source admission",
+                case_id=case_id,
+            )
+        for batch_id in batch_ids:
+            batch_row = connection.execute(
+                "SELECT state FROM batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            states = tuple(
+                str(row["state"])
+                for row in connection.execute(
+                    "SELECT state FROM batch_entries WHERE batch_id = ? ORDER BY position",
+                    (batch_id,),
+                ).fetchall()
+            )
+            if batch_row is None or batch_row["state"] != cls._derived_batch_state(states):
+                cls._raise_admission_invalid(
+                    "batch state disagrees with its durable entries",
+                    case_id=case_id,
+                )
+        return batch_ids
+
+    @classmethod
+    def _load_existing_submission(
+        cls,
+        connection: sqlite3.Connection,
+        request_id: str,
+        kind: Literal["single", "batch"],
+        fingerprint: str,
+        source_ids: tuple[str, ...],
+    ) -> SubmissionAdmission | None:
+        row = connection.execute(
+            "SELECT created_at, kind, fingerprint, redirect_target FROM submission_requests "
+            "WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["kind"] != kind or row["fingerprint"] != fingerprint:
+            raise InvoiceAgentsError(
+                ErrorCategory.ORCHESTRATION,
+                "submission ID is already bound to a different request",
+                stop_reason="SUBMISSION_FINGERPRINT_MISMATCH",
+            ) from None
+        target = str(row["redirect_target"])
+        created_at = parse_canonical_utc(row["created_at"])
+        if created_at is None:
+            cls._raise_admission_invalid("submission creation time is not canonical")
+        admitted: list[AdmittedCase] = []
+        batch_id: str | None = None
+        if kind == "single":
+            match = _CASE_LIVE_TARGET.fullmatch(target)
+            if match is None or len(source_ids) != 1:
+                cls._raise_admission_invalid("single submission redirect is invalid")
+            case_id = match.group(1)
+            state, started_at, result = cls._stored_case_admission_state(
+                connection, case_id, source_ids[0]
+            )
+            admission_state, _recovery_required = cls._validated_source_run_claim_for_target(
+                connection,
+                source_ids[0],
+                case_id,
+                state,
+                started_at,
+                result,
+            )
+            admitted.append(
+                AdmittedCase(
+                    source_id=source_ids[0],
+                    source_path=Path("."),
+                    case_id=case_id,
+                    started_at=started_at,
+                    state=admission_state,
+                    claim=None,
+                )
+            )
+        else:
+            match = _BATCH_TARGET.fullmatch(target)
+            if match is None:
+                cls._raise_admission_invalid("batch submission redirect is invalid")
+            batch_id = match.group(1)
+            batch_row = connection.execute(
+                "SELECT batch_id FROM batches WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+            entry_rows = connection.execute(
+                "SELECT position, source_id, case_id, source_path FROM batch_entries "
+                "WHERE batch_id = ? ORDER BY position",
+                (batch_id,),
+            ).fetchall()
+            if (
+                batch_row is None
+                or tuple(item["position"] for item in entry_rows) != tuple(range(len(entry_rows)))
+                or tuple(str(item["source_id"]) for item in entry_rows) != source_ids
+            ):
+                cls._raise_admission_invalid("batch submission target is inconsistent")
+            for entry in entry_rows:
+                source_id = str(entry["source_id"])
+                case_id = str(entry["case_id"])
+                state, started_at, result = cls._stored_case_admission_state(
+                    connection, case_id, source_id
+                )
+                admission_state, _recovery_required = cls._validated_source_run_claim_for_target(
+                    connection,
+                    source_id,
+                    case_id,
+                    state,
+                    started_at,
+                    result,
+                )
+                admitted.append(
+                    AdmittedCase(
+                        source_id=source_id,
+                        source_path=Path(str(entry["source_path"])),
+                        case_id=case_id,
+                        started_at=started_at,
+                        state=admission_state,
+                        claim=None,
+                    )
+                )
+        return SubmissionAdmission(
+            request_id=request_id,
+            created_at=created_at,
+            kind=kind,
+            fingerprint=fingerprint,
+            redirect_target=target,
+            cases=tuple(admitted),
+            batch_id=batch_id,
+        )
+
+    def load_submission(
+        self,
+        request_id: str,
+        kind: Literal["single", "batch"],
+        source_ids: tuple[str, ...],
+    ) -> SubmissionAdmission | None:
+        """Read and strictly validate an already-persisted request without mutation."""
+
+        if _SUBMISSION_REQUEST_ID.fullmatch(request_id) is None:
+            raise ValueError("submission request ID is not canonical")
+        fingerprint = submission_fingerprint(kind, source_ids)
+        with connect_database(self.path, read_only=True) as connection:
+            return self._load_existing_submission(
+                connection, request_id, kind, fingerprint, source_ids
+            )
+
+    def claim_source_run(
+        self,
+        connection: sqlite3.Connection,
+        staged: StagedInvoiceAdmission,
+        *,
+        claimed_at: str,
+        force_reprocess: bool,
+    ) -> AdmittedCase:
+        """Claim one source inside the caller-owned admission transaction."""
+
+        if not connection.in_transaction:
+            raise RuntimeError("source run claims require an active admission transaction")
+        claim = self._validate_staged_admission(staged)
+        if parse_canonical_utc(claimed_at) is None:
+            raise ValueError("source claim timestamp is not canonical UTC")
+        self._insert_source_in_transaction(connection, staged.source, claimed_at)
+        prior = connection.execute(
+            "SELECT source_id, case_id, state, claimed_at, released_at "
+            "FROM source_run_claims WHERE source_id = ?",
+            (staged.source.source_id,),
+        ).fetchone()
+        if prior is not None:
+            prior_case_id = str(prior["case_id"])
+            authoritative_state, prior_started_at, prior_result = self._stored_case_admission_state(
+                connection, prior_case_id, staged.source.source_id
+            )
+            prior_state, recovery_required = self._validated_source_run_claim_for_target(
+                connection,
+                staged.source.source_id,
+                prior_case_id,
+                authoritative_state,
+                prior_started_at,
+                prior_result,
+            )
+            if recovery_required:
+                if authoritative_state == "done":
+                    recovered_state: Literal["done", "failed"] = "done"
+                elif authoritative_state == "failed":
+                    recovered_state = "failed"
+                else:
+                    self._raise_admission_invalid(
+                        "recovered source admission lacks exact terminal evidence",
+                        case_id=prior_case_id,
+                    )
+                if prior_result is None:
+                    self._raise_admission_invalid(
+                        "recovered source admission lacks its terminal result",
+                        case_id=prior_case_id,
+                    )
+                self._reconcile_recovered_source_admission(
+                    connection,
+                    staged.source.source_id,
+                    prior_case_id,
+                    recovered_state,
+                    prior_started_at,
+                    prior_result,
+                )
+                prior_state = recovered_state
+        if prior is not None and not force_reprocess:
+            return AdmittedCase(
+                source_id=staged.source.source_id,
+                source_path=staged.submitted_path,
+                case_id=prior_case_id,
+                started_at=prior_started_at,
+                state=prior_state,
+                claim=None,
+            )
+        if prior is not None and prior_state not in {"done", "failed"}:
+            raise InvoiceAgentsError(
+                ErrorCategory.ORCHESTRATION,
+                "source run has not reached a durable terminal state",
+                case_id=prior_case_id,
+                stop_reason="SOURCE_RUN_NOT_TERMINAL",
+            ) from None
+        connection.execute(
+            "INSERT INTO cases("
+            "case_id, source_id, status, stop_reason, started_at, updated_at, "
+            "execution_token, execution_generation, execution_state, lease_expires_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?)",
+            (
+                staged.case_id,
+                staged.source.source_id,
+                CaseStatus.INCOMPLETE,
+                "CASE_CREATED",
+                staged.started_at.isoformat(),
+                claimed_at,
+                claim.token,
+                claim.generation,
+                claim.expires_at.isoformat(),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO extractions("
+            "extraction_id, case_id, version, payload_json, created_at, "
+            "execution_generation) VALUES (?, ?, 1, ?, ?, ?)",
+            (
+                f"ext_{uuid4().hex}",
+                staged.case_id,
+                staged.invoice.model_dump_json(),
+                claimed_at,
+                claim.generation,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO events(event_id, case_id, source_id, event_type, "
+            "payload_json, created_at) VALUES (?, ?, ?, 'case.prepared', ?, ?)",
+            (
+                f"evt_{uuid4().hex}",
+                staged.case_id,
+                staged.source.source_id,
+                json.dumps(
+                    {
+                        "source": staged.source.model_dump(mode="json"),
+                        "extraction_version": 1,
+                        "note": ("pre-model extraction enables complete batch identity visibility"),
+                    },
+                    default=str,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                claimed_at,
+            ),
+        )
+        if prior is None:
+            connection.execute(
+                "INSERT INTO source_run_claims("
+                "source_id, case_id, state, claimed_at, released_at"
+                ") VALUES (?, ?, 'queued', ?, NULL)",
+                (staged.source.source_id, staged.case_id, claimed_at),
+            )
+        else:
+            updated = connection.execute(
+                "UPDATE source_run_claims SET case_id = ?, state = 'queued', "
+                "claimed_at = ?, released_at = NULL WHERE source_id = ? "
+                "AND case_id = ? AND state IN ('done', 'failed')",
+                (
+                    staged.case_id,
+                    claimed_at,
+                    staged.source.source_id,
+                    prior["case_id"],
+                ),
+            )
+            if updated.rowcount != 1:
+                raise InvoiceAgentsError(
+                    ErrorCategory.ORCHESTRATION,
+                    "source run authority changed during forced admission",
+                    case_id=staged.case_id,
+                    stop_reason="SOURCE_RUN_NOT_TERMINAL",
+                )
+        return AdmittedCase(
+            source_id=staged.source.source_id,
+            source_path=staged.submitted_path,
+            case_id=staged.case_id,
+            started_at=staged.started_at,
+            state="queued",
+            claim=claim,
+        )
+
+    def claim_submission(
+        self,
+        request_id: str,
+        kind: Literal["single", "batch"],
+        staged_sources: tuple[StagedInvoiceAdmission, ...],
+        *,
+        concurrency: int | None = None,
+        force_reprocess: bool = False,
+    ) -> SubmissionAdmission:
+        """Atomically bind source, execution, idempotency, and redirect authority."""
+
+        if _SUBMISSION_REQUEST_ID.fullmatch(request_id) is None:
+            raise ValueError("submission request ID is not canonical")
+        if kind not in {"single", "batch"} or not staged_sources:
+            raise ValueError("admission kind and staged sources are required")
+        if kind == "single" and len(staged_sources) != 1:
+            raise ValueError("single admission requires exactly one source")
+        if type(force_reprocess) is not bool:
+            raise ValueError("force_reprocess must be an exact boolean")
+        if kind == "batch" and (type(concurrency) is not int or not 1 <= concurrency <= 8):
+            raise ValueError("batch admission concurrency must be between 1 and 8")
+        if kind == "batch" and force_reprocess:
+            raise ValueError("batch admission cannot force source reprocessing")
+        source_ids = tuple(item.source.source_id for item in staged_sources)
+        if len(set(source_ids)) != len(source_ids):
+            raise InvoiceAgentsError(
+                ErrorCategory.ORCHESTRATION,
+                "one batch cannot contain the same immutable source more than once",
+                stop_reason="DUPLICATE_BATCH_SOURCE",
+            ) from None
+        fingerprint = submission_fingerprint(kind, source_ids)
+        created_at_clock = datetime.now(UTC)
+        created_at = created_at_clock.isoformat()
+        batch_id = f"batch_{uuid4().hex[:24]}" if kind == "batch" else None
+        with connect_database(self.path) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                existing = self._load_existing_submission(
+                    connection, request_id, kind, fingerprint, source_ids
+                )
+                if existing is not None:
+                    connection.commit()
+                    return existing
+                admitted = [
+                    self.claim_source_run(
+                        connection,
+                        staged,
+                        claimed_at=created_at,
+                        force_reprocess=force_reprocess,
+                    )
+                    for staged in staged_sources
+                ]
+                if kind == "single":
+                    redirect_target = f"/cases/{admitted[0].case_id}/live"
+                    connection.execute(
+                        "INSERT INTO submission_requests("
+                        "request_id, created_at, kind, fingerprint, redirect_target"
+                        ") VALUES (?, ?, 'single', ?, ?)",
+                        (request_id, created_at, fingerprint, redirect_target),
+                    )
+                else:
+                    assert batch_id is not None and concurrency is not None
+                    redirect_target = f"/batches/{batch_id}"
+                    connection.execute(
+                        "INSERT INTO submission_requests("
+                        "request_id, created_at, kind, fingerprint, redirect_target"
+                        ") VALUES (?, ?, 'batch', ?, ?)",
+                        (request_id, created_at, fingerprint, redirect_target),
+                    )
+                    initial_batch_state = (
+                        "done"
+                        if all(item.state == "done" for item in admitted)
+                        else "failed"
+                        if any(item.state == "failed" for item in admitted)
+                        and all(item.state in {"done", "failed"} for item in admitted)
+                        else "running"
+                    )
+                    connection.execute(
+                        "INSERT INTO batches(batch_id, created_at, concurrency, state) "
+                        "VALUES (?, ?, ?, ?)",
+                        (batch_id, created_at, concurrency, initial_batch_state),
+                    )
+                    connection.executemany(
+                        "INSERT INTO batch_entries("
+                        "batch_id, position, source_id, case_id, source_path, state"
+                        ") VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            (
+                                batch_id,
+                                position,
+                                item.source_id,
+                                item.case_id,
+                                str(item.source_path),
+                                item.state,
+                            )
+                            for position, item in enumerate(admitted)
+                        ),
+                    )
+                result = SubmissionAdmission(
+                    request_id=request_id,
+                    created_at=created_at_clock,
+                    kind=kind,
+                    fingerprint=fingerprint,
+                    redirect_target=redirect_target,
+                    cases=tuple(admitted),
+                    batch_id=batch_id,
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return result
+
+    def mark_admission_running(self, case_id: str) -> None:
+        """Persist the queued-to-running transition before entering model code."""
+
+        with connect_database(self.path) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                rows = connection.execute(
+                    "SELECT source_id, case_id, state FROM source_run_claims WHERE case_id = ?",
+                    (case_id,),
+                ).fetchall()
+                if len(rows) != 1:
+                    self._raise_admission_invalid(
+                        "running case does not have exactly one durable source admission",
+                        case_id=case_id,
+                    )
+                row = rows[0]
+                authoritative_state, started_at, result = self._stored_case_admission_state(
+                    connection,
+                    case_id,
+                    str(row["source_id"]),
+                )
+                if authoritative_state != "running" or result is not None:
+                    self._raise_admission_invalid(
+                        "admission cannot enter running after its case is terminal",
+                        case_id=case_id,
+                    )
+                self._validated_exact_source_run_claim(
+                    connection,
+                    str(row["source_id"]),
+                    case_id,
+                    authoritative_state,
+                    started_at,
+                    result,
+                )
+                batch_ids = self._require_exact_case_batch_mirrors(
+                    connection,
+                    case_id,
+                    str(row["state"]),
+                )
+                if row["state"] == "queued":
+                    updated = connection.execute(
+                        "UPDATE source_run_claims SET state = 'running' "
+                        "WHERE source_id = ? AND case_id = ? AND state = 'queued'",
+                        (row["source_id"], case_id),
+                    )
+                    if updated.rowcount != 1:
+                        self._raise_admission_invalid(
+                            "source admission running transition was not exact",
+                            case_id=case_id,
+                        )
+                elif row["state"] != "running":
+                    self._raise_admission_invalid(
+                        "terminal source admission cannot re-enter running", case_id=case_id
+                    )
+                updated_entries = connection.execute(
+                    "UPDATE batch_entries SET state = 'running' "
+                    "WHERE case_id = ? AND state = 'queued'",
+                    (case_id,),
+                )
+                expected_updates = len(batch_ids) if row["state"] == "queued" else 0
+                if updated_entries.rowcount != expected_updates:
+                    self._raise_admission_invalid(
+                        "batch admission running transition was not exact",
+                        case_id=case_id,
+                    )
+                for batch_id in batch_ids:
+                    self._recompute_batch_state(connection, batch_id)
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def mark_admission_terminal(self, case_id: str) -> None:
+        """Mirror an exact terminal case into source and batch admission state."""
+
+        released_at = now_iso()
+        with connect_database(self.path) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                source_rows = connection.execute(
+                    "SELECT source_id FROM source_run_claims WHERE case_id = ?", (case_id,)
+                ).fetchall()
+                if len(source_rows) != 1:
+                    self._raise_admission_invalid(
+                        "terminal case does not have exactly one durable source admission",
+                        case_id=case_id,
+                    )
+                source_row = source_rows[0]
+                state, started_at, result = self._stored_case_admission_state(
+                    connection, case_id, str(source_row["source_id"])
+                )
+                released_at_clock = parse_canonical_utc(released_at)
+                if (
+                    state not in {"done", "failed"}
+                    or result is None
+                    or released_at_clock is None
+                    or released_at_clock < result.finished_at
+                ):
+                    self._raise_admission_invalid(
+                        "admission cannot terminalize before its case", case_id=case_id
+                    )
+                current = connection.execute(
+                    "SELECT state FROM source_run_claims WHERE source_id = ? AND case_id = ?",
+                    (source_row["source_id"], case_id),
+                ).fetchone()
+                if current is None:
+                    self._raise_admission_invalid(
+                        "terminal case source admission disappeared",
+                        case_id=case_id,
+                    )
+                current_is_active = current["state"] in {"queued", "running"}
+                if current_is_active:
+                    self._validated_exact_source_run_claim(
+                        connection,
+                        str(source_row["source_id"]),
+                        case_id,
+                        "running",
+                        started_at,
+                        None,
+                    )
+                else:
+                    self._validated_exact_source_run_claim(
+                        connection,
+                        str(source_row["source_id"]),
+                        case_id,
+                        state,
+                        started_at,
+                        result,
+                    )
+                batch_ids = self._require_exact_case_batch_mirrors(
+                    connection,
+                    case_id,
+                    str(current["state"]),
+                )
+                updated = connection.execute(
+                    "UPDATE source_run_claims SET state = ?, released_at = ? "
+                    "WHERE source_id = ? AND case_id = ? AND state IN ('queued', 'running')",
+                    (state, released_at, source_row["source_id"], case_id),
+                )
+                if updated.rowcount != (1 if current_is_active else 0):
+                    self._raise_admission_invalid(
+                        "source admission terminal transition was not exact",
+                        case_id=case_id,
+                    )
+                updated_entries = connection.execute(
+                    "UPDATE batch_entries SET state = ? WHERE case_id = ? "
+                    "AND state IN ('queued', 'running')",
+                    (state, case_id),
+                )
+                expected_entry_updates = len(batch_ids) if current_is_active else 0
+                if updated_entries.rowcount != expected_entry_updates:
+                    self._raise_admission_invalid(
+                        "batch admission terminal transition was not exact",
+                        case_id=case_id,
+                    )
+                self._validated_exact_source_run_claim(
+                    connection,
+                    str(source_row["source_id"]),
+                    case_id,
+                    state,
+                    started_at,
+                    result,
+                )
+                for selected_batch_id in batch_ids:
+                    self._recompute_batch_state(connection, selected_batch_id)
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    @staticmethod
+    def _recompute_batch_state(
+        connection: sqlite3.Connection,
+        batch_id: str,
+    ) -> Literal["running", "done", "failed"]:
+        states = tuple(
+            str(row["state"])
+            for row in connection.execute(
+                "SELECT state FROM batch_entries WHERE batch_id = ? ORDER BY position",
+                (batch_id,),
+            ).fetchall()
+        )
+        state = WorkflowStore._derived_batch_state(states)
+        updated = connection.execute(
+            "UPDATE batches SET state = ? WHERE batch_id = ?",
+            (state, batch_id),
+        )
+        if updated.rowcount != 1:
+            WorkflowStore._raise_admission_invalid("durable batch row is missing")
+        return state
+
+    def load_batch(self, batch_id: str) -> PersistedBatch | None:
+        """Reconcile one batch from terminal case authority and return its durable view."""
+
+        with connect_database(self.path) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                batch_row = connection.execute(
+                    "SELECT batch_id, created_at, concurrency, state FROM batches "
+                    "WHERE batch_id = ?",
+                    (batch_id,),
+                ).fetchone()
+                if batch_row is None:
+                    connection.commit()
+                    return None
+                if (
+                    type(batch_row["concurrency"]) is not int
+                    or not 1 <= batch_row["concurrency"] <= 8
+                    or batch_row["state"] not in {"queued", "running", "done", "failed"}
+                ):
+                    self._raise_admission_invalid("durable batch row is invalid")
+                rows = connection.execute(
+                    "SELECT position, source_id, case_id, source_path, state "
+                    "FROM batch_entries WHERE batch_id = ? ORDER BY position",
+                    (batch_id,),
+                ).fetchall()
+                entries: list[PersistedBatchEntry] = []
+                reconciled_terminal_entry = False
+                for row in rows:
+                    source_id = str(row["source_id"])
+                    case_id = str(row["case_id"])
+                    source_claim = connection.execute(
+                        "SELECT case_id, state FROM source_run_claims WHERE source_id = ?",
+                        (source_id,),
+                    ).fetchone()
+                    if source_claim is None:
+                        self._raise_admission_invalid(
+                            "batch entry has no source run claim", case_id=case_id
+                        )
+                    state, started_at, result = self._stored_case_admission_state(
+                        connection, case_id, source_id
+                    )
+                    claim_state, recovery_required = self._validated_source_run_claim_for_target(
+                        connection,
+                        source_id,
+                        case_id,
+                        state,
+                        started_at,
+                        result,
+                    )
+                    entry_state: Literal["queued", "running", "done", "failed"] = claim_state
+                    if recovery_required:
+                        if source_claim["case_id"] != case_id or result is None:
+                            self._raise_admission_invalid(
+                                "recovered batch and source run states disagree",
+                                case_id=case_id,
+                            )
+                        if state == "done":
+                            recovered_state: Literal["done", "failed"] = "done"
+                        elif state == "failed":
+                            recovered_state = "failed"
+                        else:
+                            self._raise_admission_invalid(
+                                "recovered batch lacks exact terminal evidence",
+                                case_id=case_id,
+                            )
+                        self._reconcile_recovered_source_admission(
+                            connection,
+                            source_id,
+                            case_id,
+                            recovered_state,
+                            started_at,
+                            result,
+                        )
+                        entry_state = recovered_state
+                        reconciled_terminal_entry = True
+                    elif row["state"] != claim_state:
+                        self._raise_admission_invalid(
+                            "batch entry disagrees with its exact source run claim",
+                            case_id=case_id,
+                        )
+                    entries.append(
+                        PersistedBatchEntry(
+                            source_id=source_id,
+                            source_path=Path(str(row["source_path"])),
+                            case_id=case_id,
+                            started_at=started_at,
+                            state=entry_state,
+                            result=result,
+                        )
+                    )
+                batch_state = self._recompute_batch_state(connection, batch_id)
+                if batch_row["state"] != batch_state and not (
+                    reconciled_terminal_entry and batch_row["state"] in {"queued", "running"}
+                ):
+                    self._raise_admission_invalid("batch state disagrees with its durable entries")
+                created_at = parse_canonical_utc(batch_row["created_at"])
+                if created_at is None:
+                    self._raise_admission_invalid("batch creation time is not canonical")
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return PersistedBatch(
+            batch_id=batch_id,
+            created_at=created_at,
+            concurrency=batch_row["concurrency"],
+            state=batch_state,
+            entries=tuple(entries),
+        )
 
     def register_source(self, source: SourceArtifact) -> None:
         with connect_database(self.path) as connection:

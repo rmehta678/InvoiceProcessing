@@ -260,7 +260,8 @@ def create_app(
     app.add_middleware(SecurityHeadersMiddleware)
     app.state.settings = selected_settings
     app.state.result_artifact_root = Path.cwd().absolute() / "artifacts" / "results"
-    app.state.registry = RunRegistry()
+    app.state.registry = RunRegistry(global_limit=selected_settings.case_concurrency)
+    app.state.registry._bind_settings(selected_settings)
     app.state.recovery_coordinator = recovery_coordinator
     app.state.templates = build_templates()
     app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")

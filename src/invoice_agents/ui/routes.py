@@ -21,6 +21,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any
 from urllib.parse import quote, unquote
+from uuid import uuid4
 
 from fastapi import APIRouter, Form, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
@@ -1092,6 +1093,8 @@ async def submit_page(request: Request) -> Response:
         "upload_dir": INVOICE_DIR / UPLOAD_DIR_NAME,
         "default_concurrency": settings.case_concurrency,
         "concurrency_options": list(range(1, 9)),
+        "single_submission_id": f"submission_{uuid4().hex}",
+        "batch_submission_id": f"submission_{uuid4().hex}",
     }
     return _render(request, "submit.html", context)
 
@@ -1156,6 +1159,7 @@ async def _resolve_submission(
 @router.post("/submit")
 async def submit_invoice(
     request: Request,
+    submission_id: Annotated[str, Form()],
     existing: Annotated[list[str] | None, Form()] = None,
     upload: UploadFile | None = None,
 ) -> Response:
@@ -1165,13 +1169,19 @@ async def submit_invoice(
     if isinstance(resolved, Response):
         return resolved
     if len(resolved) > 1:
-        batch = await registry.start_batch(resolved, settings, None)
+        batch = await registry.start_batch(
+            resolved,
+            settings,
+            None,
+            submission_id=submission_id,
+        )
         return RedirectResponse(f"/batches/{batch.batch_id}", status_code=303)
     source = resolved[0]
-    running = registry.running_case_for_source(source)
-    if running is not None:
-        return RedirectResponse(f"/cases/{running}/live", status_code=303)
-    outcome = await registry.start_process(source, settings)
+    outcome = await registry.start_process(
+        source,
+        settings,
+        submission_id=submission_id,
+    )
     if isinstance(outcome, CaseResult):
         context = {
             "nav": "submit",
@@ -1186,6 +1196,7 @@ async def submit_invoice(
 @router.post("/batch")
 async def submit_batch(
     request: Request,
+    submission_id: Annotated[str, Form()],
     concurrency: Annotated[int | None, Form()] = None,
 ) -> Response:
     settings = _settings(request)
@@ -1207,7 +1218,12 @@ async def submit_batch(
             stop_reason="INVALID_CONCURRENCY",
         )
         return _render(request, "error.html", {"nav": None, "error": error}, status_code=400)
-    batch = await registry.start_batch(paths, settings, selected_concurrency)
+    batch = await registry.start_batch(
+        paths,
+        settings,
+        selected_concurrency,
+        submission_id=submission_id,
+    )
     return RedirectResponse(f"/batches/{batch.batch_id}", status_code=303)
 
 
@@ -1220,11 +1236,14 @@ def _batch_rows_context(request: Request, batch_id: str) -> dict[str, Any] | Non
     rows = []
     for entry in batch.entries:
         header = queries.case_header(settings.workflow_db, entry.case_id)
+        run_state = registry.run_state(entry.case_id)
+        if run_state is None and entry.state in {"queued", "running"}:
+            run_state = entry.state
         rows.append(
             {
                 "entry": entry,
                 "header": header,
-                "run_state": registry.run_state(entry.case_id),
+                "run_state": run_state,
                 "run_error": registry.run_error(entry.case_id),
             }
         )

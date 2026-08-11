@@ -824,7 +824,14 @@ def test_submit_existing_runs_in_background(
 ) -> None:
     calls: list[str] = []
     stub_runs(monkeypatch, calls)
-    response = client.post("/submit", data={"existing": "invoice_1001.txt"}, follow_redirects=False)
+    response = client.post(
+        "/submit",
+        data={
+            "submission_id": "submission_route_single_existing",
+            "existing": "invoice_1001.txt",
+        },
+        follow_redirects=False,
+    )
     assert response.status_code == 303
     location = response.headers["location"]
     assert location.startswith("/cases/") and location.endswith("/live")
@@ -852,6 +859,7 @@ def test_submit_upload_lands_in_uploads_dir(
     content = (ui_workdir / "data" / "invoices" / "invoice_1001.txt").read_bytes()
     response = client.post(
         "/submit",
+        data={"submission_id": "submission_route_single_upload"},
         files={"upload": ("uploaded_invoice.txt", content, "text/plain")},
         follow_redirects=False,
     )
@@ -874,6 +882,7 @@ def test_submit_rejects_upload_one_byte_over_limit_without_partial_file(
 
     response = client.post(
         "/submit",
+        data={"submission_id": "submission_route_oversized_upload"},
         files={"upload": ("oversized.txt", content, "text/plain")},
         follow_redirects=False,
     )
@@ -886,10 +895,16 @@ def test_submit_rejects_upload_one_byte_over_limit_without_partial_file(
 
 
 def test_submit_rejects_unknown_and_missing_choice(client: TestClient) -> None:
-    missing = client.post("/submit", data={"existing": "nope.txt"})
+    missing = client.post(
+        "/submit",
+        data={"submission_id": "submission_route_unknown", "existing": "nope.txt"},
+    )
     assert missing.status_code == 404
     assert "SOURCE_NOT_FOUND" in missing.text
-    nothing = client.post("/submit", data={})
+    nothing = client.post(
+        "/submit",
+        data={"submission_id": "submission_route_missing_choice"},
+    )
     assert nothing.status_code == 400
     assert "choose at least one invoice file or upload one" in nothing.text
 
@@ -901,7 +916,10 @@ def test_submit_multiple_existing_runs_as_batch(
     stub_runs(monkeypatch, calls)
     response = client.post(
         "/submit",
-        data={"existing": ["invoice_1001.txt", "invoice_1002.txt"]},
+        data={
+            "submission_id": "submission_route_multiple",
+            "existing": ["invoice_1001.txt", "invoice_1002.txt"],
+        },
         follow_redirects=False,
     )
     assert response.status_code == 303
@@ -923,7 +941,13 @@ def test_submit_multiple_with_unknown_name_starts_nothing(
 ) -> None:
     calls: list[str] = []
     stub_runs(monkeypatch, calls)
-    response = client.post("/submit", data={"existing": ["invoice_1001.txt", "nope.txt"]})
+    response = client.post(
+        "/submit",
+        data={
+            "submission_id": "submission_route_multiple_unknown",
+            "existing": ["invoice_1001.txt", "nope.txt"],
+        },
+    )
     assert response.status_code == 404
     assert "SOURCE_NOT_FOUND" in response.text
     assert calls == [], "resolution fails atomically before any run starts"
@@ -932,7 +956,13 @@ def test_submit_multiple_with_unknown_name_starts_nothing(
 def test_submit_traversal_is_rejected(client: TestClient, ui_workdir: Path) -> None:
     secret = ui_workdir / "secret.txt"
     secret.write_text("outside the invoice dir", encoding="utf-8")
-    response = client.post("/submit", data={"existing": "../../secret.txt"})
+    response = client.post(
+        "/submit",
+        data={
+            "submission_id": "submission_route_traversal",
+            "existing": "../../secret.txt",
+        },
+    )
     assert response.status_code == 404
 
 
@@ -941,7 +971,11 @@ def test_batch_runs_matrix_until_terminal(
 ) -> None:
     calls: list[str] = []
     stub_runs(monkeypatch, calls)
-    response = client.post("/batch", data={"concurrency": "1"}, follow_redirects=False)
+    response = client.post(
+        "/batch",
+        data={"submission_id": "submission_route_batch", "concurrency": "1"},
+        follow_redirects=False,
+    )
     assert response.status_code == 303
     batch_url = response.headers["location"]
     page = client.get(batch_url)
@@ -977,7 +1011,7 @@ def test_batch_rejects_invalid_concurrency_before_registry_mutation(
 
     response = client.post(
         "/batch",
-        data={"concurrency": value},
+        data={"submission_id": "submission_route_invalid_batch", "concurrency": value},
         follow_redirects=False,
     )
 
