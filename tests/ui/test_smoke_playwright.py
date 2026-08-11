@@ -26,15 +26,15 @@ from invoice_agents.config import Settings
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.models import CaseResult, CaseStatus
 
-pytestmark = pytest.mark.ui_smoke
-
-playwright_sync = pytest.importorskip("playwright.sync_api", reason="playwright is not installed")
-
 if os.getenv("RUN_UI_SMOKE") != "1":
     pytest.skip(
         "UI browser smokes NOT RUN; set RUN_UI_SMOKE=1 and install chromium",
         allow_module_level=True,
     )
+
+from playwright.sync_api import sync_playwright
+
+pytestmark = pytest.mark.ui_smoke
 
 
 def _free_port() -> int:
@@ -124,13 +124,8 @@ def server_url(
 
 @pytest.fixture
 def page(server_url: str) -> Iterator[Any]:
-    from playwright.sync_api import Error, sync_playwright
-
     with sync_playwright() as playwright:
-        try:
-            browser = playwright.chromium.launch()
-        except Error:
-            pytest.skip("chromium not installed; run `uv run playwright install chromium`")
+        browser = playwright.chromium.launch()
         page = browser.new_page()
         yield page
         browser.close()
@@ -469,9 +464,13 @@ def test_u2_submit_from_browser_reaches_terminal_banner(
         f"csrf={_csrf_diagnostics(page, server_url, post.request, hidden_tokens)!r}"
     )
     request_headers = post.request.all_headers()
-    assert request_headers["origin"] == server_url
-    assert request_headers["referer"] == server_url + "/submit"
-    assert loaded.headers["referrer-policy"] == "same-origin"
+    assert request_headers["origin"] == "null"
+    assert "referer" not in request_headers
+    assert request_headers["sec-fetch-site"] == "same-origin"
+    assert request_headers["sec-fetch-mode"] == "navigate"
+    assert request_headers["sec-fetch-dest"] == "document"
+    assert request_headers["sec-fetch-user"] == "?1"
+    assert loaded.headers["referrer-policy"] == "no-referrer"
     page.wait_for_url("**/live")
     assert page.url.endswith("/live")
     page.wait_for_selector(".terminal-banner", timeout=15000)

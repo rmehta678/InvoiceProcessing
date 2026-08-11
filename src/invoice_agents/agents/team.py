@@ -37,7 +37,6 @@ from invoice_agents.models import (
 )
 from invoice_agents.observability.audit import AuditRecorder
 from invoice_agents.payment.service import mock_payment
-from invoice_agents.source_store import verified_source_path
 from invoice_agents.tools.comparison import (
     InventoryReader,
     apply_mapping_evidence,
@@ -137,8 +136,7 @@ def build_team(
         # Preparation may already have extracted the case so batch identity checks can
         # see all submissions. Re-reading uses the same parser and hash, never a canned value.
         source = context.invoice().source
-        verified_source_path(source)
-        invoice = extract_invoice_evidence(source)
+        invoice = extract_invoice_evidence(source, context.settings.pdf_policy())
         context.store.save_extraction(context.case_id, invoice, context.claim)
         payload = invoice.model_dump(mode="json")
         context.audit.record(
@@ -409,6 +407,7 @@ def build_team(
             agent_rationale,
             context.store,
             context.claim,
+            pdf_policy=context.settings.pdf_policy(),
         )
         context.audit.record(
             "workflow.review_requested",

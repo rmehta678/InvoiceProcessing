@@ -20,7 +20,6 @@ import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
-from ui.factories import make_pending_review_case
 
 from invoice_agents.cli import app as cli_app
 from invoice_agents.config import Settings
@@ -35,6 +34,7 @@ from invoice_agents.ui import runs as ui_runs
 from invoice_agents.ui import server as ui_server
 from invoice_agents.ui.runs import BatchState, RunRegistry
 from invoice_agents.ui.server import create_app
+from tests.ui.factories import make_pending_review_case
 
 
 def _write_distinct_invoice(path: Path, invoice_number: str) -> Path:

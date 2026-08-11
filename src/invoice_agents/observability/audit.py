@@ -11,16 +11,25 @@ import unicodedata
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from types import TracebackType
+from typing import Any
 from uuid import uuid4
 
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
+from pydantic import BaseModel
 
 from invoice_agents.db.core import connect_database
-from invoice_agents.models import CaseResult
+from invoice_agents.models import (
+    CaseResult,
+    Critique,
+    FinalDecision,
+    HumanDecision,
+    ReviewRequest,
+)
 
 SENSITIVE_KEYS = frozenset(
     {
@@ -88,6 +97,8 @@ SAFE_PROVIDER_REQUEST_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 SANITIZED_TEXT_MAX_CHARS = 4096
 SANITIZED_TEXT_INPUT_MAX_CHARS = 16_384
 TRUNCATION_MARKER = "…[TRUNCATED]"
+TRACEBACK_TRUNCATION_MARKER = "…[TRACEBACK FRAMES TRUNCATED]"
+EXCEPTION_SUMMARY_MAX_CHARS = 1024
 JSON_TEXT_MAX_CHARS = 65_536
 JSON_MAX_DEPTH = 20
 JSON_MAX_NODES = 1_000
@@ -98,6 +109,50 @@ JSON_MAX_TOTAL_NUMERIC_DIGITS = 2_048
 JSON_PAYLOAD_REJECTED = "JSON_PAYLOAD_REJECTED"
 EVENT_PAYLOAD_REJECTED = "EVENT_PAYLOAD_REJECTED"
 VALUE_REJECTED = "[VALUE_REJECTED]"
+STRUCTURAL_STORAGE_TEXT_FIELDS = frozenset(
+    {
+        "amount",
+        "basis",
+        "canonical_path",
+        "canonical_sku",
+        "candidate_skus",
+        "category",
+        "created_at",
+        "critic_disposition",
+        "currency",
+        "decided_at",
+        "decision",
+        "duplicate_of",
+        "evidence_event_ids",
+        "field",
+        "finished_at",
+        "idempotency_key",
+        "invoice_number",
+        "item_name",
+        "kind",
+        "locator",
+        "locator_type",
+        "mapping_basis",
+        "modified_at",
+        "normalization",
+        "normalized_item",
+        "outcome",
+        "path",
+        "processed_at",
+        "recommended_disposition",
+        "relationship",
+        "renderer",
+        "revision",
+        "sha256",
+        "sku",
+        "source_format",
+        "source_hash",
+        "started_at",
+        "status",
+        "stop_reason",
+        "superseded_case_id",
+    }
+)
 _CURRENT_AUDIT: ContextVar[AuditRecorder | None] = ContextVar(
     "invoice_agents_current_audit", default=None
 )
@@ -948,50 +1003,226 @@ def sanitize_stored_event_payload(event_type: str, value: str) -> str:
         )
 
 
-def sanitize_case_result(result: CaseResult) -> CaseResult:
-    """Normalize only terminal free text before storage or artifact publication."""
+def _structural_storage_field(key: str) -> bool:
+    normalized = key.casefold().replace("-", "_")
+    return (
+        normalized == "id"
+        or normalized.endswith("_id")
+        or normalized.endswith("_ids")
+        or normalized in STRUCTURAL_STORAGE_TEXT_FIELDS
+    )
 
-    payment = result.payment
-    if payment is not None and payment.error is not None:
-        payment = payment.model_copy(
-            update={"error": sanitize_text(payment.error)},
-            deep=True,
-        )
-    errors = [
-        error.model_copy(
-            update={
-                "category": sanitize_text(error.category),
-                "message": sanitize_text(error.message),
-                "stop_reason": (
-                    sanitize_text(error.stop_reason) if error.stop_reason is not None else None
-                ),
-                "provider_request_id": safe_provider_request_id(error.provider_request_id),
-                "details": cast(dict[str, Any], redact(error.details)),
-            },
-            deep=True,
-        )
-        for error in result.errors
-    ]
-    return result.model_copy(
-        update={"payment": payment, "errors": errors},
+
+def _preserve_structural_storage_value(value: Any, *, depth: int) -> Any:
+    if depth > JSON_MAX_DEPTH:
+        raise ValueError("structural text field exceeds the storage depth boundary")
+    if isinstance(value, Mapping):
+        preserved: dict[str, Any] = {}
+        for key, item in value.items():
+            raw_key = str(key)
+            if sanitize_text(raw_key) != raw_key or _is_sensitive_key(raw_key):
+                raise ValueError("structural text field contains credential material")
+            if raw_key in preserved:
+                raise ValueError("structural text field contains duplicate keys")
+            preserved[raw_key] = _preserve_structural_storage_value(
+                item,
+                depth=depth + 1,
+            )
+        return preserved
+    if isinstance(value, str):
+        if sanitize_text(value) != value:
+            raise ValueError("structural text field contains credential material")
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raise ValueError("structural text field is not canonical JSON text")
+    if isinstance(value, Sequence):
+        return [_preserve_structural_storage_value(item, depth=depth + 1) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("structural text field contains a non-finite number")
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    raise ValueError("structural text field is not canonical JSON data")
+
+
+def _sanitize_storage_payload(value: Any, *, depth: int = 0) -> Any:
+    """Sanitize every JSON string while retaining one typed model's exact shape."""
+
+    if depth > JSON_MAX_DEPTH:
+        return VALUE_REJECTED
+    if isinstance(value, Mapping):
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            raw_key = str(key)
+            safe_key = sanitize_text(raw_key)
+            if safe_key in cleaned:
+                raise ValueError("sanitized model keys collide")
+            if _is_sensitive_key(raw_key) or _is_sensitive_key(safe_key):
+                cleaned[safe_key] = "[REDACTED]"
+            elif _structural_storage_field(raw_key):
+                if safe_key != raw_key:
+                    raise ValueError("structural text field name contains credential material")
+                cleaned[safe_key] = _preserve_structural_storage_value(
+                    item,
+                    depth=depth + 1,
+                )
+            else:
+                cleaned[safe_key] = _sanitize_storage_payload(item, depth=depth + 1)
+        return cleaned
+    if isinstance(value, str):
+        return sanitize_text(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return sanitize_text(bytes(value).decode("utf-8", errors="replace"))
+    if isinstance(value, Sequence):
+        return [_sanitize_storage_payload(item, depth=depth + 1) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return VALUE_REJECTED
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return sanitize_text(str(value))
+
+
+def sanitize_persisted_model[ModelT: BaseModel](value: ModelT) -> ModelT:
+    """Recursively sanitize one strict model and revalidate its canonical typed form.
+
+    Revalidation makes sanitization fail closed if credential removal would alter a
+    structural identifier, enum, amount, evidence reference, or other constrained
+    value. Unknown future dictionaries and model fields do not bypass sanitization:
+    every JSON string is visited before the original model type is reconstructed.
+    """
+
+    payload = _sanitize_storage_payload(value.model_dump(mode="json"))
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return type(value).model_validate_json(encoded, strict=True)
+
+
+def sanitize_critique(value: Critique) -> Critique:
+    return sanitize_persisted_model(value)
+
+
+def sanitize_review_request(value: ReviewRequest) -> ReviewRequest:
+    return sanitize_persisted_model(value)
+
+
+def sanitize_human_decision(value: HumanDecision) -> HumanDecision:
+    return sanitize_persisted_model(value)
+
+
+def sanitize_final_decision(value: FinalDecision) -> FinalDecision:
+    return sanitize_persisted_model(value)
+
+
+def sanitize_case_result(result: CaseResult) -> CaseResult:
+    """Sanitize every nested terminal field before storage or publication."""
+
+    request_ids_normalized = result.model_copy(
+        update={
+            "errors": [
+                error.model_copy(
+                    update={
+                        "provider_request_id": safe_provider_request_id(error.provider_request_id)
+                    },
+                    deep=True,
+                )
+                for error in result.errors
+            ]
+        },
         deep=True,
     )
+    return sanitize_persisted_model(request_ids_normalized)
+
+
+def _bounded_sanitized_fragment(value: str, max_chars: int) -> str:
+    sanitized = sanitize_text(value)
+    if len(sanitized) <= max_chars:
+        return sanitized
+    visible_chars = max_chars - len(TRUNCATION_MARKER)
+    return f"{sanitized[:visible_chars]}{TRUNCATION_MARKER}"
+
+
+def _sanitize_exception_info(
+    exc_info: tuple[
+        type[BaseException] | None,
+        BaseException | None,
+        TracebackType | None,
+    ],
+) -> str:
+    """Keep bounded traceback context and the final sanitized exception identity."""
+
+    rendered = sanitize_text("".join(traceback.format_exception(*exc_info)))
+    summary = _bounded_sanitized_fragment(
+        "".join(traceback.format_exception_only(exc_info[0], exc_info[1])).rstrip(),
+        EXCEPTION_SUMMARY_MAX_CHARS,
+    )
+    if not summary or summary in rendered:
+        return rendered
+    separator = f"\n{TRACEBACK_TRUNCATION_MARKER}\n"
+    prefix_budget = SANITIZED_TEXT_MAX_CHARS - len(separator) - len(summary)
+    prefix = rendered[:prefix_budget].rstrip()
+    return f"{prefix}{separator}{summary}"
 
 
 class RedactingFilter(logging.Filter):
     """Prevent credentials from reaching console or local logging handlers."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = sanitize_text(record.getMessage())
-        record.args = ()
+        if (
+            record.name == "uvicorn.access"
+            and isinstance(record.args, tuple)
+            and len(record.args) == 5
+        ):
+            # Uvicorn's AccessFormatter requires this exact five-item tuple after
+            # handler filters run. Sanitize each rendered field without discarding
+            # the structure the formatter uses to build the request line.
+            record.msg = sanitize_text(str(record.msg))
+            record.args = tuple(
+                sanitize_text(item) if isinstance(item, str) else item for item in record.args
+            )
+        else:
+            record.msg = sanitize_text(record.getMessage())
+            record.args = ()
         if record.exc_info is not None:
-            record.exc_text = sanitize_text("".join(traceback.format_exception(*record.exc_info)))
+            record.exc_text = _sanitize_exception_info(record.exc_info)
             record.exc_info = None
         elif record.exc_text:
             record.exc_text = sanitize_text(record.exc_text)
         if record.stack_info:
             record.stack_info = sanitize_text(record.stack_info)
         return True
+
+
+def redacting_uvicorn_log_config(default_config: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy Uvicorn's log config and attach redaction to every configured handler."""
+
+    config = deepcopy(dict(default_config))
+    filters = config.get("filters")
+    if filters is None:
+        filters = {}
+        config["filters"] = filters
+    if not isinstance(filters, dict):
+        raise ValueError("Uvicorn log filters must be a mapping")
+    filter_name = "invoice_agents_redacting"
+    filters[filter_name] = {"()": RedactingFilter}
+
+    handlers = config.get("handlers")
+    if not isinstance(handlers, dict) or not handlers:
+        raise ValueError("Uvicorn log handlers must be a non-empty mapping")
+    for handler_name, handler in handlers.items():
+        if not isinstance(handler, dict):
+            raise ValueError(f"Uvicorn log handler {handler_name!r} must be a mapping")
+        handler_filters = handler.get("filters", [])
+        if not isinstance(handler_filters, (list, tuple)):
+            raise ValueError(f"Uvicorn log handler {handler_name!r} filters must be a sequence")
+        handler["filters"] = [
+            *[name for name in handler_filters if name != filter_name],
+            filter_name,
+        ]
+    return config
 
 
 class ProviderRetryAuditHandler(logging.Handler):

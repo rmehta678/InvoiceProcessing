@@ -154,6 +154,7 @@ async def _snapshot_admission_identity(path: Path, settings: Settings) -> Source
         path,
         settings.source_archive_dir,
         settings.source_max_bytes,
+        pdf_policy=settings.pdf_policy(),
     )
 
 

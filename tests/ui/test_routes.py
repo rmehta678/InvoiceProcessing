@@ -17,6 +17,7 @@ from urllib.parse import unquote
 import pytest
 from factories import (
     FIXTURE_DIR,
+    make_critique,
     make_failed_case,
     make_pending_review_case,
     make_succeeded_case,
@@ -30,7 +31,7 @@ from invoice_agents.config import Settings
 from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
-from invoice_agents.models import CaseResult, CaseStatus, RiskAssessment
+from invoice_agents.models import CaseResult, CaseStatus, DecisionKind, RiskAssessment
 from invoice_agents.observability.audit import AuditRecorder
 from invoice_agents.ui import queries
 
@@ -290,6 +291,42 @@ def test_case_result_json_requires_a_durable_artifact_binding(
     assert client.get("/cases/../secrets/result.json").status_code in {400, 404}
 
 
+def test_final_decision_is_sanitized_before_relational_and_terminal_persistence(
+    client: TestClient,
+    settings: Settings,
+) -> None:
+    secret = "sk-proj-final-row-secret-12345678"
+    case_id = make_succeeded_case(
+        settings,
+        final_reason=f"final rationale api_key={secret}",
+    )
+
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        standalone = str(
+            connection.execute(
+                "SELECT payload_json FROM final_decisions WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()["payload_json"]
+        )
+        terminal = str(
+            connection.execute(
+                "SELECT result_json FROM cases WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()["result_json"]
+        )
+    page = client.get(f"/cases/{case_id}")
+
+    assert page.status_code == 200
+    for surface in (standalone, terminal, page.text):
+        assert secret not in surface
+    assert "[REDACTED]" in standalone
+    assert "[REDACTED]" in terminal
+    stored = WorkflowStore(settings.workflow_db).load_final_decision(case_id)
+    assert stored is not None
+    assert stored.reasons == ["final rationale api_key=[REDACTED]"]
+    assert stored.decision is DecisionKind.APPROVE
+
+
 @pytest.mark.parametrize("corruption", ["authority", "result", "binding"])
 def test_case_result_json_propagates_persisted_corruption_to_error_boundary(
     corruption: str,
@@ -459,6 +496,67 @@ def test_review_detail_shows_package_and_unbiased_form(
         assert f'data-blocker-authorization-for="{kind}"' in text
     for kind in ("REJECT", "REQUEST_CORRECTION"):
         assert f'data-blocker-authorization-for="{kind}"' not in text
+
+
+def test_nested_review_and_human_text_is_redacted_before_database_and_page_rendering(
+    client: TestClient,
+    settings: Settings,
+) -> None:
+    """Removing any store-bound sanitizer must expose a canary in DB or HTML."""
+
+    secret = "sk-proj-review-page-secret-12345678"
+    critique = make_critique(DecisionKind.HOLD).model_copy(
+        update={
+            "supported_findings": [f"supported api_key={secret}"],
+            "rationale": [f"critic rationale api_key={secret}"],
+        },
+        deep=True,
+    )
+    case_id, review = make_pending_review_case(
+        settings,
+        critique=critique,
+        agent_rationale=[f"agent rationale api_key={secret}"],
+        extra_reasons=[f"review reason api_key={secret}"],
+    )
+
+    case_page = client.get(f"/cases/{case_id}")
+    review_page = client.get(f"/reviews/{review.review_id}")
+    assert case_page.status_code == 200
+    assert review_page.status_code == 200
+    for rendered in (case_page.text, review_page.text):
+        assert secret not in rendered
+        assert "[REDACTED]" in rendered
+
+    decision = client.post(
+        f"/reviews/{review.review_id}/decision",
+        data={
+            "reviewer": f"reviewer api_key={secret}",
+            "decision": "REJECT",
+            "reason": f"human rationale Authorization: Bearer {secret}",
+        },
+        follow_redirects=False,
+    )
+    assert decision.status_code == 303
+
+    decided_page = client.get(f"/reviews/{review.review_id}?decided=1")
+    assert decided_page.status_code == 200
+    assert secret not in decided_page.text
+    assert "[REDACTED]" in decided_page.text
+
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        stored_text = "\n".join(
+            str(value)
+            for row in connection.execute(
+                "SELECT payload_json FROM critique_results WHERE case_id = ? "
+                "UNION ALL SELECT payload_json FROM review_requests WHERE case_id = ? "
+                "UNION ALL SELECT reviewer || ' ' || reason || ' ' || payload_json "
+                "FROM human_decisions WHERE review_id = ?",
+                (case_id, case_id, review.review_id),
+            ).fetchall()
+            for value in row
+        )
+    assert secret not in stored_text
+    assert "[REDACTED]" in stored_text
 
 
 def test_switching_authorizing_decisions_uses_distinct_blocker_control_names(

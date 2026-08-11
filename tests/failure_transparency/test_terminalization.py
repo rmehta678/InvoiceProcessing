@@ -24,7 +24,6 @@ import pytest
 from autogen_agentchat.base import TaskResult
 from fastapi.testclient import TestClient
 from sse_starlette import ServerSentEvent
-from ui.factories import make_pending_review_case, make_succeeded_case
 
 from invoice_agents import lifecycle_process, orchestration, terminal_process
 from invoice_agents.config import Settings
@@ -40,6 +39,7 @@ from invoice_agents.ui import sse
 from invoice_agents.ui.runs import RunRegistry
 from invoice_agents.ui.server import create_app
 from invoice_agents.ui.sse import terminal_payload
+from tests.ui.factories import make_pending_review_case, make_succeeded_case
 
 
 @pytest.fixture(autouse=True)

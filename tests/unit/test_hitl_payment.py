@@ -6,6 +6,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,10 @@ from invoice_agents.db.core import (
 )
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.errors import DatabaseVerificationError, InvoiceAgentsError
-from invoice_agents.hitl.service import create_review_request, record_human_decision
+from invoice_agents.hitl.service import (
+    create_review_request as _create_review_request,
+)
+from invoice_agents.hitl.service import record_human_decision
 from invoice_agents.models import (
     CanonicalMapping,
     CaseResult,
@@ -50,13 +54,24 @@ from invoice_agents.tools.comparison import (
 from invoice_agents.tools.evidence import extract_invoice_evidence
 from invoice_agents.ui.runs import RunRegistry
 from invoice_agents.ui.sse import terminal_payload
+from tests.support.pdf_policy import TEST_PDF_POLICY
+
+create_review_request = partial(
+    _create_review_request,
+    pdf_policy=TEST_PDF_POLICY,
+)
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures"
 
 
 def load(invoice_dir: Path, name: str, archive: Path):  # type: ignore[no-untyped-def]
-    source = snapshot_source(invoice_dir / name, archive, max_bytes=10_485_760)
-    return extract_invoice_evidence(source)
+    source = snapshot_source(
+        invoice_dir / name,
+        archive,
+        max_bytes=10_485_760,
+        pdf_policy=TEST_PDF_POLICY,
+    )
+    return extract_invoice_evidence(source, TEST_PDF_POLICY)
 
 
 def persist_case(

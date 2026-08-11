@@ -9,11 +9,23 @@ import pytest
 from invoice_agents.errors import SourceEvidenceError
 from invoice_agents.models import SourceArtifact
 from invoice_agents.source_store import snapshot_source
-from invoice_agents.tools.evidence import extract_invoice_evidence
+from invoice_agents.tools.evidence import extract_invoice_evidence as _extract_invoice_evidence
+from tests.support.pdf_policy import TEST_PDF_POLICY
 
 
 def snapshot(path: Path, archive: Path):  # type: ignore[no-untyped-def]
-    return snapshot_source(path, archive, max_bytes=10_485_760)
+    return snapshot_source(
+        path,
+        archive,
+        max_bytes=10_485_760,
+        pdf_policy=TEST_PDF_POLICY,
+    )
+
+
+def extract_invoice_evidence(source: SourceArtifact):  # type: ignore[no-untyped-def]
+    """Exercise the production extractor with an explicit test PDF policy."""
+
+    return _extract_invoice_evidence(source, TEST_PDF_POLICY)
 
 
 EXPECTED = {
@@ -69,7 +81,12 @@ def write_text_invoice(
     lines.append(f"Total: {total}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
-    return snapshot_source(path, tmp_path / "sources", 10_485_760)
+    return snapshot_source(
+        path,
+        tmp_path / "sources",
+        10_485_760,
+        pdf_policy=TEST_PDF_POLICY,
+    )
 
 
 def write_row_oriented_tax_csv(
@@ -107,7 +124,12 @@ def write_row_oriented_tax_csv(
         for label, amount in tax_rows:
             writer.writerow(["", "", "", "", "", "", label, amount])
         writer.writerow(["", "", "", "", "", "", "Total", "$110.00"])
-    return snapshot_source(path, tmp_path / "sources", 10_485_760)
+    return snapshot_source(
+        path,
+        tmp_path / "sources",
+        10_485_760,
+        pdf_policy=TEST_PDF_POLICY,
+    )
 
 
 @pytest.mark.parametrize(("filename", "expected"), EXPECTED.items())
@@ -246,7 +268,12 @@ def test_notes_column_does_not_apply_before_its_table_header(tmp_path: Path) -> 
         ),
         encoding="utf-8",
     )
-    source = snapshot_source(path, tmp_path / "sources", 10_485_760)
+    source = snapshot_source(
+        path,
+        tmp_path / "sources",
+        10_485_760,
+        pdf_policy=TEST_PDF_POLICY,
+    )
 
     with pytest.raises(SourceEvidenceError) as excinfo:
         extract_invoice_evidence(source)
@@ -277,7 +304,12 @@ def test_notes_column_ends_at_the_next_table_header(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    source = snapshot_source(path, tmp_path / "sources", 10_485_760)
+    source = snapshot_source(
+        path,
+        tmp_path / "sources",
+        10_485_760,
+        pdf_policy=TEST_PDF_POLICY,
+    )
 
     with pytest.raises(SourceEvidenceError) as excinfo:
         extract_invoice_evidence(source)
@@ -305,7 +337,12 @@ def test_notes_column_does_not_turn_malformed_comma_grouping_into_a_note(tmp_pat
         ),
         encoding="utf-8",
     )
-    source = snapshot_source(path, tmp_path / "sources", 10_485_760)
+    source = snapshot_source(
+        path,
+        tmp_path / "sources",
+        10_485_760,
+        pdf_policy=TEST_PDF_POLICY,
+    )
 
     with pytest.raises(SourceEvidenceError) as excinfo:
         extract_invoice_evidence(source)
@@ -466,7 +503,12 @@ def test_row_oriented_csv_tax_rate_rejects_malformed_content(tmp_path: Path) -> 
         )
         writer.writerow(["", "", "", "", "", "", "Tax (0BAD%)", "$0.00"])
         writer.writerow(["", "", "", "", "", "", "Total", "$100.00"])
-    source = snapshot_source(path, tmp_path / "sources", 10_485_760)
+    source = snapshot_source(
+        path,
+        tmp_path / "sources",
+        10_485_760,
+        pdf_policy=TEST_PDF_POLICY,
+    )
 
     with pytest.raises(SourceEvidenceError) as excinfo:
         extract_invoice_evidence(source)
@@ -508,7 +550,12 @@ def test_row_oriented_csv_tax_rate_rejects_malformed_wrapper(tmp_path: Path) -> 
         )
         writer.writerow(["", "", "", "", "", "", "Tax (10%oops)", "$10.00"])
         writer.writerow(["", "", "", "", "", "", "Total", "$110.00"])
-    source = snapshot_source(path, tmp_path / "sources", 10_485_760)
+    source = snapshot_source(
+        path,
+        tmp_path / "sources",
+        10_485_760,
+        pdf_policy=TEST_PDF_POLICY,
+    )
 
     with pytest.raises(SourceEvidenceError) as excinfo:
         extract_invoice_evidence(source)
@@ -550,7 +597,12 @@ def test_row_oriented_csv_tax_rate_preserves_unparenthesized_label(tmp_path: Pat
         )
         writer.writerow(["", "", "", "", "", "", "Tax 10%", "$10.00"])
         writer.writerow(["", "", "", "", "", "", "Total", "$110.00"])
-    source = snapshot_source(path, tmp_path / "sources", 10_485_760)
+    source = snapshot_source(
+        path,
+        tmp_path / "sources",
+        10_485_760,
+        pdf_policy=TEST_PDF_POLICY,
+    )
 
     invoice = extract_invoice_evidence(source)
 

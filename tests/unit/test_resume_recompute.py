@@ -97,6 +97,7 @@ def first_pass_review(
         ["ambiguous mapping"],
         store,
         claim,
+        pdf_policy=settings.pdf_policy(),
     )
     return risk, review, claim
 
@@ -220,6 +221,7 @@ def test_mapping_recompute_with_exceeding_stock_stays_blocked_and_needs_second_r
         ["blocking evidence remains after mapping"],
         store,
         claim,
+        pdf_policy=settings.pdf_policy(),
     )
     assert second.sequence == 2
     latest = store.load_case_review(case_id)

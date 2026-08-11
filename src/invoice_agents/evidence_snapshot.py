@@ -266,7 +266,10 @@ def build_evidence_snapshot(
             "embedded extraction source metadata does not match source_artifacts"
         )
     try:
-        source_invoice = extract_invoice_evidence(authoritative_source)
+        source_invoice = extract_invoice_evidence(
+            authoritative_source,
+            settings.pdf_policy(),
+        )
     except InvoiceAgentsError as exc:
         raise EvidenceSnapshotError(f"authoritative source cannot be re-extracted: {exc}") from exc
     if _without_mapping_results(invoice) != source_invoice:

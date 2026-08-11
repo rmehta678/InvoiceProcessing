@@ -16,12 +16,13 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
+from io import BytesIO
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Literal, cast
 
-from invoice_agents.config import Settings
+from invoice_agents.config import PdfPolicy
 from invoice_agents.errors import ErrorCategory, SourceEvidenceError
 from invoice_agents.models import SourceArtifact
 
@@ -32,6 +33,10 @@ WIRE_READ_CHUNK_BYTES = 65_536
 METADATA_MAX_BYTES = 32_768
 TEXT_ENCODE_CHARS = 4_096
 GENERIC_WORKER_MESSAGE = "PDF worker failed"
+SOURCE_FAILURE_MESSAGES = {
+    "SOURCE_HASH_MISMATCH": "source snapshot identity mismatch",
+    "SOURCE_READ_FAILED": "source snapshot could not be read",
+}
 
 
 @dataclass(slots=True)
@@ -140,6 +145,21 @@ def _generic_failure_payload() -> dict[str, object]:
         "category": ErrorCategory.TOOL.value,
         "message": GENERIC_WORKER_MESSAGE,
         "stop_reason": "PDF_WORKER_FAILED",
+    }
+
+
+def _source_failure_payload(error: SourceEvidenceError) -> dict[str, object]:
+    stop_reason = error.stop_reason
+    if stop_reason is None:
+        return _generic_failure_payload()
+    message = SOURCE_FAILURE_MESSAGES.get(stop_reason)
+    if message is None:
+        return _generic_failure_payload()
+    return {
+        "ok": False,
+        "category": ErrorCategory.SOURCE.value,
+        "message": message,
+        "stop_reason": stop_reason,
     }
 
 
@@ -317,42 +337,49 @@ def _worker_main(
     connection: Connection,
     operation: WorkerOperation,
     source_payload: dict[str, object],
-    max_pages: int,
-    cpu_seconds: int,
-    memory_bytes: int,
-    result_max_bytes: int,
+    pdf_policy_payload: dict[str, object],
     page: int | None,
     render_target: str | None,
 ) -> None:
     """Run one PDF operation and reduce unexpected failures to a generic envelope."""
 
+    policy: PdfPolicy | None = None
     try:
         _silence_child_output()
-        _apply_resource_limits(cpu_seconds, memory_bytes)
+        policy = PdfPolicy.model_validate(pdf_policy_payload, strict=True)
+        _apply_resource_limits(
+            policy.pdf_worker_cpu_seconds,
+            policy.pdf_worker_memory_bytes,
+        )
         source = SourceArtifact.model_validate(source_payload)
-        from invoice_agents.source_store import verified_source_path
+        from invoice_agents.source_store import read_verified_source_bytes
 
-        source_path = verified_source_path(source)
+        source_bytes = read_verified_source_bytes(source)
         if operation in {"inspect", "extract"}:
             from pypdf import PdfReader
 
-            reader = PdfReader(source_path)
+            reader = PdfReader(BytesIO(source_bytes))
             page_count = len(reader.pages)
             if page_count < 1:
                 raise ValueError("PDF has no pages")
-            if page_count > max_pages:
-                _page_limit_error(connection, page_count, max_pages, result_max_bytes)
+            if page_count > policy.pdf_max_pages:
+                _page_limit_error(
+                    connection,
+                    page_count,
+                    policy.pdf_max_pages,
+                    policy.pdf_worker_result_max_bytes,
+                )
                 return
             if operation == "inspect":
                 _send(
                     connection,
                     {"ok": True, "result": {"page_count": page_count}},
-                    result_max_bytes,
+                    policy.pdf_worker_result_max_bytes,
                 )
                 return
             extraction = _ExtractionWireBuilder(
                 page_count=page_count,
-                max_bytes=result_max_bytes,
+                max_bytes=policy.pdf_worker_result_max_bytes,
             )
             for index, pdf_page in enumerate(reader.pages, 1):
                 page_text = pdf_page.extract_text() or ""
@@ -364,7 +391,11 @@ def _worker_main(
                 finally:
                     del page_text
                 if page_too_large:
-                    _send(connection, _generic_failure_payload(), result_max_bytes)
+                    _send(
+                        connection,
+                        _generic_failure_payload(),
+                        policy.pdf_worker_result_max_bytes,
+                    )
                     return
             if not extraction.has_text:
                 _send(
@@ -377,24 +408,33 @@ def _worker_main(
                         ),
                         "stop_reason": "PDF_TEXT_EMPTY",
                     },
-                    result_max_bytes,
+                    policy.pdf_worker_result_max_bytes,
                 )
                 return
             try:
                 _send_wire_message(connection, extraction.build())
             except _ResultTooLarge:
-                _send(connection, _generic_failure_payload(), result_max_bytes)
+                _send(
+                    connection,
+                    _generic_failure_payload(),
+                    policy.pdf_worker_result_max_bytes,
+                )
             return
 
         if page is None or render_target is None:
             raise ValueError("render operation requires a page and target")
         import fitz
 
-        document = fitz.open(source_path)
+        document = fitz.open(stream=source_bytes, filetype="pdf")
         try:
             page_count = document.page_count
-            if page_count > max_pages:
-                _page_limit_error(connection, page_count, max_pages, result_max_bytes)
+            if page_count > policy.pdf_max_pages:
+                _page_limit_error(
+                    connection,
+                    page_count,
+                    policy.pdf_max_pages,
+                    policy.pdf_worker_result_max_bytes,
+                )
                 return
             if page < 1 or page > page_count:
                 _send(
@@ -405,7 +445,7 @@ def _worker_main(
                         "message": f"PDF page {page} is out of range",
                         "stop_reason": "RENDER_PAGE_INVALID",
                     },
-                    result_max_bytes,
+                    policy.pdf_worker_result_max_bytes,
                 )
                 return
             pixmap = document[page - 1].get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
@@ -424,11 +464,24 @@ def _worker_main(
                     "renderer": "PyMuPDF",
                 },
             },
-            result_max_bytes,
+            policy.pdf_worker_result_max_bytes,
         )
+    except SourceEvidenceError as error:
+        if policy is not None:
+            with contextlib.suppress(BaseException):
+                _send(
+                    connection,
+                    _source_failure_payload(error),
+                    policy.pdf_worker_result_max_bytes,
+                )
     except BaseException:
-        with contextlib.suppress(BaseException):
-            _send(connection, _generic_failure_payload(), result_max_bytes)
+        if policy is not None:
+            with contextlib.suppress(BaseException):
+                _send(
+                    connection,
+                    _generic_failure_payload(),
+                    policy.pdf_worker_result_max_bytes,
+                )
     finally:
         connection.close()
 
@@ -563,6 +616,18 @@ def _decode_worker_message(
                 if category != ErrorCategory.TOOL.value or details is not None:
                     raise ValueError("invalid generic worker failure")
                 raise _worker_failed()
+            if stop_reason in SOURCE_FAILURE_MESSAGES:
+                if (
+                    category != ErrorCategory.SOURCE.value
+                    or details is not None
+                    or message != SOURCE_FAILURE_MESSAGES[stop_reason]
+                ):
+                    raise ValueError("invalid source failure")
+                raise SourceEvidenceError(
+                    ErrorCategory.SOURCE,
+                    SOURCE_FAILURE_MESSAGES[stop_reason],
+                    stop_reason=stop_reason,
+                )
             if stop_reason == "PDF_PAGE_LIMIT_EXCEEDED":
                 if (
                     category != ErrorCategory.PARSE.value
@@ -701,17 +766,11 @@ def _decode_worker_message(
 def _run_worker(
     operation: WorkerOperation,
     source: SourceArtifact,
-    timeout_seconds: float,
+    pdf_policy: PdfPolicy,
     *,
     page: int | None = None,
     render_target: Path | None = None,
 ) -> dict[str, object]:
-    if timeout_seconds <= 0:
-        raise SourceEvidenceError(
-            ErrorCategory.CONFIGURATION,
-            "PDF parse timeout must be positive",
-            stop_reason="PDF_TIMEOUT_INVALID",
-        )
     if source.source_format != "pdf":
         raise SourceEvidenceError(
             ErrorCategory.SOURCE,
@@ -719,10 +778,6 @@ def _run_worker(
             stop_reason="PDF_FORMAT_INVALID",
         )
 
-    from invoice_agents.source_store import verified_source_path
-
-    verified_source_path(source)
-    settings = Settings()
     context = multiprocessing.get_context("spawn")
     parent_connection, child_connection = context.Pipe(duplex=False)
     process = context.Process(
@@ -731,24 +786,21 @@ def _run_worker(
             child_connection,
             operation,
             cast(dict[str, object], source.model_dump(mode="json")),
-            settings.pdf_max_pages,
-            settings.pdf_worker_cpu_seconds,
-            settings.pdf_worker_memory_bytes,
-            settings.pdf_worker_result_max_bytes,
+            cast(dict[str, object], pdf_policy.model_dump()),
             page,
             str(render_target) if render_target is not None else None,
         ),
         name=f"invoice-pdf-{operation}",
     )
     started = False
-    deadline = time.monotonic() + timeout_seconds
+    deadline = time.monotonic() + pdf_policy.pdf_parse_timeout_seconds
     try:
         process.start()
         started = True
         child_connection.close()
         encoded = _receive_bounded_message(
             parent_connection,
-            max_bytes=settings.pdf_worker_result_max_bytes,
+            max_bytes=pdf_policy.pdf_worker_result_max_bytes,
             deadline=deadline,
         )
         metadata, text_payload = _split_wire_message(encoded)
@@ -756,7 +808,7 @@ def _run_worker(
             operation,
             metadata,
             expected_page=page,
-            max_pages=settings.pdf_max_pages,
+            max_pages=pdf_policy.pdf_max_pages,
             text_payload=text_payload,
             deadline=deadline,
         )
@@ -776,27 +828,27 @@ def _run_worker(
         child_connection.close()
 
 
-def inspect_pdf_in_worker(source: SourceArtifact, timeout_seconds: float) -> int:
+def inspect_pdf_in_worker(source: SourceArtifact, pdf_policy: PdfPolicy) -> int:
     """Return a verified PDF's page count from a bounded spawned worker."""
 
-    result = _run_worker("inspect", source, timeout_seconds)
+    result = _run_worker("inspect", source, pdf_policy)
     page_count = result.get("page_count")
     if not isinstance(page_count, int):
         raise _worker_failed()
     return page_count
 
 
-def extract_pdf_in_worker(source: SourceArtifact, timeout_seconds: float) -> dict[str, object]:
+def extract_pdf_in_worker(source: SourceArtifact, pdf_policy: PdfPolicy) -> dict[str, object]:
     """Extract JSON-safe PDF page text in a bounded spawned worker."""
 
-    return _run_worker("extract", source, timeout_seconds)
+    return _run_worker("extract", source, pdf_policy)
 
 
 def render_pdf_page_in_worker(
     source: SourceArtifact,
     page: int,
     target: Path,
-    timeout_seconds: float,
+    pdf_policy: PdfPolicy,
 ) -> dict[str, object]:
     """Render a page in a child and atomically publish only a completed PNG."""
 
@@ -812,7 +864,7 @@ def render_pdf_page_in_worker(
         result = _run_worker(
             "render",
             source,
-            timeout_seconds,
+            pdf_policy,
             page=page,
             render_target=temporary,
         )

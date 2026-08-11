@@ -38,7 +38,12 @@ from invoice_agents.models import (
     CaseStatus,
     HumanDecisionKind,
 )
-from invoice_agents.observability.audit import configure_logging, redact, sanitize_text
+from invoice_agents.observability.audit import (
+    configure_logging,
+    redact,
+    redacting_uvicorn_log_config,
+    sanitize_text,
+)
 from invoice_agents.orchestration import (
     claim_resumable_case,
     process_invoice,
@@ -626,6 +631,7 @@ def ui_command(
         ),
         host=bind_host,
         port=port,
+        log_config=redacting_uvicorn_log_config(uvicorn.config.LOGGING_CONFIG),
         log_level="warning",
     )
     console.print(

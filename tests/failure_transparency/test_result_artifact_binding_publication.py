@@ -33,6 +33,7 @@ def _terminal_case(settings: Settings) -> tuple[WorkflowStore, CaseResult, int]:
         SOURCE_PATH,
         settings.source_archive_dir,
         max_bytes=10_485_760,
+        pdf_policy=settings.pdf_policy(),
     )
     store = WorkflowStore(settings)
     store.register_source(source)

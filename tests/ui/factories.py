@@ -61,7 +61,11 @@ def prepare_fixture_case(settings: Settings, source: Path) -> tuple[str, datetim
 
 
 def record_case_evidence(
-    settings: Settings, case_id: str, critic_disposition: DecisionKind
+    settings: Settings,
+    case_id: str,
+    critic_disposition: DecisionKind,
+    *,
+    critique: Critique | None = None,
 ) -> tuple[RiskAssessment, ExecutionClaim]:
     """Persist inventory/risk/critique evidence exactly as the agent tools do."""
 
@@ -96,11 +100,16 @@ def record_case_evidence(
         claim,
     )
     store.save_comparison(case_id, "risk", risk.model_dump(mode="json"), claim)
-    store.save_critique(case_id, make_critique(critic_disposition), claim)
+    store.save_critique(case_id, critique or make_critique(critic_disposition), claim)
     return risk, claim
 
 
-def make_succeeded_case(settings: Settings, name: str = "invoice_1001.txt") -> str:
+def make_succeeded_case(
+    settings: Settings,
+    name: str = "invoice_1001.txt",
+    *,
+    final_reason: str = "all deterministic checks passed",
+) -> str:
     """A fully persisted approved case paid through the real mock-payment service."""
 
     case_id, started_at = prepare_fixture_case(settings, DATA_DIR / name)
@@ -109,7 +118,7 @@ def make_succeeded_case(settings: Settings, name: str = "invoice_1001.txt") -> s
     invoice = store.load_current_extraction(claim)
     decision = FinalDecision(
         decision=DecisionKind.APPROVE,
-        reasons=["all deterministic checks passed"],
+        reasons=[final_reason],
         evidence=[reference for line in invoice.lines for reference in line.evidence[:1]],
         critic_disposition=DecisionKind.APPROVE,
         payment_eligible=True,
@@ -132,24 +141,37 @@ def make_succeeded_case(settings: Settings, name: str = "invoice_1001.txt") -> s
 
 
 def make_pending_review_case(
-    settings: Settings, source: Path | None = None
+    settings: Settings,
+    source: Path | None = None,
+    *,
+    critique: Critique | None = None,
+    agent_rationale: list[str] | None = None,
+    extra_reasons: list[str] | None = None,
 ) -> tuple[str, ReviewRequest]:
     """A NEEDS_HUMAN case with a persisted pending review package and team state."""
 
     case_id, started_at = prepare_fixture_case(settings, source or (DATA_DIR / "invoice_1002.txt"))
     store = WorkflowStore(settings)
-    risk, claim = record_case_evidence(settings, case_id, DecisionKind.HOLD)
+    selected_critique = critique or make_critique(DecisionKind.HOLD)
+    risk, claim = record_case_evidence(
+        settings,
+        case_id,
+        DecisionKind.HOLD,
+        critique=selected_critique,
+    )
     invoice = store.load_current_extraction(claim)
     assert risk.policy_review_reasons, "fixture invoice must trigger review policy"
     review = create_review_request(
         case_id,
         invoice,
         risk,
-        make_critique(DecisionKind.HOLD),
+        selected_critique,
         DecisionKind.HOLD,
-        ["policy triggers require human review"],
+        agent_rationale or ["policy triggers require human review"],
         store,
         claim,
+        extra_reasons=extra_reasons,
+        pdf_policy=settings.pdf_policy(),
     )
     store.save_team_state(case_id, {"fixture": "stopped-team-state"}, claim)
     result = CaseResult(

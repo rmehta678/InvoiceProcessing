@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, TypeAdapter
 
-from invoice_agents.config import Settings
+from invoice_agents.config import PdfPolicy, Settings
 from invoice_agents.db.core import _strict_critic_follow_up_payload, connect_database
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.evidence_snapshot import (
@@ -47,7 +47,14 @@ from invoice_agents.models import (
     RiskAssessment,
     SourceArtifact,
 )
-from invoice_agents.observability.audit import sanitize_case_result, sanitize_text
+from invoice_agents.observability.audit import (
+    sanitize_case_result,
+    sanitize_critique,
+    sanitize_final_decision,
+    sanitize_human_decision,
+    sanitize_review_request,
+    sanitize_text,
+)
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -412,6 +419,7 @@ def _authoritative_identity_for_scope(
     case_id: str,
     invoice: ExtractedInvoice,
     evaluated_at: datetime,
+    pdf_policy: PdfPolicy,
 ) -> tuple[IdentityCandidate, ...]:
     """Rebuild the exact identity candidates visible when identity was evaluated."""
 
@@ -434,7 +442,8 @@ def _authoritative_identity_for_scope(
         prior_case_id = str(row["case_id"])
         try:
             prior = extract_invoice_evidence(
-                _authoritative_source_for_case(connection, prior_case_id)
+                _authoritative_source_for_case(connection, prior_case_id),
+                pdf_policy,
             )
         except InvoiceAgentsError as exc:
             raise EvidenceSnapshotError(
@@ -564,6 +573,7 @@ def load_generation_evidence_snapshot(
         case_id,
         stored_invoice,
         identity_evaluated_at,
+        settings.pdf_policy(),
     )
     return build_evidence_snapshot(
         case_id,
@@ -654,7 +664,9 @@ def _review_from_row(row: sqlite3.Row | None, review_id: str) -> ReviewRequest:
             stop_reason="REVIEW_NOT_FOUND",
         )
     try:
-        return ReviewRequest.model_validate_json(row["payload_json"], strict=True)
+        return sanitize_review_request(
+            ReviewRequest.model_validate_json(row["payload_json"], strict=True)
+        )
     except ValueError as exc:
         raise InvoiceAgentsError(
             ErrorCategory.DATABASE,
@@ -669,12 +681,18 @@ def _resolved_human_decision_replay(
     """Return an exact resolved replay or classify every difference consistently."""
 
     existing = review.human_decision
-    if (
-        decision is not None
-        and existing is not None
-        and _decision_semantics(existing) == _decision_semantics(decision)
-    ):
-        return review
+    if decision is not None and existing is not None:
+        try:
+            proposed = sanitize_human_decision(decision)
+        except ValueError as exc:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                f"review {review.review_id} is already resolved",
+                case_id=review.case_id,
+                stop_reason="REVIEW_ALREADY_RESOLVED",
+            ) from exc
+        if _decision_semantics(existing) == _decision_semantics(proposed):
+            return review
     raise InvoiceAgentsError(
         ErrorCategory.DATABASE,
         f"review {review.review_id} is already resolved",
@@ -705,7 +723,9 @@ def _reconcile_review_authorization(
 
     inconsistent = EvidenceSnapshotError("review authorization records are inconsistent")
     try:
-        review = ReviewRequest.model_validate_json(row["payload_json"], strict=True)
+        review = sanitize_review_request(
+            ReviewRequest.model_validate_json(row["payload_json"], strict=True)
+        )
     except ValueError as exc:
         raise inconsistent from exc
     human_rows = connection.execute(
@@ -739,7 +759,9 @@ def _reconcile_review_authorization(
         raise inconsistent
     human_row = human_rows[0]
     try:
-        relational_human = HumanDecision.model_validate_json(human_row["payload_json"], strict=True)
+        relational_human = sanitize_human_decision(
+            HumanDecision.model_validate_json(human_row["payload_json"], strict=True)
+        )
     except ValueError as exc:
         raise inconsistent from exc
     relational_columns_match = (
@@ -3699,6 +3721,7 @@ class WorkflowStore:
                     case_id,
                     claim.generation,
                 )
+                critique = sanitize_critique(critique)
                 records = self._critique_records(connection, case_id)
                 if len(records) >= 2:
                     self._raise_critique_cycle_error(
@@ -4070,7 +4093,9 @@ class WorkflowStore:
         created_at_by_id: dict[str, str] = {}
         for row in rows:
             try:
-                critique = Critique.model_validate_json(row["payload_json"], strict=True)
+                critique = sanitize_critique(
+                    Critique.model_validate_json(row["payload_json"], strict=True)
+                )
             except (TypeError, ValueError) as exc:
                 raise InvoiceAgentsError(
                     ErrorCategory.DATABASE,
@@ -4474,6 +4499,7 @@ class WorkflowStore:
             written_at = datetime.now(UTC)
             self._require_current_claim(connection, claim, written_at)
             self._assert_evidence_generation_mutable(connection, review.case_id, claim.generation)
+            review = sanitize_review_request(review)
             from invoice_agents.agents.decision_rules import (
                 _assert_critique_sequence_complete,
             )
@@ -4532,7 +4558,9 @@ class WorkflowStore:
                 f"review request does not exist: {review_id}",
                 stop_reason="REVIEW_NOT_FOUND",
             )
-        return ReviewRequest.model_validate_json(row["payload_json"], strict=True)
+        return sanitize_review_request(
+            ReviewRequest.model_validate_json(row["payload_json"], strict=True)
+        )
 
     def load_case_review(self, case_id: str) -> ReviewRequest | None:
         """Return the latest review cycle for the case, by sequence."""
@@ -4543,7 +4571,13 @@ class WorkflowStore:
                 "ORDER BY sequence DESC LIMIT 1",
                 (case_id,),
             ).fetchone()
-        return ReviewRequest.model_validate_json(row["payload_json"], strict=True) if row else None
+        return (
+            sanitize_review_request(
+                ReviewRequest.model_validate_json(row["payload_json"], strict=True)
+            )
+            if row
+            else None
+        )
 
     def load_current_review(self, claim: ExecutionClaim) -> ReviewRequest | None:
         """Return only the latest review owned by the current unexpired generation."""
@@ -4556,7 +4590,13 @@ class WorkflowStore:
                 "AND execution_generation = ? ORDER BY sequence DESC LIMIT 1",
                 (claim.case_id, claim.generation),
             ).fetchone()
-        return ReviewRequest.model_validate_json(row["payload_json"], strict=True) if row else None
+        return (
+            sanitize_review_request(
+                ReviewRequest.model_validate_json(row["payload_json"], strict=True)
+            )
+            if row
+            else None
+        )
 
     def list_reviews(self, pending_only: bool = True) -> list[ReviewRequest]:
         sql = "SELECT payload_json FROM review_requests"
@@ -4567,7 +4607,12 @@ class WorkflowStore:
         sql += " ORDER BY created_at, sequence"
         with connect_database(self.path, read_only=True) as connection:
             rows = connection.execute(sql, params).fetchall()
-        return [ReviewRequest.model_validate_json(row["payload_json"], strict=True) for row in rows]
+        return [
+            sanitize_review_request(
+                ReviewRequest.model_validate_json(row["payload_json"], strict=True)
+            )
+            for row in rows
+        ]
 
     def classify_human_decision_replay(
         self,
@@ -4692,6 +4737,7 @@ class WorkflowStore:
                     connection.rollback()
                     return replay
 
+                decision = sanitize_human_decision(decision)
                 mappings = _validate_human_decision(connection, review, decision)
                 resolved = review.model_copy(
                     update={"status": "RESOLVED", "human_decision": decision}, deep=True
@@ -4777,6 +4823,7 @@ class WorkflowStore:
                     case_id=case_id,
                     stop_reason="FINAL_DECISION_IMMUTABLE",
                 )
+            decision = sanitize_final_decision(decision)
             from invoice_agents.agents.decision_rules import (
                 _assert_critique_sequence_complete,
             )
@@ -4901,7 +4948,13 @@ class WorkflowStore:
             row = connection.execute(
                 "SELECT payload_json FROM final_decisions WHERE case_id = ?", (case_id,)
             ).fetchone()
-        return FinalDecision.model_validate_json(row["payload_json"], strict=True) if row else None
+        return (
+            sanitize_final_decision(
+                FinalDecision.model_validate_json(row["payload_json"], strict=True)
+            )
+            if row
+            else None
+        )
 
     def load_current_final_decision(self, claim: ExecutionClaim) -> FinalDecision | None:
         """Return only a final decision owned by the current unexpired generation."""
@@ -4914,7 +4967,13 @@ class WorkflowStore:
                 "AND decision_generation = ?",
                 (claim.case_id, claim.generation),
             ).fetchone()
-        return FinalDecision.model_validate_json(row["payload_json"], strict=True) if row else None
+        return (
+            sanitize_final_decision(
+                FinalDecision.model_validate_json(row["payload_json"], strict=True)
+            )
+            if row
+            else None
+        )
 
     def save_team_state(self, case_id: str, state: dict[str, Any], claim: ExecutionClaim) -> None:
         claim = validate_execution_claim(claim, expected_case_id=case_id)

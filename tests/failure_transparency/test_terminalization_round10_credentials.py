@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 import time
+from collections.abc import Iterator
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -20,6 +21,27 @@ from invoice_agents import isolated_process, lifecycle_process
 from invoice_agents.config import Settings
 from invoice_agents.db import migration_process
 from invoice_agents.db.store import ExecutionClaim
+
+
+@pytest.fixture
+def _irreversible_private_pipe_poison_isolation() -> Iterator[None]:
+    """Model a fresh process for tests that deliberately trigger sticky poison."""
+
+    with isolated_process._PRIVATE_PIPE_STATE_LOCK:
+        assert not isolated_process._PRIVATE_PIPE_STATE_POISONED
+        assert isolated_process._ACTIVE_PRIVATE_PIPE_ENDPOINTS == 0
+    poisoned = False
+    active_endpoints = -1
+    try:
+        yield
+    finally:
+        with isolated_process._PRIVATE_PIPE_STATE_LOCK:
+            poisoned = isolated_process._PRIVATE_PIPE_STATE_POISONED
+            active_endpoints = isolated_process._ACTIVE_PRIVATE_PIPE_ENDPOINTS
+            if poisoned and active_endpoints == 0:
+                isolated_process._PRIVATE_PIPE_STATE_POISONED = False
+    assert poisoned
+    assert active_endpoints == 0
 
 
 def _lifecycle_inputs(
@@ -271,6 +293,7 @@ def test_round10_metadata_faults_happen_before_credential_materialization(
 def test_round10_close_before_action_forgets_unsafe_raw_descriptor_ownership(
     monkeypatch: pytest.MonkeyPatch,
     endpoint_kind: str,
+    _irreversible_private_pipe_poison_isolation: None,
 ) -> None:
     """A pre-action close fault is visible but never authorizes a raw-fd retry."""
 
@@ -298,6 +321,8 @@ def test_round10_close_before_action_forgets_unsafe_raw_descriptor_ownership(
             expected.st_ino,
             expected.st_mode,
         )
+        with pytest.raises(isolated_process.IsolatedProcessCleanupError):
+            isolated_process.private_pipe_channel()
     finally:
         monkeypatch.setattr(isolated_process.os, "close", real_close)
         real_close(descriptor)
@@ -305,9 +330,10 @@ def test_round10_close_before_action_forgets_unsafe_raw_descriptor_ownership(
 
 
 @pytest.mark.parametrize("endpoint_kind", ["reader", "writer"])
-def test_round10_uncertain_endpoint_creates_no_retry_registry(
+def test_round10_uncertain_endpoint_poison_blocks_admission_without_retry_registry(
     monkeypatch: pytest.MonkeyPatch,
     endpoint_kind: str,
+    _irreversible_private_pipe_poison_isolation: None,
 ) -> None:
     """A failed raw close cannot create a registry that later acts on that number."""
 
@@ -328,9 +354,8 @@ def test_round10_uncertain_endpoint_creates_no_retry_registry(
     other.close()
 
     try:
-        admitted_reader, admitted_writer = isolated_process.private_pipe_channel()
-        admitted_reader.close()
-        admitted_writer.close()
+        with pytest.raises(isolated_process.IsolatedProcessCleanupError):
+            isolated_process.private_pipe_channel()
         assert endpoint.closed
         assert os.fstat(descriptor)
     finally:
@@ -343,6 +368,7 @@ def test_round10_close_after_action_never_claims_or_mutates_a_reused_number(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     endpoint_kind: str,
+    _irreversible_private_pipe_poison_isolation: None,
 ) -> None:
     """Post-action failure proves the pipe gone without owning a reused raw number."""
 
@@ -385,6 +411,8 @@ def test_round10_close_after_action_never_claims_or_mutates_a_reused_number(
         endpoint.close()
         current = os.fstat(descriptor)
         assert (current.st_dev, current.st_ino, current.st_mode) == replacement_identity[0]
+        with pytest.raises(isolated_process.IsolatedProcessCleanupError):
+            isolated_process.private_pipe_channel()
     finally:
         monkeypatch.setattr(isolated_process.os, "close", real_close)
         with suppress(OSError):
@@ -421,21 +449,28 @@ def test_round10_spawn_then_control_cannot_escape_before_session_containment(
         "_lifecycle_worker_command",
         lambda: [sys.executable, "-c", worker_code],
     )
-    spawned: list[isolated_process._SpawnedProcess] = []
+    real_status_process_id = isolated_process._status_process_id
+    started_process_ids: list[int] = []
     injected = False
 
-    def spawn_then_interrupt(process: isolated_process._SpawnedProcess) -> None:
+    def started_then_interrupt(status: bytes, *, prefix: bytes) -> int:
         nonlocal injected
-        if not injected:
+        process_id = real_status_process_id(status, prefix=prefix)
+        if not injected and prefix == b"STARTED ":
             injected = True
-            spawned.append(process)
+            started_process_ids.append(process_id)
             deadline = time.monotonic() + 3.0
             while not marker.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             assert marker.exists(), "real worker never published its descendant marker"
             raise control_type("round10 control after real spawn")
+        return process_id
 
-    monkeypatch.setattr(isolated_process, "_after_worker_spawn", spawn_then_interrupt)
+    monkeypatch.setattr(
+        isolated_process,
+        "_status_process_id",
+        started_then_interrupt,
+    )
     leader_id = 0
     descendant_id = 0
     try:
@@ -448,10 +483,10 @@ def test_round10_spawn_then_control_cannot_escape_before_session_containment(
                 timeout_seconds=1.0,
             )
 
-        assert injected and len(spawned) == 1
+        assert injected and len(started_process_ids) == 1
         leader_id, descendant_id = map(int, marker.read_text(encoding="ascii").split())
-        assert leader_id == spawned[0].pid
-        assert spawned[0].poll() is not None
+        assert leader_id == started_process_ids[0]
+        assert _pid_is_absent(leader_id)
         assert _pid_is_absent(descendant_id)
     finally:
         if marker.exists():
@@ -461,14 +496,9 @@ def test_round10_spawn_then_control_cannot_escape_before_session_containment(
             )
             leader_id = leader_id or published_leader
             descendant_id = descendant_id or published_descendant
-        if not leader_id and spawned:
-            leader_id = spawned[0].pid
         if leader_id and not _pid_is_absent(leader_id):
             with suppress(ProcessLookupError, PermissionError):
                 os.killpg(leader_id, signal.SIGKILL)
-        for process in spawned:
-            with suppress(BaseException):
-                process.wait(timeout=2.0)
         cleanup_deadline = time.monotonic() + 2.0
         while time.monotonic() < cleanup_deadline and any(
             process_id and not _pid_is_absent(process_id)
@@ -479,11 +509,11 @@ def test_round10_spawn_then_control_cannot_escape_before_session_containment(
         assert not descendant_id or _pid_is_absent(descendant_id)
 
 
-def test_round10_control_immediately_after_kernel_spawn_still_owns_process(
+def test_round10_control_after_canonical_started_stops_and_reaps_worker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stopped child is already published to the startup owner."""
+    """A control after exact STARTED parsing cannot escape before worker reaping."""
 
     settings, started_at, claim = _lifecycle_inputs(
         tmp_path,
@@ -494,31 +524,36 @@ def test_round10_control_immediately_after_kernel_spawn_still_owns_process(
         "_lifecycle_worker_command",
         lambda: [sys.executable, "-c", "import time; time.sleep(30)"],
     )
-    spawned: list[isolated_process._SpawnedProcess] = []
+    real_status_process_id = isolated_process._status_process_id
+    worker_ids: list[int] = []
 
-    def stop_then_interrupt(process: isolated_process._SpawnedProcess) -> None:
-        if not spawned:
-            spawned.append(process)
-            os.kill(process.pid, signal.SIGSTOP)
-            raise KeyboardInterrupt("round10 control after kernel spawn")
+    def stop_started_then_interrupt(status: bytes, *, prefix: bytes) -> int:
+        process_id = real_status_process_id(status, prefix=prefix)
+        if prefix == b"STARTED " and not worker_ids:
+            worker_ids.append(process_id)
+            os.kill(process_id, signal.SIGSTOP)
+            raise KeyboardInterrupt("round10 control after canonical STARTED")
+        return process_id
 
-    monkeypatch.setattr(isolated_process, "_after_worker_spawn", stop_then_interrupt)
+    monkeypatch.setattr(
+        isolated_process,
+        "_status_process_id",
+        stop_started_then_interrupt,
+    )
     try:
-        with pytest.raises(KeyboardInterrupt, match="after kernel spawn"):
+        with pytest.raises(KeyboardInterrupt, match="after canonical STARTED"):
             lifecycle_process.run_lifecycle_process(
                 mode="process",
                 settings=settings,
                 claim=claim,
                 started_at=started_at,
-                timeout_seconds=0.1,
+                timeout_seconds=1.0,
             )
-        assert len(spawned) == 1
-        assert spawned[0].poll() is not None
+        assert len(worker_ids) == 1
+        assert _pid_is_absent(worker_ids[0])
     finally:
-        for process in spawned:
-            if process.poll() is None:
+        for process_id in worker_ids:
+            if not _pid_is_absent(process_id):
                 with suppress(ProcessLookupError, PermissionError):
-                    os.killpg(process.pid, signal.SIGKILL)
-                with suppress(BaseException):
-                    process.wait(timeout=2.0)
-            assert _pid_is_absent(process.pid)
+                    os.killpg(process_id, signal.SIGKILL)
+            assert _pid_is_absent(process_id)

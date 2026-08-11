@@ -14,6 +14,7 @@ from invoice_agents.tools.comparison import (
     compare_inventory_evidence,
 )
 from invoice_agents.tools.evidence import extract_invoice_evidence
+from tests.support.pdf_policy import TEST_PDF_POLICY
 
 
 def prepare(invoice_dir: Path, name: str, settings: Settings) -> str:
@@ -79,9 +80,12 @@ def test_apply_mapping_evidence_leaves_input_invoice_unmodified(
     invoice_dir: Path, inventory_db: Path, tmp_path: Path
 ) -> None:
     source = snapshot_source(
-        invoice_dir / "invoice_1001.txt", tmp_path / "sources", max_bytes=10_485_760
+        invoice_dir / "invoice_1001.txt",
+        tmp_path / "sources",
+        max_bytes=10_485_760,
+        pdf_policy=TEST_PDF_POLICY,
     )
-    invoice = extract_invoice_evidence(source)
+    invoice = extract_invoice_evidence(source, TEST_PDF_POLICY)
     reader = InventoryReader(inventory_db)
     mappings, _comparisons, unresolved = compare_inventory_evidence(invoice, reader)
     enriched = apply_mapping_evidence(invoice, mappings, unresolved)

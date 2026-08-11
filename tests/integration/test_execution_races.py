@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -42,15 +43,20 @@ from invoice_agents.db.store import (
     load_generation_evidence_snapshot,
 )
 from invoice_agents.errors import DatabaseVerificationError, InvoiceAgentsError
-from invoice_agents.hitl.service import create_review_request, record_human_decision
+from invoice_agents.hitl.service import (
+    create_review_request as _create_review_request,
+)
+from invoice_agents.hitl.service import record_human_decision
 from invoice_agents.models import (
     CanonicalMapping,
     CaseResult,
     CaseStatus,
     Critique,
     DecisionKind,
+    EvidenceRef,
     ExtractedInvoice,
     FinalDecision,
+    HumanDecision,
     HumanDecisionKind,
     InventoryComparison,
     InventoryStatus,
@@ -75,6 +81,12 @@ from invoice_agents.tools.comparison import (
     find_prior_invoice_candidates,
 )
 from invoice_agents.tools.evidence import extract_invoice_evidence
+from tests.support.pdf_policy import TEST_PDF_POLICY
+
+create_review_request = partial(
+    _create_review_request,
+    pdf_policy=TEST_PDF_POLICY,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -94,8 +106,9 @@ def _persist_case(
         source_path,
         settings.source_archive_dir,
         max_bytes=settings.source_max_bytes,
+        pdf_policy=settings.pdf_policy(),
     )
-    invoice = extract_invoice_evidence(source)
+    invoice = extract_invoice_evidence(source, settings.pdf_policy())
     store = WorkflowStore(settings)
     store.register_source(source)
     store.create_case(case_id, source, datetime.now(UTC))
@@ -753,6 +766,234 @@ def test_expired_claim_cannot_write_after_new_generation_owns_case(settings: Set
 
     store.save_team_state("case_stale_claim", {"owner": "current"}, current)
     assert store.load_team_state("case_stale_claim") == {"owner": "current"}
+
+
+@pytest.mark.parametrize("write_kind", ["critique", "review", "final"])
+def test_stale_claim_precedes_invalid_structural_model_payload(
+    settings: Settings,
+    write_kind: str,
+) -> None:
+    """Removing authority-first ordering must expose the structural canary error."""
+
+    case_id = f"case_stale_structural_{write_kind}"
+    store = _persist_case(settings, case_id)
+    stale = store.claim_case_execution(
+        case_id,
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+    store.adopt_latest_evidence(stale)
+    invoice = store.load_current_extraction(stale)
+    risk = RiskAssessment.model_validate(store.load_current_comparison(stale, "risk"))
+    critique = store.load_current_critique(stale)
+    review = create_review_request(
+        case_id,
+        invoice,
+        risk,
+        critique,
+        DecisionKind.HOLD,
+        ["stale structural payload must not win authority precedence"],
+        store,
+        stale,
+        extra_reasons=["stale structural payload must not win authority precedence"],
+    )
+    secret = "sk-proj-stale-structural-secret-12345678"
+    invalid_critique = critique.model_copy(
+        update={"responds_to_critique_id": f"crit_{secret}"},
+        deep=True,
+    )
+    invalid_review = review.model_copy(
+        update={"review_id": f"rev_{secret}"},
+        deep=True,
+    )
+    invalid_final = FinalDecision(
+        decision=DecisionKind.REJECT,
+        reasons=["stale writer must not finalize"],
+        evidence=[
+            EvidenceRef(
+                source_id=f"src_{secret}",
+                locator_type="line",
+                locator="line:1",
+            )
+        ],
+        critic_disposition=DecisionKind.HOLD,
+        payment_eligible=False,
+    )
+    with connect_database(settings.workflow_db) as connection:
+        connection.execute(
+            "UPDATE cases SET lease_expires_at = ? WHERE case_id = ?",
+            ("2000-01-01T00:00:00+00:00", case_id),
+        )
+        connection.commit()
+    store.claim_case_execution(
+        case_id,
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+    writes = {
+        "critique": lambda: store.save_critique(case_id, invalid_critique, stale),
+        "review": lambda: store.save_review(invalid_review, stale),
+        "final": lambda: store.save_final_decision(case_id, invalid_final, stale),
+    }
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        writes[write_kind]()
+
+    assert excinfo.value.stop_reason == "STALE_EXECUTION_CLAIM"
+
+
+def test_existing_final_precedes_invalid_structural_final_decision_payload(
+    settings: Settings,
+) -> None:
+    case_id = "case_final_structural_precedence"
+    store = _persist_case(settings, case_id)
+    claim = store.claim_case_execution(
+        case_id,
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+    _approve(store, case_id, claim)
+    secret = "sk-proj-final-structural-secret-12345678"
+    invalid = FinalDecision(
+        decision=DecisionKind.REJECT,
+        reasons=["a second final decision must not be evaluated"],
+        evidence=[
+            EvidenceRef(
+                source_id=f"src_{secret}",
+                locator_type="line",
+                locator="line:1",
+            )
+        ],
+        critic_disposition=DecisionKind.REJECT,
+        payment_eligible=False,
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.save_final_decision(case_id, invalid, claim)
+
+    assert excinfo.value.stop_reason == "FINAL_DECISION_IMMUTABLE"
+
+
+def test_paid_final_precedes_invalid_structural_final_decision_payload(
+    settings: Settings,
+) -> None:
+    case_id = "case_paid_structural_precedence"
+    store = _persist_case(settings, case_id)
+    invoice = store.load_extraction(case_id)
+    claim = store.claim_case_execution(
+        case_id,
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+    approved = _approve(store, case_id, claim)
+    payment = mock_payment(case_id, invoice, store, settings.workflow_db, claim)
+    assert payment.status is PaymentStatus.PAID
+    invalid = FinalDecision(
+        decision=DecisionKind.REJECT,
+        reasons=["a paid decision must remain authoritative"],
+        evidence=[
+            EvidenceRef(
+                source_id="src_sk-proj-paid-structural-secret-12345678",
+                locator_type="line",
+                locator="line:1",
+            )
+        ],
+        critic_disposition=DecisionKind.REJECT,
+        payment_eligible=False,
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.save_final_decision(case_id, invalid, claim)
+
+    assert excinfo.value.stop_reason == "PAID_FINAL_DECISION_IMMUTABLE"
+    assert store.load_final_decision(case_id) == approved
+
+
+@pytest.mark.parametrize(
+    ("boundary", "expected_stop_reason"),
+    [
+        ("classify", "REVIEW_ALREADY_RESOLVED"),
+        ("save", "AUTHORIZATION_EVIDENCE_IMMUTABLE"),
+    ],
+)
+def test_resolved_human_authority_precedes_invalid_structural_decision_payload(
+    settings: Settings,
+    boundary: str,
+    expected_stop_reason: str,
+) -> None:
+    case_id = f"case_human_structural_precedence_{boundary}"
+    store = _persist_case(settings, case_id)
+    _invoice, claim = _approve_with_resolved_review(store, case_id, settings)
+    review = store.load_current_review(claim)
+    assert review is not None and review.human_decision is not None
+    invalid: HumanDecision = review.human_decision.model_copy(
+        update={"superseded_case_id": "case_sk-proj-human-structural-secret-12345678"},
+        deep=True,
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        if boundary == "classify":
+            store.classify_human_decision_replay(
+                review.review_id,
+                invalid,
+                settings.inventory_db,
+            )
+        else:
+            store.save_human_decision(invalid, settings.inventory_db)
+
+    assert excinfo.value.stop_reason == expected_stop_reason
+
+
+def test_resolved_review_without_final_precedes_invalid_structural_human_decision_payload(
+    settings: Settings,
+) -> None:
+    case_id = "case_resolved_without_final_structural_precedence"
+    store = _persist_case(settings, case_id)
+    claim = store.claim_case_execution(
+        case_id,
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+    store.adopt_latest_evidence(claim)
+    invoice = store.load_current_extraction(claim)
+    review = create_review_request(
+        case_id,
+        invoice,
+        RiskAssessment.model_validate(store.load_current_comparison(claim, "risk")),
+        store.load_current_critique(claim),
+        DecisionKind.HOLD,
+        ["an attributable human ruling is required"],
+        store,
+        claim,
+        extra_reasons=["an attributable human ruling is required"],
+    )
+    resolved = record_human_decision(
+        review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.APPROVE,
+        "the exact current evidence is authorized",
+        store,
+        settings.inventory_db,
+    )
+    assert resolved.human_decision is not None
+    invalid: HumanDecision = resolved.human_decision.model_copy(
+        update={"superseded_case_id": "case_sk-proj-resolved-structural-secret-12345678"},
+        deep=True,
+    )
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM final_decisions WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()[0]
+            == 0
+        )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.save_human_decision(invalid, settings.inventory_db)
+
+    assert excinfo.value.stop_reason == "REVIEW_ALREADY_RESOLVED"
+    assert store.load_review(review.review_id) == resolved
 
 
 def test_only_current_unexpired_claim_can_renew(settings: Settings) -> None:
@@ -1636,8 +1877,9 @@ def test_adoption_rejects_future_generation_instead_of_copying_global_latest(
         Path("data/invoices/invoice_1002.txt"),
         settings.source_archive_dir,
         max_bytes=settings.source_max_bytes,
+        pdf_policy=settings.pdf_policy(),
     )
-    forged_invoice = extract_invoice_evidence(forged_source)
+    forged_invoice = extract_invoice_evidence(forged_source, settings.pdf_policy())
     with connect_database(settings.workflow_db) as connection:
         next_version = connection.execute(
             "SELECT MAX(version) + 1 FROM extractions WHERE case_id = ?", (case_id,)

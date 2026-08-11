@@ -8,6 +8,7 @@ returning an empty invoice.
 from __future__ import annotations
 
 import csv
+import io
 import json
 import re
 from decimal import Decimal, InvalidOperation
@@ -17,7 +18,7 @@ from xml.etree import ElementTree
 
 from dateutil import parser as date_parser
 
-from invoice_agents.config import Settings
+from invoice_agents.config import PdfPolicy
 from invoice_agents.errors import ErrorCategory, SourceEvidenceError
 from invoice_agents.models import (
     EvidenceRef,
@@ -26,7 +27,7 @@ from invoice_agents.models import (
     InvoiceLine,
     SourceArtifact,
 )
-from invoice_agents.source_store import verified_source_path
+from invoice_agents.source_store import read_verified_source_bytes
 
 RELATIVE_DATE = re.compile(r"\b(today|tomorrow|yesterday|next\s+\w+|last\s+\w+)\b", re.I)
 INTEGER_VALUE = r"(?:[0-9O]{1,3}(?:,[0-9O]{3})+|[0-9O]+)"
@@ -42,10 +43,9 @@ EVIDENCE_EXCERPT_LIMIT = 160
 def read_text_invoice(source: SourceArtifact) -> dict[str, Any]:
     """Read UTF-8 text with stable one-based line references."""
 
-    path = verified_source_path(source)
     try:
-        raw = path.read_text(encoding="utf-8-sig")
-    except (OSError, UnicodeError) as exc:
+        raw = read_verified_source_bytes(source).decode("utf-8-sig")
+    except UnicodeError as exc:
         raise SourceEvidenceError(
             ErrorCategory.SOURCE,
             f"text source could not be read as UTF-8: {exc}",
@@ -66,10 +66,9 @@ def read_text_invoice(source: SourceArtifact) -> dict[str, Any]:
 def read_json_invoice(source: SourceArtifact) -> dict[str, Any]:
     """Parse one JSON object; malformed or non-object roots are explicit failures."""
 
-    path = verified_source_path(source)
     try:
-        value = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        value = json.loads(read_verified_source_bytes(source).decode("utf-8-sig"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise SourceEvidenceError(
             ErrorCategory.PARSE,
             f"JSON parse failed: {exc}",
@@ -87,11 +86,10 @@ def read_json_invoice(source: SourceArtifact) -> dict[str, Any]:
 def read_csv_invoice(source: SourceArtifact) -> dict[str, Any]:
     """Read CSV rows without assuming vertical or row-oriented layout."""
 
-    path = verified_source_path(source)
     try:
-        with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            rows = list(csv.reader(handle))
-    except (OSError, UnicodeError, csv.Error) as exc:
+        raw = read_verified_source_bytes(source).decode("utf-8-sig")
+        rows = list(csv.reader(io.StringIO(raw, newline="")))
+    except (UnicodeError, csv.Error) as exc:
         raise SourceEvidenceError(
             ErrorCategory.PARSE,
             f"CSV parse failed: {exc}",
@@ -109,10 +107,9 @@ def read_csv_invoice(source: SourceArtifact) -> dict[str, Any]:
 def read_xml_invoice(source: SourceArtifact) -> dict[str, Any]:
     """Parse XML into a transparent path/value representation."""
 
-    path = verified_source_path(source)
     try:
-        root = ElementTree.parse(path).getroot()
-    except (OSError, ElementTree.ParseError) as exc:
+        root = ElementTree.fromstring(read_verified_source_bytes(source))
+    except ElementTree.ParseError as exc:
         raise SourceEvidenceError(
             ErrorCategory.PARSE,
             f"XML parse failed: {exc}",
@@ -134,15 +131,20 @@ def read_xml_invoice(source: SourceArtifact) -> dict[str, Any]:
     return {"root": root, "nodes": walk(root, "")}
 
 
-def extract_pdf_text(source: SourceArtifact) -> dict[str, Any]:
+def extract_pdf_text(source: SourceArtifact, pdf_policy: PdfPolicy) -> dict[str, Any]:
     """Extract text by page while retaining that extraction is not visual proof."""
 
     from invoice_agents.pdf_worker import extract_pdf_in_worker
 
-    return extract_pdf_in_worker(source, Settings().pdf_parse_timeout_seconds)
+    return extract_pdf_in_worker(source, pdf_policy)
 
 
-def render_pdf_page(source: SourceArtifact, page: int, output_dir: Path) -> dict[str, Any]:
+def render_pdf_page(
+    source: SourceArtifact,
+    page: int,
+    output_dir: Path,
+    pdf_policy: PdfPolicy,
+) -> dict[str, Any]:
     """Render one page to PNG for layout evidence; page numbers are one-based."""
 
     if source.source_format != "pdf":
@@ -165,7 +167,7 @@ def render_pdf_page(source: SourceArtifact, page: int, output_dir: Path) -> dict
         source,
         page,
         target,
-        Settings().pdf_parse_timeout_seconds,
+        pdf_policy,
     )
 
 
@@ -504,6 +506,8 @@ def _finish_invoice(invoice: ExtractedInvoice) -> ExtractedInvoice:
         "total": invoice.declared_total,
     }
     invoice.missing_fields = [key for key, value in required.items() if value in (None, "")]
+    if invoice.declared_tax_rate is None and invoice.declared_tax_amount is None:
+        invoice.missing_fields.append("tax")
     if not invoice.lines:
         invoice.missing_fields.append("lines")
     if invoice.invoice_number.ambiguity:
@@ -1031,7 +1035,10 @@ def _extract_xml(source: SourceArtifact) -> ExtractedInvoice:
     )
 
 
-def extract_invoice_evidence(source: SourceArtifact) -> ExtractedInvoice:
+def extract_invoice_evidence(
+    source: SourceArtifact,
+    pdf_policy: PdfPolicy,
+) -> ExtractedInvoice:
     """Dispatch to the declared format parser; no cross-format or canned fallback exists."""
 
     if source.source_format == "json":
@@ -1043,7 +1050,7 @@ def extract_invoice_evidence(source: SourceArtifact) -> ExtractedInvoice:
     if source.source_format == "txt":
         return _extract_textual(source, read_text_invoice(source)["raw_text"])
     if source.source_format == "pdf":
-        pdf_result = extract_pdf_text(source)
+        pdf_result = extract_pdf_text(source, pdf_policy)
         pages = pdf_result["pages"]
         page_count = pdf_result.get("page_count")
         if isinstance(page_count, int):

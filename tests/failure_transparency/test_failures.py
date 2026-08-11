@@ -19,6 +19,7 @@ from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import (
+    CaseResult,
     CaseStatus,
     DecisionKind,
     FinalDecision,
@@ -127,6 +128,79 @@ def test_exception_credentials_are_sanitized_before_result_artifact_persistence(
         assert secret not in raw
     assert payload["final_decision"] is None
     assert payload["payment"] is None
+
+
+def test_final_decision_text_is_redacted_in_database_artifact_ui_and_cli(
+    invoice_dir: Path,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing terminal recursion must leak the same canary through a real surface."""
+
+    secret = "sk-proj-final-decision-secret-12345678"
+    prepared = prepare_case(invoice_dir / "invoice_1001.txt", settings)
+    assert isinstance(prepared, tuple)
+    case_id, started_at = prepared
+    store = WorkflowStore(settings)
+    claim = store.claim_case_execution(
+        case_id,
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+    invoice = store.promote_predecessor_extraction(claim)
+    decision = FinalDecision(
+        decision=DecisionKind.FAILED,
+        reasons=[f"final rationale api_key={secret}"],
+        evidence=[reference for line in invoice.lines for reference in line.evidence[:1]],
+        critic_disposition=DecisionKind.FAILED,
+        payment_eligible=False,
+    )
+    result = CaseResult(
+        case_id=case_id,
+        source_id=invoice.source.source_id,
+        status=CaseStatus.FAILED,
+        stop_reason="DECISION_FAILED",
+        final_decision=decision,
+        started_at=started_at,
+        finished_at=datetime.now(UTC),
+    )
+
+    store.finish_case(result, claim)
+    monkeypatch.chdir(tmp_path)
+    artifact = _write_result(result)
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        database_raw = str(
+            connection.execute(
+                "SELECT result_json FROM cases WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()["result_json"]
+        )
+    artifact_raw = artifact.read_text(encoding="utf-8")
+
+    with TestClient(create_app(settings), base_url="http://127.0.0.1:8787") as client:
+        page = client.get(f"/cases/{case_id}")
+    assert page.status_code == 200
+
+    output = io.StringIO()
+    monkeypatch.setattr(
+        cli,
+        "console",
+        Console(file=output, force_terminal=False, color_system=None, width=160),
+    )
+    monkeypatch.setattr(cli, "_settings", lambda: settings)
+    cli.case_status(case_id)
+    cli_raw = output.getvalue()
+
+    for surface in (database_raw, artifact_raw, page.text, cli_raw):
+        assert secret not in surface
+    for surface in (database_raw, artifact_raw, cli_raw):
+        assert "[REDACTED]" in surface
+    persisted = store.load_result(case_id)
+    assert persisted is not None and persisted.final_decision is not None
+    assert persisted.final_decision.reasons == ["final rationale api_key=[REDACTED]"]
+    assert persisted.final_decision.decision is DecisionKind.FAILED
+    assert persisted.final_decision.evidence == decision.evidence
 
 
 def test_provider_response_body_and_credential_are_not_copied_into_error_record() -> None:

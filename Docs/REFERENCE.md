@@ -92,7 +92,7 @@ assets ship in-repo (no CDN, no Node toolchain). Opt-in browser smokes exist beh
 Every POST is protected by a session-bound CSRF token and same-origin validation before route code
 can start work. Trusted-host validation limits accepted host names, and responses set a restrictive
 Content Security Policy (including `frame-ancestors 'none'`), `X-Frame-Options: DENY`,
-`X-Content-Type-Options: nosniff`, and a same-origin referrer policy. Remote binding remains an
+`X-Content-Type-Options: nosniff`, and a no-referrer policy. Remote binding remains an
 explicit risk acknowledgement, not an authentication mechanism.
 
 ## Provider compatibility contract

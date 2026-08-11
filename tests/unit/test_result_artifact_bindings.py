@@ -172,7 +172,12 @@ def _binding(case_id: str, generation: int, *, marker: int = 1) -> ResultArtifac
 
 
 def _new_case(settings: Settings, case_id: str) -> tuple[WorkflowStore, ExecutionClaim, str]:
-    source = snapshot_source(SOURCE_PATH, settings.source_archive_dir, max_bytes=10_485_760)
+    source = snapshot_source(
+        SOURCE_PATH,
+        settings.source_archive_dir,
+        max_bytes=10_485_760,
+        pdf_policy=settings.pdf_policy(),
+    )
     store = WorkflowStore(settings)
     store.register_source(source)
     store.create_case(case_id, source, STARTED_AT)

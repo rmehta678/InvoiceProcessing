@@ -32,6 +32,7 @@ from invoice_agents.models import (
     CaseStatus,
     Critique,
     DecisionKind,
+    ExtractedInvoice,
     FinalDecision,
     FinancialComparison,
     HumanDecisionKind,
@@ -61,6 +62,7 @@ from invoice_agents.tools.comparison import (
     find_prior_invoice_candidates,
 )
 from invoice_agents.tools.evidence import extract_invoice_evidence
+from tests.support.pdf_policy import TEST_PDF_POLICY
 
 
 @pytest.fixture(autouse=True)
@@ -181,6 +183,100 @@ def _critique(disposition: DecisionKind) -> Critique:
     )
 
 
+def _extract_json_tax_invoice(
+    tmp_path: Path,
+    tax_fields: dict[str, str],
+) -> ExtractedInvoice:
+    path = tmp_path / "tax-evidence.json"
+    path.write_text(
+        json.dumps(
+            {
+                "invoice_number": "INV-4242",
+                "vendor": {"name": "Tax Evidence Supplies"},
+                "date": "2026-01-15",
+                "due_date": "2026-02-14",
+                "payment_terms": "Net 30",
+                "currency": "USD",
+                "line_items": [
+                    {
+                        "item": "WidgetA",
+                        "quantity": "2",
+                        "unit_price": "50.00",
+                        "amount": "100.00",
+                    }
+                ],
+                "subtotal": "100.00",
+                "total": "100.00",
+                **tax_fields,
+            }
+        ),
+        encoding="utf-8",
+    )
+    source = snapshot_source(
+        path,
+        tmp_path / "sources",
+        max_bytes=10_485_760,
+        pdf_policy=TEST_PDF_POLICY,
+    )
+    return extract_invoice_evidence(source, TEST_PDF_POLICY)
+
+
+def test_missing_tax_cannot_become_exact_or_approval_green(
+    tmp_path: Path,
+    settings: Settings,
+) -> None:
+    invoice = _extract_json_tax_invoice(tmp_path, {})
+    financial = compute_invoice_totals(invoice)
+    risk = build_risk_assessment(invoice, [], [], financial, settings)
+
+    assert invoice.missing_fields == ["tax"]
+    assert financial.calculated_tax == Decimal("0")
+    assert financial.tax_recomputable is False
+    assert financial.exact is False
+    assert any(
+        "required fields are missing: tax" in reason for reason in risk.policy_review_reasons
+    )
+    assert any(
+        "financial evidence is incomplete" in reason for reason in risk.policy_review_reasons
+    )
+    with pytest.raises(InvoiceAgentsError) as blocked:
+        validate_final_decision(
+            DecisionKind.APPROVE,
+            True,
+            risk,
+            _critique(DecisionKind.APPROVE),
+            None,
+            case_id="case_missing_tax",
+        )
+    assert blocked.value.stop_reason == "HUMAN_REVIEW_UNRESOLVED"
+
+
+def test_explicit_zero_tax_preserves_clean_decision_path(
+    tmp_path: Path,
+    settings: Settings,
+) -> None:
+    invoice = _extract_json_tax_invoice(
+        tmp_path,
+        {"tax_rate": "0", "tax_amount": "0.00"},
+    )
+    financial = compute_invoice_totals(invoice)
+    risk = build_risk_assessment(invoice, [], [], financial, settings)
+
+    assert invoice.missing_fields == []
+    assert financial.calculated_tax == Decimal("0")
+    assert financial.tax_recomputable is True
+    assert financial.exact is True
+    assert risk.policy_review_reasons == []
+    validate_final_decision(
+        DecisionKind.APPROVE,
+        True,
+        risk,
+        _critique(DecisionKind.APPROVE),
+        None,
+        case_id="case_explicit_zero_tax",
+    )
+
+
 def _synthetic_source() -> SourceArtifact:
     return SourceArtifact(
         source_id="src_guard_test",
@@ -261,6 +357,7 @@ def _persist_blocking_review(invoice_dir: Path, settings: Settings) -> ReviewReq
         ["blocking evidence requires review"],
         store,
         claim,
+        pdf_policy=settings.pdf_policy(),
     )
     store.release_case_execution(claim)
     return review
@@ -592,19 +689,34 @@ async def test_retry_events_count_into_usage(
 
 def test_synthetic_fixture_sources_fail_visibly(tmp_path: Path) -> None:
     with pytest.raises(SourceEvidenceError) as corrupt_pdf_error:
-        snapshot_source(FIXTURES_DIR / "corrupt.pdf", tmp_path / "sources", 10_485_760)
+        snapshot_source(
+            FIXTURES_DIR / "corrupt.pdf",
+            tmp_path / "sources",
+            10_485_760,
+            pdf_policy=TEST_PDF_POLICY,
+        )
     assert corrupt_pdf_error.value.category == "TOOL"
     assert corrupt_pdf_error.value.stop_reason == "PDF_WORKER_FAILED"
 
     with pytest.raises(SourceEvidenceError) as malformed_json_error:
-        source = snapshot_source(FIXTURES_DIR / "malformed.json", tmp_path / "sources", 10_485_760)
-        extract_invoice_evidence(source)
+        source = snapshot_source(
+            FIXTURES_DIR / "malformed.json",
+            tmp_path / "sources",
+            10_485_760,
+            pdf_policy=TEST_PDF_POLICY,
+        )
+        extract_invoice_evidence(source, TEST_PDF_POLICY)
     assert malformed_json_error.value.category == "PARSE"
     assert malformed_json_error.value.stop_reason == "JSON_PARSE_FAILED"
 
     with pytest.raises(SourceEvidenceError) as empty_error:
-        source = snapshot_source(FIXTURES_DIR / "empty.txt", tmp_path / "sources", 10_485_760)
-        extract_invoice_evidence(source)
+        source = snapshot_source(
+            FIXTURES_DIR / "empty.txt",
+            tmp_path / "sources",
+            10_485_760,
+            pdf_policy=TEST_PDF_POLICY,
+        )
+        extract_invoice_evidence(source, TEST_PDF_POLICY)
     assert empty_error.value.category == "PARSE"
     assert empty_error.value.stop_reason == "SOURCE_EMPTY"
 
@@ -635,10 +747,15 @@ def test_malformed_money_error_preserves_safe_evidence_context(
         ),
         encoding="utf-8",
     )
-    source = snapshot_source(submitted, tmp_path / "sources", 10_485_760)
+    source = snapshot_source(
+        submitted,
+        tmp_path / "sources",
+        10_485_760,
+        pdf_policy=TEST_PDF_POLICY,
+    )
 
     with pytest.raises(SourceEvidenceError) as excinfo:
-        extract_invoice_evidence(source)
+        extract_invoice_evidence(source, TEST_PDF_POLICY)
 
     error = _error_record(excinfo.value)
     assert error.category == "PARSE"

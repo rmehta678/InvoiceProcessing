@@ -39,7 +39,7 @@ SECURITY_HEADERS = {
     ),
     "X-Frame-Options": "DENY",
     "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "same-origin",
+    "Referrer-Policy": "no-referrer",
 }
 _PROXY_ORIGIN_HEADERS = (
     "forwarded",
@@ -47,6 +47,12 @@ _PROXY_ORIGIN_HEADERS = (
     "x-forwarded-port",
     "x-forwarded-proto",
 )
+_NATIVE_FORM_FETCH_METADATA = {
+    "sec-fetch-site": "same-origin",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-dest": "document",
+    "sec-fetch-user": "?1",
+}
 DEFAULT_MUTATION_BODY_MAX_BYTES = 16_777_216
 
 Origin = tuple[str, str, int]
@@ -246,7 +252,12 @@ def _has_strict_same_origin(
         return referer_origin == request_origin
     origin_value = origin_values[0]
     if origin_value == "null":
-        return referer_origin == request_origin
+        if referer_values:
+            return False
+        return all(
+            headers.getlist(name) == [expected]
+            for name, expected in _NATIVE_FORM_FETCH_METADATA.items()
+        )
     return _parsed_origin(origin_value, referer=False) == request_origin
 
 

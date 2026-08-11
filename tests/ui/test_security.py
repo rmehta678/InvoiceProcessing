@@ -109,7 +109,7 @@ def _assert_security_headers(response: Any) -> None:
     assert "frame-ancestors 'none'" in policy
     assert response.headers["x-frame-options"] == "DENY"
     assert response.headers["x-content-type-options"] == "nosniff"
-    assert response.headers["referrer-policy"] == "same-origin"
+    assert response.headers["referrer-policy"] == "no-referrer"
 
 
 @pytest.mark.parametrize("attack", ["hostile_origin", "missing_token", "wrong_token"])
@@ -563,7 +563,7 @@ def test_reviewer_preference_cookie_uses_the_configured_origin_scheme(
         ),
         (
             {"Origin": "null", "Referer": "http://testserver/submit?from=review"},
-            404,
+            403,
         ),
         ({"Origin": "null"}, 403),
         ({"Origin": "null", "Referer": ""}, 403),
@@ -618,6 +618,58 @@ def test_duplicate_origin_headers_are_rejected(raw_client: TestClient) -> None:
         ],
         follow_redirects=False,
     )
+    assert response.status_code == 403
+
+
+def test_no_referrer_native_form_requires_exact_same_origin_fetch_metadata(
+    raw_client: TestClient,
+) -> None:
+    token = _rendered_token(raw_client)
+    response = raw_client.post(
+        "/batch",
+        data={"concurrency": "true", "csrf_token": token},
+        headers={
+            "Origin": "null",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-User": "?1",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("header", "value"),
+    [
+        ("Sec-Fetch-Site", "cross-site"),
+        ("Sec-Fetch-Mode", "cors"),
+        ("Sec-Fetch-Dest", "empty"),
+        ("Sec-Fetch-User", "?0"),
+    ],
+)
+def test_no_referrer_native_form_rejects_inexact_fetch_metadata(
+    raw_client: TestClient,
+    header: str,
+    value: str,
+) -> None:
+    token = _rendered_token(raw_client)
+    headers = {
+        "Origin": "null",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-User": "?1",
+    }
+    headers[header] = value
+
+    response = raw_client.post(
+        "/batch",
+        data={"concurrency": "true", "csrf_token": token},
+        headers=headers,
+    )
+
     assert response.status_code == 403
 
 

@@ -437,7 +437,6 @@ def test_round12_reserved_native_handle_and_invalid_owner_preserve_primary_after
 ) -> None:
     """A retained native handle cleans invalid OWNER cases before exact reraising."""
 
-    action_receipt = tmp_path / "owner-action"
     control_receipt = tmp_path / "control"
     exit_receipt = tmp_path / "exiting"
     unrelated = (
@@ -467,6 +466,21 @@ def test_round12_reserved_native_handle_and_invalid_owner_preserve_primary_after
         "negative": "os.write(owner_fd, b'OWNER -1\\n')",
         "non-ascii": "os.write(owner_fd, f'OWNER {os.getpid()}'.encode('ascii') + b'\\xff\\n')",
     }[owner_profile]
+    expected_parser_error = {
+        "missing": "invalid isolated supervisor ownership publication",
+        "malformed": "invalid isolated supervisor status",
+        "partial": "invalid isolated supervisor ownership publication",
+        "oversized": "invalid isolated supervisor ownership publication",
+        "trailing": "invalid isolated supervisor ownership publication",
+        "mismatch": None,
+        "leading-zero": "invalid isolated supervisor status",
+        "plus": "invalid isolated supervisor status",
+        "leading-space": "invalid isolated supervisor status",
+        "trailing-space": "invalid isolated supervisor status",
+        "zero": "invalid isolated supervisor status",
+        "negative": "invalid isolated supervisor status",
+        "non-ascii": "invalid isolated supervisor status",
+    }[owner_profile]
     supervisor_source = "\n".join(
         (
             "import os, sys",
@@ -474,7 +488,6 @@ def test_round12_reserved_native_handle_and_invalid_owner_preserve_primary_after
             "status, control, owner_fd, lifetime = map(int, sys.argv[1:5])",
             owner_action,
             "os.close(owner_fd)",
-            f"Path({os.fspath(action_receipt)!r}).write_text({owner_profile!r}, encoding='ascii')",
             "os.write(status, f'READY {os.getpid()}\\n'.encode('ascii'))",
             "received = bytearray(os.read(control, 1))",
             "received.extend(os.read(control, 1))",
@@ -492,8 +505,10 @@ def test_round12_reserved_native_handle_and_invalid_owner_preserve_primary_after
     kill_process_ids: list[int] = []
     killpg_process_ids: list[int] = []
     waitpid_process_ids: list[int] = []
+    owner_parse_observations: list[tuple[str, int | None]] = []
     injected = SystemExit(f"round12 invalid OWNER {owner_profile}")
     real_capture = isolated_process._capture_worker_session
+    real_owner_read = isolated_process._read_owner_publication
     real_spawned_poll = isolated_process._SpawnedProcess.poll
     real_kill = os.kill
     real_killpg = os.killpg
@@ -519,20 +534,31 @@ def test_round12_reserved_native_handle_and_invalid_owner_preserve_primary_after
             str(lifetime_descriptor),
         ]
 
-    def initialize_then_control(
+    def capture_initialized_process(
         process: subprocess.Popen[bytes],
         *args: Any,
         **kwargs: Any,
     ) -> None:
         real_popen_initializer(process, *args, **kwargs)
-        raw_command = args[0] if args else kwargs["args"]
-        if isinstance(raw_command, list) and any(
-            os.fspath(action_receipt) in str(argument) for argument in raw_command
-        ):
-            handles.append(process)
-            identities.append(_session_identity(process.pid))
-            assert _bounded_bytes(action_receipt) == owner_profile.encode("ascii")
-            raise injected
+        handles.append(process)
+        identities.append(_session_identity(process.pid))
+
+    def inject_after_owner_parse(
+        reader: isolated_process.PrivatePipeEndpoint,
+        *,
+        deadline: float,
+    ) -> int:
+        try:
+            process_id = real_owner_read(reader, deadline=deadline)
+        except ValueError as exc:
+            assert expected_parser_error is not None
+            assert str(exc) == expected_parser_error
+            owner_parse_observations.append(("rejected", None))
+            raise injected from exc
+        if expected_parser_error is not None or unrelated is None or process_id != unrelated.pid:
+            raise AssertionError("invalid OWNER unexpectedly parsed as native authority")
+        owner_parse_observations.append(("mismatch", process_id))
+        raise injected
 
     def observe_capture(
         process: subprocess.Popen[bytes],
@@ -571,7 +597,12 @@ def test_round12_reserved_native_handle_and_invalid_owner_preserve_primary_after
     monkeypatch.setattr(
         isolated_process,
         "_initialize_reserved_process",
-        initialize_then_control,
+        capture_initialized_process,
+    )
+    monkeypatch.setattr(
+        isolated_process,
+        "_read_owner_publication",
+        inject_after_owner_parse,
     )
     if unrelated is not None:
         monkeypatch.setattr(isolated_process, "_capture_worker_session", observe_capture)
@@ -625,6 +656,9 @@ def test_round12_reserved_native_handle_and_invalid_owner_preserve_primary_after
             _terminate_test_domain(unrelated)
 
     assert raised is injected
+    assert owner_parse_observations == [
+        ("mismatch", unrelated.pid) if unrelated is not None else ("rejected", None)
+    ]
     assert identities == [(handles[0].pid, handles[0].pid, handles[0].pid)]
     assert leader_not_running
     assert leader_reaped

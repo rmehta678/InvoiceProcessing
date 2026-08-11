@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import date
 from decimal import Decimal
 from ipaddress import IPv6Address, ip_address
 from pathlib import Path
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
@@ -16,6 +17,38 @@ from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 XAI_MODEL = "grok-4.5"
 XAI_BASE_URL = "https://api.x.ai/v1"
 _UI_HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+class PdfPolicy(BaseModel):
+    """Immutable, credential-free PDF limits safe to cross worker boundaries."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    pdf_max_pages: int = Field(ge=1, le=1_000)
+    pdf_parse_timeout_seconds: float = Field(gt=0, le=120)
+    pdf_worker_cpu_seconds: int = Field(ge=1, le=60)
+    pdf_worker_memory_bytes: int = Field(ge=134_217_728, le=1_073_741_824)
+    pdf_worker_result_max_bytes: int = Field(ge=65_536, le=16_777_216)
+
+    @field_validator(
+        "pdf_max_pages",
+        "pdf_worker_cpu_seconds",
+        "pdf_worker_memory_bytes",
+        "pdf_worker_result_max_bytes",
+        mode="before",
+    )
+    @classmethod
+    def require_native_integer(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("PDF policy integer is not a native integer")
+        return value
+
+    @field_validator("pdf_parse_timeout_seconds", mode="before")
+    @classmethod
+    def require_finite_native_float(cls, value: object) -> object:
+        if type(value) is not float or not math.isfinite(value):
+            raise ValueError("PDF policy timeout is not a finite native float")
+        return value
 
 
 def normalize_ui_host(value: str) -> str:
@@ -179,6 +212,17 @@ class Settings(BaseSettings):
         if self.ui_session_secret is None:
             return None
         return self.ui_session_secret.get_secret_value().encode("utf-8")
+
+    def pdf_policy(self) -> PdfPolicy:
+        """Project only active PDF limits into an immutable worker-safe policy."""
+
+        return PdfPolicy(
+            pdf_max_pages=self.pdf_max_pages,
+            pdf_parse_timeout_seconds=self.pdf_parse_timeout_seconds,
+            pdf_worker_cpu_seconds=self.pdf_worker_cpu_seconds,
+            pdf_worker_memory_bytes=self.pdf_worker_memory_bytes,
+            pdf_worker_result_max_bytes=self.pdf_worker_result_max_bytes,
+        )
 
     def assert_delete_journal_mode(self) -> None:
         """Defend production boundaries even if model validation was explicitly bypassed."""

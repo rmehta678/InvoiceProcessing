@@ -53,6 +53,23 @@ def content_addressed_pdf(path: Path, archive: Path, page_count: int | None) -> 
     )
 
 
+def pdf_policy(
+    *,
+    max_pages: int = 100,
+    timeout_seconds: float = 5.0,
+    result_max_bytes: int = 4_194_304,
+) -> Any:
+    """Build explicit limits so worker tests never inherit ambient PDF settings."""
+
+    return Settings(
+        pdf_max_pages=max_pages,
+        pdf_parse_timeout_seconds=timeout_seconds,
+        pdf_worker_cpu_seconds=10,
+        pdf_worker_memory_bytes=536_870_912,
+        pdf_worker_result_max_bytes=result_max_bytes,
+    ).pdf_policy()
+
+
 def write_compressed_text_pdf(path: Path, text_bytes: int) -> None:
     """Create a tiny Flate-compressed PDF whose real extracted text is much larger."""
 
@@ -129,9 +146,11 @@ def probe_real_page_extraction(connection: Connection, *worker_args: object) -> 
 
     from pypdf._page import PageObject
 
+    worker_module = pdf_worker()
     extraction_path = Path(os.environ["INVOICE_TEST_EXTRACTION_PROBE_PATH"])
     allocation_path = Path(os.environ["INVOICE_TEST_ALLOCATION_PROBE_PATH"])
     original_extract_text = PageObject.extract_text
+    original_send = worker_module._send
     extraction_count = 0
 
     def recording_extract_text(page: PageObject, *args: Any, **kwargs: Any) -> str:
@@ -140,14 +159,23 @@ def probe_real_page_extraction(connection: Connection, *worker_args: object) -> 
         extraction_path.write_text(str(extraction_count), encoding="ascii")
         return original_extract_text(page, *args, **kwargs)
 
+    def record_peak_before_failure_is_published(
+        child_connection: Connection,
+        payload: dict[str, object],
+        max_bytes: int,
+    ) -> None:
+        if payload.get("stop_reason") == "PDF_WORKER_FAILED":
+            _, peak = tracemalloc.get_traced_memory()
+            allocation_path.write_text(str(peak), encoding="ascii")
+        original_send(child_connection, payload, max_bytes)
+
     PageObject.extract_text = recording_extract_text
+    worker_module._send = record_peak_before_failure_is_published
     tracemalloc.start()
     try:
-        pdf_worker()._worker_main(connection, *worker_args)
+        worker_module._worker_main(connection, *worker_args)
     finally:
-        _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
-        allocation_path.write_text(str(peak), encoding="ascii")
 
 
 class TrackedPageText(str):
@@ -246,6 +274,41 @@ def send_page_limit_error_then_stall(connection: Connection, *_args: object) -> 
         connection.close()
 
 
+def swap_pdf_when_child_parser_opens(
+    connection: Connection,
+    *worker_args: object,
+) -> None:
+    """Replace the archive exactly when the real child parser opens its input."""
+
+    operation = worker_args[0]
+    source_payload = worker_args[1]
+    assert isinstance(operation, str)
+    assert isinstance(source_payload, dict)
+    source_path = Path(str(source_payload["canonical_path"]))
+    swapped = Path(os.environ["INVOICE_TEST_PDF_SWAP_PATH"]).read_bytes()
+    if operation in {"inspect", "extract"}:
+        import pypdf
+
+        real_pdf_reader = pypdf.PdfReader
+
+        def swapping_pdf_reader(*args: Any, **kwargs: Any) -> Any:
+            source_path.write_bytes(swapped)
+            return real_pdf_reader(*args, **kwargs)
+
+        pypdf.PdfReader = swapping_pdf_reader  # type: ignore[misc]
+    else:
+        import fitz
+
+        real_fitz_open = fitz.open
+
+        def swapping_fitz_open(*args: Any, **kwargs: Any) -> Any:
+            source_path.write_bytes(swapped)
+            return real_fitz_open(*args, **kwargs)
+
+        fitz.open = swapping_fitz_open  # type: ignore[assignment]
+    pdf_worker()._worker_main(connection, *worker_args)
+
+
 def test_worker_address_space_limit_blocks_allocation_beyond_allowance() -> None:
     context = multiprocessing.get_context("spawn")
     parent_connection, child_connection = context.Pipe(duplex=False)
@@ -269,7 +332,7 @@ def test_pdf_timeout_terminates_and_joins_spawned_worker(tmp_path: Path) -> None
     before = child_pids()
 
     with pytest.raises(SourceEvidenceError) as excinfo:
-        pdf_worker().extract_pdf_in_worker(source, timeout_seconds=0.000_001)
+        pdf_worker().extract_pdf_in_worker(source, pdf_policy(timeout_seconds=0.000_001))
 
     assert excinfo.value.stop_reason == "PDF_PARSE_TIMEOUT"
     assert child_pids() == before
@@ -310,7 +373,7 @@ def test_run_worker_automatically_reaps_child_that_stalls_mid_result(
     before = child_pids()
 
     with pytest.raises(SourceEvidenceError) as excinfo:
-        worker_module._run_worker("extract", source, timeout_seconds=0.05)
+        worker_module._run_worker("extract", source, pdf_policy(timeout_seconds=0.05))
 
     assert excinfo.value.stop_reason == "PDF_PARSE_TIMEOUT"
     assert child_pids() == before
@@ -337,7 +400,7 @@ def test_error_validation_crossing_deadline_times_out_and_reaps_worker(
     before = child_pids()
 
     with pytest.raises(SourceEvidenceError) as excinfo:
-        worker_module._run_worker("extract", source, timeout_seconds=1.0)
+        worker_module._run_worker("extract", source, pdf_policy(timeout_seconds=1.0))
 
     assert delayed
     assert excinfo.value.stop_reason == "PDF_PARSE_TIMEOUT"
@@ -414,11 +477,10 @@ def test_oversized_extraction_result_fails_generically_and_reaps_worker(
     write_compressed_text_pdf(submitted, 200_000)
     assert submitted.stat().st_size < 65_536
     source = content_addressed_pdf(submitted, tmp_path / "sources", 1)
-    monkeypatch.setenv("INVOICE_PDF_WORKER_RESULT_MAX_BYTES", "65536")
     before = child_pids()
 
     with pytest.raises(SourceEvidenceError) as excinfo:
-        pdf_worker().extract_pdf_in_worker(source, timeout_seconds=5.0)
+        pdf_worker().extract_pdf_in_worker(source, pdf_policy(result_max_bytes=65_536))
 
     assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
     assert excinfo.value.message == "PDF worker failed"
@@ -436,7 +498,6 @@ def test_oversized_first_page_stops_real_extraction_before_later_pages(
     source = content_addressed_pdf(submitted, tmp_path / "sources", 2)
     extraction_path = tmp_path / "extraction-count.txt"
     allocation_path = tmp_path / "allocation-peak.txt"
-    monkeypatch.setenv("INVOICE_PDF_WORKER_RESULT_MAX_BYTES", "65536")
     monkeypatch.setenv("INVOICE_TEST_EXTRACTION_PROBE_PATH", str(extraction_path))
     monkeypatch.setenv("INVOICE_TEST_ALLOCATION_PROBE_PATH", str(allocation_path))
     worker_module = pdf_worker()
@@ -444,7 +505,11 @@ def test_oversized_first_page_stops_real_extraction_before_later_pages(
     before = child_pids()
 
     with pytest.raises(SourceEvidenceError) as excinfo:
-        worker_module._run_worker("extract", source, timeout_seconds=10.0)
+        worker_module._run_worker(
+            "extract",
+            source,
+            pdf_policy(timeout_seconds=10.0, result_max_bytes=65_536),
+        )
 
     assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
     assert extraction_path.read_text(encoding="ascii") == "1"
@@ -471,7 +536,7 @@ def test_previous_raw_page_text_is_released_during_next_real_extraction(
     )
     before = child_pids()
 
-    result = worker_module._run_worker("extract", source, timeout_seconds=5.0)
+    result = worker_module._run_worker("extract", source, pdf_policy())
 
     assert result["page_count"] == 2
     assert liveness_path.read_text(encoding="ascii") == "released"
@@ -489,7 +554,6 @@ def test_raw_page_text_is_released_before_append_overflow_is_reported(
     source = content_addressed_pdf(submitted, tmp_path / "sources", 1)
     release_path = tmp_path / "oversized-page-released.txt"
     liveness_path = tmp_path / "failure-send-observation.txt"
-    monkeypatch.setenv("INVOICE_PDF_WORKER_RESULT_MAX_BYTES", "65536")
     monkeypatch.setenv("INVOICE_TEST_PAGE_RELEASE_PATH", str(release_path))
     monkeypatch.setenv("INVOICE_TEST_PAGE_LIVENESS_PATH", str(liveness_path))
     worker_module = pdf_worker()
@@ -501,7 +565,11 @@ def test_raw_page_text_is_released_before_append_overflow_is_reported(
     before = child_pids()
 
     with pytest.raises(SourceEvidenceError) as excinfo:
-        worker_module._run_worker("extract", source, timeout_seconds=5.0)
+        worker_module._run_worker(
+            "extract",
+            source,
+            pdf_policy(result_max_bytes=65_536),
+        )
 
     assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
     assert liveness_path.read_text(encoding="ascii") == "released"
@@ -515,9 +583,10 @@ def test_near_ceiling_result_drains_without_pipe_deadlock(
     submitted = tmp_path / "near-ceiling.pdf"
     write_compressed_text_pdf(submitted, 200_000)
     source = content_addressed_pdf(submitted, tmp_path / "sources", 1)
-    monkeypatch.setenv("INVOICE_PDF_WORKER_RESULT_MAX_BYTES", "262144")
-
-    result = pdf_worker().extract_pdf_in_worker(source, timeout_seconds=5.0)
+    result = pdf_worker().extract_pdf_in_worker(
+        source,
+        pdf_policy(result_max_bytes=262_144),
+    )
 
     pages = result["pages"]
     assert isinstance(pages, list)
@@ -533,7 +602,7 @@ def test_pdf_parser_crash_is_silent_generic_and_reaps_worker(
     before = child_pids()
 
     with pytest.raises(SourceEvidenceError) as excinfo:
-        pdf_worker().extract_pdf_in_worker(source, timeout_seconds=5.0)
+        pdf_worker().extract_pdf_in_worker(source, pdf_policy())
 
     assert excinfo.value.stop_reason == "PDF_WORKER_FAILED"
     assert excinfo.value.message == "PDF worker failed"
@@ -555,10 +624,8 @@ def test_pdf_page_limit_is_enforced_by_worker(
     with submitted.open("wb") as handle:
         writer.write(handle)
     source = content_addressed_pdf(submitted, tmp_path / "sources", 2)
-    monkeypatch.setenv("INVOICE_PDF_MAX_PAGES", "1")
-
     with pytest.raises(SourceEvidenceError) as excinfo:
-        pdf_worker().extract_pdf_in_worker(source, timeout_seconds=5.0)
+        pdf_worker().extract_pdf_in_worker(source, pdf_policy(max_pages=1))
 
     assert excinfo.value.stop_reason == "PDF_PAGE_LIMIT_EXCEEDED"
     assert excinfo.value.details == {"page_count": 2, "max_pages": 1}
@@ -567,7 +634,7 @@ def test_pdf_page_limit_is_enforced_by_worker(
 def test_pdf_worker_extracts_json_safe_page_text(tmp_path: Path) -> None:
     source = content_addressed_pdf(DATA_DIR / "invoice_1011.pdf", tmp_path / "sources", 1)
 
-    result = pdf_worker().extract_pdf_in_worker(source, timeout_seconds=5.0)
+    result = pdf_worker().extract_pdf_in_worker(source, pdf_policy())
 
     assert result["extractor"] == "pypdf"
     assert result["page_count"] == 1
@@ -585,12 +652,71 @@ def test_pdf_worker_extracts_json_safe_page_text(tmp_path: Path) -> None:
     json.dumps(result)
 
 
+def test_pdf_child_inspects_the_same_bytes_that_passed_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = content_addressed_pdf(DATA_DIR / "invoice_1011.pdf", tmp_path / "sources", 1)
+    swapped = tmp_path / "two-pages.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.add_blank_page(width=72, height=72)
+    with swapped.open("wb") as handle:
+        writer.write(handle)
+    monkeypatch.setenv("INVOICE_TEST_PDF_SWAP_PATH", str(swapped))
+    worker_module = pdf_worker()
+    monkeypatch.setattr(worker_module, "_worker_main", swap_pdf_when_child_parser_opens)
+
+    page_count = worker_module.inspect_pdf_in_worker(source, pdf_policy())
+
+    assert page_count == 1
+
+
+def test_pdf_child_extracts_the_same_bytes_that_passed_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = content_addressed_pdf(DATA_DIR / "invoice_1011.pdf", tmp_path / "sources", 1)
+    monkeypatch.setenv("INVOICE_TEST_PDF_SWAP_PATH", str(DATA_DIR / "invoice_1012.pdf"))
+    worker_module = pdf_worker()
+    monkeypatch.setattr(worker_module, "_worker_main", swap_pdf_when_child_parser_opens)
+
+    result = worker_module.extract_pdf_in_worker(source, pdf_policy())
+
+    pages = result["pages"]
+    assert isinstance(pages, list)
+    text = str(pages[0]["text"])
+    assert "INV-1011" in text
+    assert "INV-1012" not in text
+
+
+@pytest.mark.parametrize("mutation", ["changed", "missing"])
+def test_pdf_child_reports_snapshot_identity_failure_explicitly(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    source = content_addressed_pdf(DATA_DIR / "invoice_1011.pdf", tmp_path / "sources", 1)
+    if mutation == "changed":
+        source.canonical_path.write_bytes((DATA_DIR / "invoice_1012.pdf").read_bytes())
+    else:
+        source.canonical_path.unlink()
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        pdf_worker().extract_pdf_in_worker(source, pdf_policy())
+
+    assert excinfo.value.stop_reason == "SOURCE_HASH_MISMATCH"
+    assert excinfo.value.message == "source snapshot identity mismatch"
+
+
 def test_pdf_worker_renders_page_to_real_png(tmp_path: Path) -> None:
     source = content_addressed_pdf(DATA_DIR / "invoice_1011.pdf", tmp_path / "sources", 1)
     target = tmp_path / "rendered.png"
 
     result = pdf_worker().render_pdf_page_in_worker(
-        source, page=1, target=target, timeout_seconds=5.0
+        source,
+        page=1,
+        target=target,
+        pdf_policy=pdf_policy(),
     )
 
     assert result == {
@@ -601,6 +727,42 @@ def test_pdf_worker_renders_page_to_real_png(tmp_path: Path) -> None:
     }
     assert target.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     assert not [path for path in tmp_path.iterdir() if path.name.startswith(".pdf-render-")]
+
+
+def test_pdf_child_renders_the_same_bytes_that_passed_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_source = content_addressed_pdf(
+        DATA_DIR / "invoice_1011.pdf",
+        tmp_path / "baseline-sources",
+        1,
+    )
+    baseline_target = tmp_path / "baseline.png"
+    baseline = pdf_worker().render_pdf_page_in_worker(
+        baseline_source,
+        page=1,
+        target=baseline_target,
+        pdf_policy=pdf_policy(),
+    )
+    source = content_addressed_pdf(
+        DATA_DIR / "invoice_1011.pdf",
+        tmp_path / "mutated-sources",
+        1,
+    )
+    monkeypatch.setenv("INVOICE_TEST_PDF_SWAP_PATH", str(DATA_DIR / "invoice_1012.pdf"))
+    worker_module = pdf_worker()
+    monkeypatch.setattr(worker_module, "_worker_main", swap_pdf_when_child_parser_opens)
+    target = tmp_path / "mutated.png"
+
+    rendered = worker_module.render_pdf_page_in_worker(
+        source,
+        page=1,
+        target=target,
+        pdf_policy=pdf_policy(),
+    )
+
+    assert rendered["sha256"] == baseline["sha256"]
 
 
 def test_pdf_worker_memory_allowance_rejects_excessive_configuration() -> None:

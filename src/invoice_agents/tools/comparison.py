@@ -457,10 +457,8 @@ def compute_invoice_totals(invoice: ExtractedInvoice) -> FinancialComparison:
         tax_basis = "calculated subtotal multiplied by declared tax rate"
     elif invoice.declared_tax_amount is None:
         calculated_tax = Decimal("0")
-        tax_recomputable = True
-        tax_basis = (
-            "no tax rate or amount declared; treated as zero with missing-tax evidence retained"
-        )
+        tax_recomputable = False
+        tax_basis = "no tax rate or amount declared; tax is missing rather than recomputable"
     else:
         calculated_tax = invoice.declared_tax_amount
         tax_recomputable = False

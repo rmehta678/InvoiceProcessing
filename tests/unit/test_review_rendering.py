@@ -81,6 +81,7 @@ def build_review(name: str, settings: Settings) -> ReviewRequest:
         ["deterministic review rationale"],
         store,
         claim,
+        pdf_policy=settings.pdf_policy(),
     )
     store.release_case_execution(claim)
     return review
@@ -121,10 +122,10 @@ def test_pdf_render_uses_snapshot_after_submitted_path_is_replaced(
     prepared = prepare_case(submitted, settings)
     assert isinstance(prepared, tuple), f"prepare_case failed: {prepared}"
     source = WorkflowStore(settings.workflow_db).load_extraction(prepared[0]).source
-    first = render_pdf_page(source, 1, tmp_path / "first")
+    first = render_pdf_page(source, 1, tmp_path / "first", settings.pdf_policy())
 
     submitted.write_bytes((DATA_DIR / "invoice_1012.pdf").read_bytes())
-    second = render_pdf_page(source, 1, tmp_path / "second")
+    second = render_pdf_page(source, 1, tmp_path / "second", settings.pdf_policy())
 
     assert source.canonical_path != submitted.resolve()
     assert first["sha256"] == second["sha256"]

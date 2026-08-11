@@ -54,6 +54,7 @@ from invoice_agents.tools.comparison import (
     find_prior_invoice_candidates,
 )
 from invoice_agents.tools.evidence import extract_invoice_evidence
+from tests.support.pdf_policy import TEST_PDF_POLICY
 
 CASE_ID = "case_v1_legacy"
 REVIEW_ID = "rev_v1_legacy"
@@ -73,7 +74,12 @@ def make_critique() -> Critique:
 
 
 def make_source(archive_dir: Path) -> SourceArtifact:
-    return snapshot_source(LEGACY_SOURCE, archive_dir, max_bytes=10_485_760)
+    return snapshot_source(
+        LEGACY_SOURCE,
+        archive_dir,
+        max_bytes=10_485_760,
+        pdf_policy=TEST_PDF_POLICY,
+    )
 
 
 def make_review(review_id: str, created_at: datetime, source: SourceArtifact) -> ReviewRequest:
@@ -95,7 +101,7 @@ def make_review(review_id: str, created_at: datetime, source: SourceArtifact) ->
 
 
 def make_invoice(source: SourceArtifact) -> ExtractedInvoice:
-    return extract_invoice_evidence(source)
+    return extract_invoice_evidence(source, TEST_PDF_POLICY)
 
 
 def persist_bound_review_evidence(

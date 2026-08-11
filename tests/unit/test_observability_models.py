@@ -5,6 +5,9 @@ from __future__ import annotations
 import io
 import json
 import logging
+from datetime import UTC, datetime
+from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -17,7 +20,26 @@ from pydantic import ValidationError
 from invoice_agents import orchestration
 from invoice_agents.db.core import connect_database
 from invoice_agents.errors import InvoiceAgentsError
-from invoice_agents.models import DecisionKind, FinalDecision, UsageSummary
+from invoice_agents.models import (
+    CanonicalMapping,
+    CaseResult,
+    CaseStatus,
+    Critique,
+    CritiqueFollowUpOutcome,
+    CritiqueFollowUpResponse,
+    DecisionKind,
+    ErrorRecord,
+    EvidenceRef,
+    FinalDecision,
+    HumanDecision,
+    HumanDecisionKind,
+    Money,
+    PaymentResult,
+    PaymentStatus,
+    ReviewRequest,
+    SourceArtifact,
+    UsageSummary,
+)
 from invoice_agents.observability import audit as audit_module
 from invoice_agents.observability.audit import (
     AuditRecorder,
@@ -25,6 +47,7 @@ from invoice_agents.observability.audit import (
     RedactingFilter,
     bind_audit_recorder,
     redact,
+    sanitize_case_result,
 )
 from invoice_agents.ui import queries
 
@@ -68,6 +91,161 @@ def test_recursive_redaction() -> None:
     assert cleaned["nested"]["xai_api_key"] == "[REDACTED]"
     assert cleaned["nested"]["safe"] == "keep"
     assert "token123" not in cleaned["message"]
+
+
+def test_case_result_sanitizer_recurses_all_nested_text_without_changing_structure() -> None:
+    """Removing recursive typed sanitization must expose at least one nested canary."""
+
+    secret = "sk-proj-review-rationale-secret-12345678"
+    now = datetime.now(UTC)
+    source = SourceArtifact(
+        source_id="src_structural_123",
+        canonical_path=Path("/tmp/source-structural.txt"),
+        sha256="a" * 64,
+        source_format="txt",
+        size_bytes=123,
+        modified_at=now,
+    )
+    evidence = EvidenceRef(
+        source_id=source.source_id,
+        locator_type="line",
+        locator="line:7",
+        raw_value=f"api_key={secret}",
+        excerpt=f"provider returned {secret}",
+    )
+    human = HumanDecision(
+        review_id="rev_structural_123",
+        reviewer=f"reviewer api_key={secret}",
+        decision=HumanDecisionKind.REJECT,
+        reason=f"human rationale Authorization: Bearer {secret}",
+        decided_at=now,
+        mappings=[
+            CanonicalMapping(
+                raw_item=f"model item api_key={secret}",
+                sku="SKU-STRUCTURAL-123",
+                basis="human_decision",
+                evidence=[evidence],
+            )
+        ],
+        addressed_blocker_ids=["blocker_structural_123"],
+    )
+    critique = Critique(
+        supported_findings=[f"supported api_key={secret}"],
+        challenged_findings=[f"challenged Cookie: session={secret}"],
+        missing_evidence=[f"missing Bearer {secret}"],
+        requested_follow_up=[f"follow up sk-proj-{secret}"],
+        recommended_disposition=DecisionKind.HOLD,
+        rationale=[f"critic rationale api_key={secret}"],
+        follow_up_responses=[
+            CritiqueFollowUpResponse(
+                requested_item=f"requested api_key={secret}",
+                outcome=CritiqueFollowUpOutcome.MISSING,
+                evidence_event_ids=["evt_structural_123"],
+            )
+        ],
+    )
+    review = ReviewRequest(
+        review_id=human.review_id,
+        case_id="case_structural_123",
+        status="RESOLVED",
+        reasons=[f"review reason api_key={secret}"],
+        amount=Money(amount=Decimal("123.45"), currency="USD"),
+        source=source,
+        evidence_bundle={
+            "future_nested_model_text": {"summary": f"unknown api_key={secret}"},
+            "source_id": source.source_id,
+        },
+        agent_recommendation=DecisionKind.HOLD,
+        agent_rationale=[f"agent rationale api_key={secret}"],
+        critic=critique,
+        critic_disagreement_reason=None,
+        questions=[f"question Authorization=Bearer-{secret}"],
+        created_at=now,
+        human_decision=human,
+    )
+    final = FinalDecision(
+        decision=DecisionKind.HOLD,
+        reasons=[f"final rationale api_key={secret}"],
+        evidence=[evidence],
+        critic_disposition=DecisionKind.HOLD,
+        human_outcome=human,
+        payment_eligible=False,
+    )
+    result = CaseResult(
+        case_id=review.case_id,
+        source_id=source.source_id,
+        status=CaseStatus.NEEDS_HUMAN,
+        stop_reason="HUMAN_REVIEW_REQUESTED",
+        final_decision=final,
+        review_request=review,
+        payment=PaymentResult(
+            payment_id="pay_structural_123",
+            case_id=review.case_id,
+            idempotency_key="b" * 64,
+            status=PaymentStatus.FAILED,
+            vendor=f"vendor api_key={secret}",
+            amount=Money(amount=Decimal("123.45"), currency="USD"),
+            processed_at=now,
+            error=f"payment api_key={secret}",
+        ),
+        errors=[
+            ErrorRecord(
+                category="PROVIDER",
+                message=f"failure api_key={secret}",
+                case_id=review.case_id,
+                stop_reason="PROVIDER_REQUEST_FAILED",
+                provider_request_id=f"api_key={secret}",
+                details={"future_nested_error_text": f"api_key={secret}"},
+            )
+        ],
+        started_at=now,
+        finished_at=now,
+    )
+
+    sanitized = sanitize_case_result(result)
+    encoded = sanitized.model_dump_json()
+
+    assert secret not in encoded
+    assert encoded.count("[REDACTED]") >= 20
+    assert sanitized.case_id == result.case_id
+    assert sanitized.source_id == result.source_id
+    assert sanitized.status is result.status
+    assert sanitized.stop_reason == result.stop_reason
+    assert sanitized.review_request is not None
+    assert sanitized.review_request.review_id == review.review_id
+    assert sanitized.review_request.source == source
+    assert sanitized.review_request.amount == review.amount
+    assert sanitized.review_request.critic.recommended_disposition is DecisionKind.HOLD
+    assert sanitized.review_request.human_decision is not None
+    assert sanitized.review_request.human_decision.decision is HumanDecisionKind.REJECT
+    assert sanitized.review_request.human_decision.addressed_blocker_ids == [
+        "blocker_structural_123"
+    ]
+    assert sanitized.review_request.critic.follow_up_responses[0].evidence_event_ids == [
+        "evt_structural_123"
+    ]
+    assert sanitized.final_decision is not None
+    assert sanitized.final_decision.decision is DecisionKind.HOLD
+    assert sanitized.payment is not None
+    assert sanitized.payment.payment_id == "pay_structural_123"
+    assert sanitized.payment.idempotency_key == "b" * 64
+    assert sanitized.errors[0].provider_request_id is None
+
+
+def test_case_result_sanitizer_fails_closed_instead_of_rewriting_structural_ids() -> None:
+    secret = "sk-proj-structural-id-secret-12345678"
+    now = datetime.now(UTC)
+    result = CaseResult(
+        case_id=f"case_{secret}",
+        source_id=None,
+        status=CaseStatus.FAILED,
+        stop_reason="PROVIDER_REQUEST_FAILED",
+        started_at=now,
+        finished_at=now,
+    )
+
+    with pytest.raises(ValueError, match="structural text field"):
+        sanitize_case_result(result)
 
 
 @pytest.mark.parametrize("usage_key", ["prompt_tokens", "completion_tokens"])

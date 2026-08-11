@@ -28,11 +28,17 @@ from invoice_agents.tools.comparison import (
     find_prior_invoice_candidates,
 )
 from invoice_agents.tools.evidence import extract_invoice_evidence
+from tests.support.pdf_policy import TEST_PDF_POLICY
 
 
 def invoice(invoice_dir: Path, name: str, archive: Path):  # type: ignore[no-untyped-def]
-    source = snapshot_source(invoice_dir / name, archive, max_bytes=10_485_760)
-    return extract_invoice_evidence(source)
+    source = snapshot_source(
+        invoice_dir / name,
+        archive,
+        max_bytes=10_485_760,
+        pdf_policy=TEST_PDF_POLICY,
+    )
+    return extract_invoice_evidence(source, TEST_PDF_POLICY)
 
 
 def persist_extraction(store: WorkflowStore, case_id: str, extracted: ExtractedInvoice) -> None:

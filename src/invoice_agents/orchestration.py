@@ -1797,7 +1797,13 @@ def _prepare_case(
     store: WorkflowStore | None = None
     failure: BaseException | None = None
     try:
-        source = snapshot_source(path, settings.source_archive_dir, settings.source_max_bytes)
+        pdf_policy = settings.pdf_policy()
+        source = snapshot_source(
+            path,
+            settings.source_archive_dir,
+            settings.source_max_bytes,
+            pdf_policy=pdf_policy,
+        )
         source_id = source.source_id
         store = WorkflowStore(settings)
         store.register_source(source)
@@ -1809,7 +1815,7 @@ def _prepare_case(
             EXECUTION_LEASE_SECONDS,
             requested_token=preparation_token,
         )
-        invoice = extract_invoice_evidence(source)
+        invoice = extract_invoice_evidence(source, pdf_policy)
         store.save_extraction(case_id, invoice, claim)
         AuditRecorder(settings.workflow_db, case_id).record(
             "case.prepared",
@@ -3573,15 +3579,21 @@ async def stage_claimed_invoice_async(
     source_id: str | None = None
     try:
         await asyncio.to_thread(preflight, settings)
+        pdf_policy = settings.pdf_policy()
         submitted_path = path.resolve()
         source = await asyncio.to_thread(
             snapshot_source,
             path,
             settings.source_archive_dir,
             settings.source_max_bytes,
+            pdf_policy=pdf_policy,
         )
         source_id = source.source_id
-        invoice = await asyncio.to_thread(extract_invoice_evidence, source)
+        invoice = await asyncio.to_thread(
+            extract_invoice_evidence,
+            source,
+            pdf_policy,
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:

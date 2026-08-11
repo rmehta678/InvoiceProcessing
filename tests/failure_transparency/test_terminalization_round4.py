@@ -671,6 +671,7 @@ async def test_round4_preparation_reuses_exact_recovery_after_worker_response_lo
         invoice_dir / "invoice_1001.txt",
         settings.source_archive_dir,
         settings.source_max_bytes,
+        pdf_policy=settings.pdf_policy(),
     )
     store = WorkflowStore(settings)
     store.register_source(source)
@@ -750,6 +751,7 @@ async def test_round4_cancel_after_exact_preparation_finish_publishes_artifact(
         invoice_dir / "invoice_1001.txt",
         settings.source_archive_dir,
         settings.source_max_bytes,
+        pdf_policy=settings.pdf_policy(),
     )
     store = WorkflowStore(settings)
     store.register_source(source)
@@ -807,6 +809,7 @@ async def test_round4_preparation_never_claims_an_id_collision_with_another_star
         invoice_dir / "invoice_1001.txt",
         settings.source_archive_dir,
         settings.source_max_bytes,
+        pdf_policy=settings.pdf_policy(),
     )
     store = WorkflowStore(settings)
     store.register_source(source)

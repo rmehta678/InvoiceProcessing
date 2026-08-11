@@ -2,17 +2,113 @@
 
 from __future__ import annotations
 
+import logging
 import re
+import socket
 import sqlite3
+import threading
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
+import uvicorn
+from fastapi import FastAPI
 from typer.testing import CliRunner
 
 from invoice_agents.cli import app
+from invoice_agents.observability.audit import RedactingFilter
 
 runner = CliRunner()
+
+
+def test_ui_uvicorn_logging_redacts_unhandled_exception_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real CLI/Uvicorn configuration must redact its ASGI exception handler."""
+
+    canary = "sk-proj-uvicorn-exception-canary-12345678"
+    failing_app = FastAPI()
+
+    @failing_app.get("/_uvicorn_logging_failure")
+    async def uvicorn_logging_failure() -> None:
+        raise RuntimeError(f"api_key={canary}")
+
+    responses: list[tuple[int, str]] = []
+
+    def run_one_real_request(application: Any, **kwargs: Any) -> None:
+        server_socket = socket.socket()
+        server_socket.bind(("127.0.0.1", 0))
+        server_socket.listen(5)
+        port = int(server_socket.getsockname()[1])
+        server = uvicorn.Server(uvicorn.Config(application, **kwargs))
+        for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+            current: logging.Logger | None = logging.getLogger(logger_name)
+            effective_handlers: list[logging.Handler] = []
+            while current is not None:
+                effective_handlers.extend(current.handlers)
+                if not current.propagate:
+                    break
+                current = current.parent
+            assert effective_handlers
+            assert all(
+                any(isinstance(item, RedactingFilter) for item in handler.filters)
+                for handler in effective_handlers
+            )
+        logging.getLogger("uvicorn.access").warning(
+            '%s - "%s %s HTTP/%s" %d',
+            "127.0.0.1",
+            "GET",
+            f"/_uvicorn_logging_failure?api_key={canary}",
+            "1.1",
+            599,
+        )
+        thread = threading.Thread(
+            target=server.run,
+            kwargs={"sockets": [server_socket]},
+            daemon=True,
+        )
+        thread.start()
+        deadline = time.monotonic() + 5
+        while not server.started:
+            if not thread.is_alive():
+                raise AssertionError("Uvicorn exited before accepting the test request")
+            if time.monotonic() > deadline:
+                raise AssertionError("Uvicorn did not start")
+            time.sleep(0.01)
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/_uvicorn_logging_failure",
+                timeout=5,
+            )
+        except urllib.error.HTTPError as exc:
+            responses.append((exc.code, exc.read().decode("utf-8")))
+        finally:
+            server.should_exit = True
+            thread.join(timeout=5)
+            server_socket.close()
+        assert not thread.is_alive()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "invoice_agents.ui.server.create_app", lambda *_args, **_kwargs: failing_app
+    )
+    monkeypatch.setattr("uvicorn.run", run_one_real_request)
+
+    result = runner.invoke(app, ["ui", "--no-init-db"])
+
+    assert result.exit_code == 0, result.output
+    assert responses == [(500, "Internal Server Error")]
+    assert "Exception in ASGI application" in result.output
+    assert "…[TRACEBACK FRAMES TRUNCATED]" in result.output
+    assert "RuntimeError: api_key=[REDACTED]" in result.output
+    assert "GET /_uvicorn_logging_failure?api_key=[REDACTED] HTTP/1.1" in result.output
+    assert "--- Logging error ---" not in result.output
+    assert canary not in result.output
 
 
 def test_ui_refuses_non_loopback_host_without_flag() -> None:

@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from invoice_agents.config import PdfPolicy
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import (
@@ -21,11 +22,14 @@ from invoice_agents.models import (
     SourceArtifact,
     critic_disagreement_reason,
 )
-from invoice_agents.source_store import verified_source_path
 from invoice_agents.tools.evidence import render_pdf_page
 
 
-def _render_review_pages(source: SourceArtifact, review_id: str) -> list[dict[str, object]]:
+def _render_review_pages(
+    source: SourceArtifact,
+    review_id: str,
+    pdf_policy: PdfPolicy,
+) -> list[dict[str, object]]:
     """Render original-layout PDF evidence for the review package (§9).
 
     Page 1 always renders; documents of up to three pages render completely. A render
@@ -35,11 +39,10 @@ def _render_review_pages(source: SourceArtifact, review_id: str) -> list[dict[st
 
     if source.source_format != "pdf":
         return []
-    verified_source_path(source)
     page_count = source.page_count or 1
     pages = range(1, page_count + 1) if page_count <= 3 else range(1, 2)
     output_dir = Path("artifacts/reviews").resolve() / review_id
-    return [render_pdf_page(source, page, output_dir) for page in pages]
+    return [render_pdf_page(source, page, output_dir, pdf_policy) for page in pages]
 
 
 def create_review_request(
@@ -53,6 +56,7 @@ def create_review_request(
     claim: ExecutionClaim,
     *,
     extra_reasons: list[str] | None = None,
+    pdf_policy: PdfPolicy,
 ) -> ReviewRequest:
     """Persist a complete evidence package for every policy or ambiguity trigger.
 
@@ -115,7 +119,7 @@ def create_review_request(
             "blocking_evidence": [
                 blocker.model_dump(mode="json") for blocker in blocking_evidence(risk)
             ],
-            "rendered_pages": _render_review_pages(invoice.source, review_id),
+            "rendered_pages": _render_review_pages(invoice.source, review_id, pdf_policy),
         },
         agent_recommendation=agent_recommendation,
         agent_rationale=agent_rationale,
