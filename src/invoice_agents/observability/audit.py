@@ -20,6 +20,7 @@ from invoice_agents.db.core import connect_database
 
 SENSITIVE_KEY = re.compile(r"(authorization|api[_-]?key|secret|token|cookie)", re.IGNORECASE)
 BEARER_VALUE = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
+NUMERIC_USAGE_TOKEN_KEYS = frozenset({"prompt_tokens", "completion_tokens"})
 _CURRENT_AUDIT: ContextVar[AuditRecorder | None] = ContextVar(
     "invoice_agents_current_audit", default=None
 )
@@ -29,10 +30,16 @@ def redact(value: Any) -> Any:
     """Redact known secret keys and bearer values recursively."""
 
     if isinstance(value, Mapping):
-        return {
-            str(key): "[REDACTED]" if SENSITIVE_KEY.search(str(key)) else redact(item)
-            for key, item in value.items()
-        }
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized_key = str(key)
+            if normalized_key in NUMERIC_USAGE_TOKEN_KEYS and type(item) is int and item >= 0:
+                cleaned[normalized_key] = item
+            elif SENSITIVE_KEY.search(normalized_key):
+                cleaned[normalized_key] = "[REDACTED]"
+            else:
+                cleaned[normalized_key] = redact(item)
+        return cleaned
     if isinstance(value, str):
         return BEARER_VALUE.sub("Bearer [REDACTED]", value)
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):

@@ -279,9 +279,9 @@ def test_v1_database_requires_explicit_legacy_authorization_reconciliation(
         confirmed=True,
     )
     assert receipt.record_count == 2
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4, 5]
     report = verify_database(path, DatabaseKind.WORKFLOW, settings=settings)
-    assert report["schema_version"] == 4
+    assert report["schema_version"] == 5
     with connect_database(path, read_only=True) as connection:
         assert connection.execute("SELECT COUNT(*) FROM review_requests").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM human_decisions").fetchone()[0] == 0
@@ -542,12 +542,12 @@ def test_migration_003_backfills_digest_bound_immutable_durable_history(
 ) -> None:
     path = tmp_path / "durable-history.db"
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [1, 2, 3, 4]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [1, 2, 3, 4, 5]
 
     rows = _durable_history_rows(path)
     hashes = _packaged_workflow_hashes()
     assert [(ordinal, version, digest) for ordinal, version, digest, _at in rows] == [
-        (version, version, hashes[version]) for version in (1, 2, 3, 4)
+        (version, version, hashes[version]) for version in (1, 2, 3, 4, 5)
     ]
     for _ordinal, _version, _digest, applied_at in rows:
         parsed = datetime.fromisoformat(applied_at)
@@ -573,11 +573,12 @@ def test_existing_legitimate_v3_history_is_retrofitted_before_version_004(
     _remove_durable_history(path)
     settings = _retrofit_settings(tmp_path, path)
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW, settings=settings) == [4]
+    assert migrate_database(path, DatabaseKind.WORKFLOW, settings=settings) == [4, 5]
     assert [row[:3] for row in _durable_history_rows(path)] == [
-        (version, version, _packaged_workflow_hashes()[version]) for version in (1, 2, 3, 4)
+        (version, version, _packaged_workflow_hashes()[version])
+        for version in (1, 2, 3, 4, 5)
     ]
-    assert verify_database(path, DatabaseKind.WORKFLOW, settings=settings)["schema_version"] == 4
+    assert verify_database(path, DatabaseKind.WORKFLOW, settings=settings)["schema_version"] == 5
     assert any(
         resource.name.startswith("004_") for resource in _migration_resources(DatabaseKind.WORKFLOW)
     )
@@ -666,11 +667,12 @@ def test_legacy_v3_retrofit_holds_cross_process_sqlite_lock_before_begin_immedia
 
     monkeypatch.setattr(core_module, "connect_database", observed_connect)
 
-    assert _migrate_database_in_process(path, DatabaseKind.WORKFLOW, settings=settings) == [4]
+    assert _migrate_database_in_process(path, DatabaseKind.WORKFLOW, settings=settings) == [4, 5]
     assert len(rival_results) == 1
     assert rival_results[0].startswith("LOCKED:database is locked")
     assert [row[:3] for row in _durable_history_rows(path)] == [
-        (version, version, _packaged_workflow_hashes()[version]) for version in (1, 2, 3, 4)
+        (version, version, _packaged_workflow_hashes()[version])
+        for version in (1, 2, 3, 4, 5)
     ]
 
 
@@ -1017,6 +1019,7 @@ def test_malformed_durable_history_fails_before_any_write(
         (2, 2, hashes[2], valid_at),
         (3, 3, hashes[3], valid_at),
         (4, 4, hashes[4], valid_at),
+        (5, 5, hashes[5], valid_at),
     ]
     if corruption == "ordinal-gap":
         rows[1] = (4, 2, hashes[2], valid_at)
@@ -1065,7 +1068,7 @@ def test_future_synthetic_migration_appends_one_digest_bound_history_row(
     synthetic_sql = "CREATE TABLE synthetic_migration_probe(value INTEGER);\n"
 
     class SyntheticMigration:
-        name = "005_synthetic_history_probe.sql"
+        name = "006_synthetic_history_probe.sql"
 
         def read_text(self, encoding: str = "utf-8") -> str:
             assert encoding == "utf-8"
@@ -1083,14 +1086,14 @@ def test_future_synthetic_migration_appends_one_digest_bound_history_row(
 
     monkeypatch.setattr(core_module, "_migration_resources", resources)
 
-    assert _migrate_database_in_process(path, DatabaseKind.WORKFLOW) == [5]
+    assert _migrate_database_in_process(path, DatabaseKind.WORKFLOW) == [6]
     rows = _durable_history_rows(path)
     assert rows[-1][:3] == (
-        5,
-        5,
+        6,
+        6,
         hashlib.sha256(synthetic_sql.encode("utf-8")).hexdigest(),
     )
-    assert len(rows) == 5
+    assert len(rows) == 6
     with connect_database(path) as connection:
         for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'trigger' "

@@ -7,6 +7,7 @@ only run_prepared_case / resume_case - the paid model boundary - are replaced.
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from datetime import UTC, datetime
 from html.parser import HTMLParser
@@ -28,7 +29,7 @@ from invoice_agents.agents.decision_rules import unaddressed_blockers
 from invoice_agents.config import Settings
 from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
-from invoice_agents.errors import InvoiceAgentsError
+from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import CaseResult, CaseStatus, RiskAssessment
 from invoice_agents.ui import queries
 
@@ -113,7 +114,7 @@ def test_dashboard_empty_state(client: TestClient) -> None:
     assert response.status_code == 200
     assert "No cases yet" in response.text
     assert "invoice-agents process" in response.text
-    assert "schema v4, integrity ok" in response.text
+    assert "schema v5, integrity ok" in response.text
 
 
 def test_dashboard_lists_stored_case(client: TestClient, settings: Settings) -> None:
@@ -214,11 +215,17 @@ def test_needs_human_case_links_review(client: TestClient, settings: Settings) -
     assert "waiting for a human decision" in response.text
 
 
-def test_case_result_json_served_and_missing_handled(
+def test_case_result_json_requires_a_durable_artifact_binding(
     client: TestClient, settings: Settings, ui_workdir: Path
 ) -> None:
     case_id = make_succeeded_case(settings)
-    assert client.get(f"/cases/{case_id}/result.json").status_code == 404
+    missing = client.get(f"/cases/{case_id}/result.json")
+    assert missing.status_code == 409
+    assert missing.json() == {
+        "case_id": case_id,
+        "status": "SUCCEEDED",
+        "stop_reason": "RESULT_ARTIFACT_BINDING_UNRESOLVED",
+    }
     artifact_dir = ui_workdir / "artifacts" / "results"
     artifact_dir.mkdir(parents=True)
     store = WorkflowStore(settings.workflow_db)
@@ -226,9 +233,124 @@ def test_case_result_json_served_and_missing_handled(
     assert result is not None
     (artifact_dir / f"{case_id}.json").write_text(result.model_dump_json(), encoding="utf-8")
     response = client.get(f"/cases/{case_id}/result.json")
-    assert response.status_code == 200
-    assert json.loads(response.text)["case_id"] == case_id
+    assert response.status_code == 409
+    assert response.json()["stop_reason"] == "RESULT_ARTIFACT_BINDING_UNRESOLVED"
     assert client.get("/cases/../secrets/result.json").status_code in {400, 404}
+
+
+@pytest.mark.parametrize("corruption", ["authority", "result", "binding"])
+def test_case_result_json_propagates_persisted_corruption_to_error_boundary(
+    corruption: str,
+    client: TestClient,
+    settings: Settings,
+) -> None:
+    case_id = make_succeeded_case(settings)
+    with connect_database(settings.workflow_db) as connection:
+        if corruption in {"authority", "result"}:
+            triggers = connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = 'cases'"
+            ).fetchall()
+            for trigger in triggers:
+                connection.execute(f'DROP TRIGGER "{trigger["name"]}"')
+            if corruption == "authority":
+                connection.execute(
+                    "UPDATE cases SET execution_token = 'exec_not_canonical' "
+                    "WHERE case_id = ?",
+                    (case_id,),
+                )
+            else:
+                connection.execute(
+                    "UPDATE cases SET result_json = '{\"corrupt\":true}' WHERE case_id = ?",
+                    (case_id,),
+                )
+        else:
+            generation = connection.execute(
+                "SELECT execution_generation FROM cases WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()["execution_generation"]
+            connection.execute("PRAGMA ignore_check_constraints = ON")
+            connection.execute(
+                "INSERT INTO result_artifact_bindings("
+                "case_id, execution_generation, artifact_sha256, artifact_device, "
+                "artifact_inode, artifact_file_type, artifact_size_bytes) "
+                "VALUES (?, ?, 'not-a-sha256', 1, 1, 32768, 1)",
+                (case_id, generation),
+            )
+            connection.execute("PRAGMA ignore_check_constraints = OFF")
+        connection.commit()
+
+    response = client.get(f"/cases/{case_id}/result.json")
+
+    assert response.status_code == 400
+    assert "PERSISTED_RESULT_INVALID" in response.text
+    assert "RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED" not in response.text
+
+
+def test_case_result_json_propagates_unrelated_database_failure_to_error_boundary(
+    client: TestClient,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case_id = make_succeeded_case(settings)
+    loader_calls: list[str] = []
+
+    def fail_unrelated_database_read(
+        _store: WorkflowStore,
+        _case_id: str,
+    ) -> tuple[CaseResult | None, int, object | None]:
+        loader_calls.append(_case_id)
+        raise sqlite3.OperationalError("unrelated result database sentinel")
+
+    monkeypatch.setattr(
+        WorkflowStore,
+        "load_result_with_artifact_binding",
+        fail_unrelated_database_read,
+    )
+
+    response = client.get(f"/cases/{case_id}/result.json")
+
+    assert loader_calls == [case_id]
+    assert response.status_code == 500
+    assert "DATABASE_ERROR" in response.text
+    assert "unrelated result database sentinel" in response.text
+    assert "RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED" not in response.text
+
+
+def test_case_result_json_maps_only_recognized_binding_ambiguity_to_409(
+    client: TestClient,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case_id = make_succeeded_case(settings)
+    loader_calls: list[str] = []
+
+    def fail_with_recognized_binding_ambiguity(
+        _store: WorkflowStore,
+        _case_id: str,
+    ) -> tuple[CaseResult | None, int, object | None]:
+        loader_calls.append(_case_id)
+        raise InvoiceAgentsError(
+            ErrorCategory.DATABASE,
+            "result-artifact binding transaction outcome could not be proven",
+            case_id=case_id,
+            stop_reason="RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED",
+        )
+
+    monkeypatch.setattr(
+        WorkflowStore,
+        "load_result_with_artifact_binding",
+        fail_with_recognized_binding_ambiguity,
+    )
+
+    response = client.get(f"/cases/{case_id}/result.json")
+
+    assert loader_calls == [case_id]
+    assert response.status_code == 409
+    assert response.json() == {
+        "case_id": case_id,
+        "status": "INCOMPLETE",
+        "stop_reason": "RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED",
+    }
 
 
 # ----------------------------------------------------------------------------- reviews

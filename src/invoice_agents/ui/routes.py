@@ -7,21 +7,24 @@ composes no SQL of its own beyond the read-only queries in :mod:`queries`.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 import sqlite3
+import stat
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import quote, unquote
 
 from fastapi import APIRouter, Form, Request, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from sse_starlette.sse import EventSourceResponse
 
 from invoice_agents.agents.decision_rules import AUTHORIZING_HUMAN_DECISIONS
 from invoice_agents.config import XAI_BASE_URL, XAI_MODEL, Settings
 from invoice_agents.db.core import DatabaseKind, verify_database
-from invoice_agents.db.store import WorkflowStore
+from invoice_agents.db.store import ResultArtifactBinding, WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError, SourceEvidenceError
 from invoice_agents.hitl.service import record_human_decision
 from invoice_agents.models import (
@@ -95,6 +98,157 @@ def _render(
 def _not_found(request: Request, message: str, stop_reason: str) -> Response:
     error = InvoiceAgentsError(ErrorCategory.DATABASE, message, stop_reason=stop_reason)
     return _render(request, "error.html", {"nav": None, "error": error}, status_code=404)
+
+
+def _artifact_binding_conflict(result: CaseResult) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "case_id": result.case_id,
+            "status": result.status.value,
+            "stop_reason": "RESULT_ARTIFACT_BINDING_UNRESOLVED",
+        },
+    )
+
+
+def _artifact_binding_durability_conflict(case_id: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "case_id": case_id,
+            "status": CaseStatus.INCOMPLETE.value,
+            "stop_reason": "RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED",
+        },
+    )
+
+
+def _read_exact_bound_result_artifact(
+    case_id: str,
+    binding: ResultArtifactBinding,
+) -> bytes | None:
+    """Read only the exact no-follow file identity authorized by ``binding``."""
+
+    directory_descriptor: int | None = None
+    validation_directory_descriptor: int | None = None
+    artifact_descriptor: int | None = None
+    payload: bytes | None = None
+    cleanup_failed = False
+    target_name = f"{case_id}.json"
+    expected_identity = (
+        binding.artifact_device,
+        binding.artifact_inode,
+        binding.artifact_file_type,
+        binding.artifact_size_bytes,
+    )
+    try:
+        directory_path = Path.cwd() / "artifacts" / "results"
+        classified_directory = os.lstat(directory_path)
+        if not stat.S_ISDIR(classified_directory.st_mode):
+            return None
+        expected_directory_identity = (
+            classified_directory.st_dev,
+            classified_directory.st_ino,
+        )
+        directory_descriptor = os.open(
+            directory_path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        opened_directory = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(opened_directory.st_mode)
+            or (opened_directory.st_dev, opened_directory.st_ino)
+            != expected_directory_identity
+        ):
+            return None
+        namespace_identity = os.lstat(target_name, dir_fd=directory_descriptor)
+        observed_namespace = (
+            namespace_identity.st_dev,
+            namespace_identity.st_ino,
+            stat.S_IFMT(namespace_identity.st_mode),
+            namespace_identity.st_size,
+        )
+        if observed_namespace != expected_identity or not stat.S_ISREG(
+            namespace_identity.st_mode
+        ):
+            return None
+        artifact_descriptor = os.open(
+            target_name,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=directory_descriptor,
+        )
+        opened_identity = os.fstat(artifact_descriptor)
+        observed_opened = (
+            opened_identity.st_dev,
+            opened_identity.st_ino,
+            stat.S_IFMT(opened_identity.st_mode),
+            opened_identity.st_size,
+        )
+        if observed_opened != expected_identity or not stat.S_ISREG(opened_identity.st_mode):
+            return None
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        observed_size = 0
+        while True:
+            chunk = os.read(artifact_descriptor, 65_536)
+            if not chunk:
+                break
+            observed_size += len(chunk)
+            if observed_size > binding.artifact_size_bytes:
+                return None
+            digest.update(chunk)
+            chunks.append(chunk)
+        final_opened_identity = os.fstat(artifact_descriptor)
+        final_namespace_identity = os.lstat(target_name, dir_fd=directory_descriptor)
+        final_opened = (
+            final_opened_identity.st_dev,
+            final_opened_identity.st_ino,
+            stat.S_IFMT(final_opened_identity.st_mode),
+            final_opened_identity.st_size,
+        )
+        final_namespace = (
+            final_namespace_identity.st_dev,
+            final_namespace_identity.st_ino,
+            stat.S_IFMT(final_namespace_identity.st_mode),
+            final_namespace_identity.st_size,
+        )
+        if (
+            observed_size != binding.artifact_size_bytes
+            or digest.hexdigest() != binding.artifact_sha256
+            or final_opened != expected_identity
+            or final_namespace != expected_identity
+        ):
+            return None
+        validation_directory_descriptor = os.open(
+            directory_path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        validation_directory = os.fstat(validation_directory_descriptor)
+        if (
+            not stat.S_ISDIR(validation_directory.st_mode)
+            or (validation_directory.st_dev, validation_directory.st_ino)
+            != expected_directory_identity
+        ):
+            return None
+        payload = b"".join(chunks)
+    except OSError:
+        payload = None
+    finally:
+        if artifact_descriptor is not None:
+            try:
+                os.close(artifact_descriptor)
+            except OSError:
+                cleanup_failed = True
+        if validation_directory_descriptor is not None:
+            try:
+                os.close(validation_directory_descriptor)
+            except OSError:
+                cleanup_failed = True
+        if directory_descriptor is not None:
+            try:
+                os.close(directory_descriptor)
+            except OSError:
+                cleanup_failed = True
+    return None if cleanup_failed else payload
 
 
 def _invoice_files() -> list[Path]:
@@ -225,14 +379,35 @@ async def case_detail(request: Request, case_id: str) -> Response:
 async def case_result_json(request: Request, case_id: str) -> Response:
     if not SAFE_ID.match(case_id):
         return _not_found(request, f"case does not exist: {case_id}", "CASE_NOT_FOUND")
-    target = (Path("artifacts/results") / f"{case_id}.json").resolve()
-    if not target.is_file():
+    try:
+        result, generation, binding = _store(request).load_result_with_artifact_binding(case_id)
+    except InvoiceAgentsError as exc:
+        if exc.stop_reason == "CASE_NOT_FOUND":
+            return _not_found(request, exc.message, exc.stop_reason)
+        if exc.stop_reason == "RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED":
+            return _artifact_binding_durability_conflict(case_id)
+        raise
+    if result is not None and result.stop_reason == "RESULT_ARTIFACT_DURABILITY_UNRESOLVED":
+        return JSONResponse(
+            status_code=409,
+            content={
+                "case_id": case_id,
+                "status": result.status.value,
+                "stop_reason": result.stop_reason,
+            },
+        )
+    if result is None:
         return _not_found(
             request,
-            f"no result artifact exists at {target}",
+            f"no terminal result exists for case {case_id}",
             "RESULT_ARTIFACT_MISSING",
         )
-    return FileResponse(target, media_type="application/json")
+    if binding is None or binding.execution_generation != generation:
+        return _artifact_binding_conflict(result)
+    payload = _read_exact_bound_result_artifact(case_id, binding)
+    if payload is None:
+        return _artifact_binding_conflict(result)
+    return Response(content=payload, media_type="application/json")
 
 
 @router.get("/cases/{case_id}/live")

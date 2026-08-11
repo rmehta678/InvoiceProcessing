@@ -10,7 +10,10 @@ import json
 import logging
 import os
 import struct
+import subprocess
 import sys
+import threading
+from collections.abc import Iterator
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,10 +22,11 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
-from invoice_agents import isolated_process, lifecycle_process, lifecycle_worker
+from invoice_agents import isolated_process, lifecycle_process, lifecycle_worker, terminal_process
 from invoice_agents.config import Settings
 from invoice_agents.db import migration_process
 from invoice_agents.db.store import ExecutionClaim
+from invoice_agents.errors import InvoiceAgentsError
 
 
 def _lifecycle_inputs(
@@ -79,6 +83,21 @@ def _terminal_worker_command(mode: str) -> list[str]:
     return [sys.executable, "-c", child_code]
 
 
+@pytest.fixture(autouse=True)
+def _fresh_process_failure_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Each test models a fresh process without adding a production poison reset."""
+
+    monkeypatch.setattr(isolated_process, "_PRIVATE_PIPE_STATE_POISONED", False)
+    monkeypatch.setattr(isolated_process, "_ACTIVE_PRIVATE_PIPE_ENDPOINTS", 0)
+    monkeypatch.setattr(
+        migration_process,
+        "_WORKER_RESOURCE_CLEANUP_POISONED",
+        threading.Event(),
+    )
+    yield
+    assert isolated_process._ACTIVE_PRIVATE_PIPE_ENDPOINTS == 0
+
+
 def _digest_worker_command(receipt: Path, mode: str = "success") -> list[str]:
     tail = {
         "success": "sys.stdout.buffer.write(b'{\"ok\":true}')",
@@ -102,15 +121,153 @@ def _digest_worker_command(receipt: Path, mode: str = "success") -> list[str]:
 
 
 def _worker_is_contained(worker: object) -> bool:
-    if worker.cleaned:  # type: ignore[attr-defined]
-        return True
-    with migration_process._QUARANTINED_WORKERS_LOCK:
-        return (
-            migration_process._QUARANTINED_WORKERS.get(  # type: ignore[attr-defined]
-                worker.process_id  # type: ignore[attr-defined]
-            )
-            is worker
+    return bool(worker.cleaned) and worker.process.poll() is not None  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("fault_stage", ["initializer", "classifier", "capture"])
+def test_round9_terminal_post_native_spawn_control_reaps_reserved_process_before_reraise(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_stage: str,
+) -> None:
+    """A terminal worker remains owned when process initialization is interrupted."""
+
+    class PostNativeSpawnControl(BaseException):
+        pass
+
+    injected = PostNativeSpawnControl("terminal post-native-spawn control")
+    spawned: list[subprocess.Popen[bytes]] = []
+    captured_sessions: list[Any] = []
+    real_initialize = subprocess.Popen.__init__
+
+    def initialize_then_interrupt(
+        process: subprocess.Popen[bytes],
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        real_initialize(process, *args, **kwargs)  # type: ignore[arg-type]
+        spawned.append(process)
+        raise injected
+
+    if fault_stage == "initializer":
+        monkeypatch.setattr(
+            terminal_process,
+            "_initialize_reserved_terminal_process",
+            initialize_then_interrupt,
+            raising=False,
         )
+    elif fault_stage == "classifier":
+        real_classifier = terminal_process._reserved_process_has_native_child
+        interrupted = False
+
+        def classify_then_interrupt(process: subprocess.Popen[bytes]) -> bool:
+            nonlocal interrupted
+            classified = real_classifier(process)
+            if classified and not interrupted:
+                interrupted = True
+                spawned.append(process)
+                raise injected
+            return classified
+
+        monkeypatch.setattr(
+            terminal_process,
+            "_reserved_process_has_native_child",
+            classify_then_interrupt,
+        )
+    else:
+        real_capture = terminal_process._capture_worker_session
+
+        def capture_then_interrupt(
+            process: subprocess.Popen[bytes],
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            captured = real_capture(process, *args, **kwargs)  # type: ignore[arg-type]
+            captured_sessions.append(captured)
+            spawned.append(process)
+            raise injected
+
+        monkeypatch.setattr(
+            terminal_process,
+            "_capture_worker_session",
+            capture_then_interrupt,
+        )
+    monkeypatch.setattr(
+        terminal_process,
+        "_terminal_worker_command",
+        lambda: [sys.executable, "-c", "import time; time.sleep(60)"],
+    )
+    settings, started_at, claim = _lifecycle_inputs(
+        tmp_path,
+        "round9-terminal-post-native-spawn-canary",
+    )
+
+    try:
+        with pytest.raises(PostNativeSpawnControl) as excinfo:
+            terminal_process.run_terminal_process(
+                mode="cancel_unstarted",
+                settings=settings,
+                claim=claim,
+                timeout_seconds=0.02,
+                started_at=started_at,
+            )
+
+        assert excinfo.value is injected
+        assert len(spawned) == 1
+        assert spawned[0].poll() is not None
+        if fault_stage == "capture":
+            assert len(captured_sessions) == 1
+            captured = captured_sessions[0]
+            assert captured.cleaned
+            watcher = captured.exit_watcher
+            assert watcher is None or (
+                watcher._kqueue is None and watcher._pidfd is None
+            )
+    finally:
+        for process in spawned:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+
+def test_round9_terminal_poisoned_worker_resource_rejects_before_initializer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    poison = threading.Event()
+    poison.set()
+    initialized = False
+
+    def forbid_initializer(*_args: object, **_kwargs: object) -> None:
+        nonlocal initialized
+        initialized = True
+        raise AssertionError("poisoned terminal admission reached initializer")
+
+    monkeypatch.setattr(
+        terminal_process,
+        "_initialize_reserved_terminal_process",
+        forbid_initializer,
+    )
+    monkeypatch.setattr(
+        "invoice_agents.db.migration_process._WORKER_RESOURCE_CLEANUP_POISONED",
+        poison,
+    )
+    settings, started_at, claim = _lifecycle_inputs(
+        tmp_path,
+        "round9-terminal-poisoned-resource-canary",
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        terminal_process.run_terminal_process(
+            mode="cancel_unstarted",
+            settings=settings,
+            claim=claim,
+            timeout_seconds=0.02,
+            started_at=started_at,
+        )
+
+    assert excinfo.value.stop_reason == "TERMINAL_WORKER_CLEANUP_FAILED"
+    assert not initialized
 
 
 def _capture_spawned_worker(
@@ -231,6 +388,8 @@ def test_round9_unproven_parent_read_close_transmits_zero_credential_bytes(
     assert canary.encode() not in observed
     assert all(process.poll() is not None for process in spawned)
     assert canary not in repr(outcome)
+    with pytest.raises(isolated_process.IsolatedProcessCleanupError):
+        isolated_process.private_pipe_channel()
 
 
 def test_round9_repeated_read_release_faults_self_heal_and_do_not_poison_follow_up(
@@ -410,11 +569,15 @@ def test_round9_worker_terminal_paths_reap_child_and_retire_directional_endpoint
     )
 
     assert outcome.error_code == expected_code
-    assert len(captured_inputs) == len(spawned) == 1
+    assert len(captured_inputs) == 1
     assert captured_inputs[0].reader.closed
     assert captured_inputs[0].writer.closed
     assert not any(captured_inputs[0].payload)
-    assert spawned[0].poll() is not None
+    if worker_mode == "cancel":
+        assert spawned == []
+    else:
+        assert len(spawned) == 1
+        assert spawned[0].poll() is not None
     assert canary not in repr(outcome)
 
 
@@ -654,6 +817,8 @@ def test_round9_write_faults_destroy_partial_kernel_buffer_and_reap_child(
 
     def failing_write(descriptor: int, data: Any) -> int:
         nonlocal write_calls
+        if descriptor != captured_inputs[0].writer.fileno():
+            return real_write(descriptor, data)
         write_calls += 1
         if fault_profile == "before-header" and write_calls == 1:
             raise OSError(errno.EIO, "round9 write before header")
@@ -904,7 +1069,10 @@ def test_round9_capture_control_transmits_nothing_and_reaps_fallback_session(
         captured_inputs.append(kwargs["private_input"])
         return real_run(**kwargs)
 
-    def interrupt_capture(_process: isolated_process._SpawnedProcess) -> object:
+    def interrupt_capture(
+        _process: isolated_process._SpawnedProcess,
+        _retained_worker: object,
+    ) -> object:
         raise control_type("round9 worker capture control")
 
     monkeypatch.setattr(lifecycle_process, "run_isolated_process", observed_run)
@@ -942,7 +1110,10 @@ def test_round9_capture_failure_is_start_failure_with_zero_credential_bytes(
     )
     spawned = _capture_spawned_worker(monkeypatch)
 
-    def fail_capture(_process: isolated_process._SpawnedProcess) -> object:
+    def fail_capture(
+        _process: isolated_process._SpawnedProcess,
+        _retained_worker: object,
+    ) -> object:
         raise OSError(errno.EIO, "round9 worker capture failure")
 
     monkeypatch.setattr(isolated_process, "_capture_worker_session", fail_capture)
@@ -980,12 +1151,14 @@ def test_round9_stop_control_is_reraised_only_after_real_child_reap(
         lambda: _terminal_worker_command("timeout"),
     )
     captured_workers: list[object] = []
+    real_cleanup_phase = isolated_process._run_worker_cleanup_phase
 
-    def interrupt_stop(worker: object) -> object:
+    def interrupt_after_cleanup(worker: object, outcome: object) -> None:
         captured_workers.append(worker)
+        real_cleanup_phase(worker, outcome)  # type: ignore[arg-type]
         raise control_type("round9 stop control")
 
-    monkeypatch.setattr(isolated_process, "_stop_worker", interrupt_stop)
+    monkeypatch.setattr(isolated_process, "_run_worker_cleanup_phase", interrupt_after_cleanup)
 
     with pytest.raises(control_type):
         lifecycle_process.run_lifecycle_process(
@@ -1006,14 +1179,14 @@ def test_round9_stop_control_is_reraised_only_after_real_child_reap(
     "control_type",
     [KeyboardInterrupt, SystemExit, asyncio.CancelledError],
 )
-def test_round9_stop_control_with_reap_failure_leaves_durable_quarantine(
+def test_round9_cleanup_control_blocks_owner_until_exact_reap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     control_type: type[BaseException],
 ) -> None:
-    """A live child is never forgotten when both stop and independent reap interrupt."""
+    """A cleanup control cannot release the caller before exact worker reap."""
 
-    canary = f"round9-quarantine-{control_type.__name__}-canary"
+    canary = f"round9-retained-owner-{control_type.__name__}-canary"
     settings, started_at, claim = _lifecycle_inputs(tmp_path, canary)
     monkeypatch.setattr(
         lifecycle_process,
@@ -1021,20 +1194,21 @@ def test_round9_stop_control_with_reap_failure_leaves_durable_quarantine(
         lambda: _terminal_worker_command("timeout"),
     )
     captured_workers: list[object] = []
-    real_stop = isolated_process._stop_worker
+    cleanup_entered = threading.Event()
+    release_cleanup = threading.Event()
+    returned = threading.Event()
+    errors: list[BaseException] = []
+    real_cleanup = isolated_process._cleanup_cooperative_worker_session
 
-    def interrupt_stop(worker: object) -> object:
+    def controlled_cleanup(worker: object) -> None:
         captured_workers.append(worker)
-        raise control_type("round9 persistent stop control")
+        cleanup_entered.set()
+        assert release_cleanup.wait(2.0)
+        real_cleanup(worker)  # type: ignore[arg-type]
+        raise control_type("round9 cleanup control")
 
-    def fail_independent_reap(_worker: object) -> None:
-        raise OSError(errno.EIO, "round9 persistent independent reap failure")
-
-    monkeypatch.setattr(isolated_process, "_stop_worker", interrupt_stop)
-    monkeypatch.setattr(isolated_process, "_cleanup_worker_session", fail_independent_reap)
-
-    try:
-        with pytest.raises(control_type):
+    def invoke() -> None:
+        try:
             lifecycle_process.run_lifecycle_process(
                 mode="process",
                 settings=settings,
@@ -1042,19 +1216,37 @@ def test_round9_stop_control_with_reap_failure_leaves_durable_quarantine(
                 started_at=started_at,
                 timeout_seconds=0.08,
             )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            returned.set()
+
+    monkeypatch.setattr(isolated_process, "_cleanup_cooperative_worker_session", controlled_cleanup)
+    controller = threading.Thread(target=invoke, name="round9-cleanup-owner")
+    controller.start()
+
+    try:
+        assert cleanup_entered.wait(2.0)
+        assert not returned.is_set()
         assert len(captured_workers) == 1
-        assert _worker_is_contained(captured_workers[0])
+        assert not captured_workers[0].cleaned  # type: ignore[attr-defined]
+        release_cleanup.set()
+        controller.join(timeout=2.0)
     finally:
-        for worker in captured_workers:
-            with suppress(BaseException):
-                real_stop(worker)  # type: ignore[arg-type]
+        release_cleanup.set()
+        controller.join(timeout=2.0)
+
+    assert not controller.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], control_type)
+    assert _worker_is_contained(captured_workers[0])
 
 
-def test_round9_stop_and_reap_failure_returns_cleanup_error_with_quarantine(
+def test_round9_cleanup_failure_returns_only_after_exact_reap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Ordinary cleanup faults return fail-closed while retaining the worker."""
+    """Ordinary cleanup faults fail closed only after the worker is reaped."""
 
     settings, started_at, claim = _lifecycle_inputs(tmp_path, "round9-stop-cleanup-canary")
     monkeypatch.setattr(
@@ -1063,30 +1255,53 @@ def test_round9_stop_and_reap_failure_returns_cleanup_error_with_quarantine(
         lambda: _terminal_worker_command("timeout"),
     )
     captured_workers: list[object] = []
-    real_stop = isolated_process._stop_worker
+    cleanup_entered = threading.Event()
+    release_cleanup = threading.Event()
+    returned = threading.Event()
+    outcomes: list[lifecycle_process.LifecycleProcessOutcome] = []
+    errors: list[BaseException] = []
+    real_cleanup = isolated_process._cleanup_cooperative_worker_session
 
-    def failed_stop(worker: object) -> object:
+    def controlled_cleanup(worker: object) -> None:
         captured_workers.append(worker)
-        return object()
+        cleanup_entered.set()
+        assert release_cleanup.wait(2.0)
+        real_cleanup(worker)  # type: ignore[arg-type]
+        raise OSError(errno.EIO, "round9 cleanup evidence failure")
 
-    def failed_reap(_worker: object) -> None:
-        raise OSError(errno.EIO, "round9 independent reap failed")
+    def invoke() -> None:
+        try:
+            outcomes.append(
+                lifecycle_process.run_lifecycle_process(
+                    mode="process",
+                    settings=settings,
+                    claim=claim,
+                    started_at=started_at,
+                    timeout_seconds=0.08,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            returned.set()
 
-    monkeypatch.setattr(isolated_process, "_stop_worker", failed_stop)
-    monkeypatch.setattr(isolated_process, "_cleanup_worker_session", failed_reap)
+    monkeypatch.setattr(isolated_process, "_cleanup_cooperative_worker_session", controlled_cleanup)
+    controller = threading.Thread(target=invoke, name="round9-cleanup-owner")
+    controller.start()
 
     try:
-        outcome = lifecycle_process.run_lifecycle_process(
-            mode="process",
-            settings=settings,
-            claim=claim,
-            started_at=started_at,
-            timeout_seconds=0.08,
-        )
-        assert outcome.error_code == "LIFECYCLE_WORKER_CLEANUP_FAILED"
+        assert cleanup_entered.wait(2.0)
+        assert not returned.is_set()
         assert len(captured_workers) == 1
-        assert _worker_is_contained(captured_workers[0])
+        assert not captured_workers[0].cleaned  # type: ignore[attr-defined]
+        release_cleanup.set()
+        controller.join(timeout=2.0)
     finally:
-        for worker in captured_workers:
-            with suppress(BaseException):
-                real_stop(worker)  # type: ignore[arg-type]
+        release_cleanup.set()
+        controller.join(timeout=2.0)
+
+    assert not controller.is_alive()
+    assert errors == []
+    assert len(outcomes) == 1
+    assert outcomes[0].error_code == "LIFECYCLE_WORKER_CLEANUP_FAILED"
+    assert _worker_is_contained(captured_workers[0])

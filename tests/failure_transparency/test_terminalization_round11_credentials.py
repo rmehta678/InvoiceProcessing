@@ -6,13 +6,14 @@ import asyncio
 import errno
 import json
 import os
+import re
 import signal
 import socket
 import stat
 import subprocess
 import sys
 import time
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +26,10 @@ from invoice_agents import isolated_process, lifecycle_process
 from invoice_agents.config import Settings
 from invoice_agents.db import migration_process
 from invoice_agents.db.store import ExecutionClaim
+
+_AMBIENT_DESCRIPTOR_PROCESS_PHASE_SECONDS = 2.0
+_SINGLE_WORKER_SUCCESS_SECONDS = 5.0 * _AMBIENT_DESCRIPTOR_PROCESS_PHASE_SECONDS
+_AMBIENT_DESCRIPTOR_SUCCESS_SECONDS = 7.0 * _AMBIENT_DESCRIPTOR_PROCESS_PHASE_SECONDS
 
 
 def _lifecycle_inputs(
@@ -49,14 +54,64 @@ def _lifecycle_inputs(
     )
 
 
-def _pid_is_absent(process_id: int) -> bool:
-    try:
-        os.kill(process_id, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
-    return False
+def _strict_process_table_rows() -> tuple[tuple[int, int, str], ...]:
+    completed = subprocess.run(
+        ["/bin/ps", "-axo", "pid=,pgid=,stat="],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+        env={**os.environ, "LANG": "C", "LC_ALL": "C"},
+        text=False,
+        timeout=1.0,
+    )
+    if completed.stderr or not completed.stdout.endswith(b"\n"):
+        raise ValueError("process-table scan was not complete")
+    rows: list[tuple[int, int, str]] = []
+    row_pattern = re.compile(rb" *([1-9][0-9]*) +([1-9][0-9]*) +([^\x00-\x20\x7f-\xff]+)( *)")
+    for raw_line in completed.stdout.splitlines():
+        matched = row_pattern.fullmatch(raw_line)
+        if matched is None:
+            raise ValueError("process-table row was not canonical")
+        raw_process_id, raw_group_id, raw_state, raw_padding = matched.groups()
+        state = raw_state.decode("ascii")
+        if sys.platform == "darwin":
+            valid_state = (
+                re.fullmatch(
+                    r"[?IRSTUZ](?:>|W)?(?:<|N)?(?:A|S)?X?E?V?L?s?\+?",
+                    state,
+                )
+                is not None
+            )
+            expected_padding = max(0, 4 - len(state))
+        elif sys.platform.startswith("linux"):
+            valid_state = (
+                re.fullmatch(
+                    r"[DIKPRStTWXxZ](?:<|N)?L?s?l?\+?",
+                    state,
+                )
+                is not None
+            )
+            expected_padding = 0
+        else:
+            raise ValueError("process-table platform was unsupported")
+        if not valid_state or len(raw_padding) != expected_padding:
+            raise ValueError("process-table state was not canonical")
+        rows.append((int(raw_process_id), int(raw_group_id), state))
+    if len({process_id for process_id, _group_id, _state in rows}) != len(rows):
+        raise ValueError("process-table repeated a process identifier")
+    return tuple(sorted(rows))
+
+
+def _identities_and_group_are_absent(
+    process_ids: tuple[int, ...],
+    process_group_id: int,
+) -> bool:
+    rows = _strict_process_table_rows()
+    expected_ids = set(process_ids)
+    return all(
+        process_id not in expected_ids and observed_group_id != process_group_id
+        for process_id, observed_group_id, _state in rows
+    )
 
 
 def _bounded_marker_pids(marker: Path) -> tuple[int, int]:
@@ -74,6 +129,15 @@ def _bounded_marker_pids(marker: Path) -> tuple[int, int]:
             pass
         time.sleep(0.01)
     raise AssertionError("real worker did not publish its complete bounded PID receipt")
+
+
+def _wait_for_path(path: Path) -> None:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.005)
+    raise TimeoutError(f"bounded process receipt was not published: {path}")
 
 
 @pytest.mark.parametrize(
@@ -98,34 +162,39 @@ def test_round11_spawn_wrapper_control_cannot_escape_unowned_child_domain(
             "time.sleep(30)",
         )
     )
-    real_launch = subprocess.Popen
-    launched = False
+    real_initialize = isolated_process._initialize_reserved_process
+    real_status_read = isolated_process._read_supervisor_status_line
     published_ids: list[tuple[int, int]] = []
     withheld_native_handles: list[subprocess.Popen[bytes]] = []
     barrier_errors: list[Exception] = []
 
-    def spawn_then_control(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
-        nonlocal launched
-        process = real_launch(*args, **kwargs)
-        command = args[0] if args else kwargs["args"]
-        if (
-            not launched
-            and isinstance(command, list)
-            and "invoice_agents.spawn_supervisor" in command
-        ):
-            launched = True
-            withheld_native_handles.append(process)
+    def initialize_and_retain(
+        process: subprocess.Popen[bytes],
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        real_initialize(process, *args, **kwargs)
+        withheld_native_handles.append(process)
+
+    def read_started_then_control(*args: Any, **kwargs: Any) -> bytes:
+        status = real_status_read(*args, **kwargs)
+        if status.startswith(b"STARTED "):
             try:
                 published_ids.append(_bounded_marker_pids(marker))
             except Exception as exc:
                 barrier_errors.append(exc)
             raise control_type("round11 control after real supervisor spawn")
-        return process
+        return status
 
     monkeypatch.setattr(
-        isolated_process.subprocess,
-        "Popen",
-        spawn_then_control,
+        isolated_process,
+        "_initialize_reserved_process",
+        initialize_and_retain,
+    )
+    monkeypatch.setattr(
+        isolated_process,
+        "_read_supervisor_status_line",
+        read_started_then_control,
     )
 
     with pytest.raises(control_type, match="round11 control after real supervisor spawn"):
@@ -138,13 +207,14 @@ def test_round11_spawn_wrapper_control_cannot_escape_unowned_child_domain(
         )
 
     try:
-        assert launched
+        assert len(withheld_native_handles) == 1
         assert barrier_errors == []
         assert len(published_ids) == 1
         leader_id, descendant_id = published_ids[0]
-        assert _pid_is_absent(leader_id)
-        assert _pid_is_absent(descendant_id)
-        assert len(withheld_native_handles) == 1
+        assert _identities_and_group_are_absent(
+            (leader_id, descendant_id),
+            leader_id,
+        )
         withheld_handle = withheld_native_handles[0]
         assert withheld_handle.stdin is None
         assert withheld_handle.stdout is None
@@ -161,32 +231,28 @@ def test_round11_expired_reader_drains_ready_publication_before_spawn_control(
 ) -> None:
     """A ready raw PID remains ownership evidence after the request deadline."""
 
-    marker = tmp_path / "round11-expired-publication.pids"
-    descendant_code = "import time; time.sleep(30)"
-    worker_code = "\n".join(
-        (
-            "import os, subprocess, sys, time",
-            "from pathlib import Path",
-            f"child = subprocess.Popen([sys.executable, '-c', {descendant_code!r}])",
-            f"Path({os.fspath(marker)!r}).write_text(f'{{os.getpid()}} {{child.pid}}', encoding='ascii')",
-            "time.sleep(30)",
-        )
-    )
-    real_launch = subprocess.Popen
+    del tmp_path
+    worker_code = "import time; time.sleep(30)"
+    real_initialize = isolated_process._initialize_reserved_process
     launched_handles: list[subprocess.Popen[bytes]] = []
-    published_ids: list[tuple[int, int]] = []
+    published_ids: list[int] = []
 
-    def spawn_stall_then_control(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
-        process = real_launch(*args, **kwargs)
-        command = args[0] if args else kwargs["args"]
-        if isinstance(command, list) and "invoice_agents.spawn_supervisor" in command:
-            launched_handles.append(process)
-            published_ids.append(_bounded_marker_pids(marker))
-            time.sleep(0.08)
-            raise SystemExit("round11 control after expired raw PID publication")
-        return process
+    def initialize_stall_then_control(
+        process: subprocess.Popen[bytes],
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        real_initialize(process, *args, **kwargs)
+        launched_handles.append(process)
+        published_ids.append(process.pid)
+        time.sleep(0.08)
+        raise SystemExit("round11 control after expired raw PID publication")
 
-    monkeypatch.setattr(isolated_process.subprocess, "Popen", spawn_stall_then_control)
+    monkeypatch.setattr(
+        isolated_process,
+        "_initialize_reserved_process",
+        initialize_stall_then_control,
+    )
 
     try:
         with pytest.raises(
@@ -202,21 +268,193 @@ def test_round11_expired_reader_drains_ready_publication_before_spawn_control(
             )
 
         assert len(published_ids) == 1
-        leader_id, descendant_id = published_ids[0]
-        assert _pid_is_absent(leader_id)
-        assert _pid_is_absent(descendant_id)
+        supervisor_id = published_ids[0]
+        assert _identities_and_group_are_absent((supervisor_id,), supervisor_id)
     finally:
-        for handle in launched_handles:
-            with suppress(ProcessLookupError):
-                os.killpg(handle.pid, signal.SIGKILL)
-            with suppress(subprocess.TimeoutExpired):
-                handle.wait(timeout=2.0)
+        synchronized = [handle.poll() for handle in launched_handles]
+    assert synchronized == [0]
+
+
+def test_round17_unexpected_supervisor_death_cannot_report_contained_worker(
+    tmp_path: Path,
+) -> None:
+    """A crashed trusted owner cannot hide its still-live same-session worker group."""
+
+    marker = tmp_path / "round17-crashed-supervisor-worker"
+    crash_receipt = tmp_path / "round17-crashed-supervisor"
+    snapshot_receipt = tmp_path / "round17-crashed-supervisor-snapshots"
+    outcome_receipt = tmp_path / "round17-crash-outcome"
+    descendant_code = "import time; time.sleep(30)"
+    worker_code = "\n".join(
+        (
+            "import os, subprocess, sys, time",
+            "from pathlib import Path",
+            f"child = subprocess.Popen([sys.executable, '-c', {descendant_code!r}])",
+            f"destination = Path({os.fspath(marker)!r})",
+            "temporary = destination.with_name(f'{destination.name}.{os.getpid()}.tmp')",
+            "temporary.write_text(f'{os.getpid()} {child.pid} {os.getpgid(0)} {os.getsid(0)}', encoding='ascii')",
+            "os.replace(temporary, destination)",
+            "time.sleep(30)",
+        )
+    )
+    wrapper_source = "\n".join(
+        (
+            "import json, os, signal, sys, time",
+            "from pathlib import Path",
+            "source_root, marker, crash_path, snapshot_path, outcome_path, worker_code = sys.argv[1:]",
+            "sys.path.insert(0, source_root)",
+            "from invoice_agents import isolated_process",
+            "from invoice_agents.db import migration_process",
+            "real_initialize = isolated_process._initialize_reserved_process",
+            "real_status_read = isolated_process._read_supervisor_status_line",
+            "real_snapshot = migration_process._worker_session_snapshot",
+            "supervisor_id = 0",
+            "snapshot_count = 0",
+            "def publish(path, payload):",
+            "    destination = Path(path)",
+            "    temporary = destination.with_name(f'{destination.name}.{os.getpid()}.tmp')",
+            "    temporary.write_text(payload, encoding='ascii')",
+            "    os.replace(temporary, destination)",
+            "def initialize(process, *args, **kwargs):",
+            "    global supervisor_id",
+            "    real_initialize(process, *args, **kwargs)",
+            "    supervisor_id = process.pid",
+            "def read_status(*args, **kwargs):",
+            "    status = real_status_read(*args, **kwargs)",
+            "    if status.startswith(b'STARTED '):",
+            "        worker_id = int(status.removeprefix(b'STARTED ').removesuffix(b'\\n'))",
+            "        deadline = time.monotonic() + 2.0",
+            "        while not Path(marker).exists() and time.monotonic() < deadline: time.sleep(0.005)",
+            "        if not Path(marker).exists(): raise TimeoutError('worker tree was not published')",
+            "        publish(crash_path, f'{supervisor_id} {worker_id}')",
+            "        os.kill(supervisor_id, signal.SIGKILL)",
+            "    return status",
+            "def snapshot(worker):",
+            "    global snapshot_count",
+            "    observed = real_snapshot(worker)",
+            "    snapshot_count += 1",
+            "    publish(snapshot_path, json.dumps({",
+            "        'count': snapshot_count,",
+            "        'leader_state': observed.leader_state,",
+            "        'members': [[member.process_id, member.process_group_id] for member in observed.members],",
+            "    }, sort_keys=True))",
+            "    return observed",
+            "isolated_process._initialize_reserved_process = initialize",
+            "isolated_process._read_supervisor_status_line = read_status",
+            "migration_process._worker_session_snapshot = snapshot",
+            "try:",
+            "    result = isolated_process.run_isolated_process(",
+            "        command=[sys.executable, '-c', worker_code],",
+            "        request=b'{}', timeout_seconds=2.0, max_response_bytes=64,",
+            "        env=isolated_process.sanitized_worker_environment(),",
+            "    )",
+            "    publish(outcome_path, json.dumps({'failure': result.failure}))",
+            "except BaseException as exc:",
+            "    publish(outcome_path, json.dumps({'raised': type(exc).__name__}))",
+        )
+    )
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            wrapper_source,
+            os.fspath(Path(isolated_process.__file__).resolve().parents[1]),
+            os.fspath(marker),
+            os.fspath(crash_receipt),
+            os.fspath(snapshot_receipt),
+            os.fspath(outcome_receipt),
+            worker_code,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        close_fds=True,
+    )
+    supervisor_id = 0
+    worker_id = 0
+    descendant_id = 0
+    try:
+        try:
+            _wait_for_path(crash_receipt)
+        except TimeoutError as exc:
+            if process.poll() is not None and process.stderr is not None:
+                raise AssertionError(process.stderr.read().decode("utf-8", "replace")) from exc
+            raise
+        supervisor_id, started_worker_id = map(
+            int,
+            crash_receipt.read_text(encoding="ascii").split(),
+        )
+        worker_id, descendant_id, worker_group_id, worker_session_id = map(
+            int,
+            marker.read_text(encoding="ascii").split(),
+        )
+        assert started_worker_id == worker_id
+        assert worker_group_id == worker_id
+        assert worker_session_id == supervisor_id
+
+        if sys.platform == "darwin":
+            deadline = time.monotonic() + 2.0
+            observed_snapshot: dict[str, object] | None = None
+            while time.monotonic() < deadline:
+                try:
+                    candidate = json.loads(snapshot_receipt.read_text(encoding="ascii"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    pass
+                else:
+                    if (
+                        type(candidate) is dict
+                        and type(candidate.get("count")) is int
+                        and candidate["count"] >= 3
+                        and isinstance(candidate.get("leader_state"), str)
+                        and candidate["leader_state"].startswith("Z")
+                        and [worker_id, worker_id] in candidate.get("members", [])
+                        and [descendant_id, worker_id] in candidate.get("members", [])
+                    ):
+                        observed_snapshot = candidate
+                        break
+                time.sleep(0.005)
+            assert observed_snapshot is not None
+            assert process.poll() is None
+            assert not outcome_receipt.exists()
+            rows = _strict_process_table_rows()
+            assert {
+                (process_id, group_id)
+                for process_id, group_id, _state in rows
+                if process_id in {worker_id, descendant_id}
+            } == {
+                (worker_id, worker_id),
+                (descendant_id, worker_id),
+            }
+            os.killpg(worker_id, signal.SIGKILL)
+        assert process.wait(timeout=5.0) == 0
+        outcome = json.loads(outcome_receipt.read_text(encoding="ascii"))
+        assert outcome == {"failure": "crash"}
+        assert process.stderr is not None
+        assert process.stderr.read() == b""
+        assert _identities_and_group_are_absent(
+            (supervisor_id, worker_id, descendant_id),
+            worker_id,
+        )
+    finally:
+        if worker_id > 0:
+            remaining_group = [row for row in _strict_process_table_rows() if row[1] == worker_id]
+            if remaining_group:
+                os.killpg(worker_id, signal.SIGKILL)
+        if process.poll() is None:
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=2.0)
+        if process.stderr is not None:
+            process.stderr.close()
 
 
 def test_round11_parent_mask_is_unchanged_and_child_sigint_mask_is_explicit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The caller may block SIGINT; the isolated child must still start unblocked."""
+    """Watcher publication restores the caller mask; the child starts unblocked."""
 
     real_pthread_sigmask = signal.pthread_sigmask
     original_mask = real_pthread_sigmask(signal.SIG_BLOCK, set())
@@ -228,8 +466,6 @@ def test_round11_parent_mask_is_unchanged_and_child_sigint_mask_is_explicit(
         mask: set[signal.Signals],
     ) -> set[signal.Signals]:
         parent_calls.append((operation, frozenset(mask)))
-        if operation == signal.SIG_SETMASK:
-            raise OSError(errno.EIO, "round11 injected mask restoration failure")
         return real_pthread_sigmask(operation, mask)
 
     monkeypatch.setattr(signal, "pthread_sigmask", observe_parent_mask_change)
@@ -244,7 +480,9 @@ def test_round11_parent_mask_is_unchanged_and_child_sigint_mask_is_explicit(
         result = isolated_process.run_isolated_process(
             command=[sys.executable, "-c", code],
             request=b"{}",
-            timeout_seconds=1.0,
+            # Launch+OWNER, READY, CONTROL, STARTED, and response are all
+            # required; the phase-derived deadline remains a hard failure.
+            timeout_seconds=_SINGLE_WORKER_SUCCESS_SECONDS,
             max_response_bytes=32,
             env=isolated_process.sanitized_worker_environment(),
         )
@@ -254,7 +492,16 @@ def test_round11_parent_mask_is_unchanged_and_child_sigint_mask_is_explicit(
 
     assert result == isolated_process.IsolatedProcessResult(b"unblocked", None)
     assert observed_parent_mask == original_mask | {signal.SIGINT}
-    assert parent_calls == []
+    assert parent_calls == [
+        (
+            signal.SIG_BLOCK,
+            frozenset({signal.SIGINT, signal.SIGTERM}),
+        ),
+        (
+            signal.SIG_SETMASK,
+            frozenset(original_mask | {signal.SIGINT}),
+        ),
+    ]
 
 
 def _descriptor_identity(descriptor: int) -> tuple[int, int, int, int]:
@@ -285,12 +532,20 @@ def test_round11_worker_and_descendant_inherit_no_ambient_file_socket_or_pipe(
         )
         identities = {descriptor: _descriptor_identity(descriptor) for descriptor in descriptors}
         receipt = tmp_path / "round11-descendant-fds.json"
+        worker_entry = tmp_path / "round11-worker-entry.json"
+        worker_before_descendant = tmp_path / "round11-worker-before-descendant.json"
+        worker_after_descendant = tmp_path / "round11-worker-after-descendant.json"
+        worker_before_response = tmp_path / "round11-worker-before-response.json"
+        descendant_entry = tmp_path / "round11-descendant-entry.json"
+        descendant_final = tmp_path / "round11-descendant-final.json"
         for descriptor in descriptors:
             os.set_inheritable(descriptor, True)
         checker = "\n".join(
             (
                 "import json, os, sys",
                 "from pathlib import Path",
+                "process_identity = {'pid': os.getpid(), 'pgid': os.getpgrp(), 'sid': os.getsid(0)}",
+                "Path(sys.argv[3]).write_text(json.dumps(process_identity, sort_keys=True), encoding='ascii')",
                 "expected = {int(fd): tuple(value) for fd, value in json.loads(sys.argv[1]).items()}",
                 "leaked = []",
                 "for descriptor, identity in expected.items():",
@@ -302,11 +557,15 @@ def test_round11_worker_and_descendant_inherit_no_ambient_file_socket_or_pipe(
                 "    if observed == identity:",
                 "        leaked.append(descriptor)",
                 "Path(sys.argv[2]).write_text(json.dumps(leaked), encoding='ascii')",
+                "Path(sys.argv[4]).write_text(json.dumps({'identity': process_identity, 'leaked': leaked}, sort_keys=True), encoding='ascii')",
             )
         )
         worker = "\n".join(
             (
                 "import json, os, subprocess, sys",
+                "from pathlib import Path",
+                "process_identity = {'pid': os.getpid(), 'pgid': os.getpgrp(), 'sid': os.getsid(0)}",
+                "Path(sys.argv[3]).write_text(json.dumps(process_identity, sort_keys=True), encoding='ascii')",
                 "expected = {int(fd): tuple(value) for fd, value in json.loads(sys.argv[1]).items()}",
                 "leaked = []",
                 "for descriptor, identity in expected.items():",
@@ -317,15 +576,32 @@ def test_round11_worker_and_descendant_inherit_no_ambient_file_socket_or_pipe(
                 "    observed = (status.st_dev, status.st_ino, status.st_mode & 0o170000, status.st_rdev)",
                 "    if observed == identity:",
                 "        leaked.append(descriptor)",
-                f"child = subprocess.run([sys.executable, '-c', {checker!r}, sys.argv[1], sys.argv[2]], check=True)",
+                "Path(sys.argv[4]).write_text(json.dumps(process_identity, sort_keys=True), encoding='ascii')",
+                f"child = subprocess.run([sys.executable, '-c', {checker!r}, sys.argv[1], sys.argv[2], sys.argv[7], sys.argv[8]], check=True)",
+                "Path(sys.argv[5]).write_text(json.dumps({'identity': process_identity, 'returncode': child.returncode}, sort_keys=True), encoding='ascii')",
+                "Path(sys.argv[6]).write_text(json.dumps({'identity': process_identity, 'leaked': leaked}, sort_keys=True), encoding='ascii')",
                 "sys.stdout.buffer.write(json.dumps(leaked).encode('ascii'))",
             )
         )
         encoded_identities = json.dumps(identities, sort_keys=True)
         result = isolated_process.run_isolated_process(
-            command=[sys.executable, "-c", worker, encoded_identities, os.fspath(receipt)],
+            command=[
+                sys.executable,
+                "-c",
+                worker,
+                encoded_identities,
+                os.fspath(receipt),
+                os.fspath(worker_entry),
+                os.fspath(worker_before_descendant),
+                os.fspath(worker_after_descendant),
+                os.fspath(worker_before_response),
+                os.fspath(descendant_entry),
+                os.fspath(descendant_final),
+            ],
             request=b"{}",
-            timeout_seconds=2.0,
+            # The positive proof spans launch+OWNER, READY, CONTROL,
+            # STARTED, worker, descendant, and receipt phases.
+            timeout_seconds=_AMBIENT_DESCRIPTOR_SUCCESS_SECONDS,
             max_response_bytes=128,
             env=isolated_process.sanitized_worker_environment(),
         )
@@ -339,10 +615,10 @@ def test_round11_spawn_is_fail_closed_when_supervisor_is_unavailable(
 ) -> None:
     """No direct-spawn fallback may bypass the close-all descriptor boundary."""
 
-    def unavailable(*_args: Any, **_kwargs: Any) -> subprocess.Popen[bytes]:
+    def unavailable(*_args: Any, **_kwargs: Any) -> None:
         raise NotImplementedError("round11 isolated supervisor unavailable")
 
-    monkeypatch.setattr(isolated_process, "_launch_supervisor", unavailable, raising=False)
+    monkeypatch.setattr(isolated_process, "_initialize_reserved_process", unavailable)
 
     result = isolated_process.run_isolated_process(
         command=[sys.executable, "-c", "raise SystemExit(0)"],
@@ -353,6 +629,154 @@ def test_round11_spawn_is_fail_closed_when_supervisor_is_unavailable(
     )
 
     assert result == isolated_process.IsolatedProcessResult(None, "start")
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        b"73 73 Z   ",
+        b"73 73 Z   \r\n",
+        b"73 73 Z\n",
+        b"73 73 Z  \n",
+        b"073 73 Z   \n",
+        b"73 073 Z   \n",
+        b"73 73 z   \n",
+        b"73 73 Z!  \n",
+        b"73 73 Z   \n73 73 Z   \n",
+        b"73 73 Z   \n\n",
+        b"1 1 S   \n" * 120_000,
+    ],
+    ids=[
+        "missing-final-lf",
+        "crlf",
+        "missing-padding",
+        "short-padding",
+        "pid-leading-zero",
+        "pgid-leading-zero",
+        "lowercase-state",
+        "unknown-state-suffix",
+        "duplicate-pid",
+        "blank-row",
+        "oversized",
+    ],
+)
+def test_round17_session_scanner_rejects_partial_or_noncanonical_full_tables(
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: bytes,
+) -> None:
+    monkeypatch.setattr(migration_process.sys, "platform", "darwin")
+
+    with pytest.raises(migration_process._WorkerCleanupFailure):
+        migration_process._canonical_process_table_rows(stdout, b"")
+
+
+@pytest.mark.parametrize("state", ["K", "P", "x", "KNLsl+"])
+def test_round17_generic_linux_scanner_accepts_documented_primary_states(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    monkeypatch.setattr(migration_process.sys, "platform", "linux")
+    row = f"73 73 73 {state}\n".encode("ascii")
+
+    assert migration_process._canonical_process_table_rows(row, b"") == ((73, 73, 73, state),)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "R>",
+        "RW",
+        "R<",
+        "RN",
+        "RA",
+        "RS",
+        "RX",
+        "RE",
+        "RV",
+        "RL",
+        "Rs",
+        "R+",
+        "RWNAXEVLs+",
+        "RWNSXEVLs+",
+    ],
+)
+def test_round17_generic_darwin_scanner_accepts_documented_modifier_order(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    monkeypatch.setattr(migration_process.sys, "platform", "darwin")
+    row = f"73 73 {state:<4}\n".encode("ascii")
+
+    assert migration_process._canonical_process_table_rows(row, b"") == ((73, 73, None, state),)
+
+
+def test_round17_malformed_session_scan_cannot_advance_empty_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial empty-looking table remains primary after later exact cleanup."""
+
+    monkeypatch.setattr(migration_process.sys, "platform", "darwin")
+    command = ["/bin/ps", "-axo", "pid=,pgid=,stat="]
+    scans = iter(
+        (
+            b"73 73 Z   ",
+            b"73 73 Z   \n",
+            b"73 73 Z   \n",
+            b"73 73 Z   \n",
+        )
+    )
+    calls: list[tuple[object, dict[str, object]]] = []
+
+    def run(
+        invoked: object,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append((invoked, kwargs))
+        return subprocess.CompletedProcess(
+            invoked,
+            0,
+            stdout=next(scans),
+            stderr=b"",
+        )
+
+    wait_calls: list[float] = []
+    process = SimpleNamespace(stdout=None, returncode=None)
+
+    def wait(*, timeout: float) -> int:
+        wait_calls.append(timeout)
+        process.returncode = 0
+        return 0
+
+    process.wait = wait
+    worker = migration_process._WorkerSession(
+        process=process,  # type: ignore[arg-type]
+        process_id=73,
+        process_group_id=73,
+        session_id=73,
+        exit_watcher=None,
+    )
+    monkeypatch.setattr(migration_process.subprocess, "run", run)
+    monkeypatch.setattr(migration_process.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(migration_process._WorkerCleanupFailure):
+        migration_process._cleanup_cooperative_worker_session(worker)
+
+    assert worker.cleaned
+    assert wait_calls == [2.0]
+    assert len(calls) == 4
+    assert all(call[0] == command for call in calls)
+    assert all(
+        call[1]
+        == {
+            "capture_output": True,
+            "check": True,
+            "env": {**os.environ, "LANG": "C", "LC_ALL": "C"},
+            "stdin": subprocess.DEVNULL,
+            "text": False,
+            "timeout": 1.0,
+        }
+        for call in calls
+    )
 
 
 def test_round11_known_spawn_deadline_precedes_unverified_start_classification(
@@ -368,8 +792,11 @@ def test_round11_known_spawn_deadline_precedes_unverified_start_classification(
     )
     controller_clock.sleep = time.sleep
 
-    def expire_after_capture(process: isolated_process._SpawnedProcess) -> object:
-        worker = real_capture(process)
+    def expire_after_capture(
+        process: isolated_process._SpawnedProcess,
+        retained_worker: Any,
+    ) -> object:
+        worker = real_capture(process, retained_worker)
         worker.watcher_initialized = False
         worker.identity_verified = False
         controller_clock.expired = True
@@ -389,12 +816,12 @@ def test_round11_known_spawn_deadline_precedes_unverified_start_classification(
     assert result == isolated_process.IsolatedProcessResult(None, "timeout")
 
 
-def test_round11_preset_cancel_precedes_publication_deadline_and_keeps_capture(
+def test_round11_preset_cancel_precedes_publication_without_spawning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pre-set cancellation survives a startup deadline without weakening ownership."""
+    """Pre-set cancellation returns before any native ownership can exist."""
 
-    real_launch = isolated_process._launch_supervisor
+    real_initialize = isolated_process._initialize_reserved_process
     real_capture = isolated_process._capture_worker_session
     real_monotonic = time.monotonic
     controller_clock = SimpleNamespace(expired=False)
@@ -403,20 +830,33 @@ def test_round11_preset_cancel_precedes_publication_deadline_and_keeps_capture(
     )
     controller_clock.sleep = time.sleep
     captured_workers: list[Any] = []
+    initializer_calls: list[bool] = []
 
-    def launch_then_expire(*args: Any, **kwargs: Any) -> None:
-        real_launch(*args, **kwargs)
+    def initialize_then_expire(
+        process: subprocess.Popen[bytes],
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        initializer_calls.append(True)
+        real_initialize(process, *args, **kwargs)
         controller_clock.expired = True
 
-    def observed_capture(process: isolated_process._SpawnedProcess) -> object:
-        worker = real_capture(process)
+    def observed_capture(
+        process: isolated_process._SpawnedProcess,
+        retained_worker: Any,
+    ) -> object:
+        worker = real_capture(process, retained_worker)
         captured_workers.append(worker)
         return worker
 
     cancellation = isolated_process.ProcessCancellation()
     cancellation.set()
     monkeypatch.setattr(isolated_process, "time", controller_clock)
-    monkeypatch.setattr(isolated_process, "_launch_supervisor", launch_then_expire)
+    monkeypatch.setattr(
+        isolated_process,
+        "_initialize_reserved_process",
+        initialize_then_expire,
+    )
     monkeypatch.setattr(isolated_process, "_capture_worker_session", observed_capture)
 
     result = isolated_process.run_isolated_process(
@@ -429,8 +869,8 @@ def test_round11_preset_cancel_precedes_publication_deadline_and_keeps_capture(
     )
 
     assert result == isolated_process.IsolatedProcessResult(None, "cancelled")
-    assert len(captured_workers) == 1
-    assert captured_workers[0].cleaned
+    assert initializer_calls == []
+    assert captured_workers == []
 
 
 @pytest.mark.parametrize(
@@ -496,6 +936,7 @@ def test_round11_close_fault_never_retries_same_pipe_replacement_descriptor(
 ) -> None:
     """A same-inode dup2 replacement is never acted on through stale endpoint ownership."""
 
+    monkeypatch.setattr(isolated_process, "_PRIVATE_PIPE_STATE_POISONED", False)
     reader, writer = isolated_process.private_pipe_channel()
     endpoint = reader if endpoint_kind == "reader" else writer
     other_endpoint = writer if endpoint_kind == "reader" else reader
@@ -520,17 +961,14 @@ def test_round11_close_fault_never_retries_same_pipe_replacement_descriptor(
     try:
         with pytest.raises(OSError, match="same-pipe reuse"):
             endpoint.close()
-        admitted_reader, admitted_writer = isolated_process.private_pipe_channel()
-        admitted_reader.close()
-        admitted_writer.close()
+        with pytest.raises(isolated_process.IsolatedProcessCleanupError):
+            isolated_process.private_pipe_channel()
         assert endpoint.closed
         assert _descriptor_identity(descriptor) == replacement_identity
     finally:
         monkeypatch.setattr(isolated_process.os, "close", real_close)
-        with suppress(OSError):
-            real_close(descriptor)
-        with suppress(OSError):
-            real_close(replacement_source)
+        real_close(descriptor)
+        real_close(replacement_source)
         other_endpoint.close()
 
 

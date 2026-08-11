@@ -186,7 +186,7 @@ class WorkflowVersionNeutralState:
 # direction, so an unmigrated or future database never silently processes cases.
 SCHEMA_VERSIONS: dict[DatabaseKind, int] = {
     DatabaseKind.INVENTORY: 1,
-    DatabaseKind.WORKFLOW: 4,
+    DatabaseKind.WORKFLOW: 5,
 }
 
 # Named indexes created by the migrations; verification fails when one is missing.
@@ -201,6 +201,7 @@ REQUIRED_INDEXES: dict[DatabaseKind, frozenset[str]] = {
             "idx_events_case_created",
             "idx_review_requests_case_sequence",
             "idx_cases_execution_lease",
+            "idx_cases_case_generation",
             "idx_legacy_authorization_quarantine_reconciliation",
         }
     ),
@@ -320,6 +321,7 @@ def _packaged_workflow_trigger_definitions() -> dict[str, str]:
     root = files("invoice_agents.db").joinpath("migrations", "workflow")
     scripts = (
         root.joinpath("003_execution_fencing.sql").read_text(encoding="utf-8"),
+        root.joinpath("005_result_artifact_bindings.sql").read_text(encoding="utf-8"),
         root.joinpath("legacy_authorization_archive.sql").read_text(encoding="utf-8"),
     )
     definitions = {
@@ -2934,6 +2936,15 @@ def _verify_database_snapshot(
                 "archived_at",
             },
             "events": {"case_id", "event_type", "payload_json"},
+            "result_artifact_bindings": {
+                "case_id",
+                "execution_generation",
+                "artifact_sha256",
+                "artifact_device",
+                "artifact_inode",
+                "artifact_file_type",
+                "artifact_size_bytes",
+            },
         }
     try:
         with connect_database(resolved, read_only=True) as connection:

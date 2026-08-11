@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -48,6 +49,7 @@ REQUIRED_JOURNAL_MODE = "delete"
 _DATETIME_WIRE_TYPE = datetime
 _DATETIME_ADAPTER = TypeAdapter(datetime)
 _REQUESTED_EXECUTION_TOKEN = re.compile(r"^exec_[0-9a-f]{32}$")
+_ARTIFACT_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _STORED_FINISHED_AT_OMITTED = object()
 
 
@@ -55,6 +57,46 @@ def _validated_requested_execution_token(token: object) -> str:
     if type(token) is not str or _REQUESTED_EXECUTION_TOKEN.fullmatch(token) is None:
         raise ValueError("requested execution token is not canonical")
     return token
+
+
+def _execute_result_artifact_binding(
+    connection: sqlite3.Connection,
+    statement: str,
+    parameters: tuple[object, ...],
+) -> sqlite3.Cursor:
+    """Execute the one binding mutation through an injectable kernel seam."""
+
+    return connection.execute(statement, parameters)
+
+
+def _commit_result_artifact_binding(connection: sqlite3.Connection) -> None:
+    """Commit the binding transaction through an injectable kernel seam."""
+
+    connection.commit()
+
+
+def _rollback_result_artifact_binding(connection: sqlite3.Connection) -> None:
+    """Rollback the binding transaction through an injectable kernel seam."""
+
+    connection.rollback()
+
+
+def _binding_failure_precedence(
+    primary: BaseException,
+    *secondary: BaseException | None,
+) -> BaseException:
+    """Return the earliest process control, otherwise the primary failure."""
+
+    for failure in (primary, *secondary):
+        if failure is not None and not isinstance(failure, Exception):
+            return failure
+    return primary
+
+
+def _raise_chainless(error: BaseException) -> Never:
+    error.__cause__ = None
+    error.__context__ = None
+    raise error from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +120,19 @@ class CaseExecutionSnapshot:
     execution_token: str | None
     execution_generation: int
     lease_expires_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResultArtifactBinding:
+    """Exact durable file identity authorized for one terminal generation."""
+
+    case_id: str
+    execution_generation: int
+    artifact_sha256: str
+    artifact_device: int
+    artifact_inode: int
+    artifact_file_type: int
+    artifact_size_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1445,6 +1500,10 @@ class WorkflowStore:
                     require_result=previous_state == "FINISHED",
                 )
                 generation = previous_generation + 1
+                connection.execute(
+                    "DELETE FROM result_artifact_bindings WHERE case_id = ?",
+                    (case_id,),
+                )
                 updated = connection.execute(
                     "UPDATE cases SET execution_token = ?, "
                     "execution_generation = ?, "
@@ -1516,6 +1575,10 @@ class WorkflowStore:
             connection.execute("BEGIN IMMEDIATE")
             released_at = datetime.now(UTC)
             self._require_current_claim(connection, claim, released_at)
+            connection.execute(
+                "DELETE FROM result_artifact_bindings WHERE case_id = ?",
+                (claim.case_id,),
+            )
             updated = connection.execute(
                 "UPDATE cases SET execution_token = NULL, execution_state = 'IDLE', "
                 "lease_expires_at = NULL, updated_at = ? WHERE case_id = ? "
@@ -1559,6 +1622,10 @@ class WorkflowStore:
             self._require_current_claim(connection, claim, handed_off_at)
             generation = claim.generation + 1
             expires_at = handed_off_at + timedelta(seconds=lease_seconds)
+            connection.execute(
+                "DELETE FROM result_artifact_bindings WHERE case_id = ?",
+                (claim.case_id,),
+            )
             updated = connection.execute(
                 "UPDATE cases SET execution_token = ?, execution_generation = ?, "
                 "lease_expires_at = ?, updated_at = ? WHERE case_id = ? "
@@ -1809,6 +1876,10 @@ class WorkflowStore:
                         ) from exc
                     recovery_generation = int(row["execution_generation"]) + 1
                     recovery_token = f"exec_{uuid4().hex}"
+                    connection.execute(
+                        "DELETE FROM result_artifact_bindings WHERE case_id = ?",
+                        (row["case_id"],),
+                    )
                     updated = connection.execute(
                         "UPDATE cases SET status = ?, stop_reason = ?, result_json = ?, "
                         "updated_at = ?, finished_at = ?, execution_token = ?, "
@@ -3151,6 +3222,10 @@ class WorkflowStore:
             self._require_current_claim(connection, claim, datetime.fromisoformat(written_at))
             self._require_terminal_result_identity(connection, result)
             encoded_result = self._encode_terminal_result(connection, result)
+            connection.execute(
+                "DELETE FROM result_artifact_bindings WHERE case_id = ?",
+                (result.case_id,),
+            )
             updated = connection.execute(
                 "UPDATE cases SET status = ?, stop_reason = ?, result_json = ?, updated_at = ?, "
                 "finished_at = ?, execution_state = 'FINISHED', lease_expires_at = NULL "
@@ -3208,6 +3283,10 @@ class WorkflowStore:
             )
             self._require_terminal_result_identity(connection, result)
             encoded_result = self._encode_terminal_result(connection, result)
+            connection.execute(
+                "DELETE FROM result_artifact_bindings WHERE case_id = ?",
+                (result.case_id,),
+            )
             updated = connection.execute(
                 "UPDATE cases SET status = ?, stop_reason = ?, result_json = ?, "
                 "updated_at = ?, finished_at = ? WHERE case_id = ? "
@@ -3291,6 +3370,240 @@ class WorkflowStore:
                 stop_reason="PERSISTED_RESULT_INVALID",
             ) from None
         return None
+
+    @staticmethod
+    def _artifact_binding_is_valid(binding: object) -> bool:
+        return (
+            type(binding) is ResultArtifactBinding
+            and type(binding.case_id) is str
+            and bool(binding.case_id)
+            and type(binding.execution_generation) is int
+            and binding.execution_generation >= 1
+            and type(binding.artifact_sha256) is str
+            and _ARTIFACT_SHA256.fullmatch(binding.artifact_sha256) is not None
+            and type(binding.artifact_device) is int
+            and binding.artifact_device >= 0
+            and type(binding.artifact_inode) is int
+            and binding.artifact_inode > 0
+            and type(binding.artifact_file_type) is int
+            and binding.artifact_file_type == stat.S_IFREG
+            and type(binding.artifact_size_bytes) is int
+            and binding.artifact_size_bytes >= 0
+        )
+
+    @classmethod
+    def _decode_result_artifact_binding_row(
+        cls,
+        row: sqlite3.Row,
+    ) -> ResultArtifactBinding | None:
+        if row["binding_case_id"] is None:
+            return None
+        binding = ResultArtifactBinding(
+            case_id=row["binding_case_id"],
+            execution_generation=row["binding_execution_generation"],
+            artifact_sha256=row["artifact_sha256"],
+            artifact_device=row["artifact_device"],
+            artifact_inode=row["artifact_inode"],
+            artifact_file_type=row["artifact_file_type"],
+            artifact_size_bytes=row["artifact_size_bytes"],
+        )
+        if (
+            not cls._artifact_binding_is_valid(binding)
+            or binding.case_id != row["case_id"]
+            or binding.execution_generation != row["execution_generation"]
+        ):
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "case has an invalid persisted result-artifact binding",
+                case_id=str(row["case_id"]),
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from None
+        return binding
+
+    def load_result_with_artifact_binding(
+        self,
+        case_id: str,
+    ) -> tuple[CaseResult | None, int, ResultArtifactBinding | None]:
+        """Read terminal result, current generation, and binding in one snapshot."""
+
+        with connect_database(self.path, read_only=True) as connection:
+            connection.execute("BEGIN")
+            row = connection.execute(
+                "SELECT c.case_id, c.source_id, c.status, c.stop_reason, c.result_json, "
+                "c.started_at, c.finished_at, c.execution_token, c.execution_generation, "
+                "c.execution_state, c.lease_expires_at, "
+                "b.case_id AS binding_case_id, "
+                "b.execution_generation AS binding_execution_generation, "
+                "b.artifact_sha256, b.artifact_device, b.artifact_inode, "
+                "b.artifact_file_type, b.artifact_size_bytes "
+                "FROM cases c LEFT JOIN result_artifact_bindings b ON b.case_id = c.case_id "
+                "WHERE c.case_id = ?",
+                (case_id,),
+            ).fetchone()
+        if row is None:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                f"case does not exist: {case_id}",
+                case_id=case_id,
+                stop_reason="CASE_NOT_FOUND",
+            ) from None
+        if not self._authority_tuple_is_valid(row):
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "case has an invalid execution authority for result-artifact binding",
+                case_id=case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from None
+        terminal_parent = row["execution_state"] == "FINISHED"
+        result = self._decode_optional_stored_result_row(
+            row,
+            predecessor=not terminal_parent,
+            require_result=terminal_parent,
+        )
+        generation = row["execution_generation"]
+        if type(generation) is not int or generation < 0:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "case has an invalid execution generation",
+                case_id=case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from None
+        binding = self._decode_result_artifact_binding_row(row)
+        if binding is not None and (not terminal_parent or result is None):
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "case has a result-artifact binding without exact terminal authority",
+                case_id=case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
+            ) from None
+        return result, generation, binding
+
+    def load_result_artifact_binding(self, case_id: str) -> ResultArtifactBinding | None:
+        """Load only the binding currently authorized by the case generation."""
+
+        _result, _generation, binding = self.load_result_with_artifact_binding(case_id)
+        return binding
+
+    def save_result_artifact_binding(
+        self,
+        binding: ResultArtifactBinding,
+        result: CaseResult,
+    ) -> None:
+        """Bind an already-durable exact file to the still-current terminal result."""
+
+        if not self._artifact_binding_is_valid(binding) or binding.case_id != result.case_id:
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "result-artifact binding has an invalid runtime shape",
+                case_id=result.case_id,
+                stop_reason="RESULT_ARTIFACT_BINDING_INVALID",
+            ) from None
+        primary_failure: BaseException | None = None
+        rollback_failure: BaseException | None = None
+        with connect_database(self.path) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT case_id, source_id, status, stop_reason, result_json, started_at, "
+                    "finished_at, execution_token, execution_generation, execution_state, "
+                    "lease_expires_at FROM cases WHERE case_id = ?",
+                    (binding.case_id,),
+                ).fetchone()
+                if (
+                    row is None
+                    or not self._authority_tuple_is_valid(row)
+                    or row["execution_state"] != "FINISHED"
+                    or row["lease_expires_at"] is not None
+                    or row["execution_generation"] != binding.execution_generation
+                ):
+                    raise InvoiceAgentsError(
+                        ErrorCategory.DATABASE,
+                        "result-artifact binding authority is no longer current",
+                        case_id=binding.case_id,
+                        stop_reason="RESULT_ARTIFACT_BINDING_STALE",
+                    )
+                stored = self._decode_optional_stored_result_row(
+                    row,
+                    predecessor=False,
+                    require_result=True,
+                )
+                if stored != result:
+                    raise InvoiceAgentsError(
+                        ErrorCategory.DATABASE,
+                        "result-artifact binding does not match the current terminal result",
+                        case_id=binding.case_id,
+                        stop_reason="RESULT_ARTIFACT_BINDING_STALE",
+                    )
+                _execute_result_artifact_binding(
+                    connection,
+                    "INSERT INTO result_artifact_bindings("
+                    "case_id, execution_generation, artifact_sha256, artifact_device, "
+                    "artifact_inode, artifact_file_type, artifact_size_bytes) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(case_id) DO UPDATE SET "
+                    "execution_generation = excluded.execution_generation, "
+                    "artifact_sha256 = excluded.artifact_sha256, "
+                    "artifact_device = excluded.artifact_device, "
+                    "artifact_inode = excluded.artifact_inode, "
+                    "artifact_file_type = excluded.artifact_file_type, "
+                    "artifact_size_bytes = excluded.artifact_size_bytes",
+                    (
+                        binding.case_id,
+                        binding.execution_generation,
+                        binding.artifact_sha256,
+                        binding.artifact_device,
+                        binding.artifact_inode,
+                        binding.artifact_file_type,
+                        binding.artifact_size_bytes,
+                    ),
+                )
+                _commit_result_artifact_binding(connection)
+                return
+            except BaseException as exc:
+                primary_failure = exc
+                try:
+                    _rollback_result_artifact_binding(connection)
+                except BaseException as rollback_exc:
+                    rollback_failure = rollback_exc
+
+        assert primary_failure is not None
+        selected_failure = _binding_failure_precedence(primary_failure, rollback_failure)
+        try:
+            observed_result, observed_generation, observed_binding = (
+                self.load_result_with_artifact_binding(binding.case_id)
+            )
+        except BaseException as readback_failure:
+            unresolved_failure = _binding_failure_precedence(
+                primary_failure,
+                rollback_failure,
+                readback_failure,
+            )
+            if not isinstance(unresolved_failure, Exception):
+                _raise_chainless(unresolved_failure)
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                "result-artifact binding transaction outcome could not be proven",
+                case_id=binding.case_id,
+                stop_reason="RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED",
+            ) from None
+        exact_parent = (
+            observed_result == result
+            and observed_generation == binding.execution_generation
+        )
+        if exact_parent and observed_binding == binding:
+            if not isinstance(selected_failure, Exception):
+                _raise_chainless(selected_failure)
+            return
+        if exact_parent and observed_binding is None:
+            _raise_chainless(selected_failure)
+        if not isinstance(selected_failure, Exception):
+            _raise_chainless(selected_failure)
+        raise InvoiceAgentsError(
+            ErrorCategory.DATABASE,
+            "result-artifact binding transaction resolved to a contradictory state",
+            case_id=binding.case_id,
+            stop_reason="RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED",
+        ) from None
 
     def count_events(self, case_id: str, event_type: str) -> int:
         """Count persisted audit events of one type; retries use 'provider.retry'."""

@@ -50,6 +50,7 @@ def _workflow_resources() -> list[Any]:
         "002_review_sequence.sql",
         "003_execution_fencing.sql",
         "004_execution_token_grammar.sql",
+        "005_result_artifact_bindings.sql",
     ]
     return resources
 
@@ -433,7 +434,7 @@ def test_round7_public_v3_migration_replays_each_aa9e43b_recovery_path(
     assert before["execution_generation"] == abandoned_generation + 1
     assert before["execution_token"] == f"recovery_{_TOKEN_SUFFIXES[case_id]}"
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [4]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [4, 5]
 
     after = _case_row(path, case_id)
     assert after == {
@@ -485,7 +486,7 @@ def test_round7_public_migration_accepts_aa9e_wire_unicode_and_large_integer_val
         connection.commit()
     before = _case_row(path, case_id)
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [4]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [4, 5]
     assert _case_row(path, case_id) == {
         **before,
         "execution_token": f"exec_{_TOKEN_SUFFIXES[case_id]}",
@@ -523,7 +524,7 @@ def test_round7_public_migration_accepts_complete_strict_nested_case_result(
         connection.commit()
     before = _case_row(path, case_id)
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [4]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [4, 5]
     assert _case_row(path, case_id) == {
         **before,
         "execution_token": f"exec_{_TOKEN_SUFFIXES[case_id]}",

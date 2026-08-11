@@ -2151,7 +2151,7 @@ def test_mapping_review_authorizes_only_its_exact_recomputed_successor_and_payme
             DatabaseKind.WORKFLOW,
             settings=settings,
         )["schema_version"]
-        == 4
+        == 5
     )
     with connect_database(settings.inventory_db, read_only=True) as connection:
         alias = connection.execute(
@@ -2847,13 +2847,13 @@ def test_migration_003_rolls_back_and_is_retryable_after_mid_migration_failure(
         )
         connection.commit()
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4, 5]
     inventory = tmp_path / "inventory-atomic.db"
     migrate_database(inventory, DatabaseKind.INVENTORY)
     seed_inventory(inventory)
     audit_settings = Settings(workflow_db=path, inventory_db=inventory)
     assert (
-        verify_database(path, DatabaseKind.WORKFLOW, settings=audit_settings)["schema_version"] == 4
+        verify_database(path, DatabaseKind.WORKFLOW, settings=audit_settings)["schema_version"] == 5
     )
     with real_connect(path, read_only=True) as connection:
         identity_columns = {
@@ -3078,13 +3078,13 @@ def test_migration_003_rejects_unanchored_legacy_authorization_atomically_and_re
         confirmed=True,
     )
     assert receipt.record_count == 1 + int(include_payment)
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4, 5]
     inventory = tmp_path / "inventory-legacy-authorization.db"
     migrate_database(inventory, DatabaseKind.INVENTORY)
     seed_inventory(inventory)
     audit_settings = Settings(workflow_db=path, inventory_db=inventory)
     assert (
-        verify_database(path, DatabaseKind.WORKFLOW, settings=audit_settings)["schema_version"] == 4
+        verify_database(path, DatabaseKind.WORKFLOW, settings=audit_settings)["schema_version"] == 5
     )
 
 
@@ -3109,7 +3109,7 @@ def test_workflow_preflight_rejects_unanchored_v3_authorization_rows(
             DatabaseKind.WORKFLOW,
             settings=settings,
         )["schema_version"]
-        == 4
+        == 5
     )
 
     trigger_name = "trg_validated_evidence_snapshots_delete"
@@ -3235,7 +3235,7 @@ def test_workflow_preflight_accepts_complete_review_bound_payment_authorization(
         settings=settings,
     )
 
-    assert report["schema_version"] == 4
+    assert report["schema_version"] == 5
 
 
 def test_workflow_v3_verification_requires_explicit_settings_context(

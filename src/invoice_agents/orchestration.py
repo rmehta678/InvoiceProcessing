@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import hashlib
 import json
 import os
 import re
 import sqlite3
+import stat
 import threading
 from collections.abc import Awaitable, Callable
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -34,6 +38,7 @@ from invoice_agents.db.core import DatabaseKind, verify_database
 from invoice_agents.db.store import (
     CaseExecutionSnapshot,
     ExecutionClaim,
+    ResultArtifactBinding,
     WorkflowStore,
     parse_canonical_utc,
     validate_execution_claim,
@@ -378,6 +383,49 @@ def _append_error(result: CaseResult, error: ErrorRecord) -> None:
     result.errors = [*result.errors, error]
 
 
+_ARTIFACT_RESULT_ERROR_STOPS = frozenset(
+    {
+        "RESULT_ARTIFACT_WRITE_CANCELLED",
+        "RESULT_ARTIFACT_WRITE_FAILED",
+        "RESULT_ARTIFACT_DURABILITY_UNRESOLVED",
+    }
+)
+
+
+def _append_error_before_artifact(result: CaseResult, error: ErrorRecord) -> None:
+    """Keep terminal boundary error ordering stable after publication is deferred."""
+
+    insertion = len(result.errors)
+    while (
+        insertion > 0 and result.errors[insertion - 1].stop_reason in _ARTIFACT_RESULT_ERROR_STOPS
+    ):
+        insertion -= 1
+    result.errors = [*result.errors[:insertion], error, *result.errors[insertion:]]
+
+
+def _artifact_durability_unresolved_result(result: CaseResult) -> CaseResult:
+    stop_reason = "RESULT_ARTIFACT_DURABILITY_UNRESOLVED"
+    unresolved = result.model_copy(
+        update={
+            "status": CaseStatus.INCOMPLETE,
+            "stop_reason": stop_reason,
+            "finished_at": _now(),
+        },
+        deep=True,
+    )
+    if not unresolved.errors or unresolved.errors[-1].stop_reason != stop_reason:
+        _append_error(
+            unresolved,
+            ErrorRecord(
+                category=ErrorCategory.ORCHESTRATION,
+                message="result artifact rollback durability could not be proven",
+                case_id=result.case_id,
+                stop_reason=stop_reason,
+            ),
+        )
+    return unresolved
+
+
 def _cancellation_may_define_outcome(control_exception: BaseException | None) -> bool:
     return control_exception is None or isinstance(control_exception, asyncio.CancelledError)
 
@@ -658,6 +706,9 @@ def _recovery_artifact_or_raise(
         details={
             "terminal_persistence_stop_reason": terminal_persistence_error.stop_reason,
             "artifact_exception_type": type(artifact_exc).__name__,
+            "artifact_publication_stop_reason": (
+                artifact_exc.stop_reason if isinstance(artifact_exc, InvoiceAgentsError) else None
+            ),
         },
     ) from None
 
@@ -687,26 +738,49 @@ async def _close_claimed_client(execution: _ClaimedExecution) -> _CleanupOutcome
             return exc
         return None
 
+    deadline = monotonic() + CLIENT_CLOSE_TIMEOUT_SECONDS
     close_task = asyncio.create_task(capture_close())
+    boundary_control: BaseException | None = None
     try:
         close_failure = await asyncio.wait_for(
             asyncio.shield(close_task),
-            timeout=CLIENT_CLOSE_TIMEOUT_SECONDS,
+            timeout=max(0.0, deadline - monotonic()),
         )
-        if close_failure is not None:
-            raise close_failure
     except asyncio.CancelledError as exc:
-        close_task.cancel()
-        close_task.add_done_callback(_consume_task_result)
-        return _CleanupOutcome(
-            error=ErrorRecord(
-                category=ErrorCategory.CANCELLED,
-                message="client cleanup was cancelled",
-                case_id=execution.case_id,
-                stop_reason="CLIENT_CLOSE_CANCELLED",
-            ),
-            control_exception=exc,
-        )
+        boundary_control = exc
+        if close_task.done():
+            close_failure = close_task.result()
+        else:
+            try:
+                close_failure = await _await_task_despite_cancellation(
+                    close_task,
+                    deadline=deadline,
+                    case_id=execution.case_id,
+                )
+            except InvoiceAgentsError:
+                close_task.cancel()
+                close_task.add_done_callback(_consume_task_result)
+                return _CleanupOutcome(
+                    error=ErrorRecord(
+                        category=ErrorCategory.TIMEOUT,
+                        message="client cleanup exceeded its bounded timeout",
+                        case_id=execution.case_id,
+                        stop_reason="CLIENT_CLOSE_TIMEOUT",
+                    ),
+                    control_exception=boundary_control,
+                )
+            except BaseException as drain_error:
+                close_failure = drain_error
+        if close_failure is None:
+            return _CleanupOutcome(
+                error=ErrorRecord(
+                    category=ErrorCategory.CANCELLED,
+                    message="client cleanup was cancelled",
+                    case_id=execution.case_id,
+                    stop_reason="CLIENT_CLOSE_CANCELLED",
+                ),
+                control_exception=boundary_control,
+            )
     except TimeoutError:
         close_task.cancel()
         close_task.add_done_callback(_consume_task_result)
@@ -716,18 +790,32 @@ async def _close_claimed_client(execution: _ClaimedExecution) -> _CleanupOutcome
                 message="client cleanup exceeded its bounded timeout",
                 case_id=execution.case_id,
                 stop_reason="CLIENT_CLOSE_TIMEOUT",
-            )
+            ),
         )
-    except BaseException as exc:
+    if isinstance(close_failure, asyncio.CancelledError):
+        return _CleanupOutcome(
+            error=ErrorRecord(
+                category=ErrorCategory.CANCELLED,
+                message="client cleanup was cancelled",
+                case_id=execution.case_id,
+                stop_reason="CLIENT_CLOSE_CANCELLED",
+            ),
+            control_exception=boundary_control or close_failure,
+        )
+    if close_failure is not None:
         return _CleanupOutcome(
             error=_secondary_error(
-                exc,
+                close_failure,
                 case_id=execution.case_id,
                 category=ErrorCategory.ORCHESTRATION,
                 stop_reason="CLIENT_CLOSE_FAILED",
                 message="client cleanup failed",
             ),
-            control_exception=exc if not isinstance(exc, Exception) else None,
+            control_exception=(
+                boundary_control
+                if boundary_control is not None
+                else close_failure if not isinstance(close_failure, Exception) else None
+            ),
         )
     return _CleanupOutcome()
 
@@ -738,6 +826,125 @@ class _PersistenceOutcome:
     persisted: bool
     persistence_error: ErrorRecord | None
     control_exception: BaseException | None
+
+
+@dataclass(frozen=True, slots=True)
+class _TerminalWriteBoundaryOutcome:
+    """One helper result plus the exact claim evidence read under its deadline."""
+
+    process_outcome: TerminalProcessOutcome
+    evidence: _ExactClaimEvidence
+    control_exception: BaseException | None
+
+
+def _select_terminal_control_exception(
+    prior: BaseException | None,
+    later: BaseException | None,
+) -> BaseException | None:
+    """Retain explicit durability loss, then process control, then first failure."""
+
+    for candidate in (prior, later):
+        if (
+            isinstance(candidate, InvoiceAgentsError)
+            and candidate.stop_reason in _DURABILITY_PRECEDENCE_STOPS
+        ):
+            return candidate
+
+    if prior is not None and not isinstance(prior, (Exception, asyncio.CancelledError)):
+        return prior
+    if later is not None and not isinstance(later, (Exception, asyncio.CancelledError)):
+        return later
+    return prior if prior is not None else later
+
+
+def _terminal_outcome_evidence(
+    outcome: TerminalProcessOutcome,
+) -> _ExactClaimEvidence | None:
+    """Translate only one strict helper evidence state into parent-owned evidence."""
+
+    state = getattr(outcome, "evidence_state", None)
+    result = getattr(outcome, "evidence_result", None)
+    if state == _ExactClaimEvidenceState.RECOVERABLE_RUNNING.value and result is None:
+        return _ExactClaimEvidence(_ExactClaimEvidenceState.RECOVERABLE_RUNNING, None)
+    if (
+        state == _ExactClaimEvidenceState.DURABLE_DATABASE_RESULT.value
+        and type(result) is CaseResult
+    ):
+        return _ExactClaimEvidence(_ExactClaimEvidenceState.DURABLE_DATABASE_RESULT, result)
+    return None
+
+
+def _terminal_durability_timeout(case_id: str) -> InvoiceAgentsError:
+    return InvoiceAgentsError(
+        ErrorCategory.TIMEOUT,
+        "terminal durability work exceeded its monotonic deadline",
+        case_id=case_id,
+        stop_reason="TERMINAL_DURABILITY_TIMEOUT",
+    )
+
+
+async def _run_terminal_mode_owned(
+    *,
+    mode: Literal[
+        "cancel_unstarted",
+        "finish",
+        "inspect_claim",
+        "publish_cancel_recovery",
+        "update",
+    ],
+    settings: Settings,
+    claim: ExecutionClaim,
+    deadline: float,
+    started_at: datetime | None = None,
+    result: CaseResult | None = None,
+    worker_error_code: str | None = None,
+    prior_cancellation: asyncio.CancelledError | None = None,
+) -> tuple[TerminalProcessOutcome, BaseException | None]:
+    """Run one self-bounded helper and drain its thread through caller cancellation."""
+
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise _terminal_durability_timeout(claim.case_id) from None
+    timeout_seconds = float(min(DURABILITY_DEADLINE_SECONDS, remaining))
+
+    def invoke() -> tuple[TerminalProcessOutcome, BaseException | None]:
+        try:
+            return (
+                run_terminal_process(
+                    mode=mode,
+                    settings=settings,
+                    claim=claim,
+                    timeout_seconds=timeout_seconds,
+                    started_at=started_at,
+                    result=result,
+                    worker_error_code=worker_error_code,
+                ),
+                None,
+            )
+        except InvoiceAgentsError as exc:
+            if exc.stop_reason in _DURABILITY_PRECEDENCE_STOPS:
+                raise
+            return TerminalProcessOutcome(None, "TERMINAL_WORKER_FAILED"), exc
+        except BaseException as exc:
+            return TerminalProcessOutcome(None, "TERMINAL_WORKER_FAILED"), exc
+
+    worker = asyncio.create_task(
+        asyncio.to_thread(invoke),
+        name=f"invoice-terminal-{mode}-{claim.case_id}",
+    )
+    cancellation = prior_cancellation
+    while True:
+        try:
+            outcome, process_control = await asyncio.shield(worker)
+            return outcome, _select_terminal_control_exception(cancellation, process_control)
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+            if worker.done():
+                outcome, process_control = worker.result()
+                return outcome, _select_terminal_control_exception(
+                    cancellation,
+                    process_control,
+                )
 
 
 def _persist_terminal_result(
@@ -813,61 +1020,51 @@ async def _terminal_process_write(
     result: CaseResult,
     *,
     mode: Literal["finish", "update"],
-) -> tuple[object, CaseResult | None, BaseException | None]:
-    """Run one terminal write outside the event loop and return only authoritative reread."""
+    durability_deadline: float | None = None,
+) -> _TerminalWriteBoundaryOutcome:
+    """Run one terminal write and return evidence from only reaped helper sessions."""
 
     settings = execution.store._snapshot_settings()
-
-    def invoke() -> tuple[TerminalProcessOutcome, BaseException | None]:
-        try:
-            return (
-                run_terminal_process(
-                    mode=mode,
-                    settings=settings,
-                    claim=execution.claim,
-                    timeout_seconds=float(DURABILITY_DEADLINE_SECONDS),
-                    result=result,
-                ),
-                None,
-            )
-        except BaseException as exc:
-            # Process-control exceptions must be data before they cross an
-            # executor Future; SystemExit raised by a worker seam can otherwise
-            # escape asyncio's task ownership during loop shutdown.
-            return TerminalProcessOutcome(None, "TERMINAL_WORKER_FAILED"), exc
-
-    worker = asyncio.create_task(
-        asyncio.to_thread(invoke),
-        name=f"invoice-terminal-{mode}-{execution.case_id}",
+    if durability_deadline is None:
+        durability_deadline = (
+            monotonic() + DURABILITY_DEADLINE_SECONDS + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+        )
+    outcome, boundary_control = await _run_terminal_mode_owned(
+        mode=mode,
+        settings=settings,
+        claim=execution.claim,
+        deadline=durability_deadline,
+        result=result,
     )
-    boundary_control: BaseException | None = None
-    try:
-        outcome, boundary_control = await asyncio.shield(worker)
-    except asyncio.CancelledError as exc:
-        if worker.done():
-            outcome, boundary_control = worker.result()
-        else:
-            outcome, worker_control = await _await_task_despite_cancellation(
-                worker,
-                deadline=(
-                    monotonic()
-                    + DURABILITY_DEADLINE_SECONDS
-                    + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
-                ),
-                case_id=execution.case_id,
-            )
-            boundary_control = worker_control or exc
-    evidence = await asyncio.to_thread(
-        _inspect_exact_claim_evidence,
-        execution.store,
-        execution.claim,
+    evidence = _terminal_outcome_evidence(outcome)
+    if evidence is None:
+        if monotonic() >= durability_deadline:
+            raise _terminal_durability_timeout(execution.case_id) from None
+        inspection, inspection_control = await _run_terminal_mode_owned(
+            mode="inspect_claim",
+            settings=settings,
+            claim=execution.claim,
+            deadline=durability_deadline,
+            prior_cancellation=(
+                boundary_control if isinstance(boundary_control, asyncio.CancelledError) else None
+            ),
+        )
+        boundary_control = _select_terminal_control_exception(
+            boundary_control,
+            inspection_control,
+        )
+        evidence = _terminal_outcome_evidence(inspection)
+        if evidence is None:
+            if outcome.error_code == "TERMINAL_WORKER_TIMEOUT" or (
+                inspection.error_code == "TERMINAL_WORKER_TIMEOUT"
+            ):
+                raise _terminal_durability_timeout(execution.case_id) from None
+            raise _unresolved_durability_error(execution.case_id) from None
+    return _TerminalWriteBoundaryOutcome(
+        process_outcome=outcome,
+        evidence=evidence,
+        control_exception=boundary_control,
     )
-    stored = (
-        evidence.result
-        if evidence.state is _ExactClaimEvidenceState.DURABLE_DATABASE_RESULT
-        else None
-    )
-    return outcome, stored, boundary_control
 
 
 def _terminal_process_error(
@@ -902,12 +1099,27 @@ async def _persist_terminal_result_safely(
 ) -> _PersistenceOutcome:
     """Persist in a terminable helper; cancellation may require one fenced update."""
 
-    outcome, stored, boundary_control = await _terminal_process_write(
+    durability_deadline = (
+        monotonic() + DURABILITY_DEADLINE_SECONDS + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+    )
+    write = await _terminal_process_write(
         execution,
         result,
         mode="finish",
+        durability_deadline=durability_deadline,
     )
-    control_exception = control_exception or boundary_control
+    outcome = write.process_outcome
+    evidence = write.evidence
+    boundary_control = write.control_exception
+    stored = (
+        evidence.result
+        if evidence.state is _ExactClaimEvidenceState.DURABLE_DATABASE_RESULT
+        else None
+    )
+    control_exception = _select_terminal_control_exception(
+        control_exception,
+        boundary_control,
+    )
     if stored is not None:
         if boundary_control is not None and _cancellation_may_define_outcome(control_exception):
             cancelled = _cancelled_result(
@@ -922,6 +1134,7 @@ async def _persist_terminal_result_safely(
                 persisted=True,
                 persistence_error=None,
                 control_exception=control_exception,
+                durability_deadline=durability_deadline,
             )
         return _PersistenceOutcome(stored, True, None, control_exception)
     if isinstance(boundary_control, asyncio.CancelledError) and _cancellation_may_define_outcome(
@@ -933,12 +1146,24 @@ async def _persist_terminal_result_safely(
             execution.started_at,
             result,
         )
-        retry_outcome, retry_stored, retry_control = await _terminal_process_write(
+        retry_write = await _terminal_process_write(
             execution,
             cancelled,
             mode="finish",
+            durability_deadline=durability_deadline,
         )
-        control_exception = control_exception or retry_control
+        retry_outcome = retry_write.process_outcome
+        retry_evidence = retry_write.evidence
+        retry_control = retry_write.control_exception
+        retry_stored = (
+            retry_evidence.result
+            if retry_evidence.state is _ExactClaimEvidenceState.DURABLE_DATABASE_RESULT
+            else None
+        )
+        control_exception = _select_terminal_control_exception(
+            control_exception,
+            retry_control,
+        )
         if retry_stored is not None:
             return _PersistenceOutcome(
                 retry_stored,
@@ -947,12 +1172,8 @@ async def _persist_terminal_result_safely(
                 control_exception,
             )
         outcome = retry_outcome
+        evidence = retry_evidence
         result = cancelled
-    evidence = await asyncio.to_thread(
-        _inspect_exact_claim_evidence,
-        execution.store,
-        execution.claim,
-    )
     if evidence.state is not _ExactClaimEvidenceState.RECOVERABLE_RUNNING:
         raise _unresolved_durability_error(execution.case_id) from None
     persistence_error = _terminal_process_error(
@@ -976,17 +1197,33 @@ async def _refresh_terminal_evidence_safely(
     persisted: bool,
     persistence_error: ErrorRecord | None,
     control_exception: BaseException | None,
+    durability_deadline: float | None = None,
 ) -> _PersistenceOutcome:
     if not persisted:
         assert persistence_error is not None
         return _PersistenceOutcome(result, False, persistence_error, control_exception)
     prior_control = control_exception
-    outcome, stored, boundary_control = await _terminal_process_write(
+    if durability_deadline is None:
+        durability_deadline = (
+            monotonic() + DURABILITY_DEADLINE_SECONDS + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+        )
+    write = await _terminal_process_write(
         execution,
         result,
         mode="update",
+        durability_deadline=durability_deadline,
     )
-    control_exception = control_exception or boundary_control
+    outcome = write.process_outcome
+    boundary_control = write.control_exception
+    stored = (
+        write.evidence.result
+        if write.evidence.state is _ExactClaimEvidenceState.DURABLE_DATABASE_RESULT
+        else None
+    )
+    control_exception = _select_terminal_control_exception(
+        control_exception,
+        boundary_control,
+    )
     if stored == result:
         return _PersistenceOutcome(result, True, persistence_error, control_exception)
     if stored is not None:
@@ -1301,13 +1538,12 @@ async def _execute_claimed_case(
         persistence_error = persistence.persistence_error
         control_exception = persistence.control_exception
 
-    if execution.audit is not None:
+    artifact_failure: BaseException | None = None
+    artifact_current = False
+    if persisted:
         try:
-            execution.audit.record(
-                finished_event_type,
-                result.model_dump(mode="json"),
-                source_id=execution.source_id,
-            )
+            _write_bound_result(execution, result)
+            artifact_current = True
         except asyncio.CancelledError as exc:
             cancellation_may_define_outcome = _cancellation_may_define_outcome(control_exception)
             control_exception = control_exception or exc
@@ -1317,6 +1553,104 @@ async def _execute_claimed_case(
                 )
                 cancelled = True
             _append_error(
+                result,
+                ErrorRecord(
+                    category=ErrorCategory.CANCELLED,
+                    message="result artifact publication was cancelled",
+                    case_id=case_id,
+                    stop_reason="RESULT_ARTIFACT_WRITE_CANCELLED",
+                ),
+            )
+            artifact_failure = exc
+        except InvoiceAgentsError as exc:
+            if exc.stop_reason in {
+                "ARTIFACT_PUBLICATION_CLEANUP_UNRESOLVED",
+                "ARTIFACT_PUBLICATION_DURABILITY_UNRESOLVED",
+                "RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED",
+            }:
+                result = _artifact_durability_unresolved_result(result)
+            else:
+                _append_error(
+                    result,
+                    _secondary_error(
+                        exc,
+                        case_id=case_id,
+                        category=ErrorCategory.ORCHESTRATION,
+                        stop_reason="RESULT_ARTIFACT_WRITE_FAILED",
+                        message="atomic result artifact publication failed",
+                    ),
+                )
+            artifact_failure = exc
+        except BaseException as exc:
+            _append_error(
+                result,
+                _secondary_error(
+                    exc,
+                    case_id=case_id,
+                    category=ErrorCategory.ORCHESTRATION,
+                    stop_reason="RESULT_ARTIFACT_WRITE_FAILED",
+                    message="atomic result artifact publication failed",
+                ),
+            )
+            if not isinstance(exc, Exception):
+                control_exception = control_exception or exc
+            artifact_failure = exc
+
+        if artifact_failure is not None:
+            refresh = await refresh_terminal(
+                execution,
+                result,
+                persisted=persisted,
+                persistence_error=persistence_error,
+                control_exception=control_exception,
+            )
+            result = refresh.result
+            persisted = refresh.persisted
+            persistence_error = refresh.persistence_error
+            control_exception = refresh.control_exception
+
+        if (
+            persisted
+            and artifact_failure is not None
+            and getattr(artifact_failure, _PUBLICATION_ROLLBACK_PROVEN, False) is True
+        ):
+            try:
+                _write_bound_result(execution, result)
+                artifact_current = True
+            except BaseException as retry_exc:
+                if not isinstance(retry_exc, Exception):
+                    control_exception = control_exception or retry_exc
+                result = _artifact_durability_unresolved_result(result)
+                refresh = await refresh_terminal(
+                    execution,
+                    result,
+                    persisted=persisted,
+                    persistence_error=persistence_error,
+                    control_exception=control_exception,
+                )
+                result = refresh.result
+                persisted = refresh.persisted
+                persistence_error = refresh.persistence_error
+                control_exception = refresh.control_exception
+
+    audit_failure: BaseException | None = None
+    if execution.audit is not None:
+        try:
+            execution.audit.record(
+                finished_event_type,
+                result.model_dump(mode="json"),
+                source_id=execution.source_id,
+            )
+        except asyncio.CancelledError as exc:
+            audit_failure = exc
+            cancellation_may_define_outcome = _cancellation_may_define_outcome(control_exception)
+            control_exception = control_exception or exc
+            if cancellation_may_define_outcome:
+                result = _cancelled_result(
+                    case_id, execution.source_id, execution.started_at, result
+                )
+                cancelled = True
+            _append_error_before_artifact(
                 result,
                 ErrorRecord(
                     category=ErrorCategory.CANCELLED,
@@ -1337,7 +1671,8 @@ async def _execute_claimed_case(
             persistence_error = refresh.persistence_error
             control_exception = refresh.control_exception
         except BaseException as exc:
-            _append_error(
+            audit_failure = exc
+            _append_error_before_artifact(
                 result,
                 _secondary_error(
                     exc,
@@ -1360,51 +1695,13 @@ async def _execute_claimed_case(
             persisted = refresh.persisted
             persistence_error = refresh.persistence_error
             control_exception = refresh.control_exception
-
-    if persisted:
+    if audit_failure is not None and persisted and artifact_current:
         try:
-            _write_result(result)
-        except asyncio.CancelledError as exc:
-            cancellation_may_define_outcome = _cancellation_may_define_outcome(control_exception)
-            control_exception = control_exception or exc
-            if cancellation_may_define_outcome:
-                result = _cancelled_result(
-                    case_id, execution.source_id, execution.started_at, result
-                )
-                cancelled = True
-            _append_error(
-                result,
-                ErrorRecord(
-                    category=ErrorCategory.CANCELLED,
-                    message="result artifact publication was cancelled",
-                    case_id=case_id,
-                    stop_reason="RESULT_ARTIFACT_WRITE_CANCELLED",
-                ),
-            )
-            refresh = await refresh_terminal(
-                execution,
-                result,
-                persisted=persisted,
-                persistence_error=persistence_error,
-                control_exception=control_exception,
-            )
-            result = refresh.result
-            persisted = refresh.persisted
-            persistence_error = refresh.persistence_error
-            control_exception = refresh.control_exception
+            _write_bound_result(execution, result)
         except BaseException as exc:
-            _append_error(
-                result,
-                _secondary_error(
-                    exc,
-                    case_id=case_id,
-                    category=ErrorCategory.ORCHESTRATION,
-                    stop_reason="RESULT_ARTIFACT_WRITE_FAILED",
-                    message="atomic result artifact publication failed",
-                ),
-            )
             if not isinstance(exc, Exception):
                 control_exception = control_exception or exc
+            result = _artifact_durability_unresolved_result(result)
             refresh = await refresh_terminal(
                 execution,
                 result,
@@ -1730,51 +2027,564 @@ def _result_from_stop(
     )
 
 
-def _write_result(result: CaseResult) -> Path:
-    output_dir = Path("artifacts/results").resolve()
+@dataclass(frozen=True, slots=True)
+class _PublicationReceipt:
+    artifact_sha256: str
+    artifact_device: int
+    artifact_inode: int
+    artifact_file_type: int
+    artifact_size_bytes: int
+
+
+@dataclass(slots=True)
+class _PublicationLockEntry:
+    lock: Any
+    users: int = 0
+
+
+_PUBLICATION_LOCKS_GUARD = threading.Lock()
+_PUBLICATION_LOCKS: dict[str, _PublicationLockEntry] = {}
+
+
+@contextmanager
+def _serialized_publication(target: Path) -> Any:
+    key = os.fspath(target.parent.absolute() / target.name)
+    with _PUBLICATION_LOCKS_GUARD:
+        entry = _PUBLICATION_LOCKS.get(key)
+        if entry is None:
+            entry = _PublicationLockEntry(threading.Lock())
+            _PUBLICATION_LOCKS[key] = entry
+        entry.users += 1
+    entry.lock.acquire()
+    try:
+        yield
+    finally:
+        entry.lock.release()
+        with _PUBLICATION_LOCKS_GUARD:
+            entry.users -= 1
+            if entry.users == 0 and _PUBLICATION_LOCKS.get(key) is entry:
+                del _PUBLICATION_LOCKS[key]
+
+
+def _result_artifact_target(result: CaseResult) -> Path:
+    output_dir = Path.cwd() / "artifacts" / "results"
     output_dir.mkdir(parents=True, exist_ok=True)
-    target = output_dir / f"{result.case_id}.json"
+    return output_dir / f"{result.case_id}.json"
+
+
+def _write_result(result: CaseResult) -> Path:
+    target = _result_artifact_target(result)
     _atomic_publish(target, result.model_dump_json(indent=2).encode("utf-8"))
     return target
 
 
-def _atomic_publish(target: Path, payload: bytes) -> None:
-    """Publish complete bytes with file and directory durability before return."""
+def _write_result_for_generation(
+    store: WorkflowStore,
+    result: CaseResult,
+    execution_generation: int,
+) -> Path:
+    target = _result_artifact_target(result)
+    payload = result.model_dump_json(indent=2).encode("utf-8")
+
+    def bind_published_candidate(receipt: _PublicationReceipt) -> BaseException | None:
+        binding = ResultArtifactBinding(
+            case_id=result.case_id,
+            execution_generation=execution_generation,
+            artifact_sha256=receipt.artifact_sha256,
+            artifact_device=receipt.artifact_device,
+            artifact_inode=receipt.artifact_inode,
+            artifact_file_type=receipt.artifact_file_type,
+            artifact_size_bytes=receipt.artifact_size_bytes,
+        )
+        try:
+            store.save_result_artifact_binding(binding, result)
+        except BaseException as failure:
+            try:
+                observed_result, observed_generation, observed_binding = (
+                    store.load_result_with_artifact_binding(result.case_id)
+                )
+            except BaseException as readback_failure:
+                for unresolved in (failure, readback_failure):
+                    if _is_process_control(unresolved):
+                        setattr(unresolved, _PUBLICATION_PRESERVE_EVIDENCE, True)
+                        raise _clear_exception_chain(unresolved) from None
+                unresolved_error = _publication_failure(
+                    "RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED"
+                )
+                setattr(unresolved_error, _PUBLICATION_PRESERVE_EVIDENCE, True)
+                raise unresolved_error from None
+            exact_parent = (
+                observed_result == result
+                and observed_generation == execution_generation
+            )
+            if exact_parent and observed_binding == binding:
+                return failure if _is_process_control(failure) else None
+            if exact_parent and observed_binding is None:
+                raise _clear_exception_chain(failure) from None
+            if _is_process_control(failure):
+                setattr(failure, _PUBLICATION_PRESERVE_EVIDENCE, True)
+                raise _clear_exception_chain(failure) from None
+            unresolved_error = _publication_failure(
+                "RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED"
+            )
+            setattr(unresolved_error, _PUBLICATION_PRESERVE_EVIDENCE, True)
+            raise unresolved_error from None
+        return None
+
+    with _serialized_publication(target):
+        _atomic_publish_locked(
+            target,
+            payload,
+            bind_published_candidate=bind_published_candidate,
+        )
+    return target
+
+
+def _write_bound_result(execution: _ClaimedExecution, result: CaseResult) -> Path:
+    return _write_result_for_generation(
+        execution.store,
+        result,
+        execution.claim.generation,
+    )
+
+
+_PUBLICATION_ROLLBACK_PROVEN = "_invoice_agents_publication_rollback_proven"
+_PUBLICATION_PRESERVE_EVIDENCE = "_invoice_agents_publication_preserve_evidence"
+
+
+def _is_process_control(error: BaseException) -> bool:
+    return not isinstance(error, Exception)
+
+
+def _clear_exception_chain(error: BaseException) -> BaseException:
+    error.__cause__ = None
+    error.__context__ = None
+    return error
+
+
+def _publication_failure(stop_reason: str) -> InvoiceAgentsError:
+    messages = {
+        "ARTIFACT_PUBLICATION_CLEANUP_UNRESOLVED": (
+            "atomic artifact publication cleanup could not be proven complete"
+        ),
+        "ARTIFACT_PUBLICATION_DURABILITY_UNRESOLVED": (
+            "atomic artifact rollback durability could not be proven"
+        ),
+        "ARTIFACT_PUBLICATION_TARGET_UNSAFE": (
+            "atomic artifact publication target is not a regular file"
+        ),
+        "ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED": (
+            "atomic artifact publication namespace identity could not be proven"
+        ),
+        "RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED": (
+            "result-artifact binding durability could not be proven"
+        ),
+    }
+    return InvoiceAgentsError(
+        ErrorCategory.ORCHESTRATION,
+        messages[stop_reason],
+        stop_reason=stop_reason,
+    )
+
+
+def _retire_and_close(descriptor: int) -> BaseException | None:
+    """Close one owned descriptor once; callers must retire ownership first."""
+
+    try:
+        os.close(descriptor)
+    except BaseException as exc:
+        return exc
+    return None
+
+
+def _atomic_publish(target: Path, payload: bytes) -> _PublicationReceipt:
+    with _serialized_publication(target):
+        return _atomic_publish_locked(target, payload)
+
+
+def _atomic_publish_locked(
+    target: Path,
+    payload: bytes,
+    *,
+    bind_published_candidate: (
+        Callable[[_PublicationReceipt], BaseException | None] | None
+    ) = None,
+) -> _PublicationReceipt:
+    """Publish bytes durably or restore the exact prior namespace durably.
+
+    Raw descriptor ownership is transferred away before every close call.  A
+    close that reports failure may already have released and recycled the
+    numeric descriptor, so retrying or probing that number would be unsafe.
+    """
 
     temporary = target.with_name(f"{target.name}.tmp")
+    rollback = target.with_name(f".{target.name}.rollback-{uuid4().hex}")
     file_descriptor: int | None = None
-    directory_descriptor: int | None = None
-    created_temporary = False
+    directory_descriptors: list[int] = []
+    temporary_present = False
+    rollback_present = False
+    prior_present = False
+    candidate_replaced = False
+    rollback_applied = False
+    candidate_identity: tuple[int, int, int, int] | None = None
+    prior_identity: tuple[int, int, int, int] | None = None
+    published_identity: tuple[int, int, int, int] | None = None
+    publication_directory_identity: tuple[int, int] | None = None
+    binding_proven = False
+    preserve_publication_evidence = False
+    deferred_control: BaseException | None = None
+    primary_failure: BaseException | None = None
+    cleanup_failures: list[BaseException] = []
+    rollback_failures: list[BaseException] = []
+    controls: list[BaseException] = []
+
+    def capture(error: BaseException, *, cleanup: bool = False, rollback: bool = False) -> None:
+        nonlocal primary_failure
+        if _is_process_control(error):
+            controls.append(error)
+        if rollback:
+            rollback_failures.append(error)
+        elif cleanup:
+            cleanup_failures.append(error)
+        elif primary_failure is None:
+            primary_failure = error
+
+    def lstat_entry(name: str) -> os.stat_result | None:
+        try:
+            return os.lstat(name, dir_fd=directory_descriptors[0])
+        except FileNotFoundError as exc:
+            if exc.errno == errno.ENOENT:
+                return None
+            raise _publication_failure("ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED") from None
+        except OSError:
+            raise _publication_failure("ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED") from None
+
+    def identity_tuple(identity: os.stat_result) -> tuple[int, int, int, int]:
+        return (
+            identity.st_dev,
+            identity.st_ino,
+            stat.S_IFMT(identity.st_mode),
+            identity.st_size,
+        )
+
+    def acquire_publication_directory() -> int:
+        try:
+            descriptor = os.open(
+                target.parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            directory_descriptors.append(descriptor)
+            opened = os.fstat(descriptor)
+        except OSError:
+            raise _publication_failure(
+                "ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED"
+            ) from None
+        if not stat.S_ISDIR(opened.st_mode):
+            raise _publication_failure(
+                "ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED"
+            ) from None
+        opened_identity = (opened.st_dev, opened.st_ino)
+        if (
+            publication_directory_identity is None
+            or opened_identity != publication_directory_identity
+        ):
+            raise _publication_failure(
+                "ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED"
+            ) from None
+        return descriptor
+
     try:
-        file_descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o600,
-        )
-        created_temporary = True
-        offset = 0
-        while offset < len(payload):
-            written = os.write(file_descriptor, payload[offset:])
-            if written <= 0:
-                raise OSError("atomic artifact write made no forward progress")
-            offset += written
-        os.fsync(file_descriptor)
-        os.close(file_descriptor)
-        file_descriptor = None
-        os.replace(temporary, target)
-        created_temporary = False
-        directory_descriptor = os.open(
-            target.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        os.fsync(directory_descriptor)
-    finally:
+        try:
+            classified_directory = os.lstat(target.parent)
+            if not stat.S_ISDIR(classified_directory.st_mode):
+                raise _publication_failure(
+                    "ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED"
+                ) from None
+            publication_directory_identity = (
+                classified_directory.st_dev,
+                classified_directory.st_ino,
+            )
+            # Acquire every namespace capability before creating the
+            # candidate.  A directory-open failure therefore cannot strand a
+            # temporary entry, and a later candidate-close failure can still
+            # be contained through an already-owned directory descriptor.
+            for _ in range(2):
+                acquire_publication_directory()
+        except OSError:
+            capture(
+                _publication_failure("ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED")
+            )
+        except BaseException as exc:
+            capture(exc)
+
+        if primary_failure is None and not controls:
+            try:
+                file_descriptor = os.open(
+                    temporary.name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=directory_descriptors[0],
+                )
+                temporary_present = True
+                offset = 0
+                while offset < len(payload):
+                    written = os.write(file_descriptor, payload[offset:])
+                    if written <= 0:
+                        raise OSError("atomic artifact write made no forward progress")
+                    offset += written
+                os.fsync(file_descriptor)
+                candidate_identity = identity_tuple(os.fstat(file_descriptor))
+                if (
+                    candidate_identity[2] != stat.S_IFREG
+                    or candidate_identity[3] != len(payload)
+                ):
+                    raise _publication_failure(
+                        "ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED"
+                    ) from None
+            except BaseException as exc:
+                capture(exc)
+
         if file_descriptor is not None:
-            os.close(file_descriptor)
-        if directory_descriptor is not None:
-            os.close(directory_descriptor)
-        if created_temporary:
-            temporary.unlink(missing_ok=True)
+            owned_descriptor = file_descriptor
+            file_descriptor = None
+            close_failure = _retire_and_close(owned_descriptor)
+            if close_failure is not None:
+                capture(close_failure, cleanup=True)
+
+        if primary_failure is None and not cleanup_failures and not controls:
+            try:
+                classified = lstat_entry(target.name)
+                prior_present = classified is not None
+                if prior_present:
+                    assert classified is not None
+                    if not stat.S_ISREG(classified.st_mode):
+                        raise _publication_failure("ARTIFACT_PUBLICATION_TARGET_UNSAFE") from None
+                    prior_identity = identity_tuple(classified)
+                    os.link(
+                        target.name,
+                        rollback.name,
+                        src_dir_fd=directory_descriptors[0],
+                        dst_dir_fd=directory_descriptors[0],
+                        follow_symlinks=False,
+                    )
+                    rollback_present = True
+                    rollback_identity = lstat_entry(rollback.name)
+                    current_identity = lstat_entry(target.name)
+                    if (
+                        rollback_identity is None
+                        or current_identity is None
+                        or identity_tuple(rollback_identity) != prior_identity
+                        or identity_tuple(current_identity) != prior_identity
+                    ):
+                        os.unlink(rollback.name, dir_fd=directory_descriptors[0])
+                        rollback_present = False
+                        raise _publication_failure(
+                            "ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED"
+                        ) from None
+                os.replace(
+                    temporary.name,
+                    target.name,
+                    src_dir_fd=directory_descriptors[0],
+                    dst_dir_fd=directory_descriptors[0],
+                )
+                temporary_present = False
+                candidate_replaced = True
+                replaced_identity = lstat_entry(target.name)
+                if (
+                    candidate_identity is None
+                    or replaced_identity is None
+                    or identity_tuple(replaced_identity) != candidate_identity
+                ):
+                    raise _publication_failure(
+                        "ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED"
+                    ) from None
+                published_identity = candidate_identity
+                os.fsync(directory_descriptors[0])
+                # Reopen the still-named final directory after the candidate
+                # is durable.  The callback may commit the database binding,
+                # so an early capability cannot authorize a renamed directory.
+                acquire_publication_directory()
+                if bind_published_candidate is not None:
+                    receipt = _PublicationReceipt(
+                        artifact_sha256=hashlib.sha256(payload).hexdigest(),
+                        artifact_device=candidate_identity[0],
+                        artifact_inode=candidate_identity[1],
+                        artifact_file_type=candidate_identity[2],
+                        artifact_size_bytes=candidate_identity[3],
+                    )
+                    deferred_control = bind_published_candidate(receipt)
+                    if deferred_control is not None and not _is_process_control(
+                        deferred_control
+                    ):
+                        raise TypeError("binding callback returned a non-control failure")
+                    binding_proven = True
+                    preserve_publication_evidence = True
+            except BaseException as exc:
+                preserve_publication_evidence = (
+                    binding_proven
+                    or getattr(exc, _PUBLICATION_PRESERVE_EVIDENCE, False) is True
+                )
+                remaining_temporary = lstat_entry(temporary.name)
+                if temporary_present and remaining_temporary is None:
+                    temporary_present = False
+                    current_identity = lstat_entry(target.name)
+                    candidate_replaced = (
+                        candidate_identity is not None
+                        and current_identity is not None
+                        and identity_tuple(current_identity) == candidate_identity
+                    )
+                    if candidate_replaced:
+                        published_identity = candidate_identity
+                capture(exc)
+
+        # The first directory close is part of publication.  Keep independent
+        # pre-opened descriptors and the rollback link until it succeeds.
+        if candidate_replaced and primary_failure is None and not cleanup_failures and not controls:
+            owned_descriptor = directory_descriptors.pop(0)
+            close_failure = _retire_and_close(owned_descriptor)
+            if close_failure is not None:
+                capture(close_failure, cleanup=True)
+
+        publication_failed = primary_failure is not None or cleanup_failures or controls
+        if candidate_replaced and publication_failed and not preserve_publication_evidence:
+            try:
+                current_identity = lstat_entry(target.name)
+                if (
+                    candidate_identity is None
+                    or current_identity is None
+                    or identity_tuple(current_identity) != candidate_identity
+                ):
+                    raise _publication_failure(
+                        "ARTIFACT_PUBLICATION_DURABILITY_UNRESOLVED"
+                    ) from None
+                if prior_present:
+                    os.replace(
+                        rollback.name,
+                        target.name,
+                        src_dir_fd=directory_descriptors[0],
+                        dst_dir_fd=directory_descriptors[0],
+                    )
+                    rollback_present = False
+                else:
+                    os.unlink(target.name, dir_fd=directory_descriptors[0])
+                rollback_applied = True
+            except BaseException as exc:
+                current_identity = lstat_entry(target.name)
+                remaining_rollback = lstat_entry(rollback.name) if prior_present else None
+                if (
+                    prior_present
+                    and prior_identity is not None
+                    and current_identity is not None
+                    and identity_tuple(current_identity) == prior_identity
+                    and remaining_rollback is None
+                ):
+                    rollback_present = False
+                    rollback_applied = True
+                elif not prior_present and current_identity is None:
+                    rollback_applied = True
+                capture(exc, rollback=True)
+
+            if rollback_applied:
+                try:
+                    os.fsync(directory_descriptors[0])
+                except BaseException as exc:
+                    capture(exc, rollback=True)
+            else:
+                try:
+                    os.fsync(directory_descriptors[0])
+                except BaseException as exc:
+                    capture(exc, rollback=True)
+                rollback_failures.append(
+                    _publication_failure("ARTIFACT_PUBLICATION_DURABILITY_UNRESOLVED")
+                )
+
+        if candidate_replaced and publication_failed and preserve_publication_evidence:
+            try:
+                os.fsync(directory_descriptors[0])
+            except BaseException as exc:
+                capture(exc, rollback=True)
+
+        if not publication_failed and candidate_replaced and rollback_present:
+            try:
+                os.unlink(rollback.name, dir_fd=directory_descriptors[0])
+                rollback_present = False
+                os.fsync(directory_descriptors[0])
+            except BaseException as exc:
+                capture(exc, cleanup=True)
+
+        # Namespace cleanup uses an owned directory capability before raw
+        # descriptor ownership is retired.
+        if temporary_present:
+            try:
+                os.unlink(temporary.name, dir_fd=directory_descriptors[0])
+                temporary_present = False
+            except FileNotFoundError as exc:
+                if exc.errno == errno.ENOENT:
+                    temporary_present = False
+                else:
+                    capture(exc, cleanup=True)
+            except BaseException as exc:
+                capture(exc, cleanup=True)
+        if rollback_present and not candidate_replaced:
+            try:
+                os.unlink(rollback.name, dir_fd=directory_descriptors[0])
+                rollback_present = False
+            except FileNotFoundError as exc:
+                if exc.errno == errno.ENOENT:
+                    rollback_present = False
+                else:
+                    capture(exc, cleanup=True)
+            except BaseException as exc:
+                capture(exc, cleanup=True)
+        # Cleanup is exhaustive.  Each descriptor is removed from ownership
+        # before close, and every remaining resource is attempted once.
+        while directory_descriptors:
+            owned_descriptor = directory_descriptors.pop(0)
+            close_failure = _retire_and_close(owned_descriptor)
+            if close_failure is not None:
+                capture(close_failure, cleanup=True)
+    finally:
+        # Defensive containment for failures in the cleanup implementation
+        # itself.  Ownership is still retired before close and never retried.
+        if file_descriptor is not None:
+            owned_descriptor = file_descriptor
+            file_descriptor = None
+            close_failure = _retire_and_close(owned_descriptor)
+            if close_failure is not None:
+                capture(close_failure, cleanup=True)
+        while directory_descriptors:
+            owned_descriptor = directory_descriptors.pop(0)
+            close_failure = _retire_and_close(owned_descriptor)
+            if close_failure is not None:
+                capture(close_failure, cleanup=True)
+
+    if deferred_control is not None:
+        raise _clear_exception_chain(deferred_control) from None
+    if controls:
+        control = _clear_exception_chain(controls[0])
+        if candidate_replaced and rollback_applied and not rollback_failures:
+            setattr(control, _PUBLICATION_ROLLBACK_PROVEN, True)
+        raise control from None
+    if rollback_failures:
+        error = _publication_failure("ARTIFACT_PUBLICATION_DURABILITY_UNRESOLVED")
+        raise _clear_exception_chain(error) from None
+    if cleanup_failures:
+        error = _publication_failure("ARTIFACT_PUBLICATION_CLEANUP_UNRESOLVED")
+        raise _clear_exception_chain(error) from None
+    if primary_failure is not None:
+        failure = _clear_exception_chain(primary_failure)
+        if candidate_replaced and rollback_applied:
+            setattr(failure, _PUBLICATION_ROLLBACK_PROVEN, True)
+        raise failure from None
+    if published_identity is None:
+        raise _publication_failure("ARTIFACT_PUBLICATION_NAMESPACE_UNRESOLVED") from None
+    return _PublicationReceipt(
+        artifact_sha256=hashlib.sha256(payload).hexdigest(),
+        artifact_device=published_identity[0],
+        artifact_inode=published_identity[1],
+        artifact_file_type=published_identity[2],
+        artifact_size_bytes=published_identity[3],
+    )
 
 
 async def _run_prepared_case_in_process(
@@ -2012,7 +2822,7 @@ async def _publish_parent_terminal_result(
     else:
         artifact_failure: BaseException | None = None
         try:
-            _write_result(result)
+            _write_bound_result(execution, result)
         except asyncio.CancelledError as exc:
             cancellation_may_define_outcome = _cancellation_may_define_outcome(control_exception)
             control_exception = control_exception or exc
@@ -2032,6 +2842,25 @@ async def _publish_parent_terminal_result(
                     stop_reason="RESULT_ARTIFACT_WRITE_CANCELLED",
                 ),
             )
+            artifact_failure = exc
+        except InvoiceAgentsError as exc:
+            if exc.stop_reason in {
+                "ARTIFACT_PUBLICATION_CLEANUP_UNRESOLVED",
+                "ARTIFACT_PUBLICATION_DURABILITY_UNRESOLVED",
+                "RESULT_ARTIFACT_BINDING_DURABILITY_UNRESOLVED",
+            }:
+                result = _artifact_durability_unresolved_result(result)
+            else:
+                _append_error(
+                    result,
+                    _secondary_error(
+                        exc,
+                        case_id=execution.case_id,
+                        category=ErrorCategory.ORCHESTRATION,
+                        stop_reason="RESULT_ARTIFACT_WRITE_FAILED",
+                        message="atomic result artifact publication failed",
+                    ),
+                )
             artifact_failure = exc
         except BaseException as exc:
             _append_error(
@@ -2060,6 +2889,28 @@ async def _publish_parent_terminal_result(
             control_exception = refreshed.control_exception
             if not persisted:
                 raise _unresolved_durability_error(execution.case_id) from None
+        if (
+            artifact_failure is not None
+            and getattr(artifact_failure, _PUBLICATION_ROLLBACK_PROVEN, False) is True
+        ):
+            try:
+                _write_bound_result(execution, result)
+            except BaseException as retry_exc:
+                if not isinstance(retry_exc, Exception):
+                    control_exception = control_exception or retry_exc
+                result = _artifact_durability_unresolved_result(result)
+                refreshed = await _refresh_terminal_evidence_safely(
+                    execution,
+                    result,
+                    persisted=True,
+                    persistence_error=persistence_error,
+                    control_exception=control_exception,
+                )
+                result = refreshed.result
+                persisted = refreshed.persisted
+                control_exception = refreshed.control_exception
+                if not persisted:
+                    raise _unresolved_durability_error(execution.case_id) from None
     if control_exception is not None:
         raise control_exception
     return result
@@ -2502,7 +3353,11 @@ async def _reconcile_preparation_boundary(
     )
     if known_finished:
         assert snapshot.result is not None
-        _write_result(snapshot.result)
+        _write_result_for_generation(
+            store,
+            snapshot.result,
+            snapshot.execution_generation,
+        )
         if cancellation is not None:
             raise cancellation
         return snapshot.result
@@ -2845,96 +3700,92 @@ async def _terminalize_unstarted_claim(
     settings: Settings,
     claim: ExecutionClaim,
 ) -> None:
-    """Persist cancellation in a terminable helper, then trust only authoritative reread."""
+    """Persist cancellation or recovery entirely inside owned helper sessions."""
 
     claim = validate_execution_claim(claim, expected_case_id=case_id)
-    store = WorkflowStore(settings)
-
-    async def publish_recovery(result: CaseResult, error: ErrorRecord) -> None:
-        publication = asyncio.create_task(
-            asyncio.to_thread(
-                _recovery_artifact_or_raise,
-                result,
-                error,
-                store=WorkflowStore(settings),
-                claim=claim,
-            ),
-            name=f"invoice-cancel-recovery-{case_id}",
-        )
-        await _await_task_despite_cancellation(
-            publication,
-            deadline=monotonic() + DURABILITY_DEADLINE_SECONDS,
-            case_id=case_id,
-        )
-
-    worker = asyncio.create_task(
-        asyncio.to_thread(
-            run_terminal_process,
-            mode="cancel_unstarted",
+    durability_deadline = (
+        monotonic() + DURABILITY_DEADLINE_SECONDS + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+    )
+    outcome, boundary_control = await _run_terminal_mode_owned(
+        mode="cancel_unstarted",
+        settings=settings,
+        claim=claim,
+        deadline=durability_deadline,
+        started_at=started_at,
+    )
+    evidence = _terminal_outcome_evidence(outcome)
+    if evidence is None:
+        if monotonic() >= durability_deadline:
+            raise _terminal_durability_timeout(case_id) from None
+        inspection, inspection_control = await _run_terminal_mode_owned(
+            mode="inspect_claim",
             settings=settings,
             claim=claim,
-            timeout_seconds=float(DURABILITY_DEADLINE_SECONDS),
-            started_at=started_at,
-        ),
-        name=f"invoice-cancel-persistence-{case_id}",
-    )
-    try:
-        outcome = await _await_task_despite_cancellation(
-            worker,
-            deadline=(
-                monotonic() + DURABILITY_DEADLINE_SECONDS + TERMINAL_WORKER_CLEANUP_GRACE_SECONDS
+            deadline=durability_deadline,
+            prior_cancellation=(
+                boundary_control if isinstance(boundary_control, asyncio.CancelledError) else None
             ),
-            case_id=case_id,
         )
-    except InvoiceAgentsError:
-        raise InvoiceAgentsError(
-            ErrorCategory.ORCHESTRATION,
-            "terminal helper completion and cleanup could not be verified",
-            case_id=case_id,
-            stop_reason="TERMINAL_WORKER_CLEANUP_FAILED",
-        ) from None
-
-    evidence = await asyncio.to_thread(_inspect_exact_claim_evidence, store, claim)
+        boundary_control = _select_terminal_control_exception(
+            boundary_control,
+            inspection_control,
+        )
+        evidence = _terminal_outcome_evidence(inspection)
+        if evidence is None:
+            if outcome.error_code == "TERMINAL_WORKER_TIMEOUT" or (
+                inspection.error_code == "TERMINAL_WORKER_TIMEOUT"
+            ):
+                raise _terminal_durability_timeout(case_id) from None
+            raise _unresolved_durability_error(case_id) from None
     if evidence.state is _ExactClaimEvidenceState.DURABLE_DATABASE_RESULT:
+        if boundary_control is not None:
+            raise boundary_control
         return
-    if evidence.state is not _ExactClaimEvidenceState.RECOVERABLE_RUNNING:
-        raise _unresolved_durability_error(case_id) from None
     if outcome.result is not None or outcome.error_code is None:
         raise _unresolved_durability_error(case_id) from None
-
-    source_id = await asyncio.to_thread(store.load_authoritative_case_source_id, claim)
-    previous = await asyncio.to_thread(store.load_result, case_id)
-    fallback = _cancelled_result(case_id, source_id, started_at, previous)
-    fallback = await asyncio.to_thread(store.merge_relational_case_evidence, fallback)
-    if outcome.error_code == "TERMINAL_WORKER_TIMEOUT":
-        persistence_error = ErrorRecord(
-            category=ErrorCategory.TIMEOUT,
-            message="terminal cancellation persistence exceeded its monotonic deadline",
-            case_id=case_id,
-            stop_reason="TERMINAL_DURABILITY_TIMEOUT",
-        )
-    else:
-        persistence_error = _secondary_error(
-            InvoiceAgentsError(
-                ErrorCategory.DATABASE,
-                "terminal helper did not commit its exact claim",
+    if monotonic() >= durability_deadline:
+        raise _terminal_durability_timeout(case_id) from None
+    recovery, recovery_control = await _run_terminal_mode_owned(
+        mode="publish_cancel_recovery",
+        settings=settings,
+        claim=claim,
+        deadline=durability_deadline,
+        started_at=started_at,
+        worker_error_code=outcome.error_code,
+        prior_cancellation=(
+            boundary_control if isinstance(boundary_control, asyncio.CancelledError) else None
+        ),
+    )
+    boundary_control = _select_terminal_control_exception(
+        boundary_control,
+        recovery_control,
+    )
+    recovery_evidence = _terminal_outcome_evidence(recovery)
+    recovery_is_durable = (
+        recovery_evidence is not None
+        and recovery_evidence.state is _ExactClaimEvidenceState.DURABLE_DATABASE_RESULT
+    )
+    recovery_was_published = (
+        recovery.error_code is None
+        and type(recovery.result) is CaseResult
+        and recovery_evidence is not None
+        and recovery_evidence.state is _ExactClaimEvidenceState.RECOVERABLE_RUNNING
+    )
+    if not recovery_is_durable and not recovery_was_published:
+        if recovery.error_code == "TERMINAL_WORKER_TIMEOUT":
+            raise _terminal_durability_timeout(case_id) from None
+        if recovery.error_code == "TERMINAL_RECOVERY_ARTIFACT_FAILED":
+            raise InvoiceAgentsError(
+                ErrorCategory.ORCHESTRATION,
+                "atomic terminal recovery artifact publication failed",
                 case_id=case_id,
-                stop_reason=outcome.error_code,
-            ),
-            case_id=case_id,
-            category=ErrorCategory.DATABASE,
-            stop_reason="TERMINAL_PERSISTENCE_FAILED",
-            message="terminal database write failed",
-        )
-    _append_error(fallback, persistence_error)
-    await publish_recovery(fallback, persistence_error)
+                stop_reason="TERMINAL_RECOVERY_ARTIFACT_FAILED",
+            ) from None
+        raise _unresolved_durability_error(case_id) from None
     if outcome.error_code == "TERMINAL_WORKER_TIMEOUT":
-        raise InvoiceAgentsError(
-            ErrorCategory.TIMEOUT,
-            persistence_error.message,
-            case_id=case_id,
-            stop_reason=persistence_error.stop_reason,
-        ) from None
+        raise _terminal_durability_timeout(case_id) from None
+    if boundary_control is not None:
+        raise boundary_control
 
 
 async def _durably_cancel_unstarted_claim(

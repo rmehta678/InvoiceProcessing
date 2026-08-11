@@ -815,14 +815,14 @@ def test_reconciled_database_upgrades_without_fabricating_generation_provenance(
         source_archive_dir=tmp_path / "sources",
     )
 
-    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4]
+    assert migrate_database(path, DatabaseKind.WORKFLOW) == [3, 4, 5]
     assert (
         verify_database(
             path,
             DatabaseKind.WORKFLOW,
             settings=settings,
         )["schema_version"]
-        == 4
+        == 5
     )
     assert _reconcile(path) == receipt
     with pytest.raises(DatabaseVerificationError) as replay_error:
@@ -922,7 +922,7 @@ def test_explicit_migrate_retrofits_version_neutral_archive_schema_on_current_wo
         connection.commit()
 
     assert migrate_database(path, DatabaseKind.WORKFLOW, settings=settings) == []
-    assert verify_database(path, DatabaseKind.WORKFLOW, settings=settings)["schema_version"] == 4
+    assert verify_database(path, DatabaseKind.WORKFLOW, settings=settings)["schema_version"] == 5
 
 
 def test_populated_row_only_archive_cannot_be_retrofitted_without_original_database_image(
