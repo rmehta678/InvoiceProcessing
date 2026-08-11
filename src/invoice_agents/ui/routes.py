@@ -56,7 +56,7 @@ from invoice_agents.ui.preflight import key_present, run_preflight
 from invoice_agents.ui.recovery import RecoveryCoordinator
 from invoice_agents.ui.runs import RunRegistry
 from invoice_agents.ui.security import secure_cookie
-from invoice_agents.ui.sse import case_event_stream
+from invoice_agents.ui.sse import InvalidEventCursor, case_event_stream, effective_event_cursor
 
 router = APIRouter()
 
@@ -813,8 +813,19 @@ async def case_live(request: Request, case_id: str) -> Response:
 
 
 @router.get("/cases/{case_id}/events")
-async def case_events(request: Request, case_id: str, after: int = 0) -> EventSourceResponse:
+async def case_events(request: Request, case_id: str) -> Response:
     settings = _settings(request)
+    try:
+        after = effective_event_cursor(
+            request.query_params.getlist("after"),
+            request.headers.getlist("last-event-id"),
+        )
+    except InvalidEventCursor:
+        return Response(
+            "invalid event cursor\n",
+            status_code=400,
+            media_type="text/plain",
+        )
     return EventSourceResponse(
         case_event_stream(
             settings.workflow_db,

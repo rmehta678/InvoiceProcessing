@@ -14,6 +14,7 @@ import threading
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl
@@ -211,6 +212,199 @@ def test_u0_dashboard_and_case_detail_render_stored_state(
     page.wait_for_url(f"**/cases/{case_id}")
     assert "APPROVED_PAYMENT_RECORDED" in page.content()
     assert "mock" in page.content()
+
+
+def test_sse_client_deduplicates_exact_decimal_event_ids_without_losing_precision(
+    page: Any,
+) -> None:
+    case_id = "case-browser-cursor"
+    last_event_id_headers: list[list[str]] = []
+    request_lock = threading.Lock()
+
+    def case_event(event_id: str, event_type: str, payload_seq: int) -> str:
+        payload = json.dumps(
+            {
+                "seq": payload_seq,
+                "event_type": event_type,
+                "created_at": "2026-08-10T12:00:00Z",
+            },
+            separators=(",", ":"),
+        )
+        return f"id: {event_id}\nevent: case-event\ndata: {payload}\n\n"
+
+    first_response = "retry: 1000\n\n" + "".join(
+        [
+            case_event("9", "cursor.nine", 9_007_199_254_740_993),
+            case_event("10", "cursor.ten", 9),
+            case_event(
+                "9007199254740992",
+                "cursor.safe-boundary-plus-one",
+                9_007_199_254_740_993,
+            ),
+            case_event(
+                "9007199254740993",
+                "cursor.adjacent-above-safe-boundary",
+                9_007_199_254_740_992,
+            ),
+        ]
+    )
+    terminal_event = (
+        "event: terminal\n"
+        'data: {"case_id":"case-browser-cursor","status":"SUCCEEDED",'
+        '"stop_reason":"CURSOR_TEST_COMPLETE"}\n\n'
+    )
+    second_response = "".join(
+        [
+            case_event(
+                "9007199254740992",
+                "cursor.stale-duplicate",
+                9_223_372_036_854_775_807,
+            ),
+            case_event(
+                "9007199254740993",
+                "cursor.exact-duplicate",
+                9_223_372_036_854_775_806,
+            ),
+            case_event("9223372036854775807", "cursor.sqlite-rowid-maximum", 10),
+            terminal_event,
+            terminal_event,
+        ]
+    )
+
+    app_script = (
+        Path(__file__).resolve().parents[2] / "src/invoice_agents/ui/static/app.js"
+    ).read_bytes()
+    live_page = (
+        "<!doctype html><html><body>"
+        f'<section data-live-events data-case-id="{case_id}">'
+        '<p id="stream-note" class="pulsing"></p>'
+        '<div id="terminal-host"></div>'
+        '<ul id="live-timeline"></ul>'
+        "</section>"
+        '<script src="/app.js"></script>'
+        "</body></html>"
+    ).encode()
+
+    class CursorServerHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _send(self, body: bytes, content_type: str) -> None:
+            self.send_response(200)
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+            self.close_connection = True
+
+        def do_GET(self) -> None:
+            if self.path == "/live":
+                self._send(live_page, "text/html; charset=utf-8")
+                return
+            if self.path == "/app.js":
+                self._send(app_script, "text/javascript; charset=utf-8")
+                return
+            if self.path == f"/cases/{case_id}/events":
+                with request_lock:
+                    last_event_id_headers.append(
+                        self.headers.get_all("Last-Event-ID", failobj=[])
+                    )
+                    response_number = len(last_event_id_headers)
+                if response_number > 2:
+                    self.send_error(409, "terminal must prevent a third SSE request")
+                    return
+                body = first_response if response_number == 1 else second_response
+                self._send(body.encode(), "text/event-stream")
+                return
+            self.send_error(404)
+
+        def log_message(self, _format: str, *args: object) -> None:
+            del args
+
+    cursor_server = ThreadingHTTPServer(("127.0.0.1", 0), CursorServerHandler)
+    cursor_thread = threading.Thread(target=cursor_server.serve_forever)
+    cursor_thread.start()
+    cursor_url = f"http://127.0.0.1:{cursor_server.server_port}"
+    page.add_init_script(
+        """
+        (() => {
+          const NativeEventSource = window.EventSource;
+          window.nativeEventSourceInstances = [];
+          window.EventSource = new Proxy(NativeEventSource, {
+            construct(target, argumentsList) {
+              const source = Reflect.construct(target, argumentsList);
+              window.nativeEventSourceInstances.push(source);
+              return source;
+            }
+          });
+        })();
+        """
+    )
+    try:
+        page.goto(f"{cursor_url}/live")
+        page.wait_for_function("window.nativeEventSourceInstances.length === 1")
+        page.evaluate(
+            """
+            () => {
+              window.reconnectedEventStates = [];
+              window.terminalBannerEffects = 0;
+              new MutationObserver((records) => {
+                records.forEach((record) => {
+                  record.addedNodes.forEach((node) => {
+                    if (node.nodeType === Node.ELEMENT_NODE &&
+                        node.matches(".terminal-banner")) {
+                      window.terminalBannerEffects += 1;
+                    }
+                  });
+                });
+              }).observe(document.getElementById("terminal-host"), { childList: true });
+              window.nativeEventSourceInstances[0].addEventListener("case-event", (event) => {
+                window.reconnectedEventStates.push({
+                  id: event.lastEventId,
+                  readyState: event.currentTarget.readyState
+                });
+              });
+            }
+            """
+        )
+        page.wait_for_selector("#terminal-host > .terminal-banner")
+
+        rows = page.locator("#live-timeline > li")
+        assert rows.count() == 5
+        assert rows.locator(".dim").all_inner_texts() == [
+            "cursor.nine",
+            "cursor.ten",
+            "cursor.safe-boundary-plus-one",
+            "cursor.adjacent-above-safe-boundary",
+            "cursor.sqlite-rowid-maximum",
+        ]
+        with request_lock:
+            assert last_event_id_headers == [[], ["9007199254740993"]]
+        assert page.evaluate(
+            "JSON.parse('{\"seq\":9007199254740993}').seq === 9007199254740992"
+        )
+        assert page.evaluate("window.nativeEventSourceInstances.length") == 1
+        assert page.evaluate(
+            "Object.prototype.toString.call(window.nativeEventSourceInstances[0])"
+        ) == "[object EventSource]"
+        assert page.evaluate(
+            """
+            window.reconnectedEventStates.find(
+              (event) => event.id === "9223372036854775807"
+            ).readyState
+            """
+        ) == 1
+        assert page.locator("#terminal-host > .terminal-banner").count() == 1
+        assert page.locator("#terminal-host").get_by_text("CURSOR_TEST_COMPLETE").count() == 1
+        assert page.evaluate("window.terminalBannerEffects") == 1
+        assert page.evaluate("window.nativeEventSourceInstances[0].readyState") == 2
+    finally:
+        cursor_server.shutdown()
+        cursor_server.server_close()
+        cursor_thread.join(timeout=5)
+    assert not cursor_thread.is_alive()
 
 
 def test_u1_decide_reject_and_resume_in_browser(

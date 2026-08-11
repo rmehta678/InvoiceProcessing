@@ -1049,6 +1049,206 @@ def test_event_stream_replays_and_terminates(client: TestClient, settings: Setti
     assert "case.prepared" in joined
 
 
+@pytest.mark.parametrize(
+    ("query_after", "header_after"),
+    [
+        pytest.param("query", "header", id="header-ahead"),
+        pytest.param("header", "query", id="query-ahead"),
+    ],
+)
+def test_event_stream_resumes_strictly_after_greater_query_or_header_cursor(
+    client: TestClient,
+    settings: Settings,
+    query_after: str,
+    header_after: str,
+) -> None:
+    case_id = make_succeeded_case(settings)
+    audit = AuditRecorder(settings.workflow_db, case_id)
+    recorded_ids = [
+        audit.record("cursor.fixture.second", {"position": 2}),
+        audit.record("cursor.fixture.third", {"position": 3}),
+        audit.record("cursor.fixture.fourth", {"position": 4}),
+    ]
+    stored = queries.events_after(settings.workflow_db, case_id, 0)
+    assert [row.event_type for row in stored] == [
+        "case.prepared",
+        "cursor.fixture.second",
+        "cursor.fixture.third",
+        "cursor.fixture.fourth",
+    ]
+    assert [row.event_id for row in stored[1:]] == recorded_ids
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        storage_before = tuple(connection.iterdump())
+    cursors = {
+        "query": stored[0].seq,
+        "header": stored[1].seq,
+    }
+    expected = [row.seq for row in stored if row.seq > max(cursors.values())]
+    delivered: list[int] = []
+
+    with client.stream(
+        "GET",
+        f"/cases/{case_id}/events",
+        params={"after": str(cursors[query_after])},
+        headers={"Last-Event-ID": str(cursors[header_after])},
+    ) as response:
+        assert response.status_code == 200
+        for line in response.iter_lines():
+            if line.startswith("id:"):
+                delivered.append(int(line.split(":", 1)[1].strip()))
+            if line == "event: terminal":
+                break
+
+    assert delivered == expected
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        assert tuple(connection.iterdump()) == storage_before
+
+
+@pytest.mark.parametrize(
+    ("location", "value"),
+    [
+        pytest.param("query", "", id="query-empty"),
+        pytest.param("query", "+1", id="query-leading-plus"),
+        pytest.param("query", "-0", id="query-signed-zero"),
+        pytest.param("query", "-1", id="query-negative"),
+        pytest.param("query", "00", id="query-repeated-zero"),
+        pytest.param("query", "01", id="query-leading-zero"),
+        pytest.param("query", "1.0", id="query-decimal"),
+        pytest.param("query", " 1", id="query-leading-space"),
+        pytest.param("query", "1 ", id="query-trailing-space"),
+        pytest.param("query", "\N{ARABIC-INDIC DIGIT ONE}", id="query-non-ascii-digit"),
+        pytest.param("query", str(2**63), id="query-overflow"),
+        pytest.param("header", "", id="header-empty"),
+        pytest.param("header", "+1", id="header-leading-plus"),
+        pytest.param("header", "-0", id="header-signed-zero"),
+        pytest.param("header", "-1", id="header-negative"),
+        pytest.param("header", "00", id="header-repeated-zero"),
+        pytest.param("header", "01", id="header-leading-zero"),
+        pytest.param("header", "1.0", id="header-decimal"),
+        pytest.param("header", " 1", id="header-leading-space"),
+        pytest.param("header", "1 ", id="header-trailing-space"),
+        pytest.param("header", "1,2", id="header-combined-values"),
+        pytest.param("header", b"\xb2", id="header-latin1-unicode-digit"),
+        pytest.param("header", str(2**63), id="header-overflow"),
+    ],
+)
+def test_event_stream_rejects_noncanonical_cursor_before_starting_sse(
+    client: TestClient,
+    settings: Settings,
+    location: str,
+    value: str | bytes,
+) -> None:
+    case_id = make_succeeded_case(settings)
+    params = None
+    headers = None
+    if location == "query":
+        assert isinstance(value, str)
+        params = {"after": value}
+    elif isinstance(value, bytes):
+        headers = [(b"Last-Event-ID", value)]
+    else:
+        headers = {"Last-Event-ID": value}
+
+    response = client.get(
+        f"/cases/{case_id}/events",
+        params=params,
+        headers=headers,
+    )
+
+    assert response.status_code == 400
+    assert not response.headers.get("content-type", "").startswith("text/event-stream")
+    assert "event:" not in response.text
+
+
+@pytest.mark.parametrize("location", ["query", "header"])
+def test_event_stream_accepts_canonical_zero_cursor(
+    client: TestClient,
+    settings: Settings,
+    location: str,
+) -> None:
+    case_id = make_succeeded_case(settings)
+    expected = [str(row.seq) for row in queries.events_after(settings.workflow_db, case_id, 0)]
+    params = {"after": "0"} if location == "query" else None
+    headers = {"Last-Event-ID": "0"} if location == "header" else None
+    delivered_ids: list[str] = []
+
+    with client.stream(
+        "GET",
+        f"/cases/{case_id}/events",
+        params=params,
+        headers=headers,
+    ) as response:
+        assert response.status_code == 200
+        for line in response.iter_lines():
+            if line.startswith("id:"):
+                delivered_ids.append(line.split(":", 1)[1].strip())
+            if line == "event: terminal":
+                break
+
+    assert delivered_ids == expected
+
+
+def test_event_stream_rejects_ambiguous_repeated_query_cursor(
+    client: TestClient,
+    settings: Settings,
+) -> None:
+    case_id = make_succeeded_case(settings)
+
+    response = client.get(
+        f"/cases/{case_id}/events",
+        params=[("after", "1"), ("after", "2")],
+    )
+
+    assert response.status_code == 400
+    assert not response.headers.get("content-type", "").startswith("text/event-stream")
+
+
+def test_event_stream_rejects_ambiguous_repeated_header_cursor(
+    client: TestClient,
+    settings: Settings,
+) -> None:
+    case_id = make_succeeded_case(settings)
+
+    response = client.get(
+        f"/cases/{case_id}/events",
+        headers=[
+            (b"Last-Event-ID", b"1"),
+            (b"Last-Event-ID", b"2"),
+        ],
+    )
+
+    assert response.status_code == 400
+    assert not response.headers.get("content-type", "").startswith("text/event-stream")
+
+
+@pytest.mark.parametrize("location", ["query", "header"])
+def test_event_stream_accepts_maximum_sqlite_rowid_cursor(
+    client: TestClient,
+    settings: Settings,
+    location: str,
+) -> None:
+    case_id = make_succeeded_case(settings)
+    maximum = str(2**63 - 1)
+    params = {"after": maximum} if location == "query" else None
+    headers = {"Last-Event-ID": maximum} if location == "header" else None
+    delivered_ids: list[str] = []
+
+    with client.stream(
+        "GET",
+        f"/cases/{case_id}/events",
+        params=params,
+        headers=headers,
+    ) as response:
+        assert response.status_code == 200
+        for line in response.iter_lines():
+            if line.startswith("id:"):
+                delivered_ids.append(line.split(":", 1)[1].strip())
+            if line == "event: terminal":
+                break
+
+    assert delivered_ids == []
+
+
 # -------------------------------------------------------------------------------- system
 
 

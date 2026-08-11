@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+import re
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,9 @@ from invoice_agents.ui.runs import RunRegistry
 
 POLL_SECONDS = 1.0
 HEARTBEAT_SECONDS = 15.0
+MAX_EVENT_CURSOR = 2**63 - 1
+_MAX_EVENT_CURSOR_TEXT = str(MAX_EVENT_CURSOR)
+_CANONICAL_EVENT_CURSOR = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _VISIBLE_RECOVERY_STOPS = frozenset(
     {
         "PERSISTED_RESULT_INVALID",
@@ -32,6 +36,33 @@ _VISIBLE_RECOVERY_STOPS = frozenset(
         "EVIDENCE_AUTHORITY_MISSING",
     }
 )
+
+
+class InvalidEventCursor(ValueError):
+    """The request did not contain one canonical persisted-event cursor."""
+
+
+def _parse_event_cursor(value: object) -> int:
+    if type(value) is not str or _CANONICAL_EVENT_CURSOR.fullmatch(value) is None:
+        raise InvalidEventCursor("event cursor is not a canonical ASCII decimal")
+    if len(value) > len(_MAX_EVENT_CURSOR_TEXT) or (
+        len(value) == len(_MAX_EVENT_CURSOR_TEXT) and value > _MAX_EVENT_CURSOR_TEXT
+    ):
+        raise InvalidEventCursor("event cursor exceeds the SQLite rowid domain")
+    return int(value)
+
+
+def effective_event_cursor(
+    query_values: Sequence[str],
+    last_event_id_values: Sequence[str],
+) -> int:
+    """Validate both request sources and return their exact greater cursor."""
+
+    if len(query_values) > 1 or len(last_event_id_values) > 1:
+        raise InvalidEventCursor("event cursor source is ambiguous")
+    query_cursor = _parse_event_cursor(query_values[0]) if query_values else 0
+    header_cursor = _parse_event_cursor(last_event_id_values[0]) if last_event_id_values else 0
+    return max(query_cursor, header_cursor)
 
 
 def _tool_names(content: Any) -> list[dict[str, Any]]:

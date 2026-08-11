@@ -164,6 +164,22 @@
   var note = document.getElementById("stream-note");
   var bannerHost = document.getElementById("terminal-host");
   var toolStarts = {}; /* call id -> request timestamp (server created_at) */
+  var highestEventId = null;
+  var terminalShown = false;
+  var maxEventId = "9223372036854775807";
+
+  function canonicalEventId(value) {
+    if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) return false;
+    if (value.length < maxEventId.length) return true;
+    if (value.length > maxEventId.length) return false;
+    return value <= maxEventId;
+  }
+
+  function compareEventIds(left, right) {
+    if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+    if (left === right) return 0;
+    return left < right ? -1 : 1;
+  }
 
   function el(tag, className, text) {
     var node = document.createElement(tag);
@@ -272,9 +288,24 @@
 
   var source = new EventSource("/cases/" + encodeURIComponent(caseId) + "/events");
   source.addEventListener("case-event", function (event) {
-    appendRow(JSON.parse(event.data));
+    var eventId = event.lastEventId;
+    if (!canonicalEventId(eventId)) {
+      source.close();
+      if (note) {
+        note.textContent = "Event stream stopped because its persisted cursor was invalid.";
+        note.classList.add("dropped");
+        note.classList.remove("pulsing");
+      }
+      return;
+    }
+    if (highestEventId !== null && compareEventIds(eventId, highestEventId) <= 0) return;
+    var data = JSON.parse(event.data);
+    highestEventId = eventId;
+    appendRow(data);
   });
   source.addEventListener("terminal", function (event) {
+    if (terminalShown) return;
+    terminalShown = true;
     showTerminal(JSON.parse(event.data));
     source.close();
     if (note) note.classList.remove("pulsing");
