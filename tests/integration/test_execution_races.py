@@ -214,6 +214,79 @@ def _tampered_total(invoice: ExtractedInvoice) -> ExtractedInvoice:
     return invoice.model_copy(update={"declared_total": Decimal("88888.00")}, deep=True)
 
 
+def test_completed_critique_remains_authoritative_across_normal_human_review_resume(
+    settings: Settings,
+) -> None:
+    case_id = "case_completed_critique_human_resume"
+    store = _persist_case(settings, case_id)
+    review_claim = store.claim_case_execution(
+        case_id,
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+    store.adopt_latest_evidence(review_claim)
+    review_invoice = store.load_current_extraction(review_claim)
+    review = create_review_request(
+        case_id,
+        review_invoice,
+        RiskAssessment.model_validate(store.load_current_comparison(review_claim, "risk")),
+        store.load_current_critique(review_claim),
+        DecisionKind.HOLD,
+        ["an attributable human ruling is required"],
+        store,
+        review_claim,
+        extra_reasons=["an attributable human ruling is required"],
+    )
+    _finish_needs_human(store, case_id, review_claim, review)
+    resolved = record_human_decision(
+        review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.APPROVE,
+        "the exact current evidence is authorized",
+        store,
+        settings.inventory_db,
+    )
+    assert resolved.human_decision is not None
+
+    final_claim = store.claim_case_execution(
+        case_id,
+        frozenset({CaseStatus.NEEDS_HUMAN}),
+        lease_seconds=60,
+    )
+    store.adopt_latest_evidence(final_claim)
+    final_invoice = store.load_current_extraction(final_claim)
+    store.save_final_decision(
+        case_id,
+        FinalDecision(
+            decision=DecisionKind.APPROVE,
+            reasons=["the resolved review authorizes the exact evidence"],
+            evidence=[reference for line in final_invoice.lines for reference in line.evidence[:1]],
+            critic_disposition=DecisionKind.APPROVE,
+            human_outcome=resolved.human_decision,
+            payment_eligible=True,
+        ),
+        final_claim,
+    )
+
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        critique_generations = [
+            int(row[0])
+            for row in connection.execute(
+                "SELECT execution_generation FROM critique_results WHERE case_id = ?",
+                (case_id,),
+            )
+        ]
+        anchor = connection.execute(
+            "SELECT critique_disposition FROM validated_evidence_snapshots "
+            "WHERE case_id = ? AND execution_generation = ?",
+            (case_id, final_claim.generation),
+        ).fetchone()
+
+    assert critique_generations == [1]
+    assert anchor is not None
+    assert anchor["critique_disposition"] == "APPROVE"
+
+
 def _finish_needs_human(
     store: WorkflowStore,
     case_id: str,

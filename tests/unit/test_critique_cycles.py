@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+import invoice_agents.db.core as core_module
 from invoice_agents.agents import decision_rules
 from invoice_agents.config import Settings
 from invoice_agents.db.core import (
@@ -30,6 +31,7 @@ from invoice_agents.models import (
     ReviewRequest,
     SourceArtifact,
 )
+from invoice_agents.observability.audit import AuditRecorder
 
 
 def _source(tmp_path: Path, case_id: str) -> SourceArtifact:
@@ -70,21 +72,54 @@ def _critique(
     missing_evidence: list[str] | None = None,
     disposition: DecisionKind = DecisionKind.HOLD,
     rationale: list[str] | None = None,
+    follow_up_responses: list[dict[str, object]] | None = None,
 ) -> Critique:
-    return Critique(
-        cycle=cycle,
-        responds_to_critique_id=responds_to_critique_id,
-        supported_findings=(
+    payload: dict[str, object] = {
+        "cycle": cycle,
+        "responds_to_critique_id": responds_to_critique_id,
+        "supported_findings": (
             supported_findings
             if supported_findings is not None
             else ["persisted evidence reviewed"]
         ),
-        challenged_findings=challenged_findings or [],
-        missing_evidence=missing_evidence or [],
-        requested_follow_up=requested_follow_up or [],
-        recommended_disposition=disposition,
-        rationale=rationale or ["finite persisted critique cycle"],
+        "challenged_findings": challenged_findings or [],
+        "missing_evidence": missing_evidence or [],
+        "requested_follow_up": requested_follow_up or [],
+        "recommended_disposition": disposition,
+        "rationale": rationale or ["finite persisted critique cycle"],
+    }
+    if follow_up_responses is not None:
+        payload["follow_up_responses"] = follow_up_responses
+    return Critique.model_validate(payload)
+
+
+def _record_follow_up_evidence(
+    settings: Settings,
+    case_id: str,
+    requested_item: str,
+) -> str:
+    return AuditRecorder(settings.workflow_db, case_id).record(
+        "tool.critic_line_recompute",
+        {
+            "requested_item": requested_item,
+            "quantity": "2",
+            "unit_price": "5.00",
+            "line_total": "10.00",
+        },
+        agent_name="independent_critic_agent",
     )
+
+
+def _follow_up_response(
+    requested_item: str,
+    outcome: str,
+    evidence_event_id: str,
+) -> dict[str, object]:
+    return {
+        "requested_item": requested_item,
+        "outcome": outcome,
+        "evidence_event_ids": [evidence_event_id],
+    }
 
 
 def _assert_cycle_complete(case_id: str, store: WorkflowStore) -> None:
@@ -168,6 +203,236 @@ def test_strict_manifest_rejects_removed_critique_cycle_uniqueness(settings: Set
     assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
 
 
+def _empty_v6_workflow(
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+) -> tuple[Path, Settings]:
+    path = tmp_path / filename
+    packaged = core_module._migration_resources(DatabaseKind.WORKFLOW)
+    assert [resource.name[:3] for resource in packaged] == [
+        "001",
+        "002",
+        "003",
+        "004",
+        "005",
+        "006",
+        "007",
+    ]
+    original_resources = core_module._migration_resources
+
+    def resources_through_v6(kind: DatabaseKind) -> list[object]:
+        resources = original_resources(kind)
+        return resources[:-1] if kind is DatabaseKind.WORKFLOW else list(resources)
+
+    legacy_settings = settings.model_copy(
+        update={
+            "workflow_db": path,
+            "source_archive_dir": tmp_path / f"{path.stem}-sources",
+        }
+    )
+    monkeypatch.setattr(core_module, "_migration_resources", resources_through_v6)
+    assert core_module._migrate_database_in_process(
+        path,
+        DatabaseKind.WORKFLOW,
+        settings=legacy_settings,
+    ) == [1, 2, 3, 4, 5, 6]
+    monkeypatch.setattr(core_module, "_migration_resources", original_resources)
+    return path, legacy_settings
+
+
+def test_v7_upgrade_archives_every_legacy_critique_and_promotes_exact_latest(
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, legacy_settings = _empty_v6_workflow(
+        settings,
+        tmp_path,
+        monkeypatch,
+        "workflow-v6-duplicate-critiques.db",
+    )
+
+    old_at = datetime(2026, 8, 10, 12, 2, tzinfo=UTC).isoformat()
+    latest_at = datetime(2026, 8, 10, 12, 3, tzinfo=UTC).isoformat()
+    legacy_payloads = (
+        json.dumps(
+            {
+                "supported_findings": ["first legacy run"],
+                "challenged_findings": [],
+                "missing_evidence": [],
+                "requested_follow_up": [],
+                "recommended_disposition": "HOLD",
+                "rationale": ["superseded by a normal resume"],
+            },
+            sort_keys=True,
+        ),
+        json.dumps(
+            {
+                "supported_findings": ["latest legacy resumed run"],
+                "challenged_findings": [],
+                "missing_evidence": [],
+                "requested_follow_up": [],
+                "recommended_disposition": "APPROVE",
+                "rationale": ["this was the pre-v7 authoritative latest row"],
+            },
+            sort_keys=True,
+        ),
+    )
+    with connect_database(path) as connection:
+        connection.execute(
+            "INSERT INTO cases(case_id, status, started_at, updated_at) "
+            "VALUES ('case_legacy_duplicate_critiques', 'INCOMPLETE', ?, ?)",
+            (old_at, old_at),
+        )
+        connection.executemany(
+            "INSERT INTO critique_results("
+            "critique_id, case_id, payload_json, created_at, execution_generation"
+            ") VALUES (?, 'case_legacy_duplicate_critiques', ?, ?, ?)",
+            (
+                ("crit_legacy_first", legacy_payloads[0], old_at, 1),
+                ("crit_legacy_latest", legacy_payloads[1], latest_at, 2),
+            ),
+        )
+        connection.commit()
+
+    assert core_module._migrate_database_in_process(
+        path,
+        DatabaseKind.WORKFLOW,
+        settings=legacy_settings,
+    ) == [7]
+    verify_database(
+        path,
+        DatabaseKind.WORKFLOW,
+        settings=legacy_settings,
+    )
+    with connect_database(path, read_only=True) as connection:
+        active_row = connection.execute(
+            "SELECT critique_id, payload_json, execution_generation, cycle, "
+            "responds_to_critique_id FROM critique_results"
+        ).fetchone()
+        archived = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT source_rowid, critique_id, case_id, payload_json, created_at, "
+                "execution_generation, migration_role "
+                "FROM legacy_critique_history ORDER BY source_rowid"
+            )
+        ]
+
+    assert active_row is not None
+    active = tuple(active_row)
+    assert active == (
+        "crit_legacy_latest",
+        legacy_payloads[1],
+        2,
+        1,
+        None,
+    )
+    assert archived == [
+        (
+            1,
+            "crit_legacy_first",
+            "case_legacy_duplicate_critiques",
+            legacy_payloads[0],
+            old_at,
+            1,
+            "HISTORICAL_SUPERSEDED",
+        ),
+        (
+            2,
+            "crit_legacy_latest",
+            "case_legacy_duplicate_critiques",
+            legacy_payloads[1],
+            latest_at,
+            2,
+            "PROMOTED_CYCLE_ONE",
+        ),
+    ]
+    immutable_statements = (
+        "UPDATE legacy_critique_history SET payload_json = '{}'",
+        "DELETE FROM legacy_critique_history",
+        "INSERT INTO legacy_critique_history("
+        "source_rowid, critique_id, case_id, payload_json, created_at, "
+        "execution_generation, migration_role) "
+        "SELECT source_rowid + 100, critique_id || '_copy', case_id, payload_json, "
+        "created_at, execution_generation, 'HISTORICAL_SUPERSEDED' "
+        "FROM legacy_critique_history LIMIT 1",
+    )
+    for statement in immutable_statements:
+        with connect_database(path) as connection:
+            with pytest.raises(
+                sqlite3.IntegrityError,
+                match="LEGACY_CRITIQUE_HISTORY_IMMUTABLE",
+            ):
+                connection.execute(statement)
+            connection.rollback()
+
+
+def test_v7_upgrade_rolls_back_an_equal_latest_legacy_critique_ambiguity(
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, legacy_settings = _empty_v6_workflow(
+        settings,
+        tmp_path,
+        monkeypatch,
+        "workflow-v6-ambiguous-critiques.db",
+    )
+    tied_at = datetime(2026, 8, 10, 12, 2, tzinfo=UTC).isoformat()
+    payload = json.dumps(
+        {
+            "supported_findings": ["legacy evidence"],
+            "challenged_findings": [],
+            "missing_evidence": [],
+            "requested_follow_up": [],
+            "recommended_disposition": "HOLD",
+            "rationale": ["the legacy created_at tie is not authoritative"],
+        },
+        sort_keys=True,
+    )
+    with connect_database(path) as connection:
+        connection.execute(
+            "INSERT INTO cases(case_id, status, started_at, updated_at) "
+            "VALUES ('case_legacy_critique_tie', 'INCOMPLETE', ?, ?)",
+            (tied_at, tied_at),
+        )
+        connection.executemany(
+            "INSERT INTO critique_results("
+            "critique_id, case_id, payload_json, created_at, execution_generation"
+            ") VALUES (?, 'case_legacy_critique_tie', ?, ?, ?)",
+            (
+                ("crit_legacy_tied_a", payload, tied_at, 1),
+                ("crit_legacy_tied_b", payload, tied_at, 2),
+            ),
+        )
+        connection.commit()
+    before = path.read_bytes()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        core_module._migrate_database_in_process(
+            path,
+            DatabaseKind.WORKFLOW,
+            settings=legacy_settings,
+        )
+
+    assert excinfo.value.stop_reason == "LEGACY_CRITIQUE_HISTORY_AMBIGUOUS"
+    assert path.read_bytes() == before
+    with connect_database(path, read_only=True) as connection:
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_version"
+        ).fetchone()[0] == 6
+        assert connection.execute(
+            "SELECT COUNT(*) FROM critique_results WHERE case_id = 'case_legacy_critique_tie'"
+        ).fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'legacy_critique_history'"
+        ).fetchone() is None
+
+
 def test_legacy_payload_and_default_relational_columns_remain_cycle_one(
     settings: Settings,
     tmp_path: Path,
@@ -223,27 +488,28 @@ def test_save_and_list_critiques_preserve_cycle_order_and_exact_parent(
         lease_seconds=60,
     )
     assert resumed_claim.generation == claim.generation + 1
+    evidence_event_id = _record_follow_up_evidence(
+        settings,
+        resumed_claim.case_id,
+        "inventory mapping needs recheck",
+    )
     second_id = store.save_critique(
         resumed_claim.case_id,
         _critique(
             cycle=2,
             responds_to_critique_id=first_id,
             challenged_findings=["inventory mapping needs recheck"],
+            follow_up_responses=[
+                _follow_up_response(
+                    "inventory mapping needs recheck",
+                    "CHALLENGED",
+                    evidence_event_id,
+                )
+            ],
         ),
         resumed_claim,
     )
 
-    # Cycle is authoritative even if timestamps are skewed or collide.
-    with connect_database(settings.workflow_db) as connection:
-        connection.execute(
-            "UPDATE critique_results SET created_at = ? WHERE critique_id = ?",
-            (datetime(2026, 8, 10, 12, 5, tzinfo=UTC).isoformat(), first_id),
-        )
-        connection.execute(
-            "UPDATE critique_results SET created_at = ? WHERE critique_id = ?",
-            (datetime(2026, 8, 10, 12, 4, tzinfo=UTC).isoformat(), second_id),
-        )
-        connection.commit()
     critiques = store.list_critiques(resumed_claim.case_id)
     with connect_database(settings.workflow_db, read_only=True) as connection:
         ids = tuple(
@@ -326,8 +592,12 @@ def test_cycle_two_covers_requested_follow_up_across_the_exact_structured_union(
         _critique(requested_follow_up=requested),
         claim,
     )
+    evidence_event_ids = [
+        _record_follow_up_evidence(settings, claim.case_id, requested_item)
+        for requested_item in requested
+    ]
 
-    store.save_critique(
+    second_id = store.save_critique(
         claim.case_id,
         _critique(
             cycle=2,
@@ -335,11 +605,186 @@ def test_cycle_two_covers_requested_follow_up_across_the_exact_structured_union(
             supported_findings=[requested[0]],
             challenged_findings=[requested[1]],
             missing_evidence=[requested[2]],
+            follow_up_responses=[
+                _follow_up_response(requested[0], "SUPPORTED", evidence_event_ids[0]),
+                _follow_up_response(requested[1], "CHALLENGED", evidence_event_ids[1]),
+                _follow_up_response(requested[2], "MISSING", evidence_event_ids[2]),
+            ],
         ),
         claim,
     )
 
     _assert_cycle_complete(claim.case_id, store)
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        persisted_responses = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT requested_item, outcome, evidence_event_id "
+                "FROM critique_follow_up_evidence WHERE critique_id = ? "
+                "ORDER BY requested_item",
+                (second_id,),
+            )
+        ]
+    assert persisted_responses == sorted(
+        [
+            (requested[0], "SUPPORTED", evidence_event_ids[0]),
+            (requested[1], "CHALLENGED", evidence_event_ids[1]),
+            (requested[2], "MISSING", evidence_event_ids[2]),
+        ]
+    )
+
+
+def test_cycle_two_cannot_satisfy_follow_up_by_echoing_items_without_evidence(
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    store, claim = _claimed_case(settings, tmp_path, "case_follow_up_echo")
+    requested_item = "recompute exact line extension"
+    first_id = store.save_critique(
+        claim.case_id,
+        _critique(requested_follow_up=[requested_item]),
+        claim,
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.save_critique(
+            claim.case_id,
+            _critique(
+                cycle=2,
+                responds_to_critique_id=first_id,
+                supported_findings=[requested_item],
+            ),
+            claim,
+        )
+
+    assert excinfo.value.stop_reason == "CRITIQUE_FOLLOW_UP_EVIDENCE_REQUIRED"
+    assert [item.cycle for item in store.list_critiques(claim.case_id)] == [1]
+
+
+@pytest.mark.parametrize(
+    "evidence_boundary",
+    ["different-case", "before-parent", "wrong-type"],
+)
+def test_cycle_two_rejects_an_unbound_or_preexisting_audit_event(
+    settings: Settings,
+    tmp_path: Path,
+    evidence_boundary: str,
+) -> None:
+    store, claim = _claimed_case(
+        settings,
+        tmp_path,
+        f"case_follow_up_event_{evidence_boundary}",
+    )
+    requested_item = "recompute exact line extension"
+    if evidence_boundary == "before-parent":
+        evidence_event_id = _record_follow_up_evidence(
+            settings,
+            claim.case_id,
+            requested_item,
+        )
+    first_id = store.save_critique(
+        claim.case_id,
+        _critique(requested_follow_up=[requested_item]),
+        claim,
+    )
+    if evidence_boundary == "different-case":
+        other_store, other_claim = _claimed_case(
+            settings,
+            tmp_path,
+            "case_follow_up_event_owner",
+        )
+        evidence_event_id = _record_follow_up_evidence(
+            settings,
+            other_claim.case_id,
+            requested_item,
+        )
+        assert other_store.list_critiques(other_claim.case_id) == []
+    elif evidence_boundary == "wrong-type":
+        assert evidence_boundary == "wrong-type"
+        evidence_event_id = AuditRecorder(settings.workflow_db, claim.case_id).record(
+            "tool.case_metadata",
+            {"requested_item": requested_item},
+            agent_name="case_coordinator",
+        )
+    else:
+        assert evidence_boundary == "before-parent"
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.save_critique(
+            claim.case_id,
+            _critique(
+                cycle=2,
+                responds_to_critique_id=first_id,
+                supported_findings=[requested_item],
+                follow_up_responses=[
+                    _follow_up_response(
+                        requested_item,
+                        "SUPPORTED",
+                        evidence_event_id,
+                    )
+                ],
+            ),
+            claim,
+        )
+
+    assert excinfo.value.stop_reason == "CRITIQUE_FOLLOW_UP_EVIDENCE_INVALID"
+    assert [item.cycle for item in store.list_critiques(claim.case_id)] == [1]
+
+
+@pytest.mark.parametrize(
+    "mutation_sql",
+    [
+        "UPDATE events SET payload_json = '{}' WHERE event_id = ?",
+        "DELETE FROM events WHERE event_id = ?",
+    ],
+    ids=["update", "delete"],
+)
+def test_bound_critique_follow_up_events_are_immutable(
+    settings: Settings,
+    tmp_path: Path,
+    mutation_sql: str,
+) -> None:
+    store, claim = _claimed_case(settings, tmp_path, "case_follow_up_event_immutable")
+    requested_item = "recompute exact line extension"
+    first_id = store.save_critique(
+        claim.case_id,
+        _critique(requested_follow_up=[requested_item]),
+        claim,
+    )
+    evidence_event_id = _record_follow_up_evidence(
+        settings,
+        claim.case_id,
+        requested_item,
+    )
+    store.save_critique(
+        claim.case_id,
+        _critique(
+            cycle=2,
+            responds_to_critique_id=first_id,
+            supported_findings=[requested_item],
+            follow_up_responses=[
+                _follow_up_response(
+                    requested_item,
+                    "SUPPORTED",
+                    evidence_event_id,
+                )
+            ],
+        ),
+        claim,
+    )
+
+    with connect_database(settings.workflow_db) as connection:
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="CRITIQUE_FOLLOW_UP_EVIDENCE_IMMUTABLE",
+        ):
+            connection.execute(mutation_sql, (evidence_event_id,))
+        connection.rollback()
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM events WHERE event_id = ?",
+            (evidence_event_id,),
+        ).fetchone() is not None
 
 
 @pytest.mark.parametrize(
@@ -510,6 +955,27 @@ def test_clean_cycle_one_is_complete_without_fabricating_a_second_cycle(
     assert [item.cycle for item in store.list_critiques(claim.case_id)] == [1]
 
 
+def test_clean_cycle_one_rejects_an_unnecessary_prompt_requested_cycle_two(
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    store, claim = _claimed_case(settings, tmp_path, "case_unnecessary_cycle_two")
+    first_id = store.save_critique(claim.case_id, _critique(), claim)
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.save_critique(
+            claim.case_id,
+            _critique(
+                cycle=2,
+                responds_to_critique_id=first_id,
+            ),
+            claim,
+        )
+
+    assert excinfo.value.stop_reason == "CRITIQUE_FOLLOW_UP_NOT_REQUIRED"
+    assert [item.cycle for item in store.list_critiques(claim.case_id)] == [1]
+
+
 def test_cycle_two_cannot_request_an_unpersistable_third_cycle(
     settings: Settings,
     tmp_path: Path,
@@ -547,12 +1013,24 @@ def test_third_critique_fails_with_exact_limit_and_preserves_two_rows(
         _critique(challenged_findings=["recompute amount"]),
         claim,
     )
+    evidence_event_id = _record_follow_up_evidence(
+        settings,
+        claim.case_id,
+        "recompute amount",
+    )
     second_id = store.save_critique(
         claim.case_id,
         _critique(
             cycle=2,
             responds_to_critique_id=first_id,
             challenged_findings=["recompute amount"],
+            follow_up_responses=[
+                _follow_up_response(
+                    "recompute amount",
+                    "CHALLENGED",
+                    evidence_event_id,
+                )
+            ],
         ),
         claim,
     )
@@ -575,6 +1053,7 @@ def _save_cycle_two_worker(
     claim: ExecutionClaim,
     first_id: str,
     requested: list[str],
+    evidence_event_id: str,
     start: Any,
     result: Any,
 ) -> None:
@@ -600,6 +1079,13 @@ def _save_cycle_two_worker(
                     cycle=2,
                     responds_to_critique_id=first_id,
                     supported_findings=requested,
+                    follow_up_responses=[
+                        _follow_up_response(
+                            requested[0],
+                            "SUPPORTED",
+                            evidence_event_id,
+                        )
+                    ],
                 ),
                 claim,
             )
@@ -624,6 +1110,11 @@ def test_concurrent_cycle_two_writers_commit_exactly_one_response(
         _critique(requested_follow_up=requested),
         claim,
     )
+    evidence_event_id = _record_follow_up_evidence(
+        settings,
+        claim.case_id,
+        requested[0],
+    )
     context = multiprocessing.get_context("spawn")
     start = context.Event()
     result_pairs = [context.Pipe(duplex=False) for _ in range(2)]
@@ -636,6 +1127,7 @@ def test_concurrent_cycle_two_writers_commit_exactly_one_response(
                 claim,
                 first_id,
                 requested,
+                evidence_event_id,
                 start,
                 child_result,
             ),

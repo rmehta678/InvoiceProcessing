@@ -281,6 +281,37 @@ class EvidenceBlocker(StrictModel):
     description: str
 
 
+class CritiqueFollowUpOutcome(StrEnum):
+    SUPPORTED = "SUPPORTED"
+    CHALLENGED = "CHALLENGED"
+    MISSING = "MISSING"
+
+
+class CritiqueFollowUpResponse(StrictModel):
+    """One exact cycle-one item, its outcome, and the persisted evidence consulted."""
+
+    requested_item: str = Field(min_length=1)
+    outcome: CritiqueFollowUpOutcome
+    evidence_event_ids: list[str] = Field(min_length=1)
+
+    @field_validator("requested_item")
+    @classmethod
+    def requested_item_is_nonblank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("critique follow-up item cannot be blank")
+        return value
+
+    @field_validator("evidence_event_ids")
+    @classmethod
+    def evidence_event_ids_are_exact(cls, values: list[str]) -> list[str]:
+        if (
+            len(set(values)) != len(values)
+            or any(not value.startswith("evt_") or not value[4:] for value in values)
+        ):
+            raise ValueError("critique follow-up evidence event IDs must be unique exact IDs")
+        return values
+
+
 class Critique(StrictModel):
     cycle: int = Field(default=1, ge=1, le=2)
     responds_to_critique_id: str | None = None
@@ -290,6 +321,7 @@ class Critique(StrictModel):
     requested_follow_up: list[str]
     recommended_disposition: DecisionKind
     rationale: list[str]
+    follow_up_responses: list[CritiqueFollowUpResponse] = Field(default_factory=list)
 
 
 class HumanDecision(StrictModel):

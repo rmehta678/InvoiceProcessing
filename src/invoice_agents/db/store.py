@@ -30,6 +30,7 @@ from invoice_agents.models import (
     CaseResult,
     CaseStatus,
     Critique,
+    CritiqueFollowUpResponse,
     ErrorRecord,
     ExtractedInvoice,
     FinalDecision,
@@ -56,6 +57,17 @@ _SUBMISSION_REQUEST_ID = re.compile(r"^submission_[A-Za-z0-9][A-Za-z0-9_-]{0,126
 _CASE_LIVE_TARGET = re.compile(r"^/cases/(case_[0-9a-f]{32})/live$")
 _BATCH_TARGET = re.compile(r"^/batches/(batch_[0-9a-f]{24})$")
 _STORED_FINISHED_AT_OMITTED = object()
+_DIRECT_CRITIQUE_FOLLOW_UP_EVENT_TYPES = frozenset(
+    {"tool.critic_inventory_recheck", "tool.critic_line_recompute"}
+)
+_PERSISTED_SPECIALIST_FOLLOW_UP_EVENT_TYPES = frozenset(
+    {
+        "tool.identity_candidates",
+        "tool.inventory_comparison",
+        "tool.mapping_evidence_recorded",
+        "tool.financial_risk_assessment",
+    }
+)
 
 
 def _validated_requested_execution_token(token: object) -> str:
@@ -3652,7 +3664,11 @@ class WorkflowStore:
                         "CRITIQUE_CYCLE_LIMIT",
                     )
                 if not records:
-                    if critique.cycle != 1 or critique.responds_to_critique_id is not None:
+                    if (
+                        critique.cycle != 1
+                        or critique.responds_to_critique_id is not None
+                        or critique.follow_up_responses
+                    ):
                         self._raise_critique_cycle_error(
                             case_id,
                             "the first critique cannot respond to another critique",
@@ -3671,10 +3687,34 @@ class WorkflowStore:
                             "CRITIQUE_RESPONSE_INVALID",
                         )
                     from invoice_agents.agents.decision_rules import (
-                        _assert_critique_follow_up_addressed,
+                        _assert_critique_sequence_complete,
                     )
 
-                    _assert_critique_follow_up_addressed(case_id, parent, critique)
+                    _assert_critique_sequence_complete(case_id, [parent, critique])
+                    parent_row = connection.execute(
+                        "SELECT created_at FROM critique_results WHERE critique_id = ?",
+                        (parent_id,),
+                    ).fetchone()
+                    if parent_row is None:
+                        self._raise_critique_cycle_error(
+                            case_id,
+                            "the first critique disappeared during follow-up validation",
+                            "CRITIQUE_RESPONSE_INVALID",
+                        )
+                    for response in critique.follow_up_responses:
+                        for event_id in response.evidence_event_ids:
+                            if not self._follow_up_event_is_valid(
+                                connection,
+                                case_id,
+                                str(parent_row["created_at"]),
+                                event_id,
+                            ):
+                                self._raise_critique_cycle_error(
+                                    case_id,
+                                    "critique follow-up evidence is not bound to the exact "
+                                    "case, chronology, and evidence-producing tool",
+                                    "CRITIQUE_FOLLOW_UP_EVIDENCE_INVALID",
+                                )
                 connection.execute(
                     "INSERT INTO critique_results("
                     "critique_id, case_id, payload_json, created_at, execution_generation, "
@@ -3689,6 +3729,21 @@ class WorkflowStore:
                         critique.responds_to_critique_id,
                     ),
                 )
+                for response in critique.follow_up_responses:
+                    connection.executemany(
+                        "INSERT INTO critique_follow_up_evidence("
+                        "critique_id, requested_item, outcome, evidence_event_id) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            (
+                                critique_id,
+                                response.requested_item,
+                                response.outcome.value,
+                                event_id,
+                            )
+                            for event_id in response.evidence_event_ids
+                        ),
+                    )
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -3708,6 +3763,71 @@ class WorkflowStore:
             stop_reason=stop_reason,
         )
 
+    @staticmethod
+    def _follow_up_event_is_valid(
+        connection: sqlite3.Connection,
+        case_id: str,
+        parent_created_at: str,
+        event_id: str,
+    ) -> bool:
+        row = connection.execute(
+            "SELECT case_id, event_type, db_evidence_id, created_at FROM events "
+            "WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        parent_timestamp = parse_canonical_utc(parent_created_at)
+        if row is None or parent_timestamp is None:
+            return False
+        event_timestamp = parse_canonical_utc(row["created_at"])
+        event_type = row["event_type"]
+        if (
+            event_timestamp is None
+            or event_timestamp <= parent_timestamp
+            or row["case_id"] != case_id
+            or type(event_type) is not str
+        ):
+            return False
+        if event_type in _DIRECT_CRITIQUE_FOLLOW_UP_EVENT_TYPES:
+            return True
+        return (
+            event_type in _PERSISTED_SPECIALIST_FOLLOW_UP_EVENT_TYPES
+            and type(row["db_evidence_id"]) is str
+            and bool(str(row["db_evidence_id"]).strip())
+        )
+
+    @classmethod
+    def _follow_up_rows_match_payload(
+        cls,
+        connection: sqlite3.Connection,
+        case_id: str,
+        parent_created_at: str,
+        critique_id: str,
+        responses: list[CritiqueFollowUpResponse],
+    ) -> bool:
+        rows = connection.execute(
+            "SELECT requested_item, outcome, evidence_event_id "
+            "FROM critique_follow_up_evidence WHERE critique_id = ?",
+            (critique_id,),
+        ).fetchall()
+        expected = {
+            (response.requested_item, response.outcome.value, event_id)
+            for response in responses
+            for event_id in response.evidence_event_ids
+        }
+        actual = {
+            (str(row["requested_item"]), str(row["outcome"]), str(row["evidence_event_id"]))
+            for row in rows
+        }
+        return expected == actual and all(
+            cls._follow_up_event_is_valid(
+                connection,
+                case_id,
+                parent_created_at,
+                str(row["evidence_event_id"]),
+            )
+            for row in rows
+        )
+
     @classmethod
     def _critique_records(
         cls,
@@ -3715,12 +3835,13 @@ class WorkflowStore:
         case_id: str,
     ) -> list[tuple[str, Critique, int]]:
         rows = connection.execute(
-            "SELECT critique_id, payload_json, execution_generation, cycle, "
+            "SELECT critique_id, payload_json, created_at, execution_generation, cycle, "
             "responds_to_critique_id FROM critique_results WHERE case_id = ? "
             "ORDER BY cycle",
             (case_id,),
         ).fetchall()
         records: list[tuple[str, Critique, int]] = []
+        created_at_by_id: dict[str, str] = {}
         for row in rows:
             try:
                 critique = Critique.model_validate_json(row["payload_json"], strict=True)
@@ -3734,13 +3855,17 @@ class WorkflowStore:
             relational_cycle = row["cycle"]
             relational_parent = row["responds_to_critique_id"]
             generation = row["execution_generation"]
+            created_at = row["created_at"]
             if (
                 type(row["critique_id"]) is not str
                 or type(relational_cycle) is not int
                 or (relational_parent is not None and type(relational_parent) is not str)
                 or type(generation) is not int
+                or type(created_at) is not str
+                or parse_canonical_utc(created_at) is None
                 or critique.cycle != relational_cycle
                 or critique.responds_to_critique_id != relational_parent
+                or (critique.cycle == 1 and bool(critique.follow_up_responses))
             ):
                 raise InvoiceAgentsError(
                     ErrorCategory.DATABASE,
@@ -3748,14 +3873,26 @@ class WorkflowStore:
                     case_id=case_id,
                     stop_reason="PERSISTED_RESULT_INVALID",
                 )
+            created_at_by_id[row["critique_id"]] = created_at
             records.append((row["critique_id"], critique, generation))
         if records:
-            first_id, first, _first_generation = records[0]
+            first_id, first, first_generation = records[0]
             relationship_is_valid = first.cycle == 1 and first.responds_to_critique_id is None
             if len(records) == 2:
-                _second_id, second, _second_generation = records[1]
+                second_id, second, second_generation = records[1]
                 relationship_is_valid = relationship_is_valid and (
-                    second.cycle == 2 and second.responds_to_critique_id == first_id
+                    second.cycle == 2
+                    and second.responds_to_critique_id == first_id
+                    and second_generation >= first_generation
+                    and datetime.fromisoformat(created_at_by_id[second_id])
+                    > datetime.fromisoformat(created_at_by_id[first_id])
+                )
+                relationship_is_valid = relationship_is_valid and cls._follow_up_rows_match_payload(
+                    connection,
+                    case_id,
+                    created_at_by_id[first_id],
+                    second_id,
+                    second.follow_up_responses,
                 )
             if len(records) > 2 or not relationship_is_valid:
                 raise InvoiceAgentsError(
@@ -3765,6 +3902,50 @@ class WorkflowStore:
                     stop_reason="PERSISTED_RESULT_INVALID",
                 )
         return records
+
+    def list_current_critique_follow_up_events(
+        self,
+        claim: ExecutionClaim,
+        parent_critique_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return exact post-parent evidence identities eligible for cycle two."""
+
+        claim = validate_execution_claim(claim)
+        with connect_database(self.path, read_only=True) as connection:
+            self._begin_current_read(connection, claim)
+            parent = connection.execute(
+                "SELECT created_at FROM critique_results WHERE critique_id = ? "
+                "AND case_id = ? AND cycle = 1",
+                (parent_critique_id, claim.case_id),
+            ).fetchone()
+            if parent is None or parse_canonical_utc(parent["created_at"]) is None:
+                raise InvoiceAgentsError(
+                    ErrorCategory.DATABASE,
+                    "critique follow-up parent is absent or invalid",
+                    case_id=claim.case_id,
+                    stop_reason="PERSISTED_RESULT_INVALID",
+                )
+            rows = connection.execute(
+                "SELECT event_id, event_type, db_evidence_id, created_at FROM events "
+                "WHERE case_id = ? AND created_at > ? ORDER BY created_at, event_id",
+                (claim.case_id, parent["created_at"]),
+            ).fetchall()
+            eligible = [
+                {
+                    "evidence_event_id": str(row["event_id"]),
+                    "event_type": str(row["event_type"]),
+                    "db_evidence_id": row["db_evidence_id"],
+                    "created_at": str(row["created_at"]),
+                }
+                for row in rows
+                if self._follow_up_event_is_valid(
+                    connection,
+                    claim.case_id,
+                    str(parent["created_at"]),
+                    str(row["event_id"]),
+                )
+            ]
+        return eligible
 
     def list_critiques(self, case_id: str) -> list[Critique]:
         with connect_database(self.path, read_only=True) as connection:

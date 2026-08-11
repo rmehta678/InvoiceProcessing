@@ -142,6 +142,10 @@ _WORKER_DOMAIN_ERROR_CONTRACTS: dict[str, _WorkerErrorContract] = {
         ErrorCategory.DATABASE,
         "inventory database must use DELETE journal mode",
     ),
+    "LEGACY_CRITIQUE_HISTORY_AMBIGUOUS": _WorkerErrorContract(
+        ErrorCategory.DATABASE,
+        "legacy critique history has no unique latest record",
+    ),
     "LEGACY_RECONCILIATION_ARCHIVE_INVALID": _WorkerErrorContract(
         ErrorCategory.DATABASE,
         "legacy reconciliation archive failed integrity verification",

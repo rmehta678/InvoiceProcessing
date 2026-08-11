@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import (
     Critique,
+    CritiqueFollowUpOutcome,
     DecisionKind,
     EvidenceBlocker,
     HumanDecision,
@@ -347,6 +348,13 @@ def _assert_critique_sequence_complete(
             case_id=case_id,
             stop_reason="CRITIQUE_RESPONSE_INVALID",
         )
+    if not follow_up_required:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "the clean first critique does not permit a follow-up cycle",
+            case_id=case_id,
+            stop_reason="CRITIQUE_FOLLOW_UP_NOT_REQUIRED",
+        )
     _assert_critique_follow_up_addressed(case_id, first, second)
 
 
@@ -381,6 +389,61 @@ def _assert_critique_follow_up_addressed(
             case_id=case_id,
             stop_reason="CRITIQUE_FOLLOW_UP_UNADDRESSED",
         )
+    responses = second.follow_up_responses
+    if not responses:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "the second critique has no persisted evidence-bound follow-up responses",
+            case_id=case_id,
+            stop_reason="CRITIQUE_FOLLOW_UP_EVIDENCE_REQUIRED",
+        )
+    response_items = [response.requested_item for response in responses]
+    response_evidence = [
+        evidence_event_id
+        for response in responses
+        for evidence_event_id in response.evidence_event_ids
+    ]
+    if (
+        len(response_items) != len(set(response_items))
+        or set(response_items) != required
+        or len(response_evidence) != len(set(response_evidence))
+    ):
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "the second critique does not bind exactly one unique response to every required item",
+            case_id=case_id,
+            stop_reason="CRITIQUE_FOLLOW_UP_EVIDENCE_INVALID",
+        )
+    outcome_lists = {
+        CritiqueFollowUpOutcome.SUPPORTED: second.supported_findings,
+        CritiqueFollowUpOutcome.CHALLENGED: second.challenged_findings,
+        CritiqueFollowUpOutcome.MISSING: second.missing_evidence,
+    }
+    for response in responses:
+        appearances = sum(
+            response.requested_item in findings for findings in outcome_lists.values()
+        )
+        if (
+            appearances != 1
+            or response.requested_item not in outcome_lists[response.outcome]
+        ):
+            raise InvoiceAgentsError(
+                ErrorCategory.ORCHESTRATION,
+                "a critique follow-up outcome does not match its exact structured finding list",
+                case_id=case_id,
+                stop_reason="CRITIQUE_FOLLOW_UP_OUTCOME_INVALID",
+            )
+    if second.recommended_disposition is DecisionKind.APPROVE and (
+        second.challenged_findings
+        or second.missing_evidence
+        or second.requested_follow_up
+    ):
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "APPROVE cannot coexist with unresolved critique evidence",
+            case_id=case_id,
+            stop_reason="CRITIQUE_EVIDENCE_UNRESOLVED",
+        )
 
 
 def assert_critique_cycle_complete(case_id: str, store: WorkflowStore) -> None:
@@ -411,6 +474,17 @@ def validate_final_decision(
     4. APPROVE and payment eligibility must agree exactly.
     """
 
+    if selected is DecisionKind.APPROVE and (
+        critique.challenged_findings
+        or critique.missing_evidence
+        or critique.requested_follow_up
+    ):
+        raise InvoiceAgentsError(
+            ErrorCategory.TOOL,
+            "APPROVE cannot mask unresolved evidence in the latest persisted critique",
+            case_id=case_id,
+            stop_reason="CRITIQUE_EVIDENCE_UNRESOLVED",
+        )
     if risk.policy_review_reasons and (review is None or review.status != "RESOLVED"):
         raise InvoiceAgentsError(
             ErrorCategory.TOOL,

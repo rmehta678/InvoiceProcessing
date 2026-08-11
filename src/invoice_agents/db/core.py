@@ -208,6 +208,7 @@ REQUIRED_INDEXES: dict[DatabaseKind, frozenset[str]] = {
             "idx_batch_entries_case_id",
             "idx_legacy_authorization_quarantine_reconciliation",
             "idx_critique_results_case_cycle",
+            "idx_critique_follow_up_evidence_event",
         }
     ),
 }
@@ -2699,6 +2700,12 @@ def _migrate_database_in_process(
         except DatabaseVerificationError:
             raise
         except (sqlite3.Error, ValueError) as exc:
+            if str(exc) == "LEGACY_CRITIQUE_HISTORY_AMBIGUOUS":
+                raise DatabaseVerificationError(
+                    ErrorCategory.DATABASE,
+                    "legacy critique history has no unique latest record",
+                    stop_reason="LEGACY_CRITIQUE_HISTORY_AMBIGUOUS",
+                ) from exc
             raise DatabaseVerificationError(
                 ErrorCategory.DATABASE,
                 f"migration {resource.name} failed: {exc}",
@@ -3038,6 +3045,21 @@ def _verify_database_snapshot(
                 "execution_generation",
                 "cycle",
                 "responds_to_critique_id",
+            },
+            "legacy_critique_history": {
+                "source_rowid",
+                "critique_id",
+                "case_id",
+                "payload_json",
+                "created_at",
+                "execution_generation",
+                "migration_role",
+            },
+            "critique_follow_up_evidence": {
+                "critique_id",
+                "requested_item",
+                "outcome",
+                "evidence_event_id",
             },
             "review_requests": {
                 "review_id",

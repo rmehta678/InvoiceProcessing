@@ -93,12 +93,18 @@ def make_risk(
     )
 
 
-def make_critique(disposition: DecisionKind) -> Critique:
+def make_critique(
+    disposition: DecisionKind,
+    *,
+    challenged_findings: list[str] | None = None,
+    missing_evidence: list[str] | None = None,
+    requested_follow_up: list[str] | None = None,
+) -> Critique:
     return Critique(
         supported_findings=["evidence reviewed"],
-        challenged_findings=[],
-        missing_evidence=[],
-        requested_follow_up=[],
+        challenged_findings=challenged_findings or [],
+        missing_evidence=missing_evidence or [],
+        requested_follow_up=requested_follow_up or [],
         recommended_disposition=disposition,
         rationale=["test rationale"],
     )
@@ -154,6 +160,35 @@ def test_authorizing_human_decision_permits_approve_despite_critic(
         make_review(decision),
     )
     assert result is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("challenged_findings", ["inventory mapping remains disputed"]),
+        ("missing_evidence", ["purchase order remains absent"]),
+        ("requested_follow_up", ["recompute the exact line extension"]),
+    ],
+    ids=["challenged", "missing", "follow-up-requested"],
+)
+def test_human_authorization_cannot_mask_unresolved_latest_critique_evidence(
+    field: str,
+    value: list[str],
+) -> None:
+    critique = make_critique(DecisionKind.APPROVE).model_copy(
+        update={field: value},
+        deep=True,
+    )
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        validate_final_decision(
+            DecisionKind.APPROVE,
+            True,
+            make_risk(reasons=["policy trigger"]),
+            critique,
+            make_review(HumanDecisionKind.APPROVE),
+        )
+
+    assert excinfo.value.stop_reason == "CRITIQUE_EVIDENCE_UNRESOLVED"
 
 
 def test_authorizing_decision_permits_hold_when_blocking_evidence_remains() -> None:

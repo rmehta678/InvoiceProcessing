@@ -27,6 +27,7 @@ from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.hitl.service import create_review_request
 from invoice_agents.models import (
     Critique,
+    CritiqueFollowUpResponse,
     DecisionKind,
     ExtractedInvoice,
     FinalDecision,
@@ -265,10 +266,25 @@ def build_team(
             {"critique_id": critique_id, **critique.model_dump(mode="json")}
             for critique_id, critique in context.store.list_critique_records(context.case_id)
         ]
+        eligible_follow_up_evidence: list[dict[str, Any]] = []
+        if len(prior_critiques) == 1:
+            parent = prior_critiques[0]
+            if (
+                parent["challenged_findings"]
+                or parent["missing_evidence"]
+                or parent["requested_follow_up"]
+            ):
+                eligible_follow_up_evidence = (
+                    context.store.list_current_critique_follow_up_events(
+                        context.claim,
+                        str(parent["critique_id"]),
+                    )
+                )
         return {
             "invoice": invoice.model_dump(mode="json"),
             "risk": risk.model_dump(mode="json"),
             "prior_critiques": prior_critiques,
+            "eligible_follow_up_evidence": eligible_follow_up_evidence,
             "instruction": (
                 "Challenge mappings, aggregation, arithmetic, dates, identity, and "
                 "evidence completeness."
@@ -283,23 +299,23 @@ def build_team(
             "exact": reader.lookup_inventory_exact(item_name).model_dump(mode="json"),
             "approved_alias": reader.lookup_item_alias(item_name).model_dump(mode="json"),
         }
-        context.audit.record(
+        evidence_event_id = context.audit.record(
             "tool.critic_inventory_recheck",
             payload,
             agent_name="independent_critic_agent",
         )
-        return payload
+        return {"evidence_event_id": evidence_event_id, **payload}
 
     async def recompute_line(quantity: str, unit_price: str) -> dict[str, Any]:
         """Recompute one exact Decimal line extension with no stored state."""
 
         payload: dict[str, Any] = dict(recompute_line_extension(quantity, unit_price))
-        context.audit.record(
+        evidence_event_id = context.audit.record(
             "tool.critic_line_recompute",
             payload,
             agent_name="independent_critic_agent",
         )
-        return payload
+        return {"evidence_event_id": evidence_event_id, **payload}
 
     async def record_critique(
         cycle: Literal[1, 2],
@@ -310,6 +326,7 @@ def build_team(
         requested_follow_up: list[str],
         recommended_disposition: Literal["APPROVE", "REJECT", "HOLD", "FAILED"],
         rationale: list[str],
+        follow_up_responses: list[CritiqueFollowUpResponse],
     ) -> dict[str, Any]:
         """Validate and persist the critic's independent structured result."""
 
@@ -322,6 +339,7 @@ def build_team(
             requested_follow_up=requested_follow_up,
             recommended_disposition=DecisionKind(recommended_disposition),
             rationale=rationale,
+            follow_up_responses=follow_up_responses,
         )
         record_id = context.store.save_critique(context.case_id, critique, context.claim)
         critique_payload = critique.model_dump(mode="json")
@@ -547,13 +565,17 @@ def build_team(
         ],
         system_message=(
             "Independently inspect the package using get_critic_evidence. If prior_critiques is empty, call "
-            "record_critique exactly once with cycle=1 and responds_to_critique_id=null. If it contains one "
+            "record_critique exactly once with cycle=1, responds_to_critique_id=null, and "
+            "follow_up_responses=[]. If prior_critiques contains one "
             "clean cycle-1 result, hand off to approval_agent without recording another. If the single "
             "cycle-1 result has challenged_findings, missing_evidence, or requested_follow_up, complete its "
             "one focused specialist follow-up and call record_critique exactly once with cycle=2, "
             "responds_to_critique_id set to that result's exact critique_id, no requested_follow_up, and "
             "every exact cycle-1 challenge, missing-evidence item, and requested follow-up represented in "
-            "supported_findings, challenged_findings, or missing_evidence. After an initial cycle containing "
+            "supported_findings, challenged_findings, or missing_evidence. Bind each one through exactly one "
+            "follow_up_responses entry whose requested_item is exact, outcome matches that structured list, "
+            "and evidence_event_ids names persisted eligible_follow_up_evidence produced after cycle 1. "
+            "Never invent or reuse an event ID. After an initial cycle containing "
             "any challenge, missing evidence, or request, "
             "handoff for that required follow-up instead of approaching approval. Two prior critiques is the "
             "finite limit: do not request or record another. "
