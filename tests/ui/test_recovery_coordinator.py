@@ -19,7 +19,10 @@ from invoice_agents.config import Settings
 from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.errors import InvoiceAgentsError
+from invoice_agents.isolated_process import ProcessCancellation
 from invoice_agents.models import CaseResult, CaseStatus
+from invoice_agents.recovery_process import RecoveryProcessOutcome
+from invoice_agents.ui import recovery as recovery_module
 from invoice_agents.ui import server as ui_server
 from invoice_agents.ui import sse
 from invoice_agents.ui.recovery import RecoveryCoordinator
@@ -107,15 +110,15 @@ async def _get_once(app: FastAPI, path: str) -> list[dict[str, Any]]:
 
 
 @pytest.mark.parametrize("invalid_timeout", [0.0, -1.0, math.inf, math.nan])
-def test_recovery_shutdown_deadline_must_be_finite_and_positive(
+def test_recovery_worker_timeout_must_be_finite_and_positive(
     settings: Settings,
     invalid_timeout: float,
 ) -> None:
-    with pytest.raises(ValueError, match="shutdown timeout must be"):
+    with pytest.raises(ValueError, match="worker timeout must be"):
         RecoveryCoordinator(
             settings,
             scan_interval_seconds=1,
-            shutdown_timeout_seconds=invalid_timeout,
+            worker_timeout_seconds=invalid_timeout,
         )
 
 
@@ -141,22 +144,22 @@ async def test_concurrent_coordinators_serialize_one_process_wide_scan_reservati
         second_requested_at.set()
         return first_scan_at + timedelta(seconds=second_clock_calls)
 
-    def blocking_recovery(_self: WorkflowStore, **kwargs: object) -> list[str]:
+    def blocking_recovery(**kwargs: object) -> RecoveryProcessOutcome:
         nonlocal active, calls, maximum_active
         with calls_lock:
             calls += 1
             active += 1
             maximum_active = max(maximum_active, active)
-            scan_times.append(cast(datetime, kwargs["now"]))
+            scan_times.append(cast(datetime, kwargs["scan_at"]))
         entered.set()
         try:
             assert release.wait(timeout=2)
-            return []
+            return RecoveryProcessOutcome(True, None)
         finally:
             with calls_lock:
                 active -= 1
 
-    monkeypatch.setattr(WorkflowStore, "recover_expired_executions", blocking_recovery)
+    monkeypatch.setattr(recovery_module, "run_recovery_process", blocking_recovery)
     first = RecoveryCoordinator(
         settings,
         scan_interval_seconds=3_600,
@@ -193,61 +196,6 @@ async def test_concurrent_coordinators_serialize_one_process_wide_scan_reservati
                 await start_task
         await first.close()
         await second.close()
-
-
-@pytest.mark.asyncio
-async def test_unresolved_scan_quarantine_blocks_new_coordinator_admission(
-    settings: Settings,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    entered = Event()
-    release = Event()
-    calls_lock = Lock()
-    calls = 0
-    first = RecoveryCoordinator(
-        settings,
-        scan_interval_seconds=3_600,
-        shutdown_timeout_seconds=0.02,
-    )
-    await first.start()
-
-    def wedged_recovery(_self: WorkflowStore, **_kwargs: object) -> list[str]:
-        nonlocal calls
-        with calls_lock:
-            calls += 1
-            call = calls
-        if call == 1:
-            entered.set()
-            assert release.wait(timeout=2)
-        return []
-
-    monkeypatch.setattr(WorkflowStore, "recover_expired_executions", wedged_recovery)
-    first.request_scan()
-    assert await asyncio.wait_for(asyncio.to_thread(entered.wait), timeout=1)
-    with pytest.raises(InvoiceAgentsError) as close_error:
-        await first.close()
-    assert close_error.value.stop_reason == "EXECUTION_RECOVERY_DRAIN_TIMEOUT"
-    assert first.health().quarantined_scans == 1
-
-    blocked = RecoveryCoordinator(settings, scan_interval_seconds=3_600)
-    try:
-        with pytest.raises(InvoiceAgentsError) as admission_error:
-            await asyncio.wait_for(blocked.start(), timeout=0.2)
-        assert admission_error.value.stop_reason == "EXECUTION_RECOVERY_OWNERSHIP_UNRESOLVED"
-        assert blocked.state == "failed"
-        assert calls == 1
-    finally:
-        release.set()
-
-    async def quarantine_is_drained() -> None:
-        while first.health().quarantined_scans:
-            await asyncio.sleep(0)
-
-    await asyncio.wait_for(quarantine_is_drained(), timeout=1)
-    successor = RecoveryCoordinator(settings, scan_interval_seconds=3_600)
-    await successor.start()
-    await successor.close()
-    assert calls == 2
 
 
 @pytest.mark.asyncio
@@ -514,10 +462,8 @@ async def test_sse_get_is_observational_for_hostile_and_same_origin_requests(
         assert coordinator.state == "running"
 
 
-@pytest.mark.parametrize("silent_noop", [False, True])
 @pytest.mark.asyncio
 async def test_runtime_recovery_failure_is_health_failing_and_never_fakes_terminal_state(
-    silent_noop: bool,
     invoice_dir: Path,
     settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
@@ -541,15 +487,10 @@ async def test_runtime_recovery_failure_is_health_failing_and_never_fakes_termin
             )
             stream_event = asyncio.create_task(anext(stream))
 
-            def failed_recovery(
-                _self: WorkflowStore,
-                **_kwargs: object,
-            ) -> list[str]:
-                if silent_noop:
-                    return []
-                raise RuntimeError("runtime recovery sentinel")
+            def failed_recovery(**_kwargs: object) -> RecoveryProcessOutcome:
+                return RecoveryProcessOutcome(False, "EXECUTION_RECOVERY_FAILED")
 
-            monkeypatch.setattr(WorkflowStore, "recover_expired_executions", failed_recovery)
+            monkeypatch.setattr(recovery_module, "run_recovery_process", failed_recovery)
             completed_before = coordinator.completed_scans
             coordinator.request_scan()
             with pytest.raises((RuntimeError, InvoiceAgentsError)):
@@ -596,104 +537,6 @@ async def test_runtime_recovery_failure_is_health_failing_and_never_fakes_termin
 
     assert background_task is not None and background_task.done()
     assert coordinator.state == "failed"
-
-
-@pytest.mark.asyncio
-async def test_shutdown_deadline_quarantines_wedged_scan_despite_repeated_cancellation(
-    settings: Settings,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    entered = Event()
-    release = Event()
-    finished = Event()
-    coordinator = RecoveryCoordinator(
-        settings,
-        scan_interval_seconds=3_600,
-        shutdown_timeout_seconds=0.02,
-    )
-    await coordinator.start()
-
-    def never_released_during_close(
-        _self: WorkflowStore,
-        **_kwargs: object,
-    ) -> list[str]:
-        entered.set()
-        try:
-            assert release.wait(timeout=2)
-            return []
-        finally:
-            finished.set()
-
-    monkeypatch.setattr(
-        WorkflowStore,
-        "recover_expired_executions",
-        never_released_during_close,
-    )
-    coordinator.request_scan()
-    assert await asyncio.wait_for(asyncio.to_thread(entered.wait), timeout=1)
-    health_version = coordinator.health().version
-    close_task = asyncio.create_task(coordinator.close())
-    try:
-        stopping = await coordinator.wait_for_change(health_version, timeout=1)
-        assert stopping.state == "stopping"
-        for _ in range(3):
-            close_task.cancel()
-            await asyncio.sleep(0)
-
-        with pytest.raises(InvoiceAgentsError) as error:
-            await asyncio.wait_for(asyncio.shield(close_task), timeout=0.5)
-
-        assert error.value.stop_reason == "EXECUTION_RECOVERY_DRAIN_TIMEOUT"
-        assert coordinator.health().state == "failed"
-        assert coordinator.health().quarantined_scans == 1
-        assert coordinator.background_task is not None
-        assert coordinator.background_task.done()
-    finally:
-        release.set()
-        assert await asyncio.wait_for(asyncio.to_thread(finished.wait), timeout=1)
-
-    async def quarantine_is_drained() -> None:
-        while coordinator.health().quarantined_scans:
-            await asyncio.sleep(0)
-
-    await asyncio.wait_for(quarantine_is_drained(), timeout=1)
-    assert coordinator.health().state == "failed"
-    assert coordinator.health().quarantined_scans == 0
-
-
-@pytest.mark.asyncio
-async def test_recovery_failure_precedes_shutdown_cancellation_and_remains_failed(
-    settings: Settings,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    entered = Event()
-    release = Event()
-    coordinator = RecoveryCoordinator(
-        settings,
-        scan_interval_seconds=3_600,
-        shutdown_timeout_seconds=1,
-    )
-    await coordinator.start()
-
-    def fail_after_release(_self: WorkflowStore, **_kwargs: object) -> list[str]:
-        entered.set()
-        assert release.wait(timeout=2)
-        raise RuntimeError("round4 recovery failure sentinel")
-
-    monkeypatch.setattr(WorkflowStore, "recover_expired_executions", fail_after_release)
-    coordinator.request_scan()
-    assert await asyncio.wait_for(asyncio.to_thread(entered.wait), timeout=1)
-    health_version = coordinator.health().version
-    close_task = asyncio.create_task(coordinator.close())
-    stopping = await coordinator.wait_for_change(health_version, timeout=1)
-    assert stopping.state == "stopping"
-    close_task.cancel()
-    release.set()
-
-    with pytest.raises(RuntimeError, match="round4 recovery failure sentinel"):
-        await asyncio.wait_for(close_task, timeout=1)
-
-    assert coordinator.health().state == "failed"
 
 
 @pytest.mark.asyncio
@@ -818,16 +661,26 @@ async def test_shutdown_cancellation_drains_the_owned_scan_before_propagating(
     lifespan = app.router.lifespan_context(app)
     await lifespan.__aenter__()
     entered = Event()
+    cancellation_seen = Event()
     release = Event()
-    original_recovery = WorkflowStore.recover_expired_executions
     background_task = coordinator.background_task
 
-    def blocking_recovery(self: WorkflowStore, **kwargs: object) -> list[str]:
+    def blocking_recovery(
+        *,
+        cancel_requested: ProcessCancellation,
+        **_kwargs: object,
+    ) -> RecoveryProcessOutcome:
         entered.set()
-        release.wait()
-        return original_recovery(self, **kwargs)
+        while not cancel_requested.is_set():
+            assert release.wait(timeout=0.01) is False
+        cancellation_seen.set()
+        assert release.wait(timeout=2)
+        return RecoveryProcessOutcome(
+            False,
+            "EXECUTION_RECOVERY_WORKER_CANCELLED",
+        )
 
-    monkeypatch.setattr(WorkflowStore, "recover_expired_executions", blocking_recovery)
+    monkeypatch.setattr(recovery_module, "run_recovery_process", blocking_recovery)
     try:
         coordinator.request_scan()
         assert await asyncio.wait_for(asyncio.to_thread(entered.wait), timeout=1)
@@ -835,6 +688,7 @@ async def test_shutdown_cancellation_drains_the_owned_scan_before_propagating(
         close_task = asyncio.create_task(coordinator.close())
         health = await coordinator.wait_for_change(version, timeout=1)
         assert health.state == "stopping"
+        assert await asyncio.wait_for(asyncio.to_thread(cancellation_seen.wait), timeout=1)
 
         close_task.cancel()
         await asyncio.sleep(0)

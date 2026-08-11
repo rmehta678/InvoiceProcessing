@@ -1,4 +1,4 @@
-"""Lifespan-owned recovery for abandoned durable execution claims."""
+"""Lifespan-owned, fail-closed recovery for abandoned execution claims."""
 
 from __future__ import annotations
 
@@ -17,13 +17,13 @@ from starlette.responses import PlainTextResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from invoice_agents.config import Settings
-from invoice_agents.db.store import WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
+from invoice_agents.isolated_process import ProcessCancellation
+from invoice_agents.recovery_process import RecoveryProcessOutcome, run_recovery_process
 
 RecoveryState = Literal["created", "starting", "running", "failed", "stopping", "stopped"]
-DEFAULT_RECOVERY_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+DEFAULT_RECOVERY_WORKER_TIMEOUT_SECONDS = 120.0
 
-type _ScanOutcome = Literal["succeeded", "failed", "quarantined"]
 type _ScanSignature = tuple[Path, Path]
 
 
@@ -31,66 +31,39 @@ type _ScanSignature = tuple[Path, Path]
 class _ScanReservation:
     signature: _ScanSignature
     scan_at: datetime
-    worker: Future[None]
-    settled: Future[_ScanOutcome]
-    quarantined: bool = False
+    cancellation: ProcessCancellation
+    worker: Future[RecoveryProcessOutcome]
+    thread: Thread | None = None
 
 
 _SCAN_RESERVATION: _ScanReservation | None = None
-_QUARANTINED_BACKGROUND_TASK: asyncio.Task[None] | None = None
-_QUARANTINE_LOCK = Lock()
+_RECOVERY_OWNERSHIP_POISONED = False
+_RESERVATION_LOCK = Lock()
 
 
 def _ownership_unresolved_error() -> InvoiceAgentsError:
     return InvoiceAgentsError(
         ErrorCategory.ORCHESTRATION,
-        "a prior execution recovery worker still owns unresolved process resources",
+        "execution recovery process ownership could not be proven clean",
         stop_reason="EXECUTION_RECOVERY_OWNERSHIP_UNRESOLVED",
     )
 
 
-def _finish_scan_reservation(reservation: _ScanReservation) -> None:
-    global _SCAN_RESERVATION
-    failure = reservation.worker.exception()
-    with _QUARANTINE_LOCK:
-        if _SCAN_RESERVATION is reservation:
-            _SCAN_RESERVATION = None
-        if not reservation.settled.done():
-            reservation.settled.set_result("failed" if failure is not None else "succeeded")
+def _validate_process_outcome(value: object) -> RecoveryProcessOutcome:
+    if type(value) is not RecoveryProcessOutcome:
+        raise TypeError("recovery controller returned an invalid outcome type")
+    return RecoveryProcessOutcome(value.acknowledged, value.error_code)
 
 
-def _quarantine_scan(future: Future[None]) -> None:
-    with _QUARANTINE_LOCK:
-        reservation = _SCAN_RESERVATION
-        if reservation is None or reservation.worker is not future or reservation.worker.done():
-            return
-        reservation.quarantined = True
-        if not reservation.settled.done():
-            reservation.settled.set_result("quarantined")
-
-
-def _consume_quarantined_background_task(task: asyncio.Task[None]) -> None:
-    global _QUARANTINED_BACKGROUND_TASK
-    try:
-        task.exception()
-    except asyncio.CancelledError:
-        pass
-    finally:
-        with _QUARANTINE_LOCK:
-            if _QUARANTINED_BACKGROUND_TASK is task:
-                _QUARANTINED_BACKGROUND_TASK = None
-
-
-def _quarantine_background_task(task: asyncio.Task[None]) -> None:
-    global _QUARANTINED_BACKGROUND_TASK
-    with _QUARANTINE_LOCK:
-        retained = _QUARANTINED_BACKGROUND_TASK
-        if retained is task:
-            return
-        if retained is not None and not retained.done():
-            raise _ownership_unresolved_error()
-        _QUARANTINED_BACKGROUND_TASK = task
-    task.add_done_callback(_consume_quarantined_background_task)
+def _outcome_error(outcome: RecoveryProcessOutcome) -> InvoiceAgentsError:
+    validated = _validate_process_outcome(outcome)
+    if validated.acknowledged or validated.error_code is None:
+        raise ValueError("acknowledged recovery does not carry a failure")
+    return InvoiceAgentsError(
+        ErrorCategory.ORCHESTRATION,
+        "the isolated execution recovery scan failed",
+        stop_reason=validated.error_code,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,31 +74,35 @@ class RecoveryHealth:
     version: int
     completed_scans: int
     last_successful_scan_at: datetime | None
-    quarantined_scans: int
+    ownership_poisoned: bool
 
     @property
     def available(self) -> bool:
-        return self.state == "running"
+        return self.state == "running" and not self.ownership_poisoned
 
 
 class RecoveryCoordinator:
-    """Own exactly one periodic recovery loop for one application lifespan."""
+    """Own exactly one periodic, isolated recovery loop for one app lifespan."""
 
     def __init__(
         self,
         settings: Settings,
         *,
         scan_interval_seconds: float,
-        shutdown_timeout_seconds: float = DEFAULT_RECOVERY_SHUTDOWN_TIMEOUT_SECONDS,
+        worker_timeout_seconds: float = DEFAULT_RECOVERY_WORKER_TIMEOUT_SECONDS,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if scan_interval_seconds <= 0:
             raise ValueError("recovery scan interval must be positive")
-        if not isfinite(shutdown_timeout_seconds) or shutdown_timeout_seconds <= 0:
-            raise ValueError("recovery shutdown timeout must be finite and positive")
+        if (
+            type(worker_timeout_seconds) is not float
+            or not isfinite(worker_timeout_seconds)
+            or worker_timeout_seconds <= 0
+        ):
+            raise ValueError("recovery worker timeout must be a finite positive float")
         self._settings = settings
         self._scan_interval_seconds = scan_interval_seconds
-        self._shutdown_timeout_seconds = shutdown_timeout_seconds
+        self._worker_timeout_seconds = worker_timeout_seconds
         self._clock = clock or (lambda: datetime.now(UTC))
         self._state: RecoveryState = "created"
         self._version = 0
@@ -137,7 +114,7 @@ class RecoveryCoordinator:
         self._scan_requested = asyncio.Event()
         self._stop_requested = asyncio.Event()
         self._background_task: asyncio.Task[None] | None = None
-        self._active_scan_future: Future[None] | None = None
+        self._active_scan_reservation: _ScanReservation | None = None
 
     @property
     def state(self) -> RecoveryState:
@@ -152,17 +129,15 @@ class RecoveryCoordinator:
         return self._background_task
 
     def health(self) -> RecoveryHealth:
+        with _RESERVATION_LOCK:
+            poisoned = _RECOVERY_OWNERSHIP_POISONED
         with self._state_lock:
             return RecoveryHealth(
                 state=self._state,
                 version=self._version,
                 completed_scans=self._completed_scans,
                 last_successful_scan_at=self._last_successful_scan_at,
-                quarantined_scans=int(
-                    self._active_scan_future is not None
-                    and not self._active_scan_future.done()
-                    and self._state in {"failed", "stopped"}
-                ),
+                ownership_poisoned=poisoned,
             )
 
     async def _publish_state(
@@ -170,31 +145,29 @@ class RecoveryCoordinator:
         state: RecoveryState,
         *,
         failure: BaseException | None = None,
-        completed_at: datetime | None = None,
     ) -> None:
         with self._state_lock:
-            if completed_at is not None and self._state == "stopping":
-                state = "stopping"
             self._state = state
             self._failure = failure
-            if completed_at is not None:
-                self._completed_scans += 1
-                self._last_successful_scan_at = completed_at
             self._version += 1
         async with self._changed:
             self._changed.notify_all()
 
-    def _recover_in_thread(self, scan_at: datetime) -> None:
-        store = WorkflowStore(self._settings)
-        store.recover_expired_executions(now=scan_at)
-        remaining = store.unrecovered_execution_case_ids(checked_at=scan_at)
-        if remaining:
-            raise InvoiceAgentsError(
-                ErrorCategory.ORCHESTRATION,
-                "execution recovery completed without terminalizing every eligible claim",
-                stop_reason="EXECUTION_RECOVERY_INCOMPLETE",
-                details={"unrecovered_case_ids": remaining},
-            )
+    async def _publish_successful_scan(self, completed_at: datetime) -> None:
+        with _RESERVATION_LOCK:
+            if _RECOVERY_OWNERSHIP_POISONED:
+                raise _ownership_unresolved_error()
+            with self._state_lock:
+                state: RecoveryState = (
+                    "stopping" if self._state == "stopping" else "running"
+                )
+                self._state = state
+                self._failure = None
+                self._completed_scans += 1
+                self._last_successful_scan_at = completed_at
+                self._version += 1
+        async with self._changed:
+            self._changed.notify_all()
 
     def _scan_signature(self) -> _ScanSignature:
         return (
@@ -203,98 +176,187 @@ class RecoveryCoordinator:
         )
 
     def _reserve_scan(self, scan_at: datetime) -> tuple[_ScanReservation, bool]:
-        global _QUARANTINED_BACKGROUND_TASK, _SCAN_RESERVATION
+        global _RECOVERY_OWNERSHIP_POISONED, _SCAN_RESERVATION
 
-        future: Future[None] = Future()
-        candidate = _ScanReservation(
-            signature=self._scan_signature(),
-            scan_at=scan_at,
-            worker=future,
-            settled=Future(),
-        )
+        with _RESERVATION_LOCK:
+            if _RECOVERY_OWNERSHIP_POISONED:
+                raise _ownership_unresolved_error()
+            if _SCAN_RESERVATION is not None:
+                return _SCAN_RESERVATION, False
 
-        def run() -> None:
-            if not future.set_running_or_notify_cancel():
-                return
-            try:
-                self._recover_in_thread(scan_at)
-            except BaseException as exc:
-                future.set_exception(exc)
-            else:
-                future.set_result(None)
+            cancellation = ProcessCancellation()
+            future: Future[RecoveryProcessOutcome] = Future()
+            candidate = _ScanReservation(
+                signature=self._scan_signature(),
+                scan_at=scan_at,
+                cancellation=cancellation,
+                worker=future,
+            )
 
-        def finish(_future: Future[None]) -> None:
-            _finish_scan_reservation(candidate)
+            def run() -> None:
+                global _RECOVERY_OWNERSHIP_POISONED
 
-        thread = Thread(
-            target=run,
-            name="invoice-ui-execution-recovery-scan",
-            daemon=True,
-        )
-        with _QUARANTINE_LOCK:
-            background = _QUARANTINED_BACKGROUND_TASK
-            if background is not None:
-                if not background.done():
-                    raise _ownership_unresolved_error()
-                _QUARANTINED_BACKGROUND_TASK = None
+                try:
+                    outcome = _validate_process_outcome(
+                        run_recovery_process(
+                            settings=self._settings,
+                            scan_at=scan_at,
+                            timeout_seconds=self._worker_timeout_seconds,
+                            cancel_requested=cancellation,
+                        )
+                    )
+                except BaseException as exc:
+                    with _RESERVATION_LOCK:
+                        _RECOVERY_OWNERSHIP_POISONED = True
+                    future.set_exception(exc)
+                    return
+                with _RESERVATION_LOCK:
+                    if outcome.error_code == "EXECUTION_RECOVERY_WORKER_CLEANUP_FAILED":
+                        _RECOVERY_OWNERSHIP_POISONED = True
+                future.set_result(outcome)
 
-            reservation = _SCAN_RESERVATION
-            if reservation is not None and reservation.worker.done():
-                failure = reservation.worker.exception()
-                if not reservation.settled.done():
-                    reservation.settled.set_result("failed" if failure is not None else "succeeded")
-                _SCAN_RESERVATION = None
-                reservation = None
-            if reservation is not None:
-                if reservation.quarantined:
-                    raise _ownership_unresolved_error()
-                return reservation, False
-
+            thread = Thread(
+                target=run,
+                name="invoice-ui-execution-recovery-scan",
+                daemon=False,
+            )
+            candidate.thread = thread
             _SCAN_RESERVATION = candidate
-            self._active_scan_future = future
-            future.add_done_callback(finish)
             try:
                 thread.start()
             except BaseException:
-                _SCAN_RESERVATION = None
-                self._active_scan_future = None
-                candidate.settled.set_result("failed")
+                try:
+                    possibly_started = thread.ident is not None or thread.is_alive()
+                except BaseException:
+                    possibly_started = True
+                if possibly_started:
+                    cancellation.set()
+                    _RECOVERY_OWNERSHIP_POISONED = True
+                else:
+                    _SCAN_RESERVATION = None
                 raise
-        return candidate, True
+            return candidate, True
+
+    @staticmethod
+    def _retire_completed_reservation(reservation: _ScanReservation) -> None:
+        global _RECOVERY_OWNERSHIP_POISONED, _SCAN_RESERVATION
+
+        thread = reservation.thread
+        if thread is None or not reservation.worker.done():
+            with _RESERVATION_LOCK:
+                _RECOVERY_OWNERSHIP_POISONED = True
+            raise _ownership_unresolved_error()
+        try:
+            thread.join()
+        except BaseException:
+            with _RESERVATION_LOCK:
+                _RECOVERY_OWNERSHIP_POISONED = True
+            raise _ownership_unresolved_error() from None
+        try:
+            thread_is_alive = thread.is_alive()
+        except BaseException:
+            with _RESERVATION_LOCK:
+                _RECOVERY_OWNERSHIP_POISONED = True
+            raise _ownership_unresolved_error() from None
+        if thread_is_alive:
+            with _RESERVATION_LOCK:
+                _RECOVERY_OWNERSHIP_POISONED = True
+            raise _ownership_unresolved_error()
+        with _RESERVATION_LOCK:
+            if not _RECOVERY_OWNERSHIP_POISONED and _SCAN_RESERVATION is reservation:
+                _SCAN_RESERVATION = None
+
+    def _set_active_reservation(self, reservation: _ScanReservation | None) -> None:
+        with self._state_lock:
+            self._active_scan_reservation = reservation
+
+    def _cancel_active_reservation(self) -> None:
+        with self._state_lock:
+            reservation = self._active_scan_reservation
+        if reservation is not None and not reservation.worker.done():
+            reservation.cancellation.set()
+
+    async def _wait_for_owned_scan(
+        self,
+        reservation: _ScanReservation,
+    ) -> RecoveryProcessOutcome:
+        wrapped = asyncio.wrap_future(reservation.worker)
+        cancellation: asyncio.CancelledError | None = None
+        while not wrapped.done():
+            try:
+                await asyncio.shield(wrapped)
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+                reservation.cancellation.set()
+            except BaseException:
+                break
+        try:
+            outcome = wrapped.result()
+        finally:
+            self._retire_completed_reservation(reservation)
+            self._set_active_reservation(None)
+        if not outcome.acknowledged:
+            if (
+                cancellation is not None
+                and outcome.error_code == "EXECUTION_RECOVERY_WORKER_CANCELLED"
+            ):
+                raise cancellation
+            raise _outcome_error(outcome)
+        if cancellation is not None:
+            raise cancellation
+        return outcome
+
+    async def _wait_for_shared_scan(
+        self,
+        reservation: _ScanReservation,
+    ) -> RecoveryProcessOutcome:
+        try:
+            outcome = await asyncio.shield(asyncio.wrap_future(reservation.worker))
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            self._retire_completed_reservation(reservation)
+            with _RESERVATION_LOCK:
+                poisoned = _RECOVERY_OWNERSHIP_POISONED
+            if poisoned:
+                raise _ownership_unresolved_error() from None
+            raise
+        self._retire_completed_reservation(reservation)
+        return outcome
 
     async def _recover_once(self) -> None:
         signature = self._scan_signature()
         while True:
             scan_at = self._clock()
-            if scan_at.tzinfo is None or scan_at.utcoffset() != UTC.utcoffset(scan_at):
-                raise ValueError("recovery coordinator clock must be timezone-aware UTC")
+            if type(scan_at) is not datetime or scan_at.tzinfo is not UTC:
+                raise ValueError("recovery coordinator clock must be canonical UTC")
             reservation, owns_worker = self._reserve_scan(scan_at)
             if owns_worker:
+                self._set_active_reservation(reservation)
                 try:
-                    await asyncio.shield(asyncio.wrap_future(reservation.worker))
-                except asyncio.CancelledError:
-                    if not reservation.worker.done():
-                        _quarantine_scan(reservation.worker)
+                    outcome = await self._wait_for_owned_scan(reservation)
+                except InvoiceAgentsError as exc:
+                    if (
+                        self._stop_requested.is_set()
+                        and exc.stop_reason == "EXECUTION_RECOVERY_WORKER_CANCELLED"
+                    ):
+                        return
                     raise
-                finally:
-                    if reservation.worker.done() and self._active_scan_future is reservation.worker:
-                        self._active_scan_future = None
-                await self._publish_state("running", completed_at=reservation.scan_at)
+                if not outcome.acknowledged:
+                    raise _outcome_error(outcome)
+                await self._publish_successful_scan(reservation.scan_at)
                 return
 
-            outcome = await asyncio.shield(asyncio.wrap_future(reservation.settled))
-            if outcome == "quarantined":
-                raise _ownership_unresolved_error()
+            outcome = await self._wait_for_shared_scan(reservation)
+            if not outcome.acknowledged:
+                if outcome.error_code == "EXECUTION_RECOVERY_WORKER_CLEANUP_FAILED":
+                    raise _ownership_unresolved_error()
+                raise _outcome_error(outcome)
             if reservation.signature != signature:
                 continue
-            if outcome == "failed":
-                raise InvoiceAgentsError(
-                    ErrorCategory.ORCHESTRATION,
-                    "the shared execution recovery scan failed",
-                    stop_reason="EXECUTION_RECOVERY_FAILED",
-                )
-            # A successful reservation proves only its owner's scan. Run this
-            # coordinator's own fresh scan once the process-wide slot is free.
+            # Another coordinator's successful pass does not authorize this
+            # coordinator. Wait for release, then run a fresh pass of our own.
 
     async def start(self) -> None:
         if self.state == "stopped":
@@ -307,11 +369,11 @@ class RecoveryCoordinator:
                 self._completed_scans = 0
                 self._last_successful_scan_at = None
                 self._failure = None
+                self._active_scan_reservation = None
             self._changed = asyncio.Condition()
             self._scan_requested = asyncio.Event()
             self._stop_requested = asyncio.Event()
             self._background_task = None
-            self._active_scan_future = None
         if self.state != "created":
             raise RuntimeError("recovery coordinator can only be started once")
         await self._publish_state("starting")
@@ -389,6 +451,20 @@ class RecoveryCoordinator:
                 pass
         return self.health()
 
+    async def _drain_background_task(
+        self,
+        task: asyncio.Task[None],
+        cancellation: asyncio.CancelledError | None,
+    ) -> asyncio.CancelledError | None:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+                self._cancel_active_reservation()
+        return cancellation
+
     async def close(self) -> None:
         state = self.state
         if state in {"created", "stopped"}:
@@ -401,70 +477,25 @@ class RecoveryCoordinator:
         if state != "failed":
             try:
                 await self._publish_state("stopping")
-            except asyncio.CancelledError as cancellation:
-                shutdown_cancellation = cancellation
+            except asyncio.CancelledError as exc:
+                shutdown_cancellation = exc
         self._stop_requested.set()
         self._scan_requested.set()
+        self._cancel_active_reservation()
         task = self._background_task
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._shutdown_timeout_seconds
         if task is not None and not task.done():
             shutdown_cancellation = await self._drain_background_task(
                 task,
-                deadline=deadline,
-                cancellation=shutdown_cancellation,
+                shutdown_cancellation,
             )
-        if task is not None and not task.done():
-            active_scan = self._active_scan_future
-            if active_scan is not None and not active_scan.done():
-                _quarantine_scan(active_scan)
-            task.cancel()
-            cancellation_deadline = loop.time() + self._shutdown_timeout_seconds
-            shutdown_cancellation = await self._drain_background_task(
-                task,
-                deadline=cancellation_deadline,
-                cancellation=shutdown_cancellation,
-            )
-            if not task.done():
-                _quarantine_background_task(task)
-            failure = InvoiceAgentsError(
-                ErrorCategory.ORCHESTRATION,
-                "execution recovery scan did not drain before the shutdown deadline",
-                stop_reason="EXECUTION_RECOVERY_DRAIN_TIMEOUT",
-            )
-            with suppress(asyncio.CancelledError):
-                await self._publish_state("failed", failure=failure)
-            raise failure
         self._raise_failure()
         try:
             await self._publish_state("stopped")
-        except asyncio.CancelledError as cancellation:
+        except asyncio.CancelledError as exc:
             if shutdown_cancellation is None:
-                shutdown_cancellation = cancellation
+                shutdown_cancellation = exc
         if shutdown_cancellation is not None:
             raise shutdown_cancellation
-
-    async def _drain_background_task(
-        self,
-        task: asyncio.Task[None],
-        *,
-        deadline: float,
-        cancellation: asyncio.CancelledError | None,
-    ) -> asyncio.CancelledError | None:
-        loop = asyncio.get_running_loop()
-        while not task.done():
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-            try:
-                async with asyncio.timeout(remaining):
-                    await asyncio.shield(task)
-            except asyncio.CancelledError as exc:
-                if cancellation is None:
-                    cancellation = exc
-            except TimeoutError:
-                break
-        return cancellation
 
 
 class RecoveryHealthMiddleware:
