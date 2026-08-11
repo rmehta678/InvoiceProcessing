@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -159,8 +160,7 @@ def render_pdf_page(
             f"PDF page {page} is out of range",
             stop_reason="RENDER_PAGE_INVALID",
         )
-    output_dir.mkdir(parents=True, exist_ok=True)
-    target = (output_dir / f"{source.source_id}-page-{page}.png").resolve()
+    target = Path(os.path.abspath(output_dir / f"{source.source_id}-page-{page}.png"))
     from invoice_agents.pdf_worker import render_pdf_page_in_worker
 
     return render_pdf_page_in_worker(

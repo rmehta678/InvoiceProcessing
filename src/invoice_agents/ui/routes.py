@@ -24,8 +24,9 @@ from urllib.parse import quote, unquote
 from uuid import uuid4
 
 from fastapi import APIRouter, Form, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from sse_starlette.sse import EventSourceResponse
+from starlette.concurrency import run_in_threadpool
 
 from invoice_agents.agents.decision_rules import AUTHORIZING_HUMAN_DECISIONS
 from invoice_agents.config import XAI_BASE_URL, XAI_MODEL, Settings
@@ -51,6 +52,11 @@ from invoice_agents.models import (
 )
 from invoice_agents.observability.audit import sanitize_case_result, sanitize_text
 from invoice_agents.orchestration import validate_case_concurrency
+from invoice_agents.review_artifact import (
+    ReviewPageBinding,
+    ReviewPageEvidenceError,
+    read_verified_review_page,
+)
 from invoice_agents.ui import queries
 from invoice_agents.ui.preflight import key_present, run_preflight
 from invoice_agents.ui.recovery import RecoveryCoordinator
@@ -973,11 +979,29 @@ async def review_page_image(request: Request, review_id: str, page: int) -> Resp
         review = store.load_review(review_id)
     except InvoiceAgentsError as exc:
         return _not_found(request, exc.message, exc.stop_reason or "REVIEW_NOT_FOUND")
-    for entry in review.evidence_bundle.get("rendered_pages") or []:
-        if isinstance(entry, dict) and entry.get("page") == page:
-            target = Path(str(entry.get("path")))
-            if target.is_file():
-                return FileResponse(target, media_type="image/png")
+    matches = [
+        entry
+        for entry in review.evidence_bundle.get("rendered_pages") or []
+        if isinstance(entry, dict) and entry.get("page") == page
+    ]
+    if len(matches) == 1:
+        try:
+            binding = ReviewPageBinding.from_payload(
+                matches[0],
+                review_id=review.review_id,
+                source_id=review.source.source_id,
+                expected_page=page,
+            )
+            payload = await run_in_threadpool(read_verified_review_page, binding)
+        except ReviewPageEvidenceError:
+            error = InvoiceAgentsError(
+                ErrorCategory.SOURCE,
+                "rendered review page failed exact evidence validation",
+                case_id=review.case_id,
+                stop_reason="REVIEW_PAGE_EVIDENCE_INVALID",
+            )
+            return _render(request, "error.html", {"nav": None, "error": error}, status_code=409)
+        return Response(content=payload, media_type="image/png")
     return _not_found(
         request, f"no rendered page {page} for review {review_id}", "RENDER_PAGE_INVALID"
     )

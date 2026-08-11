@@ -7,6 +7,7 @@ only run_prepared_case / resume_case - the paid model boundary - are replaced.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from datetime import UTC, datetime
@@ -16,6 +17,7 @@ from urllib.parse import unquote
 
 import pytest
 from factories import (
+    DATA_DIR,
     FIXTURE_DIR,
     make_critique,
     make_failed_case,
@@ -25,15 +27,23 @@ from factories import (
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from markupsafe import escape
+from starlette.responses import FileResponse as StarletteFileResponse
 
+from invoice_agents import review_artifact
 from invoice_agents.agents.decision_rules import unaddressed_blockers
 from invoice_agents.config import Settings
 from invoice_agents.db.core import connect_database
 from invoice_agents.db.store import ExecutionClaim, WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
-from invoice_agents.models import CaseResult, CaseStatus, DecisionKind, RiskAssessment
+from invoice_agents.models import (
+    CaseResult,
+    CaseStatus,
+    DecisionKind,
+    ReviewRequest,
+    RiskAssessment,
+)
 from invoice_agents.observability.audit import AuditRecorder
-from invoice_agents.ui import queries
+from invoice_agents.ui import queries, routes
 
 
 def wait_for(predicate, timeout: float = 5.0) -> None:
@@ -601,6 +611,153 @@ def test_review_detail_missing_is_404(client: TestClient) -> None:
     response = client.get("/reviews/rev_missing")
     assert response.status_code == 404
     assert "REVIEW_NOT_FOUND" in response.text
+
+
+def _pdf_review_page(settings: Settings) -> tuple[ReviewRequest, Path, bytes]:
+    _, review = make_pending_review_case(settings, source=DATA_DIR / "invoice_1011.pdf")
+    pages = review.evidence_bundle["rendered_pages"]
+    assert isinstance(pages, list) and len(pages) == 1
+    entry = pages[0]
+    assert isinstance(entry, dict)
+    path = Path(str(entry["path"]))
+    return review, path, path.read_bytes()
+
+
+def test_review_page_rejects_content_replacement_after_persistence(
+    client: TestClient,
+    settings: Settings,
+) -> None:
+    """Removing the exact digest check must serve same-inode forged page bytes."""
+
+    review, path, original = _pdf_review_page(settings)
+    path.write_bytes(b"X" * len(original))
+
+    response = client.get(f"/reviews/{review.review_id}/pages/1")
+
+    assert response.status_code == 409
+    assert "REVIEW_PAGE_EVIDENCE_INVALID" in response.text
+    assert response.content != path.read_bytes()
+
+
+def test_review_page_returns_verified_bytes_without_path_reopen(
+    client: TestClient,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keeping FileResponse must reopen and serve the post-verification mutation."""
+
+    review, path, original = _pdf_review_page(settings)
+    reopened = b"R" * len(original)
+    real_file_response = StarletteFileResponse
+
+    def mutate_before_file_response_open(*args: object, **kwargs: object) -> object:
+        path.write_bytes(reopened)
+        return real_file_response(*args, **kwargs)
+
+    monkeypatch.setattr(
+        routes,
+        "FileResponse",
+        mutate_before_file_response_open,
+        raising=False,
+    )
+
+    response = client.get(f"/reviews/{review.review_id}/pages/1")
+
+    assert response.status_code == 200
+    assert response.content == original
+    assert path.read_bytes() == original
+
+
+def test_review_page_rejects_symlink_substitution(
+    client: TestClient,
+    settings: Settings,
+) -> None:
+    """Removing no-follow opening must serve a substituted symlink target."""
+
+    review, path, original = _pdf_review_page(settings)
+    displaced = path.with_name(f"displaced-{path.name}")
+    path.rename(displaced)
+    path.symlink_to(displaced)
+
+    response = client.get(f"/reviews/{review.review_id}/pages/1")
+
+    assert response.status_code == 409
+    assert "REVIEW_PAGE_EVIDENCE_INVALID" in response.text
+    assert response.content != original
+
+
+def test_review_page_rejects_hardlink_substitution(
+    client: TestClient,
+    settings: Settings,
+) -> None:
+    """Removing the single-link check must admit a multiply-named evidence inode."""
+
+    review, path, original = _pdf_review_page(settings)
+    os.link(path, path.with_name(f"linked-{path.name}"))
+
+    response = client.get(f"/reviews/{review.review_id}/pages/1")
+
+    assert response.status_code == 409
+    assert "REVIEW_PAGE_EVIDENCE_INVALID" in response.text
+    assert response.content != original
+
+
+def test_review_page_rejects_parent_directory_swap(
+    client: TestClient,
+    settings: Settings,
+) -> None:
+    """Removing persisted inode/parent identity checks must serve the replacement tree."""
+
+    review, path, original = _pdf_review_page(settings)
+    displaced = path.parent.with_name(f"displaced-{path.parent.name}")
+    path.parent.rename(displaced)
+    path.parent.mkdir()
+    path.write_bytes(original)
+
+    response = client.get(f"/reviews/{review.review_id}/pages/1")
+
+    assert response.status_code == 409
+    assert "REVIEW_PAGE_EVIDENCE_INVALID" in response.text
+    assert response.content != original
+
+
+def test_review_page_rejects_parent_swap_during_descriptor_walk(
+    client: TestClient,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The held old directory must not authorize a replacement named namespace."""
+
+    review, path, original = _pdf_review_page(settings)
+    displaced = path.parent.with_name(f"raced-{path.parent.name}")
+    real_open = review_artifact.os.open
+    swapped = False
+    opened_targets: list[str] = []
+
+    def swap_after_review_directory_open(
+        target: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        opened_targets.append(str(target))
+        descriptor = real_open(target, flags, mode, dir_fd=dir_fd)
+        if not swapped and target == review.review_id and flags & os.O_DIRECTORY:
+            path.parent.rename(displaced)
+            path.parent.mkdir()
+            path.write_bytes(original)
+            swapped = True
+        return descriptor
+
+    monkeypatch.setattr(review_artifact.os, "open", swap_after_review_directory_open)
+
+    response = client.get(f"/reviews/{review.review_id}/pages/1")
+
+    assert swapped, opened_targets
+    assert response.status_code == 409
+    assert "REVIEW_PAGE_EVIDENCE_INVALID" in response.text
 
 
 # ------------------------------------------------------------------- decision recording

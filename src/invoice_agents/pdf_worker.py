@@ -10,10 +10,10 @@ import multiprocessing
 import os
 import resource
 import selectors
+import stat
 import struct
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -21,10 +21,12 @@ from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Literal, cast
+from uuid import uuid4
 
 from invoice_agents.config import PdfPolicy
 from invoice_agents.errors import ErrorCategory, SourceEvidenceError
 from invoice_agents.models import SourceArtifact
+from invoice_agents.review_artifact import REVIEW_PAGE_HARD_MAX_BYTES
 
 WorkerOperation = Literal["inspect", "extract", "render"]
 JOIN_GRACE_SECONDS = 1.0
@@ -37,6 +39,9 @@ SOURCE_FAILURE_MESSAGES = {
     "SOURCE_HASH_MISMATCH": "source snapshot identity mismatch",
     "SOURCE_READ_FAILED": "source snapshot could not be read",
 }
+_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
+_STAT_SUPPORTS_DIR_FD = os.stat in os.supports_dir_fd
+_STAT_SUPPORTS_NOFOLLOW = os.stat in os.supports_follow_symlinks
 
 
 @dataclass(slots=True)
@@ -844,6 +849,215 @@ def extract_pdf_in_worker(source: SourceArtifact, pdf_policy: PdfPolicy) -> dict
     return _run_worker("extract", source, pdf_policy)
 
 
+def _render_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_size,
+    )
+
+
+def _validate_render_parent_relationships(
+    relationships: list[tuple[int, str, os.stat_result]],
+) -> None:
+    for parent_descriptor, component, opened in relationships:
+        linked = os.stat(component, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            linked.st_dev != opened.st_dev
+            or linked.st_ino != opened.st_ino
+            or not stat.S_ISDIR(linked.st_mode)
+        ):
+            raise ValueError("render publication parent changed")
+
+
+def _open_render_parent(
+    target: Path,
+) -> tuple[list[int], list[tuple[int, str, os.stat_result]]]:
+    if (
+        not target.is_absolute()
+        or not target.name
+        or target.name in {".", ".."}
+        or not _OPEN_SUPPORTS_DIR_FD
+        or not _STAT_SUPPORTS_DIR_FD
+        or not _STAT_SUPPORTS_NOFOLLOW
+    ):
+        raise ValueError("render publication target is invalid")
+    required = ("O_RDONLY", "O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK", "O_DIRECTORY")
+    flags: dict[str, int] = {}
+    for name in required:
+        value = getattr(os, name, None)
+        if type(value) is not int:
+            raise ValueError("render publication flags are unavailable")
+        flags[name] = value
+    directory_flags = (
+        flags["O_RDONLY"]
+        | flags["O_CLOEXEC"]
+        | flags["O_NOFOLLOW"]
+        | flags["O_NONBLOCK"]
+        | flags["O_DIRECTORY"]
+    )
+    descriptors: list[int] = []
+    relationships: list[tuple[int, str, os.stat_result]] = []
+    try:
+        root_descriptor = os.open(target.anchor, directory_flags)
+        descriptors.append(root_descriptor)
+        parent_descriptor = root_descriptor
+        for component in target.parent.parts[1:]:
+            if not component or component in {".", ".."} or os.sep in component:
+                raise ValueError("render publication parent component is invalid")
+            directory_descriptor = os.open(
+                component,
+                directory_flags,
+                dir_fd=parent_descriptor,
+            )
+            descriptors.append(directory_descriptor)
+            opened = os.fstat(directory_descriptor)
+            if not stat.S_ISDIR(opened.st_mode):
+                raise ValueError("render publication parent is not a directory")
+            relationships.append((parent_descriptor, component, opened))
+            parent_descriptor = directory_descriptor
+        _validate_render_parent_relationships(relationships)
+        return descriptors, relationships
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            with contextlib.suppress(BaseException):
+                os.close(descriptor)
+        raise
+
+
+def _publish_verified_render(
+    target: Path,
+    temporary_name: str,
+    child_digest: str,
+    *,
+    max_bytes: int,
+    descriptors: list[int],
+    relationships: list[tuple[int, str, os.stat_result]],
+) -> tuple[int, int, int, int]:
+    if not descriptors:
+        raise ValueError("render publication parent descriptor is missing")
+    parent_descriptor = descriptors[-1]
+    artifact_descriptor: int | None = None
+    candidate_identity: tuple[int, int, int, int] | None = None
+    try:
+        namespace = os.stat(
+            temporary_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(namespace.st_mode)
+            or namespace.st_nlink != 1
+            or not 0 < namespace.st_size <= min(max_bytes, REVIEW_PAGE_HARD_MAX_BYTES)
+        ):
+            raise ValueError("render candidate namespace is invalid")
+        file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        artifact_descriptor = os.open(
+            temporary_name,
+            file_flags,
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(artifact_descriptor)
+        candidate_identity = _render_identity(opened)
+        if (
+            candidate_identity != _render_identity(namespace)
+            or candidate_identity[2] != stat.S_IFREG
+            or opened.st_nlink != 1
+        ):
+            raise ValueError("opened render candidate is invalid")
+        digest = hashlib.sha256()
+        observed_size = 0
+        while True:
+            chunk = os.read(artifact_descriptor, 65_536)
+            if not chunk:
+                break
+            observed_size += len(chunk)
+            if observed_size > candidate_identity[3]:
+                raise ValueError("render candidate exceeded its exact size")
+            digest.update(chunk)
+        final_opened = os.fstat(artifact_descriptor)
+        final_namespace = os.stat(
+            temporary_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            observed_size != candidate_identity[3]
+            or digest.hexdigest() != child_digest
+            or _render_identity(final_opened) != candidate_identity
+            or _render_identity(final_namespace) != candidate_identity
+            or final_opened.st_nlink != 1
+            or final_namespace.st_nlink != 1
+        ):
+            raise ValueError("render candidate changed during verification")
+        os.fsync(artifact_descriptor)
+        _validate_render_parent_relationships(relationships)
+        try:
+            os.stat(target.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("render publication target already exists")
+        os.link(
+            temporary_name,
+            target.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        published = os.stat(target.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        candidate_namespace = os.stat(
+            temporary_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        linked_opened = os.fstat(artifact_descriptor)
+        if (
+            _render_identity(published) != candidate_identity
+            or _render_identity(candidate_namespace) != candidate_identity
+            or _render_identity(linked_opened) != candidate_identity
+            or published.st_nlink != 2
+            or candidate_namespace.st_nlink != 2
+            or linked_opened.st_nlink != 2
+        ):
+            raise ValueError("render publication did not bind the verified candidate")
+        os.unlink(temporary_name, dir_fd=parent_descriptor)
+        final_namespace = os.stat(
+            target.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        final_opened = os.fstat(artifact_descriptor)
+        if (
+            _render_identity(final_namespace) != candidate_identity
+            or _render_identity(final_opened) != candidate_identity
+            or final_namespace.st_nlink != 1
+            or final_opened.st_nlink != 1
+        ):
+            raise ValueError("render publication final binding is invalid")
+        _validate_render_parent_relationships(relationships)
+        os.fsync(parent_descriptor)
+        return candidate_identity
+    except BaseException:
+        if candidate_identity is not None:
+            for name in (target.name, temporary_name):
+                with contextlib.suppress(BaseException):
+                    observed = os.stat(
+                        name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if _render_identity(observed) == candidate_identity:
+                        os.unlink(name, dir_fd=parent_descriptor)
+        raise
+    finally:
+        if artifact_descriptor is not None:
+            os.close(artifact_descriptor)
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 def render_pdf_page_in_worker(
     source: SourceArtifact,
     page: int,
@@ -852,15 +1066,12 @@ def render_pdf_page_in_worker(
 ) -> dict[str, object]:
     """Render a page in a child and atomically publish only a completed PNG."""
 
-    resolved = target.resolve()
-    resolved.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=".pdf-render-", suffix=".png", dir=resolved.parent
-    )
-    os.close(descriptor)
-    temporary = Path(temporary_name)
-    temporary.unlink()
+    resolved = Path(os.path.abspath(target))
+    temporary = resolved.with_name(f".pdf-render-{uuid4().hex}.png")
+    publication_descriptors: list[int] | None = None
     try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        publication_descriptors, relationships = _open_render_parent(resolved)
         result = _run_worker(
             "render",
             source,
@@ -868,14 +1079,41 @@ def render_pdf_page_in_worker(
             page=page,
             render_target=temporary,
         )
-        if not temporary.is_file():
-            raise _worker_failed()
-        os.replace(temporary, resolved)
+        digest = result["sha256"]
+        if not isinstance(digest, str):
+            raise ValueError("render worker digest is invalid")
+        owned_descriptors = publication_descriptors
+        publication_descriptors = None
+        identity = _publish_verified_render(
+            resolved,
+            temporary.name,
+            digest,
+            max_bytes=pdf_policy.pdf_worker_result_max_bytes,
+            descriptors=owned_descriptors,
+            relationships=relationships,
+        )
         return {
             "path": str(resolved),
             "page": result["page"],
-            "sha256": result["sha256"],
+            "sha256": digest,
             "renderer": result["renderer"],
+            "device": identity[0],
+            "inode": identity[1],
+            "file_type": identity[2],
+            "size_bytes": identity[3],
         }
+    except SourceEvidenceError:
+        raise
+    except Exception:
+        raise SourceEvidenceError(
+            ErrorCategory.SOURCE,
+            "rendered review page publication failed validation",
+            stop_reason="REVIEW_PAGE_PUBLICATION_INVALID",
+        ) from None
     finally:
-        temporary.unlink(missing_ok=True)
+        if publication_descriptors:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary.name, dir_fd=publication_descriptors[-1])
+            for descriptor in reversed(publication_descriptors):
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)

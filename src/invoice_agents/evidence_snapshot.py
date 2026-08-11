@@ -8,7 +8,6 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from pathlib import Path
 from typing import Any
 
 from invoice_agents.config import Settings
@@ -28,6 +27,7 @@ from invoice_agents.models import (
     ToolStatus,
     critic_disagreement_reason,
 )
+from invoice_agents.review_artifact import ReviewPageBinding, ReviewPageEvidenceError
 
 SNAPSHOT_DIGEST_DOMAIN = b"galatiq.invoice-agents/evidence-snapshot\x00"
 SNAPSHOT_DIGEST_VERSION = 1
@@ -399,28 +399,14 @@ def validate_review_snapshot(review: ReviewRequest, snapshot: EvidenceSnapshot) 
     if isinstance(raw_pages, list) and len(raw_pages) == len(expected_page_numbers):
         rendered_pages_valid = True
         for raw_page, page_number in zip(raw_pages, expected_page_numbers, strict=True):
-            if not isinstance(raw_page, dict):
-                rendered_pages_valid = False
-                break
-            path = raw_page.get("path")
-            rendered_path = Path(path) if isinstance(path, str) else None
-            if (
-                set(raw_page) != {"path", "page", "sha256", "renderer"}
-                or type(raw_page.get("page")) is not int
-                or raw_page.get("page") != page_number
-                or not isinstance(raw_page.get("renderer"), str)
-                or not str(raw_page.get("renderer")).strip()
-                or not isinstance(raw_page.get("sha256"), str)
-                or len(str(raw_page.get("sha256"))) != 64
-                or any(
-                    character not in "0123456789abcdef" for character in str(raw_page.get("sha256"))
+            try:
+                ReviewPageBinding.from_payload(
+                    raw_page,
+                    review_id=review.review_id,
+                    source_id=invoice.source.source_id,
+                    expected_page=page_number,
                 )
-                or rendered_path is None
-                or not rendered_path.is_absolute()
-                or rendered_path.name != f"{invoice.source.source_id}-page-{page_number}.png"
-                or rendered_path.parent.name != review.review_id
-                or rendered_path.parent.parent.name != "reviews"
-            ):
+            except ReviewPageEvidenceError:
                 rendered_pages_valid = False
                 break
     else:

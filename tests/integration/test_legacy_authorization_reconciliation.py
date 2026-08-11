@@ -8,6 +8,7 @@ import os
 import sqlite3
 import struct
 import subprocess
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -41,6 +42,17 @@ ACTIVE_TABLE_KEYS = {
     "final_decisions": "decision_id",
     "payments": "payment_id",
 }
+
+
+def _database_cli_subprocess_command(*arguments: str) -> list[str]:
+    """Invoke the real database CLI with the exact interpreter running this test."""
+
+    return [
+        sys.executable,
+        "-c",
+        "from invoice_agents.db.cli import app; app()",
+        *arguments,
+    ]
 
 
 def _canonical_row(row: dict[str, Any]) -> str:
@@ -351,15 +363,13 @@ def test_database_cli_subprocess_reports_only_stable_code_for_secret_bearing_dri
         connection.commit()
 
     completed = subprocess.run(
-        [
-            str(Path(__file__).parents[2] / ".venv" / "bin" / "invoice-agents"),
-            "db",
+        _database_cli_subprocess_command(
             "migrate",
             "--db",
             str(path),
             "--kind",
             "workflow",
-        ],
+        ),
         check=False,
         capture_output=True,
         text=True,
@@ -381,9 +391,7 @@ def test_database_cli_settings_failures_are_sanitized_in_real_subprocess(
 ) -> None:
     secret = "sk-proj-task8-invalid-decimal-must-never-reach-operator-output"
     completed = subprocess.run(
-        [
-            str(Path(__file__).parents[2] / ".venv" / "bin" / "invoice-agents"),
-            "db",
+        _database_cli_subprocess_command(
             operation,
             "--db",
             str(tmp_path / "workflow.db"),
@@ -391,7 +399,7 @@ def test_database_cli_settings_failures_are_sanitized_in_real_subprocess(
             "workflow",
             "--inventory-db",
             str(tmp_path / "inventory.db"),
-        ],
+        ),
         check=False,
         capture_output=True,
         text=True,
@@ -415,9 +423,7 @@ def test_database_cli_reconciliation_failure_is_sanitized_with_invalid_settings_
 ) -> None:
     secret = "sk-proj-task8-invalid-decimal-must-never-reach-operator-output"
     completed = subprocess.run(
-        [
-            str(Path(__file__).parents[2] / ".venv" / "bin" / "invoice-agents"),
-            "db",
+        _database_cli_subprocess_command(
             "reconcile-legacy-authorization",
             "--db",
             str(tmp_path / "missing-workflow.db"),
@@ -428,7 +434,7 @@ def test_database_cli_reconciliation_failure_is_sanitized_with_invalid_settings_
             "--disposition",
             DISPOSITION,
             "--confirm",
-        ],
+        ),
         check=False,
         capture_output=True,
         text=True,

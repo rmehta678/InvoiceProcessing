@@ -14,4 +14,7 @@ def test_each_database_kind_has_packaged_migrations() -> None:
         "002_review_sequence.sql",
         "003_execution_fencing.sql",
         "004_execution_token_grammar.sql",
+        "005_result_artifact_bindings.sql",
+        "006_durable_admission.sql",
+        "007_critique_cycles.sql",
     ]

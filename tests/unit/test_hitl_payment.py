@@ -308,6 +308,142 @@ def test_review_request_and_human_decision_are_persisted(
     assert resolved.agent_recommendation is DecisionKind.HOLD
 
 
+def test_authorizing_decision_rejects_mutated_rendered_page_without_state_mutation(
+    invoice_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+) -> None:
+    """Removing transaction-local page validation must authorize forged review bytes."""
+
+    monkeypatch.chdir(tmp_path)
+    review = pending_review(
+        invoice_dir / "invoice_1011.pdf",
+        "case_mutated_review_page",
+        settings,
+    )
+    pages = review.evidence_bundle["rendered_pages"]
+    assert isinstance(pages, list) and len(pages) == 1
+    entry = pages[0]
+    assert isinstance(entry, dict)
+    rendered = Path(str(entry["path"]))
+    original = rendered.read_bytes()
+    rendered.write_bytes(b"M" * len(original))
+    before = persisted_decision_state(
+        settings.workflow_db,
+        settings.inventory_db,
+        review.review_id,
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        record_human_decision(
+            review.review_id,
+            "reviewer@example.com",
+            HumanDecisionKind.APPROVE,
+            "the displayed PDF evidence supports authorization",
+            WorkflowStore(settings),
+            settings.inventory_db,
+        )
+
+    assert excinfo.value.stop_reason == "EVIDENCE_SNAPSHOT_INVALID"
+    assert (
+        persisted_decision_state(
+            settings.workflow_db,
+            settings.inventory_db,
+            review.review_id,
+        )
+        == before
+    )
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 0
+
+
+def test_non_authorizing_reject_remains_available_when_rendered_page_is_invalid(
+    invoice_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+) -> None:
+    """A corrupt display artifact cannot prevent a fail-closed human rejection."""
+
+    monkeypatch.chdir(tmp_path)
+    review = pending_review(
+        invoice_dir / "invoice_1011.pdf",
+        "case_reject_invalid_review_page",
+        settings,
+    )
+    entry = review.evidence_bundle["rendered_pages"][0]
+    assert isinstance(entry, dict)
+    rendered = Path(str(entry["path"]))
+    rendered.write_bytes(b"invalid review page")
+    aliases_before = persisted_decision_state(
+        settings.workflow_db,
+        settings.inventory_db,
+        review.review_id,
+    )[0]
+
+    resolved = record_human_decision(
+        review.review_id,
+        "reviewer@example.com",
+        HumanDecisionKind.REJECT,
+        "the evidence cannot be authorized",
+        WorkflowStore(settings),
+        settings.inventory_db,
+    )
+
+    assert resolved.status == "RESOLVED"
+    assert resolved.human_decision is not None
+    assert resolved.human_decision.decision is HumanDecisionKind.REJECT
+    aliases_after, decisions_after, _review_after = persisted_decision_state(
+        settings.workflow_db,
+        settings.inventory_db,
+        review.review_id,
+    )
+    assert aliases_after == aliases_before
+    assert len(decisions_after) == 1
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM payments").fetchone()[0] == 0
+
+
+def test_resolved_review_authority_precedes_later_rendered_page_mutation(
+    invoice_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+) -> None:
+    """Page validation must not mask an already-resolved authority-state error."""
+
+    monkeypatch.chdir(tmp_path)
+    review = pending_review(
+        invoice_dir / "invoice_1011.pdf",
+        "case_resolved_review_page_precedence",
+        settings,
+    )
+    record_human_decision(
+        review.review_id,
+        "first@example.com",
+        HumanDecisionKind.APPROVE,
+        "the exact rendered evidence is authorized",
+        WorkflowStore(settings),
+        settings.inventory_db,
+    )
+    entry = review.evidence_bundle["rendered_pages"][0]
+    assert isinstance(entry, dict)
+    Path(str(entry["path"])).write_bytes(b"mutated after resolution")
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        record_human_decision(
+            review.review_id,
+            "second@example.com",
+            HumanDecisionKind.APPROVE,
+            "a conflicting second ruling",
+            WorkflowStore(settings),
+            settings.inventory_db,
+        )
+
+    assert excinfo.value.stop_reason == "REVIEW_ALREADY_RESOLVED"
+
+
 def test_nonexistent_review_decision_leaves_both_databases_unchanged(
     settings: Settings,
 ) -> None:

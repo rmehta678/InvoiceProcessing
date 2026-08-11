@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 import sqlite3
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NoReturn
@@ -218,15 +217,13 @@ def _install_downstream_failure(
         monkeypatch.setattr(cli, "resume_case", fail_async)
         return ["settings", "claim", command]
     elif command == "ui":
-        monkeypatch.setitem(
-            sys.modules,
-            "uvicorn",
-            SimpleNamespace(run=lambda *_args, **_kwargs: fail()),
+        monkeypatch.setattr(
+            "uvicorn.run",
+            lambda *_args, **_kwargs: fail(),
         )
-        monkeypatch.setitem(
-            sys.modules,
-            "invoice_agents.ui.server",
-            SimpleNamespace(create_app=lambda _settings, **_kwargs: object()),
+        monkeypatch.setattr(
+            "invoice_agents.ui.server.create_app",
+            lambda _settings, **_kwargs: object(),
         )
     elif command == "contract":
         monkeypatch.setattr(cli, "run_live_contracts", fail_async)

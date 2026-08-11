@@ -548,6 +548,9 @@ async def test_create_app_registry_budget_spans_single_batch_and_resume_routes(
     )
     assert single_response.status_code == 303
     single = single_response.headers["location"].split("/")[2]
+    single_handle = registry.handle(single)
+    assert single_handle is not None and single_handle.task is not None
+    single_task = single_handle.task
     paths[0].unlink()
     batch_response = await ui_routes.submit_batch(
         request("/batch"),
@@ -557,13 +560,16 @@ async def test_create_app_registry_budget_spans_single_batch_and_resume_routes(
     assert batch_response.status_code == 303
     batch_id = batch_response.headers["location"].split("/")[2]
     batch = registry.batch(batch_id)
-    assert batch is not None
+    assert batch is not None and batch.task is not None
+    batch_task = batch.task
     resume_response = await ui_routes.case_resume(
         request(f"/cases/{resume_case_id}/resume"), resume_case_id
     )
     assert resume_response.status_code == 303
     resume_handle = registry.handle(resume_case_id)
     assert resume_handle is not None
+    resume_task = resume_handle.task
+    assert resume_task is not None
 
     await _await_event(at_capacity)
     turn_completed = asyncio.Event()
@@ -573,11 +579,12 @@ async def test_create_app_registry_budget_spans_single_batch_and_resume_routes(
     assert len(calls) == 2
 
     release.set()
-    await _await_case(registry, single)
-    await _await_batch(batch)
-    assert resume_handle.task is not None
     async with asyncio.timeout(10):
-        await asyncio.shield(resume_handle.task)
+        await asyncio.shield(single_task)
+    async with asyncio.timeout(10):
+        await asyncio.shield(batch_task)
+    async with asyncio.timeout(10):
+        await asyncio.shield(resume_task)
 
     assert peak == 2
     assert len(calls) == 4

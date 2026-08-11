@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -41,7 +42,7 @@ def _render_review_pages(
         return []
     page_count = source.page_count or 1
     pages = range(1, page_count + 1) if page_count <= 3 else range(1, 2)
-    output_dir = Path("artifacts/reviews").resolve() / review_id
+    output_dir = Path(os.path.abspath("artifacts/reviews")) / review_id
     return [render_pdf_page(source, page, output_dir, pdf_policy) for page in pages]
 
 

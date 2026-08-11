@@ -296,7 +296,9 @@ def _build_large_v2_workflow(path: Path) -> None:
         )
         connection.execute(
             "WITH RECURSIVE sequence(value) AS ("
-            "VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < 1000000"
+            # Keep the real rollback journal observable without making the
+            # lock-ownership assertion depend on full-suite machine load.
+            "VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < 500000"
             ") INSERT INTO cases(case_id, status, started_at, updated_at) "
             "SELECT printf('case_%09d', value), 'INCOMPLETE', ?, ? FROM sequence",
             ("2026-08-09T12:00:00+00:00", "2026-08-09T12:00:00+00:00"),

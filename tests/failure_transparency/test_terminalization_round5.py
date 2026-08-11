@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
 import sqlite3
 import struct
 import sys
+from collections.abc import Coroutine
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -346,56 +348,96 @@ async def test_round5_run_prepared_case_rejects_caller_start_before_lifecycle(
 
 @pytest.mark.asyncio
 async def test_round5_completed_public_registry_has_no_execution_claim(
+    invoice_dir: Path,
     settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A completed public handle cannot expose reusable execution authority."""
 
-    case_id = "case_round5_public_registry"
-    started_at = datetime.now(UTC)
-    claim = ExecutionClaim(
-        case_id,
-        f"exec_{'a' * 32}",
-        1,
-        started_at + timedelta(minutes=1),
-    )
-    expected = CaseResult(
-        case_id=case_id,
-        source_id=None,
-        status=CaseStatus.INCOMPLETE,
-        stop_reason="ROUND5_LOCAL_RESULT",
-        started_at=started_at,
-        finished_at=started_at,
-    )
+    completed: list[tuple[CaseResult, ExecutionClaim]] = []
 
-    async def durable(
-        claims: list[tuple[str, datetime, ExecutionClaim]],
-        _settings: Settings,
-    ) -> dict[str, BaseException | None]:
-        return {selected_case_id: None for selected_case_id, _started, _claim in claims}
+    async def finish_locally(
+        case_id: str,
+        started_at: datetime,
+        selected_settings: Settings,
+        *,
+        claim: ExecutionClaim,
+    ) -> CaseResult:
+        store = WorkflowStore(selected_settings)
+        result = CaseResult(
+            case_id=case_id,
+            source_id=store.load_authoritative_case_source_id(claim),
+            status=CaseStatus.INCOMPLETE,
+            stop_reason="ROUND5_LOCAL_RESULT",
+            started_at=started_at,
+            finished_at=max(datetime.now(UTC), started_at),
+        )
+        store.finish_case(result, claim)
+        completed.append((result, claim))
+        return result
 
-    async def local_result() -> CaseResult:
-        return expected
-
-    monkeypatch.setattr(ui_runs, "_inspect_claim_durability", durable)
+    monkeypatch.setattr(ui_runs, "run_prepared_case", finish_locally)
     registry = RunRegistry(global_limit=settings.case_concurrency)
-    handle = await registry._launch(
-        case_id,
-        "process",
-        local_result(),
-        claim=claim,
-        source_path=None,
-        settings=settings,
-        claimed_started_at=started_at,
+    case_id = await registry.start_process(
+        invoice_dir / "invoice_1001.txt",
+        settings,
+        submission_id="submission_round5_public_registry",
     )
+    assert isinstance(case_id, str)
+    handle = registry.handle(case_id)
+    assert handle is not None
     owner_task = handle.task
     assert owner_task is not None
-    assert await owner_task == expected
+    result = await owner_task
+    assert result.stop_reason == "ROUND5_LOCAL_RESULT"
     await asyncio.sleep(0)
 
     retained = repr(handle) + repr(registry._runs) + repr(registry._batches)
-    assert claim.token not in retained
+    assert completed and completed[0][0] == result
+    assert completed[0][1].token not in retained
     assert getattr(handle, "claim", None) is None
+
+
+@pytest.mark.asyncio
+async def test_round5_running_admission_failure_closes_unstarted_model_coroutine(
+    invoice_dir: Path,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed queued-to-running transition must release its unstarted coroutine."""
+
+    operations: list[Coroutine[Any, Any, CaseResult]] = []
+
+    async def must_not_run() -> CaseResult:
+        raise AssertionError("model coroutine ran without durable running admission")
+
+    def build_operation(*_args: object, **_kwargs: object) -> Coroutine[Any, Any, CaseResult]:
+        operation = must_not_run()
+        operations.append(operation)
+        return operation
+
+    def fail_running_admission(_self: WorkflowStore, _case_id: str) -> None:
+        raise RuntimeError("running admission sentinel")
+
+    monkeypatch.setattr(ui_runs, "run_prepared_case", build_operation)
+    monkeypatch.setattr(WorkflowStore, "mark_admission_running", fail_running_admission)
+    registry = RunRegistry(global_limit=settings.case_concurrency)
+    case_id = await registry.start_process(
+        invoice_dir / "invoice_1001.txt",
+        settings,
+        submission_id="submission_round5_running_admission_failure",
+    )
+    assert isinstance(case_id, str)
+    handle = registry.handle(case_id)
+    assert handle is not None and handle.task is not None
+    owner_task = handle.task
+
+    with pytest.raises(RuntimeError, match="running admission sentinel"):
+        await owner_task
+    await asyncio.sleep(0)
+
+    assert len(operations) == 1
+    assert inspect.getcoroutinestate(operations[0]) == inspect.CORO_CLOSED
 
 
 @pytest.mark.asyncio
@@ -522,47 +564,52 @@ async def test_round5_public_batch_nested_entries_logs_templates_and_sse_hide_cl
 async def test_round5_public_handle_cannot_authorize_finished_result_update(
     invoice_dir: Path,
     settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The private owner finishes authoritatively, then no public reusable claim remains."""
 
-    prepared = orchestration.prepare_claimed_invoice(
-        invoice_dir / "invoice_1001.txt",
-        settings,
-    )
-    assert isinstance(prepared, tuple)
-    case_id, started_at, claim = prepared
-    store = WorkflowStore(settings)
-    result = CaseResult(
-        case_id=case_id,
-        source_id=store.load_authoritative_case_source_id(claim),
-        status=CaseStatus.INCOMPLETE,
-        stop_reason="ROUND5_PRIVATE_OWNER",
-        started_at=started_at,
-        finished_at=max(datetime.now(UTC), started_at),
-    )
+    completed: list[CaseResult] = []
 
-    async def finish_locally() -> CaseResult:
+    async def finish_locally(
+        case_id: str,
+        started_at: datetime,
+        selected_settings: Settings,
+        *,
+        claim: ExecutionClaim,
+    ) -> CaseResult:
+        store = WorkflowStore(selected_settings)
+        result = CaseResult(
+            case_id=case_id,
+            source_id=store.load_authoritative_case_source_id(claim),
+            status=CaseStatus.INCOMPLETE,
+            stop_reason="ROUND5_PRIVATE_OWNER",
+            started_at=started_at,
+            finished_at=max(datetime.now(UTC), started_at),
+        )
         store.finish_case(result, claim)
+        completed.append(result)
         return result
 
+    monkeypatch.setattr(ui_runs, "run_prepared_case", finish_locally)
     registry = RunRegistry(global_limit=settings.case_concurrency)
-    handle = await registry._launch(
-        case_id,
-        "process",
-        finish_locally(),
-        claim=claim,
-        source_path=None,
-        settings=settings,
-        claimed_started_at=started_at,
+    case_id = await registry.start_process(
+        invoice_dir / "invoice_1001.txt",
+        settings,
+        submission_id="submission_round5_public_handle_update",
     )
+    assert isinstance(case_id, str)
+    handle = registry.handle(case_id)
+    assert handle is not None
     owner_task = handle.task
     assert owner_task is not None
-    assert await owner_task == result
+    result = await owner_task
+    assert completed == [result]
     await asyncio.sleep(0)
     assert registry._lifecycle_owners == {}
     public_authority = getattr(handle, "claim", None)
     assert public_authority is None
 
+    store = WorkflowStore(settings)
     updated = result.model_copy(update={"finished_at": datetime.now(UTC)}, deep=True)
     with pytest.raises(InvoiceAgentsError) as excinfo:
         store.update_finished_case_result(updated, public_authority)
@@ -908,9 +955,17 @@ def test_round5_forward_migration_history_contains_exact_token_grammar_hash(
             "SELECT ordinal, version, migration_sha256 FROM schema_migration_history "
             "ORDER BY ordinal"
         ).fetchall()
-    assert versions == [1, 2, 3, 4]
-    assert [row[:2] for row in history] == [(1, 1), (2, 2), (3, 3), (4, 4)]
-    assert history[-1][2] == expected_hash
+    assert versions == [1, 2, 3, 4, 5, 6, 7]
+    assert [row[:2] for row in history] == [
+        (1, 1),
+        (2, 2),
+        (3, 3),
+        (4, 4),
+        (5, 5),
+        (6, 6),
+        (7, 7),
+    ]
+    assert history[3][2] == expected_hash
 
 
 def _round5_build_v3_with_malformed_authority(path: Path) -> None:

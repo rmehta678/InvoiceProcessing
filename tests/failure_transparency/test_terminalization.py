@@ -7897,7 +7897,7 @@ async def test_core_batch_preserves_recovery_only_preparation_publication(
     monkeypatch.setattr(
         orchestration,
         "extract_invoice_evidence",
-        lambda _source: (_ for _ in ()).throw(RuntimeError("preparation sentinel")),
+        lambda _source, _pdf_policy: (_ for _ in ()).throw(RuntimeError("preparation sentinel")),
     )
     monkeypatch.setattr(
         WorkflowStore,
@@ -7943,7 +7943,7 @@ async def test_core_batch_post_claim_preparation_failure_has_one_recovery_owner(
     monkeypatch.setattr(
         orchestration,
         "extract_invoice_evidence",
-        lambda _source: (_ for _ in ()).throw(fault_type("preparation sentinel")),
+        lambda _source, _pdf_policy: (_ for _ in ()).throw(fault_type("preparation sentinel")),
     )
     monkeypatch.setattr(
         WorkflowStore,

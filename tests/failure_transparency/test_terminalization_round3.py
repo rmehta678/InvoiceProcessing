@@ -87,13 +87,13 @@ async def test_round3_single_same_tick_cancel_has_durability_owner(
 
 
 @pytest.mark.asyncio
-async def test_round3_terminal_timeout_cannot_later_commit_after_recovery(
+async def test_round3_terminal_timeout_publishes_no_unverified_recovery_and_cannot_later_commit(
     invoice_dir: Path,
     settings: Settings,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A timed-out terminal worker must not outlive recovery publication."""
+    """Unavailable terminal workers must publish no evidence and cannot commit later."""
 
     prepared = orchestration.prepare_claimed_invoice(invoice_dir / "invoice_1001.txt", settings)
     assert isinstance(prepared, tuple)
@@ -109,7 +109,7 @@ async def test_round3_terminal_timeout_cannot_later_commit_after_recovery(
         await orchestration._durably_cancel_unstarted_claim(case_id, started_at, settings, claim)
     assert excinfo.value.stop_reason == "TERMINAL_DURABILITY_TIMEOUT"
     recovery = tmp_path / "artifacts" / "results" / f"{case_id}.recovery.json"
-    assert recovery.is_file()
+    assert not recovery.exists()
 
     snapshot = WorkflowStore(settings).load_case_execution_snapshot(case_id)
     assert snapshot is not None and snapshot.execution_state != "FINISHED"

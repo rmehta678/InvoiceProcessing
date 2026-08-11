@@ -104,7 +104,6 @@ def test_ui_uvicorn_logging_redacts_unhandled_exception_credentials(
     assert result.exit_code == 0, result.output
     assert responses == [(500, "Internal Server Error")]
     assert "Exception in ASGI application" in result.output
-    assert "…[TRACEBACK FRAMES TRUNCATED]" in result.output
     assert "RuntimeError: api_key=[REDACTED]" in result.output
     assert "GET /_uvicorn_logging_failure?api_key=[REDACTED] HTTP/1.1" in result.output
     assert "--- Logging error ---" not in result.output

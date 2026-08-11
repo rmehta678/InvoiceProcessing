@@ -55,6 +55,10 @@ from invoice_agents.observability.audit import (
     sanitize_review_request,
     sanitize_text,
 )
+from invoice_agents.review_artifact import (
+    ReviewPageEvidenceError,
+    validate_review_page_evidence,
+)
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -4739,6 +4743,17 @@ class WorkflowStore:
 
                 decision = sanitize_human_decision(decision)
                 mappings = _validate_human_decision(connection, review, decision)
+                from invoice_agents.agents.decision_rules import AUTHORIZING_HUMAN_DECISIONS
+
+                if decision.decision in AUTHORIZING_HUMAN_DECISIONS:
+                    try:
+                        validate_review_page_evidence(review)
+                    except ReviewPageEvidenceError:
+                        self._raise_snapshot_invalid(
+                            case_id,
+                            generation,
+                            "rendered review page evidence failed exact validation",
+                        )
                 resolved = review.model_copy(
                     update={"status": "RESOLVED", "human_decision": decision}, deep=True
                 )

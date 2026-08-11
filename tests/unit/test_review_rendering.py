@@ -1,6 +1,7 @@
 """G10a: PDF review requests render original-layout pages with verifiable hashes."""
 
 import hashlib
+import stat
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from invoice_agents.db.store import WorkflowStore
 from invoice_agents.hitl.service import create_review_request
 from invoice_agents.models import CaseStatus, Critique, DecisionKind, ReviewRequest
 from invoice_agents.orchestration import prepare_case
+from invoice_agents.review_artifact import ReviewPageBinding, ReviewPageEvidenceError
 from invoice_agents.tools.comparison import (
     InventoryReader,
     apply_mapping_evidence,
@@ -95,7 +97,16 @@ def test_pdf_review_renders_page_one_with_verifiable_hash(
     pages = review.evidence_bundle["rendered_pages"]
     assert len(pages) == 1
     entry = pages[0]
-    assert set(entry) == {"path", "page", "sha256", "renderer"}
+    assert set(entry) == {
+        "path",
+        "page",
+        "sha256",
+        "renderer",
+        "device",
+        "inode",
+        "file_type",
+        "size_bytes",
+    }
     assert entry["page"] == 1
     assert entry["renderer"] == "PyMuPDF"
     rendered = Path(entry["path"])
@@ -104,6 +115,12 @@ def test_pdf_review_renders_page_one_with_verifiable_hash(
     expected_dir = (tmp_path / "artifacts" / "reviews" / review.review_id).resolve()
     assert rendered.parent == expected_dir
     assert hashlib.sha256(rendered.read_bytes()).hexdigest() == entry["sha256"]
+    identity = rendered.stat()
+    assert entry["device"] == identity.st_dev
+    assert entry["inode"] == identity.st_ino
+    assert entry["file_type"] == stat.S_IFMT(identity.st_mode) == stat.S_IFREG
+    assert entry["size_bytes"] == identity.st_size
+    assert identity.st_nlink == 1
 
 
 def test_non_pdf_review_has_no_rendered_pages(
@@ -112,6 +129,26 @@ def test_non_pdf_review_has_no_rendered_pages(
     monkeypatch.chdir(tmp_path)
     review = build_review("invoice_1002.txt", settings)
     assert review.evidence_bundle["rendered_pages"] == []
+
+
+def test_review_page_binding_rejects_forged_renderer_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    review = build_review("invoice_1011.pdf", settings)
+    entry = review.evidence_bundle["rendered_pages"][0]
+    assert isinstance(entry, dict)
+    forged = {**entry, "renderer": "forged-renderer"}
+
+    with pytest.raises(ReviewPageEvidenceError):
+        ReviewPageBinding.from_payload(
+            forged,
+            review_id=review.review_id,
+            source_id=review.source.source_id,
+            expected_page=1,
+        )
 
 
 def test_pdf_render_uses_snapshot_after_submitted_path_is_replaced(

@@ -308,9 +308,11 @@ class RunRegistry:
                 exc.__traceback__ = None
                 exc.__cause__ = None
                 exc.__context__ = None
-        # Keep the completed task as the stable wait handle returned to callers.
-        # Calling ``exception`` above consumes detached-task failures; retaining
-        # the task does not make task completion a durability signal.
+        if task is not None and task.done():
+            # Callers that need the completion value capture the task before
+            # yielding.  Public completed state must not retain a raw exception
+            # object (or anything reachable from its locals) indefinitely.
+            handle.task = None
 
     def _finish_batch(self, batch: BatchState) -> None:
         """Retain only stable batch display state after its owner has completed."""
@@ -429,13 +431,22 @@ class RunRegistry:
         launch = asyncio.Event()
 
         async def run_at_model_boundary() -> CaseResult:
-            async with self._model_slots:
-                if kind == "process":
-                    await asyncio.to_thread(
-                        WorkflowStore(settings).mark_admission_running,
-                        case_id,
-                    )
-                return await run
+            run_started = False
+            try:
+                async with self._model_slots:
+                    if kind == "process":
+                        await asyncio.to_thread(
+                            WorkflowStore(settings).mark_admission_running,
+                            case_id,
+                        )
+                    run_started = True
+                    return await run
+            finally:
+                if not run_started:
+                    # The registry created and owns this coroutine.  If durable
+                    # running admission (or slot acquisition) fails first, no
+                    # later owner can await it, so close it deterministically.
+                    run.close()
 
         async def own_lifecycle() -> CaseResult:
             child: asyncio.Task[CaseResult] | None = None

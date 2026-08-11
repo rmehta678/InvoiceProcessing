@@ -6,6 +6,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import stat
 import struct
 import time
 import tracemalloc
@@ -23,6 +24,7 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from invoice_agents.config import Settings
 from invoice_agents.errors import SourceEvidenceError
 from invoice_agents.models import SourceArtifact
+from invoice_agents.tools.evidence import render_pdf_page
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "invoices"
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures"
@@ -719,14 +721,177 @@ def test_pdf_worker_renders_page_to_real_png(tmp_path: Path) -> None:
         pdf_policy=pdf_policy(),
     )
 
-    assert result == {
-        "path": str(target.resolve()),
-        "page": 1,
-        "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
-        "renderer": "PyMuPDF",
+    assert set(result) == {
+        "path",
+        "page",
+        "sha256",
+        "renderer",
+        "device",
+        "inode",
+        "file_type",
+        "size_bytes",
     }
+    assert result["path"] == str(target.resolve())
+    assert result["page"] == 1
+    assert result["sha256"] == hashlib.sha256(target.read_bytes()).hexdigest()
+    assert result["renderer"] == "PyMuPDF"
+    identity = target.stat()
+    assert result["device"] == identity.st_dev
+    assert result["inode"] == identity.st_ino
+    assert result["file_type"] == stat.S_IFMT(identity.st_mode) == stat.S_IFREG
+    assert result["size_bytes"] == identity.st_size
+    assert identity.st_nlink == 1
     assert target.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     assert not [path for path in tmp_path.iterdir() if path.name.startswith(".pdf-render-")]
+
+
+def test_pdf_parent_rejects_candidate_mutated_after_child_digest_before_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing the parent's descriptor digest check must publish the forged bytes."""
+
+    source = content_addressed_pdf(DATA_DIR / "invoice_1011.pdf", tmp_path / "sources", 1)
+    target = tmp_path / "rendered.png"
+    child_bytes = b"\x89PNG\r\n\x1a\nchild-verified"
+    forged_bytes = b"\x89PNG\r\n\x1a\nforged-after-child-digest"
+    worker_module = pdf_worker()
+
+    def mutate_after_child_digest(
+        operation: str,
+        _source: SourceArtifact,
+        _pdf_policy: object,
+        *,
+        page: int | None = None,
+        render_target: Path | None = None,
+    ) -> dict[str, object]:
+        assert operation == "render"
+        assert page == 1
+        assert render_target is not None
+        render_target.write_bytes(child_bytes)
+        child_digest = hashlib.sha256(child_bytes).hexdigest()
+        render_target.write_bytes(forged_bytes)
+        return {"page": page, "sha256": child_digest, "renderer": "PyMuPDF"}
+
+    monkeypatch.setattr(worker_module, "_run_worker", mutate_after_child_digest)
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        worker_module.render_pdf_page_in_worker(
+            source,
+            page=1,
+            target=target,
+            pdf_policy=pdf_policy(),
+        )
+
+    assert excinfo.value.stop_reason == "REVIEW_PAGE_PUBLICATION_INVALID"
+    assert excinfo.value.message == "rendered review page publication failed validation"
+    assert not target.exists()
+
+
+def test_pdf_review_publication_rejects_symlinked_parent_namespace(tmp_path: Path) -> None:
+    """Resolving the target before publication must follow and authorize this symlink."""
+
+    source = content_addressed_pdf(DATA_DIR / "invoice_1011.pdf", tmp_path / "sources", 1)
+    outside = tmp_path / "outside"
+    (outside / "reviews").mkdir(parents=True)
+    artifacts = tmp_path / "artifacts"
+    artifacts.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        render_pdf_page(
+            source,
+            1,
+            artifacts / "reviews" / "rev_symlinked_parent",
+            pdf_policy(),
+        )
+
+    assert excinfo.value.stop_reason == "REVIEW_PAGE_PUBLICATION_INVALID"
+    assert not list((outside / "reviews" / "rev_symlinked_parent").glob("*.png"))
+
+
+def test_pdf_parent_rejects_render_candidate_over_configured_byte_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = content_addressed_pdf(DATA_DIR / "invoice_1011.pdf", tmp_path / "sources", 1)
+    target = tmp_path / "oversized.png"
+    worker_module = pdf_worker()
+    oversized = b"P" * 65_537
+
+    def render_oversized_candidate(
+        operation: str,
+        _source: SourceArtifact,
+        _pdf_policy: object,
+        *,
+        page: int | None = None,
+        render_target: Path | None = None,
+    ) -> dict[str, object]:
+        assert operation == "render"
+        assert page == 1
+        assert render_target is not None
+        render_target.write_bytes(oversized)
+        return {
+            "page": page,
+            "sha256": hashlib.sha256(oversized).hexdigest(),
+            "renderer": "PyMuPDF",
+        }
+
+    monkeypatch.setattr(worker_module, "_run_worker", render_oversized_candidate)
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        worker_module.render_pdf_page_in_worker(
+            source,
+            page=1,
+            target=target,
+            pdf_policy=pdf_policy(result_max_bytes=65_536),
+        )
+
+    assert excinfo.value.stop_reason == "REVIEW_PAGE_PUBLICATION_INVALID"
+    assert not target.exists()
+
+
+def test_pdf_parent_rejects_render_directory_swap_after_child_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = content_addressed_pdf(DATA_DIR / "invoice_1011.pdf", tmp_path / "sources", 1)
+    review_dir = tmp_path / "artifacts" / "reviews" / "rev_parent_swap"
+    target = review_dir / "rendered.png"
+    displaced = review_dir.with_name("displaced-review")
+    worker_module = pdf_worker()
+    child_bytes = b"\x89PNG\r\n\x1a\nparent-swap"
+
+    def swap_parent_after_child_digest(
+        operation: str,
+        _source: SourceArtifact,
+        _pdf_policy: object,
+        *,
+        page: int | None = None,
+        render_target: Path | None = None,
+    ) -> dict[str, object]:
+        assert operation == "render"
+        assert page == 1
+        assert render_target is not None
+        render_target.write_bytes(child_bytes)
+        digest = hashlib.sha256(child_bytes).hexdigest()
+        review_dir.rename(displaced)
+        review_dir.mkdir()
+        render_target.write_bytes(child_bytes)
+        return {"page": page, "sha256": digest, "renderer": "PyMuPDF"}
+
+    monkeypatch.setattr(worker_module, "_run_worker", swap_parent_after_child_digest)
+
+    with pytest.raises(SourceEvidenceError) as excinfo:
+        worker_module.render_pdf_page_in_worker(
+            source,
+            page=1,
+            target=target,
+            pdf_policy=pdf_policy(),
+        )
+
+    assert excinfo.value.stop_reason == "REVIEW_PAGE_PUBLICATION_INVALID"
+    assert not target.exists()
+    assert not (displaced / target.name).exists()
 
 
 def test_pdf_child_renders_the_same_bytes_that_passed_verification(
