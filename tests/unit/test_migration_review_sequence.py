@@ -251,6 +251,36 @@ def build_v1_workflow_db(tmp_path: Path) -> tuple[Path, SourceArtifact]:
     return path, source
 
 
+def test_v1_migration_preflight_rejects_schema_corruption_before_v2_can_rebuild_it(
+    tmp_path: Path,
+) -> None:
+    path, _source = build_v1_workflow_db(tmp_path)
+    with connect_database(path) as connection:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_schema "
+            "WHERE type = 'table' AND name = 'review_requests'"
+        ).fetchone()
+        assert row is not None and type(row["sql"]) is str
+        weakened = row["sql"].replace("status TEXT NOT NULL", "status TEXT", 1)
+        assert weakened != row["sql"]
+        connection.execute("PRAGMA writable_schema = ON")
+        updated = connection.execute(
+            "UPDATE sqlite_schema SET sql = ? "
+            "WHERE type = 'table' AND name = 'review_requests'",
+            (weakened,),
+        )
+        assert updated.rowcount == 1
+        connection.execute("PRAGMA writable_schema = RESET")
+        connection.commit()
+    before = path.read_bytes()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(path, DatabaseKind.WORKFLOW)
+
+    assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+    assert path.read_bytes() == before
+
+
 def test_v1_database_requires_explicit_legacy_authorization_reconciliation(
     tmp_path: Path,
 ) -> None:

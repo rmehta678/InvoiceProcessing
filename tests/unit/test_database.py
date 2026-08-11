@@ -281,6 +281,29 @@ def test_workflow_manifest_rejects_unicode_lookalike_trigger_redirect(
     assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
 
 
+def test_required_trigger_contract_discovers_every_packaged_workflow_migration() -> None:
+    root = core_module.files("invoice_agents.db").joinpath("migrations", "workflow")
+    scripts = [
+        resource.read_text(encoding="utf-8")
+        for resource in root.iterdir()
+        if core_module.re.fullmatch(r"[0-9]{3}_[A-Za-z0-9_]+\.sql", resource.name)
+    ]
+    scripts.append(
+        root.joinpath("legacy_authorization_archive.sql").read_text(encoding="utf-8")
+    )
+    packaged_names = {
+        match.group(1)
+        for script in scripts
+        for match in core_module.re.finditer(
+            r"CREATE\s+TRIGGER(?:\s+IF\s+NOT\s+EXISTS)?\s+([A-Za-z0-9_]+)\b.*?\bEND\s*;",
+            script,
+            flags=core_module.re.IGNORECASE | core_module.re.DOTALL,
+        )
+    }
+
+    assert packaged_names <= set(core_module.REQUIRED_WORKFLOW_TRIGGERS)
+
+
 @pytest.mark.parametrize(
     "separator",
     ["\u00a0", "\u2003", "\u202f"],
@@ -372,6 +395,155 @@ def test_migrate_seed_verify_is_repeatable(tmp_path: Path) -> None:
     result = verify_database(path, DatabaseKind.INVENTORY)
     assert result["integrity"] == "ok"
     assert result["schema_version"] == 1
+
+
+def _rewrite_table_schema_sql(
+    path: Path,
+    table: str,
+    expected_fragment: str,
+    replacement: str,
+) -> None:
+    with connect_database(path) as connection:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        assert row is not None and type(row["sql"]) is str
+        rewritten = row["sql"].replace(expected_fragment, replacement, 1)
+        assert rewritten != row["sql"]
+        connection.execute("PRAGMA writable_schema = ON")
+        updated = connection.execute(
+            "UPDATE sqlite_schema SET sql = ? WHERE type = 'table' AND name = ?",
+            (rewritten, table),
+        )
+        assert updated.rowcount == 1
+        connection.execute("PRAGMA writable_schema = RESET")
+        connection.commit()
+
+
+@pytest.mark.parametrize(
+    ("table", "expected_fragment", "replacement"),
+    [
+        (
+            "inventory",
+            "available_stock INTEGER NOT NULL CHECK (available_stock >= 0)",
+            "available_stock INTEGER NOT NULL",
+        ),
+        (
+            "inventory",
+            "sku TEXT PRIMARY KEY",
+            "sku BLOB PRIMARY KEY",
+        ),
+        (
+            "item_aliases",
+            "sku TEXT NOT NULL REFERENCES inventory(sku)",
+            "sku TEXT NOT NULL",
+        ),
+        (
+            "item_aliases",
+            "source TEXT NOT NULL",
+            "source TEXT",
+        ),
+    ],
+    ids=[
+        "stock-check",
+        "sku-affinity",
+        "alias-foreign-key",
+        "alias-not-null",
+    ],
+)
+@pytest.mark.parametrize("verification", ["standalone", "attached-workflow"])
+def test_inventory_manifest_rejects_weakened_table_contracts(
+    settings: Settings,
+    table: str,
+    expected_fragment: str,
+    replacement: str,
+    verification: str,
+) -> None:
+    _rewrite_table_schema_sql(
+        settings.inventory_db,
+        table,
+        expected_fragment,
+        replacement,
+    )
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        if verification == "standalone":
+            verify_database(settings.inventory_db, DatabaseKind.INVENTORY)
+        else:
+            verify_database(
+                settings.workflow_db,
+                DatabaseKind.WORKFLOW,
+                settings=settings,
+            )
+
+    assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+
+
+@pytest.mark.parametrize("verification", ["standalone", "attached-workflow"])
+def test_inventory_manifest_rejects_changed_index_definition(
+    settings: Settings,
+    verification: str,
+) -> None:
+    with connect_database(settings.inventory_db) as connection:
+        connection.execute("DROP INDEX idx_item_aliases_sku")
+        connection.execute(
+            "CREATE INDEX idx_item_aliases_sku ON item_aliases(sku DESC) "
+            "WHERE source <> ''"
+        )
+        connection.commit()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        if verification == "standalone":
+            verify_database(settings.inventory_db, DatabaseKind.INVENTORY)
+        else:
+            verify_database(
+                settings.workflow_db,
+                DatabaseKind.WORKFLOW,
+                settings=settings,
+            )
+
+    assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+
+
+@pytest.mark.parametrize("verification", ["standalone", "attached-workflow"])
+def test_inventory_manifest_rejects_unexpected_schema_objects(
+    settings: Settings,
+    verification: str,
+) -> None:
+    with connect_database(settings.inventory_db) as connection:
+        connection.execute("CREATE TABLE untrusted_inventory_shadow(value BLOB)")
+        connection.commit()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        if verification == "standalone":
+            verify_database(settings.inventory_db, DatabaseKind.INVENTORY)
+        else:
+            verify_database(
+                settings.workflow_db,
+                DatabaseKind.WORKFLOW,
+                settings=settings,
+            )
+
+    assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+
+
+def test_inventory_migration_preflight_rejects_corrupt_installed_prefix_without_mutation(
+    settings: Settings,
+) -> None:
+    _rewrite_table_schema_sql(
+        settings.inventory_db,
+        "item_aliases",
+        "approved_by TEXT NOT NULL",
+        "approved_by TEXT",
+    )
+    before = settings.inventory_db.read_bytes()
+
+    with pytest.raises(DatabaseVerificationError) as excinfo:
+        migrate_database(settings.inventory_db, DatabaseKind.INVENTORY)
+
+    assert excinfo.value.stop_reason == "DATABASE_SCHEMA_MISMATCH"
+    assert settings.inventory_db.read_bytes() == before
 
 
 def test_workflow_verify_cli_requires_explicit_inventory_context(tmp_path: Path) -> None:

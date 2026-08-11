@@ -79,6 +79,7 @@ class SchemaColumnManifest:
     cid: int
     name: str
     declared_type: str
+    affinity: str
     not_null: int
     default_sql: str | None
     primary_key_position: int
@@ -153,7 +154,7 @@ class SQLiteSchemaEntry:
 
 
 @dataclass(frozen=True, slots=True)
-class WorkflowSchemaManifest:
+class SchemaManifest:
     tables: tuple[TableSchemaManifest, ...]
     objects: tuple[SchemaObjectManifest, ...]
 
@@ -319,9 +320,18 @@ def _packaged_workflow_trigger_definitions() -> dict[str, str]:
     """Use packaged schema SQL itself as the exact preflight trigger contract."""
 
     root = files("invoice_agents.db").joinpath("migrations", "workflow")
+    numbered = tuple(
+        sorted(
+            (
+                resource
+                for resource in root.iterdir()
+                if re.fullmatch(r"[0-9]{3}_[A-Za-z0-9_]+\.sql", resource.name)
+            ),
+            key=lambda resource: resource.name,
+        )
+    )
     scripts = (
-        root.joinpath("003_execution_fencing.sql").read_text(encoding="utf-8"),
-        root.joinpath("005_result_artifact_bindings.sql").read_text(encoding="utf-8"),
+        *(resource.read_text(encoding="utf-8") for resource in numbered),
         root.joinpath("legacy_authorization_archive.sql").read_text(encoding="utf-8"),
     )
     definitions = {
@@ -443,9 +453,14 @@ def _migration_versions(resources: list[Traversable], kind: DatabaseKind) -> tup
     return versions
 
 
-def _sqlite_schema_entries(connection: sqlite3.Connection) -> tuple[SQLiteSchemaEntry, ...]:
+def _sqlite_schema_entries(
+    connection: sqlite3.Connection,
+    *,
+    schema: str = "main",
+) -> tuple[SQLiteSchemaEntry, ...]:
     """Enumerate every persistent schema row; SQL pattern syntax is never involved."""
 
+    quoted_schema = _quote_identifier(schema)
     return tuple(
         SQLiteSchemaEntry(
             object_type=row["type"],
@@ -455,7 +470,7 @@ def _sqlite_schema_entries(connection: sqlite3.Connection) -> tuple[SQLiteSchema
             sql=row["sql"],
         )
         for row in connection.execute(
-            "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema "
+            f"SELECT type, name, tbl_name, rootpage, sql FROM {quoted_schema}.sqlite_schema "
             "ORDER BY type, name, tbl_name"
         ).fetchall()
     )
@@ -465,6 +480,8 @@ def _is_sqlite_owned_autoindex(
     connection: sqlite3.Connection,
     entry: SQLiteSchemaEntry,
     entries: tuple[SQLiteSchemaEntry, ...],
+    *,
+    schema: str = "main",
 ) -> bool:
     """Recognize only an actual SQLite-created constraint autoindex."""
 
@@ -500,10 +517,14 @@ def _is_sqlite_owned_autoindex(
     )
     if len(owners) != 1:
         return False
-    matching_indexes = connection.execute(
-        'SELECT name, "unique", origin, partial FROM pragma_index_list(?) WHERE name = ?',
-        (entry.table_name, entry.name),
-    ).fetchall()
+    matching_indexes = [
+        row
+        for row in connection.execute(
+            f"PRAGMA {_quote_identifier(schema)}.index_list("
+            f"{_quote_identifier(entry.table_name)})"
+        ).fetchall()
+        if row["name"] == entry.name
+    ]
     return len(matching_indexes) == 1 and (
         matching_indexes[0]["name"] == entry.name
         and matching_indexes[0]["unique"] == 1
@@ -570,6 +591,7 @@ def _is_sqlite_runtime_table(
     entries: tuple[SQLiteSchemaEntry, ...],
     *,
     require_empty: bool = False,
+    schema: str = "main",
 ) -> bool:
     """Recognize only the exact runtime tables this SQLite build proves it creates."""
 
@@ -593,14 +615,17 @@ def _is_sqlite_runtime_table(
     columns = tuple(
         tuple(row)
         for row in connection.execute(
-            f"PRAGMA table_xinfo({_quote_identifier(entry.name)})"
+            f"PRAGMA {_quote_identifier(schema)}.table_xinfo("
+            f"{_quote_identifier(entry.name)})"
         ).fetchall()
     )
     if columns != expected_columns:
         return False
     if (
         require_empty
-        and connection.execute(f"SELECT 1 FROM {_quote_identifier(entry.name)} LIMIT 1").fetchone()
+        and connection.execute(
+            f"SELECT 1 FROM {_quote_identifier(schema)}.{_quote_identifier(entry.name)} LIMIT 1"
+        ).fetchone()
         is not None
     ):
         return False
@@ -619,10 +644,11 @@ def _non_internal_schema_objects(
     *,
     allowed_names: frozenset[str] = frozenset(),
     require_empty_runtime_tables: bool = False,
+    schema: str = "main",
 ) -> tuple[SQLiteSchemaEntry, ...]:
     """Return every schema row except exact allowlisted rows and proven autoindexes."""
 
-    entries = _sqlite_schema_entries(connection)
+    entries = _sqlite_schema_entries(connection, schema=schema)
     return tuple(
         entry
         for entry in entries
@@ -632,8 +658,14 @@ def _non_internal_schema_objects(
             entry,
             entries,
             require_empty=require_empty_runtime_tables,
+            schema=schema,
         )
-        and not _is_sqlite_owned_autoindex(connection, entry, entries)
+        and not _is_sqlite_owned_autoindex(
+            connection,
+            entry,
+            entries,
+            schema=schema,
+        )
     )
 
 
@@ -897,18 +929,49 @@ def _inspect_workflow_version_neutral_contract(
 ) -> WorkflowVersionNeutralState:
     """Validate the installed migration prefix before any version-neutral write."""
 
-    if not history or history[-1] < 3:
+    schema_version_exists = bool(
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'"
+        ).fetchone()
+    )
+    if schema_version_exists:
+        integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+        if integrity != "ok":
+            raise DatabaseVerificationError(
+                ErrorCategory.DATABASE,
+                f"SQLite integrity_check returned {integrity}",
+                stop_reason="DATABASE_INTEGRITY_FAILED",
+            )
+    if not history:
+        if schema_version_exists:
+            _verify_schema_manifest(
+                connection,
+                _expected_workflow_schema_manifest(
+                    (),
+                    include_durable_history=False,
+                    include_archive=False,
+                ),
+                allow_partial_empty_archive=False,
+            )
         return WorkflowVersionNeutralState(
             applies=False,
             durable_history_exists=False,
             archive_install_required=False,
         )
-    integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
-    if integrity != "ok":
-        raise DatabaseVerificationError(
-            ErrorCategory.DATABASE,
-            f"SQLite integrity_check returned {integrity}",
-            stop_reason="DATABASE_INTEGRITY_FAILED",
+    if history[-1] < 3:
+        _verify_schema_manifest(
+            connection,
+            _expected_workflow_schema_manifest(
+                history,
+                include_durable_history=False,
+                include_archive=False,
+            ),
+            allow_partial_empty_archive=False,
+        )
+        return WorkflowVersionNeutralState(
+            applies=False,
+            durable_history_exists=False,
+            archive_install_required=False,
         )
     durable_history_exists = bool(
         connection.execute(
@@ -1037,6 +1100,26 @@ def _preflight_existing_migration_history(
             allow_durable_retrofit=True,
         )
         history_snapshot = _migration_history_snapshot(connection)
+        schema_version_exists = bool(
+            connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'schema_version'"
+            ).fetchone()
+        )
+        if kind is DatabaseKind.INVENTORY and (history or schema_version_exists):
+            integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+            if integrity != "ok":
+                raise DatabaseVerificationError(
+                    ErrorCategory.DATABASE,
+                    f"SQLite integrity_check returned {integrity}",
+                    stop_reason="DATABASE_INTEGRITY_FAILED",
+                )
+            _verify_schema_manifest(
+                connection,
+                _expected_inventory_schema_manifest(history),
+                allow_partial_empty_archive=False,
+                database_label="inventory",
+            )
         version_neutral_state = (
             _inspect_workflow_version_neutral_contract(connection, history=history)
             if kind is DatabaseKind.WORKFLOW
@@ -1364,12 +1447,31 @@ def _quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
+def _sqlite_affinity(declared_type: str) -> str:
+    """Apply SQLite's documented declared-type affinity rules exactly."""
+
+    normalized = _ascii_lower(declared_type)
+    if "int" in normalized:
+        return "INTEGER"
+    if any(token in normalized for token in ("char", "clob", "text")):
+        return "TEXT"
+    if not normalized or "blob" in normalized:
+        return "BLOB"
+    if any(token in normalized for token in ("real", "floa", "doub")):
+        return "REAL"
+    return "NUMERIC"
+
+
 def _table_schema_manifest(
     connection: sqlite3.Connection,
     table: str,
+    *,
+    schema: str = "main",
 ) -> TableSchemaManifest:
+    quoted_schema = _quote_identifier(schema)
     table_row = connection.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        f"SELECT sql FROM {quoted_schema}.sqlite_master "
+        "WHERE type = 'table' AND name = ?",
         (table,),
     ).fetchone()
     if table_row is None or table_row["sql"] is None:
@@ -1380,11 +1482,14 @@ def _table_schema_manifest(
             cid=int(row["cid"]),
             name=str(row["name"]),
             declared_type=str(row["type"]),
+            affinity=_sqlite_affinity(str(row["type"])),
             not_null=int(row["notnull"]),
             default_sql=str(row["dflt_value"]) if row["dflt_value"] is not None else None,
             primary_key_position=int(row["pk"]),
         )
-        for row in connection.execute(f"PRAGMA table_info({quoted_table})").fetchall()
+        for row in connection.execute(
+            f"PRAGMA {quoted_schema}.table_info({quoted_table})"
+        ).fetchall()
     )
     foreign_keys = tuple(
         SchemaForeignKeyManifest(
@@ -1397,14 +1502,19 @@ def _table_schema_manifest(
             on_delete=str(row["on_delete"]),
             match=str(row["match"]),
         )
-        for row in connection.execute(f"PRAGMA foreign_key_list({quoted_table})").fetchall()
+        for row in connection.execute(
+            f"PRAGMA {quoted_schema}.foreign_key_list({quoted_table})"
+        ).fetchall()
     )
     indexes: list[SchemaIndexManifest] = []
-    for row in connection.execute(f"PRAGMA index_list({quoted_table})").fetchall():
+    for row in connection.execute(
+        f"PRAGMA {quoted_schema}.index_list({quoted_table})"
+    ).fetchall():
         index_name = str(row["name"])
         quoted_index = _quote_identifier(index_name)
         index_sql_row = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            f"SELECT sql FROM {quoted_schema}.sqlite_master "
+            "WHERE type = 'index' AND name = ?",
             (index_name,),
         ).fetchone()
         index_sql = (
@@ -1421,7 +1531,9 @@ def _table_schema_manifest(
                 collation=str(column["coll"]),
                 key_column=int(column["key"]),
             )
-            for column in connection.execute(f"PRAGMA index_xinfo({quoted_index})").fetchall()
+            for column in connection.execute(
+                f"PRAGMA {quoted_schema}.index_xinfo({quoted_index})"
+            ).fetchall()
         )
         indexes.append(
             SchemaIndexManifest(
@@ -1440,7 +1552,8 @@ def _table_schema_manifest(
             normalized_sql=_normalized_sql(str(row["sql"])),
         )
         for row in connection.execute(
-            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ? "
+            f"SELECT name, sql FROM {quoted_schema}.sqlite_master "
+            "WHERE type = 'trigger' AND tbl_name = ? "
             "ORDER BY name",
             (table,),
         ).fetchall()
@@ -1458,10 +1571,12 @@ def _table_schema_manifest(
 
 def _schema_object_manifest(
     connection: sqlite3.Connection,
+    *,
+    schema: str = "main",
 ) -> tuple[SchemaObjectManifest, ...]:
     """Inventory persistent application objects and constraint autoindexes."""
 
-    entries = _sqlite_schema_entries(connection)
+    entries = _sqlite_schema_entries(connection, schema=schema)
     return tuple(
         SchemaObjectManifest(
             object_type=str(entry.object_type),
@@ -1470,7 +1585,7 @@ def _schema_object_manifest(
             normalized_sql=(_normalized_sql(str(entry.sql)) if entry.sql is not None else None),
         )
         for entry in entries
-        if not _is_sqlite_runtime_table(connection, entry, entries)
+        if not _is_sqlite_runtime_table(connection, entry, entries, schema=schema)
     )
 
 
@@ -1479,7 +1594,8 @@ def _expected_workflow_schema_manifest(
     versions: tuple[int, ...] | None = None,
     *,
     include_durable_history: bool = True,
-) -> WorkflowSchemaManifest:
+    include_archive: bool = True,
+) -> SchemaManifest:
     """Build the complete exact contract from the selected packaged migrations."""
 
     reference = sqlite3.connect(":memory:")
@@ -1500,13 +1616,17 @@ def _expected_workflow_schema_manifest(
             if version not in selected_versions:
                 continue
             reference.executescript(resource.read_text(encoding="utf-8"))
-        if not include_durable_history:
+        if not include_durable_history and reference.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'schema_migration_history'"
+        ).fetchone():
             reference.execute("DROP TABLE schema_migration_history")
-        reference.executescript(
-            files("invoice_agents.db")
-            .joinpath("migrations", "workflow", "legacy_authorization_archive.sql")
-            .read_text(encoding="utf-8")
-        )
+        if include_archive:
+            reference.executescript(
+                files("invoice_agents.db")
+                .joinpath("migrations", "workflow", "legacy_authorization_archive.sql")
+                .read_text(encoding="utf-8")
+            )
         table_names = tuple(
             sorted(
                 str(entry.name)
@@ -1514,7 +1634,45 @@ def _expected_workflow_schema_manifest(
                 if entry.object_type == "table" and type(entry.name) is str
             )
         )
-        return WorkflowSchemaManifest(
+        return SchemaManifest(
+            tables=tuple(_table_schema_manifest(reference, table) for table in table_names),
+            objects=_schema_object_manifest(reference),
+        )
+    finally:
+        reference.close()
+
+
+@cache
+def _expected_inventory_schema_manifest(
+    versions: tuple[int, ...] | None = None,
+) -> SchemaManifest:
+    """Build the exact inventory contract from a packaged migration prefix."""
+
+    reference = sqlite3.connect(":memory:")
+    reference.row_factory = sqlite3.Row
+    try:
+        reference.execute(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        resources = _migration_resources(DatabaseKind.INVENTORY)
+        selected_versions = (
+            versions
+            if versions is not None
+            else _migration_versions(resources, DatabaseKind.INVENTORY)
+        )
+        for resource in resources:
+            version = int(resource.name.split("_", 1)[0])
+            if version not in selected_versions:
+                continue
+            reference.executescript(resource.read_text(encoding="utf-8"))
+        table_names = tuple(
+            sorted(
+                str(entry.name)
+                for entry in _non_internal_schema_objects(reference)
+                if entry.object_type == "table" and type(entry.name) is str
+            )
+        )
+        return SchemaManifest(
             tables=tuple(_table_schema_manifest(reference, table) for table in table_names),
             objects=_schema_object_manifest(reference),
         )
@@ -1532,16 +1690,18 @@ def _is_legacy_archive_object(item: SchemaObjectManifest) -> bool:
 
 def _verify_schema_manifest(
     connection: sqlite3.Connection,
-    expected: WorkflowSchemaManifest,
+    expected: SchemaManifest,
     *,
     allow_partial_empty_archive: bool,
+    database_label: str = "workflow",
+    schema: str = "main",
 ) -> bool:
     """Verify one exact schema; return whether optional archive objects are absent."""
 
     expected_archive_tables = {
         table.name for table in expected.tables if _is_legacy_archive_table(table.name)
     }
-    actual_objects = _schema_object_manifest(connection)
+    actual_objects = _schema_object_manifest(connection, schema=schema)
     actual_archive_tables = {
         item.name
         for item in actual_objects
@@ -1556,7 +1716,11 @@ def _verify_schema_manifest(
     invalid: list[str] = []
     for table_manifest in compared_tables:
         try:
-            actual = _table_schema_manifest(connection, table_manifest.name)
+            actual = _table_schema_manifest(
+                connection,
+                table_manifest.name,
+                schema=schema,
+            )
         except ValueError:
             invalid.append(table_manifest.name)
             continue
@@ -1565,7 +1729,7 @@ def _verify_schema_manifest(
     if invalid:
         raise DatabaseVerificationError(
             ErrorCategory.DATABASE,
-            "workflow schema definitions differ from the complete packaged manifest",
+            f"{database_label} schema definitions differ from the complete packaged manifest",
             stop_reason="DATABASE_SCHEMA_MISMATCH",
             details={"invalid_schema_definitions": invalid},
         )
@@ -1589,7 +1753,7 @@ def _verify_schema_manifest(
     if missing_objects or unexpected_objects or changed_objects:
         raise DatabaseVerificationError(
             ErrorCategory.DATABASE,
-            "workflow schema definitions differ from the complete packaged manifest",
+            f"{database_label} schema definitions differ from the complete packaged manifest",
             stop_reason="DATABASE_SCHEMA_MISMATCH",
             details={
                 "invalid_schema_definitions": [],
@@ -1601,7 +1765,10 @@ def _verify_schema_manifest(
     if missing_archive_tables:
         archived_rows = sum(
             int(
-                connection.execute(f"SELECT COUNT(*) FROM {_quote_identifier(table)}").fetchone()[0]
+                connection.execute(
+                    f"SELECT COUNT(*) FROM {_quote_identifier(schema)}."
+                    f"{_quote_identifier(table)}"
+                ).fetchone()[0]
             )
             for table in actual_archive_tables
         )
@@ -1620,6 +1787,21 @@ def _verify_workflow_schema_manifest(connection: sqlite3.Connection) -> None:
         connection,
         _expected_workflow_schema_manifest(),
         allow_partial_empty_archive=False,
+    )
+
+
+def _verify_inventory_schema_manifest(
+    connection: sqlite3.Connection,
+    *,
+    schema: str = "main",
+    database_label: str = "inventory",
+) -> None:
+    _verify_schema_manifest(
+        connection,
+        _expected_inventory_schema_manifest(),
+        allow_partial_empty_archive=False,
+        database_label=database_label,
+        schema=schema,
     )
 
 
@@ -2685,6 +2867,11 @@ def _verify_attached_inventory_context(connection: sqlite3.Connection) -> None:
             f"attached inventory indexes are missing: {sorted(missing_indexes)}",
             stop_reason="DATABASE_SCHEMA_MISMATCH",
         )
+    _verify_inventory_schema_manifest(
+        connection,
+        schema="authorization_inventory",
+        database_label="attached inventory",
+    )
 
 
 def verify_database(
@@ -3023,7 +3210,9 @@ def _verify_database_snapshot(
                     f"required indexes are missing: {sorted(missing_indexes)}",
                     stop_reason="DATABASE_SCHEMA_MISMATCH",
                 )
-            if selected_kind is DatabaseKind.WORKFLOW:
+            if selected_kind is DatabaseKind.INVENTORY:
+                _verify_inventory_schema_manifest(connection)
+            else:
                 _verify_workflow_schema_manifest(connection)
                 trigger_rows = connection.execute(
                     "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
