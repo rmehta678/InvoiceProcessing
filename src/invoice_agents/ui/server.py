@@ -23,7 +23,11 @@ from fastapi.templating import Jinja2Templates
 
 from invoice_agents.config import Settings
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
-from invoice_agents.observability.audit import redact, sanitize_text
+from invoice_agents.observability.audit import (
+    redact,
+    safe_provider_request_id,
+    sanitize_text,
+)
 from invoice_agents.ui.recovery import RecoveryCoordinator, RecoveryHealthMiddleware
 from invoice_agents.ui.routes import router
 from invoice_agents.ui.runs import RunRegistry
@@ -270,11 +274,7 @@ def create_app(
             message=sanitize_text(str(exc.message)),
             case_id=(sanitize_text(exc.case_id) if exc.case_id is not None else None),
             stop_reason=(sanitize_text(exc.stop_reason) if exc.stop_reason is not None else None),
-            provider_request_id=(
-                sanitize_text(exc.provider_request_id)
-                if exc.provider_request_id is not None
-                else None
-            ),
+            provider_request_id=safe_provider_request_id(exc.provider_request_id),
             details=redact(exc.details or {}),
         )
         response: Response = app.state.templates.TemplateResponse(

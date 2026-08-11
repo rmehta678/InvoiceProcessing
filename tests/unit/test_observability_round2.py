@@ -6,12 +6,17 @@ import io
 import json
 import logging
 import math
+from types import SimpleNamespace
 
 import pytest
+from autogen_agentchat.messages import ToolCallExecutionEvent, ToolCallRequestEvent
+from autogen_core import FunctionCall
+from autogen_core.models import FunctionExecutionResult
 
 from invoice_agents import orchestration
 from invoice_agents.db.core import connect_database
 from invoice_agents.errors import InvoiceAgentsError
+from invoice_agents.models import UsageSummary
 from invoice_agents.observability import audit as audit_module
 from invoice_agents.observability.audit import (
     AuditRecorder,
@@ -39,6 +44,9 @@ DEFAULT_IGNORABLES = (
 REJECTED_JSON = '{"error":"JSON_PAYLOAD_REJECTED","original":"[REDACTED]"}'
 REJECTED_EVENT = "EVENT_PAYLOAD_REJECTED"
 REJECTED_VALUE = "[VALUE_REJECTED]"
+FULLY_CYRILLIC_API_KEY = "\u0430\u0440\u0456_\u043a\u0435\u0443"
+FULLY_CYRILLIC_SK = "\u0455\u043a"
+FULLY_CYRILLIC_XAI = "\u0445\u0430\u0456"
 
 
 class _ExplodingRepresentation:
@@ -570,6 +578,224 @@ def test_unrelated_unicode_assignments_are_preserved_without_false_redaction(
     assert redact({ordinary.split("=", 1)[0]: ordinary.split("=", 1)[1]}) == {
         ordinary.split("=", 1)[0]: ordinary.split("=", 1)[1]
     }
+
+
+@pytest.mark.parametrize(
+    ("credential", "expected"),
+    [
+        ("provider σκ-abcdefgh_12345678", "provider [REDACTED]"),
+        ("απι_κεγ=round6-secret", "απι_κεγ=[REDACTED]"),
+    ],
+)
+def test_fully_substituted_spoof_script_credentials_fail_closed(
+    credential: str,
+    expected: str,
+) -> None:
+    assert sanitize_text(credential) == expected
+
+
+def test_fully_substituted_sensitive_mapping_key_redacts_its_value() -> None:
+    assert redact({"απι_κεγ": "round6-map-secret", "prompt_tokens": 47}) == {
+        "απι_κεγ": "[REDACTED]",
+        "prompt_tokens": 47,
+    }
+
+
+def test_fully_cyrillic_provider_and_key_credentials_are_redacted() -> None:
+    assert (
+        sanitize_text(
+            f"providers {FULLY_CYRILLIC_SK}-abcdefgh_12345678 "
+            f"and {FULLY_CYRILLIC_XAI}-abcdefgh_12345678"
+        )
+        == "providers [REDACTED] and [REDACTED]"
+    )
+    assert (
+        sanitize_text(f"{FULLY_CYRILLIC_API_KEY}=round6-cyrillic-key-secret")
+        == f"{FULLY_CYRILLIC_API_KEY}=[REDACTED]"
+    )
+
+
+def test_recursive_redaction_handles_fully_cyrillic_credentials_without_wildcards() -> None:
+    ordinary_cyrillic = "смета_города"
+    ordinary_japanese = "日本語_請求書"
+
+    assert redact(
+        {
+            "nested": {
+                FULLY_CYRILLIC_API_KEY: "round6-cyrillic-map-secret",
+                "provider_error": f"provider {FULLY_CYRILLIC_SK}-abcdefgh_12345678",
+                ordinary_cyrillic: "ordinary",
+                ordinary_japanese: "ordinary",
+            }
+        }
+    ) == {
+        "nested": {
+            FULLY_CYRILLIC_API_KEY: "[REDACTED]",
+            "provider_error": "provider [REDACTED]",
+            ordinary_cyrillic: "ordinary",
+            ordinary_japanese: "ordinary",
+        }
+    }
+
+
+def test_fully_cyrillic_credentials_cannot_persist_as_tool_request_or_execution_ids(
+    workflow_db: object,
+) -> None:
+    request_case_id = "case_round6_cyrillic_request_id"
+    request_context = SimpleNamespace(
+        case_id=request_case_id,
+        audit=AuditRecorder(workflow_db, request_case_id),
+        tool_failures=[],
+        invoice=lambda: SimpleNamespace(source=SimpleNamespace(source_id="src_round6_request")),
+    )
+    request = ToolCallRequestEvent(
+        source="coordinator",
+        content=[
+            FunctionCall(
+                id=f"call_{FULLY_CYRILLIC_API_KEY}=round6-request-id-secret",
+                name="lookup_invoice",
+                arguments='{"invoice_number":"INV-42"}',
+            )
+        ],
+    )
+    with pytest.raises(InvoiceAgentsError) as request_failure:
+        orchestration._record_stream_event(request, request_context, UsageSummary())
+    assert request_failure.value.stop_reason == "TOOL_CALL_ID_INVALID"
+
+    execution_case_id = "case_round6_cyrillic_execution_id"
+    execution_context = SimpleNamespace(
+        case_id=execution_case_id,
+        audit=AuditRecorder(workflow_db, execution_case_id),
+        tool_failures=[],
+        invoice=lambda: SimpleNamespace(source=SimpleNamespace(source_id="src_round6_execution")),
+    )
+    execution = ToolCallExecutionEvent(
+        source="coordinator",
+        content=[
+            FunctionExecutionResult(
+                call_id=f"call_{FULLY_CYRILLIC_SK}-abcdefgh_12345678",
+                name="lookup_invoice",
+                content="not executed",
+                is_error=False,
+            )
+        ],
+    )
+    with pytest.raises(InvoiceAgentsError) as execution_failure:
+        orchestration._record_stream_event(execution, execution_context, UsageSummary())
+    assert execution_failure.value.stop_reason == "TOOL_CALL_ID_INVALID"
+
+    with connect_database(workflow_db, read_only=True) as connection:
+        rows = connection.execute(
+            "SELECT case_id, tool_call_id FROM events WHERE case_id IN (?, ?)",
+            (request_case_id, execution_case_id),
+        ).fetchall()
+    assert rows == []
+
+
+def test_audit_recorder_redacts_fully_cyrillic_payload_and_error_surfaces(
+    workflow_db: object,
+) -> None:
+    case_id = "case_round6_cyrillic_audit"
+    fullwidth_key = "\uff41\uff50\uff49\uff3f\uff4b\uff45\uff59"
+    ordinary_cyrillic = "смета_города"
+    ordinary_japanese = "日本語_請求書"
+    AuditRecorder(workflow_db, case_id).record(
+        "provider.failure",
+        {
+            "error": f"{FULLY_CYRILLIC_API_KEY}=round6-cyrillic-error-secret",
+            "details": {
+                FULLY_CYRILLIC_API_KEY: "round6-cyrillic-map-secret",
+                "provider": f"{FULLY_CYRILLIC_XAI}-abcdefgh_12345678",
+            },
+            ordinary_cyrillic: "ordinary",
+            ordinary_japanese: "ordinary",
+            "fullwidth": f"{fullwidth_key}=round6-fullwidth-secret",
+        },
+    )
+
+    with connect_database(workflow_db, read_only=True) as connection:
+        row = connection.execute(
+            "SELECT payload_json FROM events WHERE case_id = ?",
+            (case_id,),
+        ).fetchone()
+    assert row is not None
+    assert json.loads(row["payload_json"]) == {
+        "details": {
+            FULLY_CYRILLIC_API_KEY: "[REDACTED]",
+            "provider": "[REDACTED]",
+        },
+        "error": f"{FULLY_CYRILLIC_API_KEY}=[REDACTED]",
+        ordinary_cyrillic: "ordinary",
+        ordinary_japanese: "ordinary",
+        "fullwidth": f"{fullwidth_key}=[REDACTED]",
+    }
+
+
+def test_compatibility_width_credential_skeleton_remains_fail_closed() -> None:
+    fullwidth_key = "\uff41\uff50\uff49\uff3f\uff4b\uff45\uff59"
+    credential = f"{fullwidth_key}=round6-fullwidth-secret"
+    tool_call_id = f"call_{credential}"
+
+    assert sanitize_text(credential) == f"{fullwidth_key}=[REDACTED]"
+    with pytest.raises(InvoiceAgentsError) as failure:
+        orchestration._validated_tool_call_ids([tool_call_id], "case_round6_fullwidth")
+    assert failure.value.stop_reason == "TOOL_CALL_ID_INVALID"
+
+
+@pytest.mark.parametrize(
+    "tool_call_id",
+    [
+        "call_σκ-abcdefgh_12345678",
+        "call_απι_κεγ=round6-secret",
+    ],
+)
+def test_fully_substituted_credential_tool_ids_are_rejected_at_both_boundaries(
+    workflow_db: object,
+    tool_call_id: str,
+) -> None:
+    with pytest.raises(InvoiceAgentsError) as failure:
+        orchestration._validated_tool_call_ids([tool_call_id], "case_round6")
+    assert failure.value.stop_reason == "TOOL_CALL_ID_INVALID"
+
+    recorder = AuditRecorder(workflow_db, "case_round6_raw_tool_id")
+    with pytest.raises(ValueError, match="tool call"):
+        recorder.record("test.raw-tool-id", {"safe": True}, tool_call_id=tool_call_id)
+    with connect_database(workflow_db, read_only=True) as connection:
+        rows = connection.execute(
+            "SELECT tool_call_id FROM events WHERE case_id = ?",
+            ("case_round6_raw_tool_id",),
+        ).fetchall()
+    assert rows == []
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    [
+        "a日本_語文字",
+        "σχέδιο_πόλης",
+        "смета_города",
+    ],
+)
+def test_unrelated_multilingual_identifier_remains_intact_at_both_boundaries(
+    workflow_db: object,
+    identifier: str,
+) -> None:
+    assignment = f"{identifier}=ordinary"
+    tool_call_id = f"call_{assignment}"
+
+    assert sanitize_text(assignment) == assignment
+    assert redact({identifier: "ordinary"}) == {identifier: "ordinary"}
+    assert orchestration._validated_tool_call_ids([tool_call_id], "case_round6") == [tool_call_id]
+
+    recorder = AuditRecorder(workflow_db, "case_round6_multilingual_tool_id")
+    recorder.record("test.raw-tool-id", {"safe": True}, tool_call_id=tool_call_id)
+    with connect_database(workflow_db, read_only=True) as connection:
+        stored = connection.execute(
+            "SELECT tool_call_id FROM events WHERE case_id = ?",
+            ("case_round6_multilingual_tool_id",),
+        ).fetchone()
+    assert stored is not None
+    assert stored["tool_call_id"] == tool_call_id
 
 
 @pytest.mark.parametrize(

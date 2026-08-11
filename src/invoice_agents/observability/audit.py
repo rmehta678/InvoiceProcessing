@@ -104,9 +104,21 @@ _CURRENT_AUDIT: ContextVar[AuditRecorder | None] = ContextVar(
 _DETECTION_JOINER = "\ufff0"
 _DETECTION_JOINER_PATTERN = rf"[\t\r\n{_DETECTION_JOINER}]"
 _DETECTION_GAP = rf"(?:[ ]|{_DETECTION_JOINER_PATTERN})*"
-_DETECTION_NON_ASCII_LETTER = "\ufff1"
 _ASCII_WHITESPACE = frozenset(" \t\r\n\f\v")
 _KNOWN_CONFUSABLE_ASCII = {
+    # A bounded skeleton of reviewed Greek/Cyrillic substitutions used in
+    # credential identifiers. Unknown letters stay intact and never become
+    # arbitrary ASCII-letter wildcards.
+    "\u03b1": "a",
+    "\u03b3": "y",
+    "\u03b5": "e",
+    "\u03b9": "i",
+    "\u03ba": "k",
+    "\u03bf": "o",
+    "\u03c0": "p",
+    "\u03c1": "p",
+    "\u03c2": "s",
+    "\u03c3": "s",
     "\u0430": "a",
     "\u0435": "e",
     "\u0456": "i",
@@ -116,6 +128,7 @@ _KNOWN_CONFUSABLE_ASCII = {
     "\u0441": "c",
     "\u0455": "s",
     "\u0445": "x",
+    "\u0443": "y",
 }
 _JSON_NUMBER_TOKEN = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
 
@@ -191,10 +204,6 @@ def _credential_detection_projection(value: str) -> tuple[str, list[int]]:
             known = _KNOWN_CONFUSABLE_ASCII.get(normalized_character)
             if known is not None:
                 projected.append(known)
-            elif not normalized_character.isascii() and unicodedata.category(
-                normalized_character
-            ).startswith("L"):
-                projected.append(_DETECTION_NON_ASCII_LETTER)
             else:
                 projected.append(normalized_character)
             source_indexes.append(source_index)
@@ -208,7 +217,9 @@ def _skip_detection_whitespace(value: str, position: int) -> int:
 
 
 def _is_detection_boundary_word_character(value: str) -> bool:
-    return value in "abcdefghijklmnopqrstuvwxyz0123456789-" or value == _DETECTION_NON_ASCII_LETTER
+    return value in "abcdefghijklmnopqrstuvwxyz0123456789-" or (
+        len(value) == 1 and unicodedata.category(value).startswith("L")
+    )
 
 
 def _is_provider_token_character(value: str) -> bool:
@@ -216,7 +227,6 @@ def _is_provider_token_character(value: str) -> bool:
 
 
 def _match_detection_identifier(value: str, position: int, identifier: str) -> int | None:
-    matched_ascii_letter = False
     for offset, expected in enumerate(identifier):
         if offset:
             position = _skip_detection_whitespace(value, position)
@@ -226,15 +236,10 @@ def _match_detection_identifier(value: str, position: int, identifier: str) -> i
         if expected == "_":
             if actual not in {"_", "-"}:
                 return None
-        elif actual == _DETECTION_NON_ASCII_LETTER:
-            if not expected.isascii() or not expected.isalpha():
-                return None
         elif actual != expected:
             return None
-        else:
-            matched_ascii_letter = True
         position += 1
-    return position if matched_ascii_letter else None
+    return position
 
 
 def _quoted_value_end(value: str, start: int, quote: str) -> int:

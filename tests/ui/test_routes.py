@@ -215,6 +215,7 @@ def test_ui_exception_handler_sanitizes_embedded_credentials(client: TestClient)
             category="PROVIDER",
             message=f"provider exception AUTHORIZATION: Bearer {secret}",
             stop_reason="PROVIDER_REQUEST_FAILED",
+            provider_request_id="raw provider body round7-request-marker",
         )
 
     client.app.add_api_route("/_task13-sensitive-error", sensitive_error)
@@ -223,6 +224,8 @@ def test_ui_exception_handler_sanitizes_embedded_credentials(client: TestClient)
     assert response.status_code == 400
     assert "[REDACTED]" in response.text
     assert secret not in response.text
+    assert "round7-request-marker" not in response.text
+    assert "provider request ID" not in response.text
 
 
 def test_case_detail_displays_matching_tool_call_rows_without_secrets(

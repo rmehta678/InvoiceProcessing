@@ -18,6 +18,7 @@ import stat
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 from typing import Annotated, Any
 from urllib.parse import quote, unquote
 
@@ -31,7 +32,13 @@ from invoice_agents.db.core import DatabaseKind, verify_database
 from invoice_agents.db.store import ResultArtifactBinding, WorkflowStore
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError, SourceEvidenceError
 from invoice_agents.hitl.service import record_human_decision
-from invoice_agents.isolated_process import run_isolated_process
+from invoice_agents.isolated_process import (
+    IsolatedProcessCleanupError,
+    IsolatedProcessResult,
+    ProcessCancellation,
+    run_isolated_process,
+    sanitized_worker_environment,
+)
 from invoice_agents.models import (
     CanonicalMapping,
     CaseResult,
@@ -49,7 +56,6 @@ from invoice_agents.ui.recovery import RecoveryCoordinator
 from invoice_agents.ui.runs import RunRegistry
 from invoice_agents.ui.security import secure_cookie
 from invoice_agents.ui.sse import case_event_stream
-from invoice_agents.worker_environment import sanitized_worker_environment
 
 router = APIRouter()
 
@@ -69,10 +75,20 @@ _OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 _STAT_SUPPORTS_DIR_FD = os.stat in os.supports_dir_fd
 _STAT_SUPPORTS_NOFOLLOW = os.stat in os.supports_follow_symlinks
 _RESULT_ARTIFACT_WORKER_BINDING: ResultArtifactBinding | None = None
+_RESULT_ARTIFACT_PROCESS_LOCK = Lock()
+_RESULT_ARTIFACT_OWNERSHIP_POISONED = False
 
 
 class _ResultArtifactMissing(FileNotFoundError):
     pass
+
+
+class _ResultArtifactWorkerError(ValueError):
+    """One sanitized isolated-worker failure code safe for the UI boundary."""
+
+    def __init__(self, error_code: str) -> None:
+        super().__init__("isolated result artifact validation failed")
+        self.error_code = error_code
 
 
 # One-line consequence per HumanDecisionKind, matching decision_rules exactly:
@@ -344,12 +360,17 @@ def _read_bounded_regular_file(target: Path) -> bytes:
     return raw
 
 
-def _invalid_result_artifact(request: Request, case_id: str) -> Response:
+def _invalid_result_artifact(
+    request: Request,
+    case_id: str,
+    *,
+    stop_reason: str = "RESULT_ARTIFACT_INVALID",
+) -> Response:
     error = InvoiceAgentsError(
         ErrorCategory.DATABASE,
         "result artifact failed validation against the authoritative case",
         case_id=case_id,
-        stop_reason="RESULT_ARTIFACT_INVALID",
+        stop_reason=stop_reason,
     )
     return _render(request, "error.html", {"nav": None, "error": error}, status_code=409)
 
@@ -398,7 +419,11 @@ def _reject_excessive_result_nesting(value: str) -> None:
 
 
 def _result_artifact_worker_command() -> list[str]:
-    return [sys.executable, "-I", "-m", "invoice_agents.ui.result_artifact_worker"]
+    executable = os.fspath(Path(sys.executable).resolve(strict=True))
+    worker = os.fspath(
+        Path(__file__).with_name("result_artifact_worker.py").resolve(strict=True)
+    )
+    return [executable, "-I", worker]
 
 
 def _encode_result_artifact_worker_request(
@@ -437,7 +462,11 @@ def _decode_result_artifact_worker_request(encoded: bytes) -> Path:
 
     if _RESULT_ARTIFACT_WORKER_BINDING is not None:
         raise ValueError("result artifact worker binding was already established")
-    if not encoded or len(encoded) > RESULT_ARTIFACT_WORKER_MAX_REQUEST_BYTES:
+    if (
+        type(encoded) is not bytes
+        or not encoded
+        or len(encoded) > RESULT_ARTIFACT_WORKER_MAX_REQUEST_BYTES
+    ):
         raise ValueError("invalid result artifact worker request size")
     payload = json.loads(
         encoded.decode("utf-8"),
@@ -498,7 +527,7 @@ def _decode_result_artifact_worker_request(encoded: bytes) -> Path:
         or target.name != f"{case_id}.json"
     ):
         raise ValueError("invalid result artifact worker target")
-    _RESULT_ARTIFACT_WORKER_BINDING = ResultArtifactBinding(
+    binding = ResultArtifactBinding(
         case_id=case_id,
         execution_generation=generation,
         artifact_sha256=artifact_sha256,
@@ -507,29 +536,61 @@ def _decode_result_artifact_worker_request(encoded: bytes) -> Path:
         artifact_file_type=artifact_file_type,
         artifact_size_bytes=artifact_size_bytes,
     )
+    if _encode_result_artifact_worker_request(target, binding) != encoded:
+        raise ValueError("noncanonical result artifact worker request")
+    _RESULT_ARTIFACT_WORKER_BINDING = binding
     return target
 
 
 def _read_bounded_regular_file_isolated(
     target: Path,
     binding: ResultArtifactBinding,
+    *,
+    cancel_requested: ProcessCancellation | None = None,
 ) -> bytes | None:
-    outcome = run_isolated_process(
-        command=_result_artifact_worker_command(),
-        request=_encode_result_artifact_worker_request(target, binding),
-        timeout_seconds=RESULT_ARTIFACT_WORKER_TIMEOUT_SECONDS,
-        max_response_bytes=RESULT_ARTIFACT_WORKER_MAX_RESPONSE_BYTES,
-        env=sanitized_worker_environment(),
+    global _RESULT_ARTIFACT_OWNERSHIP_POISONED
+
+    if cancel_requested is not None and type(cancel_requested) is not ProcessCancellation:
+        raise ValueError("invalid result artifact cancellation owner")
+    cancellation = (
+        ProcessCancellation() if cancel_requested is None else cancel_requested
     )
-    if outcome.failure is not None or outcome.response is None:
-        raise ValueError("result artifact worker failed without trusted output")
+    with _RESULT_ARTIFACT_PROCESS_LOCK:
+        if _RESULT_ARTIFACT_OWNERSHIP_POISONED:
+            raise _ResultArtifactWorkerError("RESULT_ARTIFACT_OWNERSHIP_UNRESOLVED")
+        try:
+            outcome = run_isolated_process(
+                command=_result_artifact_worker_command(),
+                request=_encode_result_artifact_worker_request(target, binding),
+                timeout_seconds=RESULT_ARTIFACT_WORKER_TIMEOUT_SECONDS,
+                max_response_bytes=RESULT_ARTIFACT_WORKER_MAX_RESPONSE_BYTES,
+                cancel_requested=cancellation,
+                env=sanitized_worker_environment(),
+            )
+        except IsolatedProcessCleanupError:
+            _RESULT_ARTIFACT_OWNERSHIP_POISONED = True
+            raise _ResultArtifactWorkerError(
+                "RESULT_ARTIFACT_WORKER_CLEANUP_FAILED"
+            ) from None
+    if type(outcome) is not IsolatedProcessResult:
+        raise _ResultArtifactWorkerError("RESULT_ARTIFACT_WORKER_PROTOCOL_INVALID")
+    if outcome.failure == "cancelled":
+        raise _ResultArtifactWorkerError("RESULT_ARTIFACT_WORKER_CANCELLED")
+    if outcome.failure == "timeout":
+        raise _ResultArtifactWorkerError("RESULT_ARTIFACT_WORKER_TIMED_OUT")
+    if outcome.failure in {"start", "crash"}:
+        raise _ResultArtifactWorkerError("RESULT_ARTIFACT_WORKER_CRASHED")
+    if outcome.failure == "protocol" or outcome.response is None:
+        raise _ResultArtifactWorkerError("RESULT_ARTIFACT_WORKER_PROTOCOL_INVALID")
+    if outcome.failure is not None or type(outcome.response) is not bytes:
+        raise _ResultArtifactWorkerError("RESULT_ARTIFACT_WORKER_PROTOCOL_INVALID")
     if outcome.response in {_RESULT_ARTIFACT_MISSING, _RESULT_ARTIFACT_INVALID}:
         return None
     if not outcome.response.startswith(_RESULT_ARTIFACT_OK):
-        raise ValueError("result artifact worker returned an invalid frame")
+        raise _ResultArtifactWorkerError("RESULT_ARTIFACT_WORKER_PROTOCOL_INVALID")
     raw = outcome.response[len(_RESULT_ARTIFACT_OK) :]
     if not raw or len(raw) > RESULT_ARTIFACT_MAX_BYTES:
-        raise ValueError("result artifact worker returned an invalid payload")
+        raise _ResultArtifactWorkerError("RESULT_ARTIFACT_WORKER_PROTOCOL_INVALID")
     return raw
 
 
@@ -715,7 +776,13 @@ def case_result_json(request: Request, case_id: str) -> Response:
         if payload is None:
             return _artifact_binding_conflict(result)
         artifact = _decode_canonical_result_artifact(payload)
-    except (OSError, RecursionError, TypeError, ValueError):
+    except _ResultArtifactWorkerError as exc:
+        return _invalid_result_artifact(
+            request,
+            case_id,
+            stop_reason=exc.error_code,
+        )
+    except (OSError, RecursionError, TypeError, UnicodeError, ValueError):
         return _invalid_result_artifact(request, case_id)
     authoritative = sanitize_case_result(result)
     if artifact.case_id != case_id or artifact != authoritative:

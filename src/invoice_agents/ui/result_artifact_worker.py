@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 
 from invoice_agents.ui.routes import (
@@ -16,6 +17,14 @@ from invoice_agents.ui.routes import (
 
 
 def main() -> int:
+    try:
+        stderr_descriptor = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(stderr_descriptor, sys.stderr.fileno())
+        finally:
+            os.close(stderr_descriptor)
+    except BaseException:
+        return 1
     encoded = sys.stdin.buffer.read(RESULT_ARTIFACT_WORKER_MAX_REQUEST_BYTES + 1)
     try:
         target = _decode_result_artifact_worker_request(encoded)
