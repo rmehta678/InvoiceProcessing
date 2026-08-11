@@ -282,6 +282,8 @@ class EvidenceBlocker(StrictModel):
 
 
 class Critique(StrictModel):
+    cycle: int = Field(default=1, ge=1, le=2)
+    responds_to_critique_id: str | None = None
     supported_findings: list[str]
     challenged_findings: list[str]
     missing_evidence: list[str]

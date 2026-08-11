@@ -15,6 +15,7 @@ from autogen_agentchat.teams import Swarm
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 
 from invoice_agents.agents.decision_rules import (
+    assert_critique_cycle_complete,
     assert_new_review_cycle_permitted,
     blocking_evidence,
     unaddressed_blockers,
@@ -260,10 +261,18 @@ def build_team(
 
         invoice = context.invoice()
         risk = context.risk()
+        prior_critiques = [
+            {"critique_id": critique_id, **critique.model_dump(mode="json")}
+            for critique_id, critique in context.store.list_critique_records(context.case_id)
+        ]
         return {
             "invoice": invoice.model_dump(mode="json"),
             "risk": risk.model_dump(mode="json"),
-            "instruction": "Challenge mappings, aggregation, arithmetic, dates, identity, and evidence completeness.",
+            "prior_critiques": prior_critiques,
+            "instruction": (
+                "Challenge mappings, aggregation, arithmetic, dates, identity, and "
+                "evidence completeness."
+            ),
         }
 
     async def recheck_inventory_item(item_name: str) -> dict[str, Any]:
@@ -293,6 +302,8 @@ def build_team(
         return payload
 
     async def record_critique(
+        cycle: Literal[1, 2],
+        responds_to_critique_id: str | None,
         supported_findings: list[str],
         challenged_findings: list[str],
         missing_evidence: list[str],
@@ -303,6 +314,8 @@ def build_team(
         """Validate and persist the critic's independent structured result."""
 
         critique = Critique(
+            cycle=cycle,
+            responds_to_critique_id=responds_to_critique_id,
             supported_findings=supported_findings,
             challenged_findings=challenged_findings,
             missing_evidence=missing_evidence,
@@ -311,10 +324,11 @@ def build_team(
             rationale=rationale,
         )
         record_id = context.store.save_critique(context.case_id, critique, context.claim)
-        payload = critique.model_dump(mode="json")
+        critique_payload = critique.model_dump(mode="json")
+        payload = {"critique_id": record_id, **critique_payload}
         context.audit.record(
             "tool.critique_recorded",
-            payload,
+            critique_payload,
             source_id=context.invoice().source.source_id,
             agent_name="independent_critic_agent",
             db_evidence_id=record_id,
@@ -402,6 +416,7 @@ def build_team(
 
         selected = DecisionKind(decision)
         risk = context.risk()
+        assert_critique_cycle_complete(context.case_id, context.store)
         critique = context.store.load_current_critique(context.claim)
         review = context.store.load_current_review(context.claim)
         validate_final_decision(
@@ -531,8 +546,18 @@ def build_team(
             "approval_agent",
         ],
         system_message=(
-            "Independently inspect the package using get_critic_evidence, then call record_critique exactly "
-            "once with concise evidence-backed findings. You can re-derive evidence yourself: "
+            "Independently inspect the package using get_critic_evidence. If prior_critiques is empty, call "
+            "record_critique exactly once with cycle=1 and responds_to_critique_id=null. If it contains one "
+            "clean cycle-1 result, hand off to approval_agent without recording another. If the single "
+            "cycle-1 result has challenged_findings, missing_evidence, or requested_follow_up, complete its "
+            "one focused specialist follow-up and call record_critique exactly once with cycle=2, "
+            "responds_to_critique_id set to that result's exact critique_id, no requested_follow_up, and "
+            "every exact cycle-1 challenge, missing-evidence item, and requested follow-up represented in "
+            "supported_findings, challenged_findings, or missing_evidence. After an initial cycle containing "
+            "any challenge, missing evidence, or request, "
+            "handoff for that required follow-up instead of approaching approval. Two prior critiques is the "
+            "finite limit: do not request or record another. "
+            "Use concise evidence-backed findings. You can re-derive evidence yourself: "
             "recheck_inventory_item(item_name) returns the exact inventory row and approved-alias provenance, "
             "and recompute_line(quantity, unit_price) returns the exact Decimal extension. Use them to check "
             "at least one disputed mapping or amount instead of narrating. If a concrete discrepancy needs "

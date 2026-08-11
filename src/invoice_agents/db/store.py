@@ -446,7 +446,7 @@ def load_generation_evidence_snapshot(
     inventory_connection: sqlite3.Connection | None = None,
     inventory_schema: str = "main",
 ) -> EvidenceSnapshot:
-    """Load one generation's latest component rows and validate them as one snapshot."""
+    """Load one generation's evidence plus the latest durable critique cycle."""
 
     specifications = {
         "extraction": (
@@ -455,6 +455,7 @@ def load_generation_evidence_snapshot(
             "extractions",
             "execution_generation",
             "",
+            False,
         ),
         "identity": (
             "SELECT payload_json, evaluated_at FROM identity_results WHERE case_id = ? "
@@ -462,6 +463,7 @@ def load_generation_evidence_snapshot(
             "identity_results",
             "execution_generation",
             "",
+            False,
         ),
         "inventory": (
             "SELECT payload_json FROM comparison_results WHERE case_id = ? "
@@ -470,6 +472,7 @@ def load_generation_evidence_snapshot(
             "comparison_results",
             "execution_generation",
             "AND comparison_type = 'inventory'",
+            False,
         ),
         "risk": (
             "SELECT payload_json FROM comparison_results WHERE case_id = ? "
@@ -478,20 +481,22 @@ def load_generation_evidence_snapshot(
             "comparison_results",
             "execution_generation",
             "AND comparison_type = 'risk'",
+            False,
         ),
         "critique": (
             "SELECT payload_json FROM critique_results WHERE case_id = ? "
-            "AND execution_generation = ? ORDER BY rowid DESC LIMIT 1",
+            "AND execution_generation <= ? ORDER BY cycle DESC LIMIT 1",
             "critique_results",
             "execution_generation",
             "",
+            True,
         ),
     }
     payloads: dict[str, str] = {}
     missing: list[str] = []
     stale: list[str] = []
     identity_evaluated_at: datetime | None = None
-    for name, (sql, table, column, predicate) in specifications.items():
+    for name, (sql, table, column, predicate, carry_forward) in specifications.items():
         row = connection.execute(sql, (case_id, generation)).fetchone()
         if row is None:
             missing.append(name)
@@ -508,7 +513,9 @@ def load_generation_evidence_snapshot(
                 f"SELECT MAX({column}) AS generation FROM {table} WHERE case_id = ? {predicate}",
                 (case_id,),
             ).fetchone()["generation"]
-            if latest is None or int(latest) != generation:
+            if latest is None or (
+                int(latest) > generation if carry_forward else int(latest) != generation
+            ):
                 stale.append(f"{name}:{latest}")
     if missing or stale:
         raise EvidenceSnapshotError(
@@ -3625,34 +3632,191 @@ class WorkflowStore:
         return json.loads(row["payload_json"]) if row else None
 
     def save_critique(self, case_id: str, critique: Critique, claim: ExecutionClaim) -> str:
+        claim = validate_execution_claim(claim, expected_case_id=case_id)
         critique_id = f"crit_{uuid4().hex}"
-        self._insert_payload(
-            "critique_results", "critique_id", critique_id, case_id, critique, claim
-        )
+        with connect_database(self.path) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                written_at = datetime.now(UTC)
+                self._require_current_claim(connection, claim, written_at)
+                self._assert_evidence_generation_mutable(
+                    connection,
+                    case_id,
+                    claim.generation,
+                )
+                records = self._critique_records(connection, case_id)
+                if len(records) >= 2:
+                    self._raise_critique_cycle_error(
+                        case_id,
+                        "the persisted two-cycle critic limit has been reached",
+                        "CRITIQUE_CYCLE_LIMIT",
+                    )
+                if not records:
+                    if critique.cycle != 1 or critique.responds_to_critique_id is not None:
+                        self._raise_critique_cycle_error(
+                            case_id,
+                            "the first critique cannot respond to another critique",
+                            "CRITIQUE_RESPONSE_INVALID",
+                        )
+                else:
+                    parent_id, parent, _parent_generation = records[0]
+                    if (
+                        parent.cycle != 1
+                        or critique.cycle != 2
+                        or critique.responds_to_critique_id != parent_id
+                    ):
+                        self._raise_critique_cycle_error(
+                            case_id,
+                            "the second critique does not identify the exact first cycle",
+                            "CRITIQUE_RESPONSE_INVALID",
+                        )
+                    from invoice_agents.agents.decision_rules import (
+                        _assert_critique_follow_up_addressed,
+                    )
+
+                    _assert_critique_follow_up_addressed(case_id, parent, critique)
+                connection.execute(
+                    "INSERT INTO critique_results("
+                    "critique_id, case_id, payload_json, created_at, execution_generation, "
+                    "cycle, responds_to_critique_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        critique_id,
+                        case_id,
+                        critique.model_dump_json(),
+                        written_at.isoformat(),
+                        claim.generation,
+                        critique.cycle,
+                        critique.responds_to_critique_id,
+                    ),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
         return critique_id
 
+    @staticmethod
+    def _raise_critique_cycle_error(
+        case_id: str,
+        message: str,
+        stop_reason: str,
+    ) -> Never:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            message,
+            case_id=case_id,
+            stop_reason=stop_reason,
+        )
+
+    @classmethod
+    def _critique_records(
+        cls,
+        connection: sqlite3.Connection,
+        case_id: str,
+    ) -> list[tuple[str, Critique, int]]:
+        rows = connection.execute(
+            "SELECT critique_id, payload_json, execution_generation, cycle, "
+            "responds_to_critique_id FROM critique_results WHERE case_id = ? "
+            "ORDER BY cycle",
+            (case_id,),
+        ).fetchall()
+        records: list[tuple[str, Critique, int]] = []
+        for row in rows:
+            try:
+                critique = Critique.model_validate_json(row["payload_json"], strict=True)
+            except (TypeError, ValueError) as exc:
+                raise InvoiceAgentsError(
+                    ErrorCategory.DATABASE,
+                    "persisted critique payload is invalid",
+                    case_id=case_id,
+                    stop_reason="PERSISTED_RESULT_INVALID",
+                ) from exc
+            relational_cycle = row["cycle"]
+            relational_parent = row["responds_to_critique_id"]
+            generation = row["execution_generation"]
+            if (
+                type(row["critique_id"]) is not str
+                or type(relational_cycle) is not int
+                or (relational_parent is not None and type(relational_parent) is not str)
+                or type(generation) is not int
+                or critique.cycle != relational_cycle
+                or critique.responds_to_critique_id != relational_parent
+            ):
+                raise InvoiceAgentsError(
+                    ErrorCategory.DATABASE,
+                    "persisted critique relationship does not match its payload",
+                    case_id=case_id,
+                    stop_reason="PERSISTED_RESULT_INVALID",
+                )
+            records.append((row["critique_id"], critique, generation))
+        if records:
+            first_id, first, _first_generation = records[0]
+            relationship_is_valid = first.cycle == 1 and first.responds_to_critique_id is None
+            if len(records) == 2:
+                _second_id, second, _second_generation = records[1]
+                relationship_is_valid = relationship_is_valid and (
+                    second.cycle == 2 and second.responds_to_critique_id == first_id
+                )
+            if len(records) > 2 or not relationship_is_valid:
+                raise InvoiceAgentsError(
+                    ErrorCategory.DATABASE,
+                    "persisted critique cycle sequence is invalid",
+                    case_id=case_id,
+                    stop_reason="PERSISTED_RESULT_INVALID",
+                )
+        return records
+
+    def list_critiques(self, case_id: str) -> list[Critique]:
+        with connect_database(self.path, read_only=True) as connection:
+            records = self._critique_records(connection, case_id)
+        return [critique for _critique_id, critique, _generation in records]
+
+    def list_critique_records(self, case_id: str) -> list[tuple[str, Critique]]:
+        """Return persisted critique IDs and payloads in authoritative cycle order."""
+
+        with connect_database(self.path, read_only=True) as connection:
+            records = self._critique_records(connection, case_id)
+        return [
+            (critique_id, critique)
+            for critique_id, critique, _generation in records
+        ]
+
     def load_critique(self, case_id: str) -> Critique:
-        payload = self._load_latest_payload("critique_results", case_id)
-        if not payload:
+        critiques = self.list_critiques(case_id)
+        if not critiques:
             raise InvoiceAgentsError(
                 ErrorCategory.DATABASE,
                 f"critic has not recorded a result for case {case_id}",
                 case_id=case_id,
                 stop_reason="CRITIQUE_MISSING",
             )
-        return Critique.model_validate(payload)
+        return critiques[-1]
 
     def load_current_critique(self, claim: ExecutionClaim) -> Critique:
         claim = validate_execution_claim(claim)
-        payload = self._load_current_payload("critique_results", claim)
-        if not payload:
+        with connect_database(self.path, read_only=True) as connection:
+            self._begin_current_read(connection, claim)
+            records = self._critique_records(connection, claim.case_id)
+        if any(generation > claim.generation for _id, _critique, generation in records):
+            raise InvoiceAgentsError(
+                ErrorCategory.DATABASE,
+                f"future critique evidence exists for case {claim.case_id}",
+                case_id=claim.case_id,
+                stop_reason="PERSISTED_RESULT_INVALID",
+            )
+        current = [
+            critique
+            for _critique_id, critique, generation in records
+            if generation <= claim.generation
+        ]
+        if not current:
             raise InvoiceAgentsError(
                 ErrorCategory.DATABASE,
                 f"current execution has no critique for case {claim.case_id}",
                 case_id=claim.case_id,
                 stop_reason="CRITIQUE_GENERATION_MISMATCH",
             )
-        return Critique.model_validate(payload)
+        return current[-1]
 
     def adopt_latest_evidence(self, claim: ExecutionClaim) -> None:
         """Promote one complete, coherent immediate-predecessor snapshot."""
@@ -3711,45 +3875,18 @@ class WorkflowStore:
                         claim.generation,
                     ),
                 )
-                for table, id_column, prefix, payload_json in (
+                connection.execute(
+                    "INSERT INTO identity_results(identity_id, case_id, payload_json, created_at, "
+                    "execution_generation, evaluated_at) VALUES (?, ?, ?, ?, ?, ?)",
                     (
-                        "identity_results",
-                        "identity_id",
-                        "ident",
+                        f"ident_{uuid4().hex}",
+                        claim.case_id,
                         encode([item.model_dump(mode="json") for item in snapshot.identity]),
+                        adopted_at.isoformat(),
+                        claim.generation,
+                        snapshot.identity_evaluated_at.isoformat(),
                     ),
-                    (
-                        "critique_results",
-                        "critique_id",
-                        "crit",
-                        snapshot.critique.model_dump_json(),
-                    ),
-                ):
-                    if table == "identity_results":
-                        connection.execute(
-                            f"INSERT INTO {table}({id_column}, case_id, payload_json, created_at, "
-                            "execution_generation, evaluated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                            (
-                                f"{prefix}_{uuid4().hex}",
-                                claim.case_id,
-                                payload_json,
-                                adopted_at.isoformat(),
-                                claim.generation,
-                                snapshot.identity_evaluated_at.isoformat(),
-                            ),
-                        )
-                    else:
-                        connection.execute(
-                            f"INSERT INTO {table}({id_column}, case_id, payload_json, created_at, "
-                            "execution_generation) VALUES (?, ?, ?, ?, ?)",
-                            (
-                                f"{prefix}_{uuid4().hex}",
-                                claim.case_id,
-                                payload_json,
-                                adopted_at.isoformat(),
-                                claim.generation,
-                            ),
-                        )
+                )
                 for comparison_type, payload_json in (
                     ("inventory", encode(snapshot.inventory_payload)),
                     ("risk", snapshot.risk.model_dump_json()),
@@ -3923,6 +4060,18 @@ class WorkflowStore:
             written_at = datetime.now(UTC)
             self._require_current_claim(connection, claim, written_at)
             self._assert_evidence_generation_mutable(connection, review.case_id, claim.generation)
+            from invoice_agents.agents.decision_rules import (
+                _assert_critique_sequence_complete,
+            )
+
+            persisted_critiques = [
+                critique
+                for _critique_id, critique, _generation in self._critique_records(
+                    connection,
+                    review.case_id,
+                )
+            ]
+            _assert_critique_sequence_complete(review.case_id, persisted_critiques)
             try:
                 snapshot = load_generation_evidence_snapshot(
                     connection,
@@ -4214,6 +4363,18 @@ class WorkflowStore:
                     case_id=case_id,
                     stop_reason="FINAL_DECISION_IMMUTABLE",
                 )
+            from invoice_agents.agents.decision_rules import (
+                _assert_critique_sequence_complete,
+            )
+
+            persisted_critiques = [
+                critique
+                for _critique_id, critique, _generation in self._critique_records(
+                    connection,
+                    case_id,
+                )
+            ]
+            _assert_critique_sequence_complete(case_id, persisted_critiques)
             try:
                 review_authorization = load_authoritative_review_authorization(
                     connection,

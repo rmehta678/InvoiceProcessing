@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.models import (
@@ -17,6 +18,9 @@ from invoice_agents.models import (
     RiskAssessment,
 )
 from invoice_agents.tools.comparison import normalize_alias
+
+if TYPE_CHECKING:
+    from invoice_agents.db.store import WorkflowStore
 
 AUTHORIZING_HUMAN_DECISIONS = frozenset(
     {
@@ -293,6 +297,96 @@ def assert_new_review_cycle_permitted(
             case_id=case_id,
             stop_reason="HUMAN_DECISION_MUST_BE_OBEYED",
         )
+
+
+def _assert_critique_sequence_complete(
+    case_id: str,
+    critiques: list[Critique],
+) -> None:
+    if not critiques:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "no persisted critique cycle exists",
+            case_id=case_id,
+            stop_reason="CRITIQUE_MISSING",
+        )
+    if len(critiques) > 2:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "the persisted critic cycle exceeds its finite limit",
+            case_id=case_id,
+            stop_reason="CRITIQUE_CYCLE_LIMIT",
+        )
+    first = critiques[0]
+    if first.cycle != 1 or first.responds_to_critique_id is not None:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "the persisted first critique has an invalid response relationship",
+            case_id=case_id,
+            stop_reason="CRITIQUE_RESPONSE_INVALID",
+        )
+    follow_up_required = bool(
+        first.challenged_findings
+        or first.missing_evidence
+        or first.requested_follow_up
+    )
+    if len(critiques) == 1:
+        if follow_up_required:
+            raise InvoiceAgentsError(
+                ErrorCategory.ORCHESTRATION,
+                "the first critique requires one persisted follow-up cycle",
+                case_id=case_id,
+                stop_reason="CRITIQUE_FOLLOW_UP_REQUIRED",
+            )
+        return
+    second = critiques[1]
+    if second.cycle != 2 or second.responds_to_critique_id is None:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "the persisted second critique has an invalid response relationship",
+            case_id=case_id,
+            stop_reason="CRITIQUE_RESPONSE_INVALID",
+        )
+    _assert_critique_follow_up_addressed(case_id, first, second)
+
+
+def _assert_critique_follow_up_addressed(
+    case_id: str,
+    first: Critique,
+    second: Critique,
+) -> None:
+    """Require cycle two to account for every fact that forced the follow-up."""
+
+    if second.requested_follow_up:
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "the second critique requests an unpersistable third cycle",
+            case_id=case_id,
+            stop_reason="CRITIQUE_CYCLE_LIMIT",
+        )
+    addressed = {
+        *second.supported_findings,
+        *second.challenged_findings,
+        *second.missing_evidence,
+    }
+    required = {
+        *first.challenged_findings,
+        *first.missing_evidence,
+        *first.requested_follow_up,
+    }
+    if any(item not in addressed for item in required):
+        raise InvoiceAgentsError(
+            ErrorCategory.ORCHESTRATION,
+            "the persisted second critique omits an exact required follow-up item",
+            case_id=case_id,
+            stop_reason="CRITIQUE_FOLLOW_UP_UNADDRESSED",
+        )
+
+
+def assert_critique_cycle_complete(case_id: str, store: WorkflowStore) -> None:
+    """Require the exact persisted finite critic sequence before finalization."""
+
+    _assert_critique_sequence_complete(case_id, store.list_critiques(case_id))
 
 
 def validate_final_decision(

@@ -187,7 +187,7 @@ class WorkflowVersionNeutralState:
 # direction, so an unmigrated or future database never silently processes cases.
 SCHEMA_VERSIONS: dict[DatabaseKind, int] = {
     DatabaseKind.INVENTORY: 1,
-    DatabaseKind.WORKFLOW: 6,
+    DatabaseKind.WORKFLOW: 7,
 }
 
 # Named indexes created by the migrations; verification fails when one is missing.
@@ -207,6 +207,7 @@ REQUIRED_INDEXES: dict[DatabaseKind, frozenset[str]] = {
             "idx_batches_state",
             "idx_batch_entries_case_id",
             "idx_legacy_authorization_quarantine_reconciliation",
+            "idx_critique_results_case_cycle",
         }
     ),
 }
@@ -3031,7 +3032,13 @@ def _verify_database_snapshot(
                 "payload_json",
                 "execution_generation",
             },
-            "critique_results": {"case_id", "payload_json", "execution_generation"},
+            "critique_results": {
+                "case_id",
+                "payload_json",
+                "execution_generation",
+                "cycle",
+                "responds_to_critique_id",
+            },
             "review_requests": {
                 "review_id",
                 "case_id",

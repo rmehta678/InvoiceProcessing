@@ -4,9 +4,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from invoice_agents.db.core import connect_database
-from invoice_agents.models import ToolStatus
+from invoice_agents.models import Critique, DecisionKind, ToolStatus
 from invoice_agents.tools.comparison import (
     InventoryReader,
     normalize_alias,
@@ -73,3 +74,60 @@ def test_lookup_item_alias_resolves_only_persisted_approved_aliases(inventory_db
         "approved_by": "reviewer@example.com",
         "approved_at": approved_at,
     }
+
+
+def test_legacy_critique_payload_defaults_to_the_only_initial_cycle() -> None:
+    critique = Critique.model_validate(
+        {
+            "supported_findings": ["the persisted arithmetic is exact"],
+            "challenged_findings": [],
+            "missing_evidence": [],
+            "requested_follow_up": [],
+            "recommended_disposition": "APPROVE",
+            "rationale": ["all persisted evidence agrees"],
+        }
+    )
+
+    assert critique.cycle == 1
+    assert critique.responds_to_critique_id is None
+
+
+def test_critique_model_accepts_an_exact_persisted_cycle_two_relationship() -> None:
+    critique = Critique(
+        cycle=2,
+        responds_to_critique_id="crit_cycle_one",
+        supported_findings=["the requested inventory row was rechecked"],
+        challenged_findings=[],
+        missing_evidence=[],
+        requested_follow_up=[],
+        recommended_disposition=DecisionKind.APPROVE,
+        rationale=["the persisted follow-up resolved the challenge"],
+    )
+
+    assert critique.cycle == 2
+    assert critique.responds_to_critique_id == "crit_cycle_one"
+
+
+@pytest.mark.parametrize(
+    ("cycle", "responds_to_critique_id"),
+    [
+        (0, None),
+        (3, "crit_prior"),
+    ],
+    ids=["cycle-zero", "cycle-three"],
+)
+def test_critique_model_rejects_out_of_range_cycle(
+    cycle: int,
+    responds_to_critique_id: str | None,
+) -> None:
+    with pytest.raises(ValidationError):
+        Critique(
+            cycle=cycle,
+            responds_to_critique_id=responds_to_critique_id,
+            supported_findings=["persisted evidence reviewed"],
+            challenged_findings=[],
+            missing_evidence=[],
+            requested_follow_up=[],
+            recommended_disposition=DecisionKind.HOLD,
+            rationale=["finite-cycle contract test"],
+        )
