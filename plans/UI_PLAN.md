@@ -6,6 +6,12 @@ Status: implemented 2026-08-06 (`src/invoice_agents/ui/`, `invoice-agents ui`, t
 `tests/ui/`). This plan adds a local web UI on top of the existing, verified CLI prototype.
 Nothing in it changes agent behavior, policy, storage, or failure semantics.
 
+> **Historical design:** The later application-audit repair adds immutable source snapshots,
+> bounded uploads/PDF workers, CSRF/origin/host/header enforcement, durable submission and batch
+> claims, one application-wide model semaphore, responsive real-anchor keyboard behavior, and
+> cursor-correct SSE replay. The current Markdown system guide and reference are authoritative
+> where this original UI plan conflicts.
+
 ## 1. Goal and audience
 
 Give the two people who actually touch this system a screen that is faster and clearer than the CLI:
@@ -282,8 +288,9 @@ running view instead of double-starting. SQLite access stays short-lived-connect
 (the store already works that way); the events SSE poller reads with a `> last_event_id` cursor at
 ~1s cadence, which is well within local SQLite comfort.
 
-Uploads are copied into `data/invoices/uploads/` before processing so `SourceArtifact` provenance
-(canonical path + hash) stays meaningful.
+Uploads are streamed through a hard byte ceiling into immutable content-addressed storage. The
+persisted `SourceArtifact` names that snapshot; later reads verify its size and hash and never fall
+back to a mutable upload or sample path.
 
 ## 7. Delivery phases
 

@@ -7,6 +7,13 @@ owner) completed with every artifact terminal as scripted, exactly the five expe
 and zero review-cycle loops. Completion evidence: `artifacts/verification/workflow_phase8_run2.db`
 (the phase database copy), run-1 evidence retained alongside it.
 
+> **Historical evidence only:** This run predates the application-audit remediation. It does not
+> prove the final integrated source snapshot, execution fencing, cancellation/orphan recovery,
+> UI-request security, global admission, observability, finite critique-cycle, CLI, or browser/SSE
+> contracts. It also does not reverify current xAI compatibility. The current release gate and a
+> newly approved paid contract run remain pending; no result below is promoted to current release
+> evidence by documentation alone.
+
 Mechanics per [`REMEDIATION_PLAN.md`](REMEDIATION_PLAN.md) §6.1: fresh `workflow.db` (prior
 database archived as `artifacts/verification/workflow_pre_phase8.db`), verified seeded
 `inventory.db` with an empty alias table, `INVOICE_MAX_MESSAGES=40`,
@@ -148,9 +155,10 @@ cycle - nothing was masked - but the two cases loop rather than terminate, which
    by submitting the forced decision). Authorizing-decision second cycles (§3.5) are untouched.
 2. The approval prompt's second-review directive is now explicitly scoped: "A resolved REJECT is
    final ... A resolved REQUEST_CORRECTION is final ... Only after an AUTHORIZING decision ...".
-3. Unit tests cover the guard for both final kinds, all three authorizing kinds, and
-   absent/pending reviews. Full gate after the fix: ruff format/check clean, mypy strict clean,
-   162 passed / 2 environment-gated skips.
+3. Unit tests covered the guard for both final kinds, all three authorizing kinds, and
+   absent/pending reviews. The then-current formatting, lint, strict-type, and local-test gate was
+   recorded as passing; its historical test count is intentionally omitted because it is not the
+   final integrated release gate.
 
 **§6.3 consequence:** because two artifacts required a code change to finish, the phase-restart
 clause applies. Run-1 spend measured from persisted case usage: **2,042,352 prompt tokens,

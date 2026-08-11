@@ -7,6 +7,10 @@ net, review and resume, payment idempotency, storage, and the web console - is c
 diagrams in [`SYSTEM_GUIDE.md`](SYSTEM_GUIDE.md); [`DEMO.md`](DEMO.md) is the short business
 walkthrough.
 
+> **Documentation authority:** This Markdown file is the current operational reference. The
+> checked-in [`REFERENCE.pdf`](REFERENCE.pdf) is a historical derived snapshot and was not
+> regenerated or visually verified for the application-audit repair.
+
 ## Database lifecycle
 
 `invoice-agents ui` migrates, seeds, and verifies both databases on start (idempotently). The same
@@ -69,6 +73,12 @@ uv run invoice-agents review resume CASE_ID
 revision decisions require `--superseded-case-id`. Reviewer and reason are mandatory. Review
 packages for PDF sources include rendered page images under `artifacts/reviews/{review_id}/`.
 
+Authorizing decisions are evidence-bound: they name the exact blocker IDs they address, and a
+mapping or supersession must match candidates recorded in the pending review. The workflow
+decision and any inventory alias change are written through one `ATTACH DATABASE` transaction in
+SQLite `DELETE` journal mode. Semantic replay of the same decision is a no-op; a different replay,
+invalid review state, or any write failure changes neither database.
+
 ## Web console operations
 
 The console's pages and design rules are covered in
@@ -79,9 +89,15 @@ there is no auth layer - the CLI refuses non-loopback hosts without
 assets ship in-repo (no CDN, no Node toolchain). Opt-in browser smokes exist behind
 `RUN_UI_SMOKE=1` (`uv run playwright install chromium` first).
 
+Every POST is protected by a session-bound CSRF token and same-origin validation before route code
+can start work. Trusted-host validation limits accepted host names, and responses set a restrictive
+Content Security Policy (including `frame-ancestors 'none'`), `X-Frame-Options: DENY`,
+`X-Content-Type-Options: nosniff`, and a same-origin referrer policy. Remote binding remains an
+explicit risk acknowledgement, not an authentication mechanism.
+
 ## Provider compatibility contract
 
-The paid live suite proves authentication, the exact model and endpoint, strict typed tools,
+The paid live suite checks authentication, the exact model and endpoint, strict typed tools,
 sequential tool iterations, Pydantic structured output after tool evidence, Swarm handoff,
 agent-name configuration, stopped-state save/load/human resume, and tool-exception visibility:
 
@@ -93,13 +109,22 @@ Without `--live`, the CLI reports `NOT RUN` and exits nonzero; a skipped contrac
 described as a pass. The verified xAI-safe message-name configuration is fixed at
 `include_name_in_message=False` and `add_name_prefixes=True`, not selected as a fallback.
 
+The 2026-08-06 results are historical evidence only. A remediated release requires a fresh paid
+run after the free gate and explicit owner approval. Until that run is recorded, current xAI
+compatibility is **NOT REVERIFIED**; no local or synthetic test may substitute for it.
+
 ## Tests and quality checks
 
 ```powershell
+uv lock --check
 uv run ruff format --check .
 uv run ruff check .
-uv run mypy src
-uv run pytest -m "not live"
+uv run mypy --strict src/invoice_agents
+uv run pytest -m "not live" -q
+RUN_UI_SMOKE=1 uv run pytest tests/ui/test_smoke_playwright.py -q
+uv run pip-audit
+uv pip check
+uv build --out-dir /tmp/galatiq-release-build
 
 # Explicitly opt into paid xAI tests:
 $env:RUN_LIVE_XAI="1"
@@ -121,6 +146,28 @@ remediated system, with the expected-decision script, per-artifact outcomes, exa
 payments, and both run records - is documented in
 [`PHASE8_RECONCILIATION.md`](../plans/PHASE8_RECONCILIATION.md).
 
+Those artifacts predate the current application-audit remediation. They are useful historical
+records, but they are not evidence that the final integrated checkout passes today's gate.
+
+### Pending release evidence
+
+Nothing in this documentation-only branch closes the release. The following must be captured from
+one clean, integrated candidate checkout and must fail closed if evidence is absent:
+
+- [ ] lock, formatting, lint, strict type, free-test, browser-smoke, dependency-audit, package
+  compatibility, and source/wheel build commands above all exit zero;
+- [ ] a newly built wheel installs into a fresh Python 3.12 environment, migrates and verifies both
+  temporary databases, serves CLI help, fails concise missing/empty-directory cases, and renders
+  the dashboard through `TestClient`;
+- [ ] the local Markdown link check passes against the integrated documentation;
+- [ ] every audit finding is mapped to its exact passing test or command, rather than closed by
+  code inspection;
+- [ ] `gh repo view --json url,visibility,defaultBranchRef` proves the intended submission URL is
+  public and the default branch contains the verified candidate, or publication is recorded as an
+  external blocker;
+- [ ] after explicit cost approval, the current paid xAI contract passes with sanitized request-ID
+  and timing evidence, or compatibility remains explicitly not reverified.
+
 ## Framework notes
 
 AutoGen 0.7.5 is in maintenance mode and identifies Microsoft Agent Framework as its successor.
@@ -137,11 +184,14 @@ frameworks at runtime. The team is a `Swarm` with model-driven handoff tools;
 | `tools/comparison.py` | Read-only SQL, explicit aliases, aggregation, Decimal totals, dates, identity, policy evidence |
 | `agents/team.py` | Narrow prompts, one composite deterministic tool per specialist plus two read-only critic recheck tools ([ADR-001](../plans/adr/001-composite-agent-tools.md)), handoffs, critic loop, approval and payment agent construction |
 | `agents/decision_rules.py` | Pure final-decision rules; `APPROVE` requires the critic's agreement or a resolved authorizing human decision |
-| `orchestration.py` | Preflight, fresh-team streaming, circuit breakers, state save/resume, final status mapping |
-| `hitl/` | Complete review packages and attributable human decisions |
-| `payment/` | Approval checks, mock transaction ledger, idempotency, injected failure |
-| `db/` and `migrations/` | Explicit versioned database lifecycle and workflow persistence |
-| `observability/` | Redacted correlated events and local OpenTelemetry spans |
+| `orchestration.py` | Execution claims/heartbeats, one outer terminalization boundary, cancellation, orphan recovery, state save/resume, and status mapping |
+| `source_store.py` | Immutable content-addressed source snapshots and verified later reads |
+| `pdf_worker.py` | Killable, time/CPU/memory/page/result-bounded PDF extraction and rendering |
+| `hitl/` | Complete review packages and atomic, evidence-bound human decisions across both databases |
+| `payment/` | Transaction-local authorization snapshot, execution fencing, mock ledger, and idempotency |
+| `db/` and packaged `db/migrations/` | Strict schema manifests, execution/source/submission claims, durable batches, critique cycles, and explicit versioned lifecycle |
+| `ui/security.py` and `ui/runs.py` | Same-origin request security, one global paid-work semaphore, and restart-safe admission state |
+| `observability/` | Bounded free-text redaction, correlated tool-call events, and local OpenTelemetry spans |
 
 ## Evidence and data limitations
 
@@ -152,9 +202,16 @@ independent per-invoice validation reference - processing does not reserve or de
 a production batch could overcommit inventory; reservation and shared-commit semantics must be
 designed before enabling real payment.
 
-PDF extraction uses `pypdf`; `render_pdf_page` uses PyMuPDF when layout evidence is needed. A
-successful text extraction is not treated as visual proof. xAI vision is not required by the
-current workflow, so invoice page images are not sent to the provider.
+Every submitted source is first streamed to `artifacts/sources/<sha256><suffix>` and persisted only
+after an atomic rename. Later reads verify the stored size and SHA-256; a missing or changed
+snapshot fails `SOURCE_HASH_MISMATCH` and never falls back to the original path. The default source
+and upload ceiling is 10 MiB.
+
+PDF extraction uses `pypdf`; `render_pdf_page` uses PyMuPDF when layout evidence is needed. PDF
+work runs in a killable child process with a 15-second parse timeout, a 100-page ceiling, bounded
+CPU/memory/result size, and explicit failure reasons. A successful text extraction is not treated
+as visual proof. xAI vision is not required by the current workflow, so invoice page images are
+not sent to the provider.
 
 Invoice evidence, agent messages, and results are sensitive local data. `.env`, databases,
 rendered pages, results, and other runtime artifacts are ignored by Git. Logs recursively redact
@@ -175,7 +232,13 @@ stop reasons and their fixes:
   the database.
 - `PROVIDER_AUTHENTICATION_FAILED`: verify `XAI_API_KEY`; there is no alternate model.
 - `PROVIDER_RATE_LIMIT_EXHAUSTED` / `PROVIDER_TIMEOUT`: configured bounded retries were exhausted;
-  the case remains failed/incomplete and keeps the provider request ID when available.
+  the case is `FAILED` and keeps a sanitized provider request ID when available. A provider timeout
+  is exactly `FAILED / PROVIDER_TIMEOUT`.
+- `CANCELLED`: caller cancellation is durably recorded as `INCOMPLETE / CANCELLED`, shielded
+  cleanup runs, and cancellation is re-raised to the asyncio caller.
+- `ORPHANED_EXECUTION`: startup found an expired nonterminal execution lease and durably recovered
+  it as `INCOMPLETE / ORPHANED_EXECUTION` while retaining existing evidence. This is process-crash
+  recovery, not a provider failure, and it is never automatically resumed.
 - `NEEDS_HUMAN`: inspect the review package, record a reasoned decision, then resume the case.
 - `MAX_MESSAGES_EXHAUSTED`: inspect persisted events; the latest prose is not accepted as a result.
 - `PAYMENT_FAILED`: inspect the ledger/event error; no success event is synthesized.

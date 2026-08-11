@@ -3,6 +3,11 @@
 Status: **Accepted**, 2026-08-06. Recorded as part of remediation phase R3
 ([`REMEDIATION_PLAN.md`](../REMEDIATION_PLAN.md) §5, gap G7).
 
+> This ADR records what the 2026-08-06 provider run established and which cases intentionally
+> remained synthetic. It does not claim current xAI compatibility for a changed release candidate.
+> A fresh run requires the free gate and explicit cost approval; until then compatibility is
+> **NOT REVERIFIED**.
+
 Related: [`IMPLEMENTATION_PLAN.md`](../IMPLEMENTATION_PLAN.md) §11 (the fourteen compatibility
 items), `src/invoice_agents/compatibility.py` (`run_live_contracts`),
 [provider compatibility contract](../../Docs/REFERENCE.md#provider-compatibility-contract),
@@ -38,7 +43,7 @@ without the network. R3 closes this by adding four live checks to `run_live_cont
 
 ## Decision
 
-With R3 in place, the §11 items are proven as follows:
+For the recorded 2026-08-06 candidate, the §11 items were evidenced as follows:
 
 | §11 item | Proven | How |
 |---|---|---|
@@ -66,7 +71,7 @@ With R3 in place, the §11 items are proven as follows:
   exhaustion or timeout against the live endpoint is unreliable (it depends on account limits and
   provider load) and costly, so these stay local by decision rather than omission.
 - **True HTTP 401 handling** also remains synthetic: xAI does not emit 401 for incorrect keys (it
-  signals 400 `invalid-argument`, proven live above), so the `AuthenticationError` branch cannot
+  signaled 400 `invalid-argument` in the dated live run above), so the `AuthenticationError` branch cannot
   be exercised against this endpoint without a credential state we cannot create on demand
   (e.g. a revoked-but-well-formed token).
 - **Missing-key visibility** is a local preflight guarantee by design: `Settings.provider_key`

@@ -9,6 +9,10 @@ This guide complements [`REFERENCE.md`](REFERENCE.md) (operational reference) an
 [`DEMO.md`](DEMO.md) (business walkthrough). Everything below was derived from the code;
 module names are given so you can go one level deeper when you need to.
 
+> **Documentation authority:** This Markdown file describes the current safety behavior. The
+> checked-in [`SYSTEM_GUIDE.pdf`](SYSTEM_GUIDE.pdf) is a historical derived snapshot and was not
+> regenerated or visually verified for the application-audit repair.
+
 ---
 
 ## 1. What this system is
@@ -32,6 +36,17 @@ design rules keep the AI honest:
    decision are re-loaded from the database — while the run's own observations (the stop
    reason, tool failures, the payment result) fill in the remaining branches. A stopped team
    with no persisted decision is `FAILED`, never silently approved.
+
+The four public statuses are stable, and the stop reason supplies the exact operational meaning:
+
+| Status / stop reason | Exact meaning |
+|---|---|
+| `SUCCEEDED / ...` | A valid `APPROVE`, `REJECT`, or `HOLD` completed; approval also has a valid `PAID` or `DUPLICATE` payment result. |
+| `NEEDS_HUMAN / HUMAN_REVIEW_REQUESTED` | A valid pending review and resumable team state were persisted. |
+| `FAILED / PROVIDER_TIMEOUT` | A provider request exceeded its timeout. Provider timeout is a failure, never cancellation or ordinary incompleteness. |
+| `INCOMPLETE / CANCELLED` | The caller cancelled execution. The result is durably recorded, shielded cleanup runs, and cancellation is re-raised to the asyncio caller. |
+| `INCOMPLETE / ORPHANED_EXECUTION` | Startup recovered an expired nonterminal execution lease after process abandonment. Existing evidence is retained; this is not provider failure and is not automatically resumed. |
+| `FAILED` or `INCOMPLETE` with another stop reason | The named failure or circuit breaker remains visible; no generic success or fallback replaces it. |
 
 ```mermaid
 flowchart TB
@@ -97,20 +112,28 @@ preparation (deterministic, free), the agent run (model calls, paid), and classi
 1. **Preflight** — the xAI key must be configured and *both* SQLite databases must pass strict
    verification (correct signature, integrity, exact schema version, required tables, indexes,
    and seed rows). Preflight only verifies; it never repairs. A failure here still produces a
-   terminal `FAILED` result JSON, so every outcome has an artifact.
-2. **Source registration** — the file is hashed (SHA-256) and given a deterministic
-   `source_id`; the case row is created in `workflow.db`, *born* `INCOMPLETE` with stop reason
-   `CASE_CREATED`. A crash mid-run can therefore never leave a case looking successful.
+   terminal `FAILED` result and normally publishes its result JSON. If terminal persistence
+   itself fails, the fail-closed recovery contract below applies.
+2. **Immutable source snapshot and registration** — the file is streamed into
+   `artifacts/sources/<sha256><suffix>`, with size and SHA-256 computed during the copy, `fsync`,
+   and atomic rename. Only that content-addressed path is registered. Every later read verifies
+   both size and hash and fails `SOURCE_HASH_MISMATCH` rather than reopening a changed original.
+   The case row is *born* `INCOMPLETE` with stop reason `CASE_CREATED`.
 3. **Extraction v1** — the file is parsed into a structured `ExtractedInvoice` and persisted
-   as immutable version 1. In a batch, preparation runs sequentially for all files *before*
-   any agent runs, so every case's identity agent can see all sibling submissions (that is how
-   duplicate txt/pdf pairs find each other).
+   as immutable version 1. Batch admission computes source identities and persists durable batch,
+   source-claim, and case relationships before paid runs start, so a restart does not lose the
+   batch and sibling identity evidence remains available.
 
 ### 2.2 The agent run
 
 `run_prepared_case` builds a **fresh model client and a fresh eight-agent Swarm for every
 case** — agents and conversation history are never shared between cases. The team streams
 until one of three termination conditions fires:
+
+Single and batch runs acquire the same application-wide semaphore immediately before model work.
+The limit is global to the application process, not recreated per batch, and is always released in
+`finally`. Durable submission IDs and source-run claims make ordinary double submissions reuse the
+authoritative case/batch instead of spending another model call.
 
 | Termination | Meaning |
 |---|---|
@@ -151,10 +174,21 @@ did its job by refusing a bad invoice. And a `DUPLICATE` payment also counts as 
 because the ledger is idempotent: re-processing an already-paid invoice correctly refuses to
 pay twice.
 
-Any exception anywhere — provider outage, database error, schema violation — is caught,
-categorized into an `ErrorRecord`, and produces a terminal `FAILED` result. The result JSON at
-`artifacts/results/<case_id>.json` is written for **every** terminal outcome, including
-failures that happen before a model call.
+Any ordinary exception — provider outage, database error, schema violation — is caught,
+categorized into an `ErrorRecord`, and produces a terminal `FAILED` result. After the terminal
+database result is durable, the normal path atomically publishes
+`artifacts/results/<case_id>.json`, including for failures that happen before a model call. If
+that ordinary artifact publication fails, the durable database result remains authoritative and
+the artifact error is recorded explicitly. If the terminal database write itself fails, the
+system instead makes one bounded, claim-bound attempt to atomically publish
+`artifacts/results/<case_id>.recovery.json` with the `INCOMPLETE` result and its persistence
+error. Failure to publish that recovery evidence raises `TERMINAL_RECOVERY_ARTIFACT_FAILED`;
+missing terminal evidence is never treated as success.
+
+Caller cancellation is the deliberate exception to the `FAILED` mapping: it is recorded as
+`INCOMPLETE / CANCELLED`, cleanup is shielded, and `CancelledError` is re-raised. Separately, startup
+scans expired nonterminal leases and records `INCOMPLETE / ORPHANED_EXECUTION`; an orphan is never
+relabeled `PROVIDER_TIMEOUT` and is never automatically resumed.
 
 ### 2.4 Case status lifecycle
 
@@ -164,7 +198,7 @@ stateDiagram-v2
     INCOMPLETE --> SUCCEEDED : decision persisted (+ payment if approved)
     INCOMPLETE --> NEEDS_HUMAN : review requested, team state saved
     INCOMPLETE --> FAILED : any failure path
-    INCOMPLETE --> INCOMPLETE : max messages exhausted
+    INCOMPLETE --> INCOMPLETE : max messages, cancellation, or orphan recovery
     NEEDS_HUMAN --> SUCCEEDED : human decided, case resumed and finished
     NEEDS_HUMAN --> NEEDS_HUMAN : resumed but new review cycle opened
     NEEDS_HUMAN --> FAILED : resume failed
@@ -231,6 +265,8 @@ all prior cases sharing the invoice number *or* vendor and classifies each as
 in a different file — typically another format — with matching declared totals),
 `POSSIBLE_REVISION` (same invoice, different revision label), or `CONFLICT` (partial or
 contradictory identity). It never picks a winning revision — that is a human's call.
+An expected no-prior-case result is represented explicitly. SQLite/query/schema errors propagate as
+database failures; they are never caught and converted into an ordinary identity conflict.
 
 **`inventory_comparison_agent`** — maps invoice line items onto the inventory database. The
 tool resolves each distinct item name by **exact name match**, then by **human-approved
@@ -247,15 +283,20 @@ them with the declared amounts (any nonzero delta is recorded), classifies every
 review policy — producing the `policy_review_reasons` list that later forces human review. It
 also restates five reconciliations this prototype *cannot* do (no vendor master, PO, price
 catalog, tax table, or bank data), so no agent can imply a check that never happened.
+Every quantity and money field must parse as a complete value. A valid numeric prefix followed by
+extra digits, units, words, or malicious suffix text fails visibly; it is never truncated into a
+plausible amount.
 
 **`independent_critic_agent`** — the built-in skeptic. It receives the immutable evidence
 package and must challenge it before any approval. Crucially it has real computation, not just
 opinions: `recheck_inventory_item` re-derives a stock row and alias provenance straight from
 the database, and `recompute_line` redoes one line's arithmetic. Its prompt requires it to
 verify at least one disputed mapping or amount "instead of narrating." It records exactly one
-structured `Critique` with a recommended disposition (`APPROVE`/`REJECT`/`HOLD`/`FAILED`), and
-may send exactly one focused follow-up back to a specialist. It is explicitly told the known
-scope limits are not, by themselves, reasons to hold — and that it may never approve or pay.
+structured `Critique` with a recommended disposition (`APPROVE`/`REJECT`/`HOLD`/`FAILED`). Critique
+cycles and their parent ID are persisted. Challenged findings, missing evidence, or an explicit
+request require exactly one linked cycle-2 response that addresses each requested item; a third
+cycle is rejected. Final-decision submission checks this persisted state, so follow-up is not a
+prompt convention. The critic may never approve or pay.
 
 **`approval_agent`** — the only agent that can *decide* a case: it alone can persist the
 final decision or escalate to a human. It fetches the approval package
@@ -268,8 +309,8 @@ final decision or escalate to a human. It fetches the approval package
   `HOLD`. Those rulings are final.
 - An *authorizing* human decision (`APPROVE`, `ESTABLISH_MAPPING`, `SUPERSEDE_REVISION`)
   permits approval. If blocking evidence remains, the agent's script is to open a *new*
-  review cycle recommending `HOLD` instead of approving over it (the rules permit `HOLD` in
-  exactly that situation) — a human "yes" is treated as covering only what it addressed.
+  review cycle recommending `HOLD` instead of approving over it. Stable blocker IDs make the
+  coverage check exact: a human "yes" applies only to blocker IDs it named.
 - With no triggers and no disagreement, it decides independently.
 
 An `APPROVE` must be marked payment-eligible and handed to the payment agent; `REJECT` and
@@ -298,6 +339,8 @@ Prompts are guidance; the enforcement is structural:
   `recompute_line(quantity, unit_price)` — which raises on anything that is not an exact
   decimal string.
 - **All decisions pass through pure rules** (next section) that raise on violation.
+- **Critique completion is persisted and checked.** Finalization fails if cycle 1 requested
+  follow-up without an exact linked cycle 2, or if a third cycle is attempted.
 - **Every tool call is audited** with the agent's name and the database row it produced, and
   every model event is persisted verbatim.
 
@@ -385,15 +428,19 @@ exist, each with a fixed consequence:
 
 | Human decision | Kind | Effect on the case |
 |---|---|---|
-| `APPROVE` | authorizing | Permits approval; if blocking evidence remains, the agent is scripted to open another review cycle recommending `HOLD` instead of approving over it |
+| `APPROVE` | authorizing | Permits approval only for the exact review blocker IDs recorded as addressed; residual or changed blockers remain blocking |
 | `ESTABLISH_MAPPING` | authorizing | Writes human-approved item aliases (with provenance) into `inventory.db` at decide time; a deterministic recompute re-derives all evidence before the team resumes |
 | `SUPERSEDE_REVISION` | authorizing | Records which prior case this one supersedes (same authorizing effect as `APPROVE`); the prior case's stored row is not modified |
 | `REJECT` | final | Forces the final decision `REJECT` |
 | `REQUEST_CORRECTION` | final | Forces the final decision `HOLD` |
 
 Reviewer and reason are mandatory. Recording is transactional and replay-safe: submitting the
-byte-identical decision twice is a no-op; a *different* decision raises
-`REVIEW_ALREADY_RESOLVED`.
+same semantic decision twice is a no-op; a *different* decision raises `REVIEW_ALREADY_RESOLVED`.
+Mappings must name raw-item/SKU candidates from the review, supersession must name a candidate case,
+and addressed blocker IDs must match the reviewed evidence. The decision service opens workflow DB
+as the main connection, attaches inventory DB, reloads the pending review under `BEGIN IMMEDIATE`,
+and commits the decision, review resolution, and any aliases once. An exception rolls back both
+files; presentation state is never treated as authorization.
 
 ### 5.3 Resume
 
@@ -403,11 +450,14 @@ sequenceDiagram
     participant CLI as CLI / Console
     participant O as orchestration.resume_case
     participant S as workflow.db
+    participant I as inventory.db
     participant T as Restored Swarm
     participant A as approval_agent
 
     H->>CLI: review decide (reviewer, decision, reason)
-    CLI->>S: save_human_decision - review RESOLVED<br/>(ESTABLISH_MAPPING also writes approved<br/>aliases into inventory.db at this step)
+    CLI->>S: BEGIN IMMEDIATE + attach inventory.db<br/>validate pending review and exact evidence
+    S->>I: write approved aliases if mapping decision
+    CLI->>S: commit decision + review + aliases atomically
     H->>CLI: review resume CASE_ID
     CLI->>O: resume_case
     O->>S: guards - status NEEDS_HUMAN, review RESOLVED, team state exists
@@ -436,9 +486,8 @@ stateDiagram-v2
     FinalDecision --> [*]
 ```
 
-Review cycles are sequenced (`UNIQUE(case_id, sequence)`) — schema v2 explicitly migrated away
-from one-review-per-case so an authorizing decision that does not cover all blockers can spawn
-cycle 2, while final rulings can never be re-litigated.
+Review cycles are sequenced (`UNIQUE(case_id, sequence)`). An authorizing decision that does not
+cover all blockers can spawn another review, while final rulings can never be re-litigated.
 
 ---
 
@@ -449,14 +498,16 @@ ledger with idempotency.
 
 ```mermaid
 flowchart TD
-    START["execute_mock_payment"] --> G1{"Gate 1<br/>persisted final decision is<br/>APPROVE + payment_eligible?"}
+    START["execute_mock_payment"] --> TX["BEGIN IMMEDIATE<br/>one authorization snapshot"]
+    TX --> C1{"Current unexpired<br/>execution token +<br/>generation?"}
+    C1 -- no --> STALE["STALE_EXECUTION_CLAIM<br/>no ledger write"]
+    C1 -- yes --> G1{"Gate 1<br/>persisted final decision is<br/>APPROVE + payment_eligible<br/>for this generation?"}
     G1 -- no --> NE["NOT_ELIGIBLE<br/>no ledger write"]
-    G1 -- yes --> G2{"Gate 2<br/>if a review exists - is it<br/>RESOLVED with an<br/>authorizing decision?"}
+    G1 -- yes --> G2{"Gate 2<br/>review + blocker IDs<br/>still authorize approval?"}
     G2 -- no --> NE
     G2 -- yes --> G3{"Gate 3<br/>vendor + currency +<br/>positive declared total?"}
     G3 -- no --> NE
-    G3 -- yes --> TX["BEGIN IMMEDIATE<br/>exclusive write lock"]
-    TX --> LOOK{"Row with this<br/>idempotency key exists?"}
+    G3 -- yes --> LOOK{"Row with this<br/>idempotency key exists?"}
     LOOK -- "yes, PAID" --> DUP["return DUPLICATE<br/>duplicate_of = original payment"]
     LOOK -- "yes, FAILED" --> FAILED2["return the stored FAILED row<br/>key stays occupied - no retry"]
     LOOK -- no --> INSERT["INSERT payment row - PAID<br/>commit in same transaction"]
@@ -484,6 +535,12 @@ Defense in depth: gate 2 re-verifies the human review even though the decision r
 blocked an unauthorized approval — the ledger does not trust that the LLM persisted only what
 it was allowed to.
 
+All authorization reads above occur after the write transaction begins, and the payment insert
+commits in that same transaction. Every evidence/final/terminal mutation carries the exact
+database-issued `ExecutionClaim` (token, generation, and expiry), so a stale resume cannot write.
+A schema trigger also prevents final-decision mutation after a `PAID` row exists; concurrent
+writers cannot create `PAID` beside a stored non-approval.
+
 ---
 
 ## 7. Persistence and audit
@@ -497,10 +554,10 @@ event log.
 processing (connections are opened with SQLite's `mode=ro`), written only by the human-review
 mapping flow.
 
-**`workflow.db` (schema v2)** — everything mutable: cases, versioned extractions, evidence,
-reviews, decisions, payments, and the audit log. `WorkflowStore` is the typed gateway for
-case, extraction, evidence, review, and decision mutations; the payment ledger writes through
-its own exclusive transaction, and audit events are appended directly by `AuditRecorder`.
+**`workflow.db`** — everything mutable: sources, cases, versioned extractions, evidence, critique
+cycles, reviews, decisions, payments, execution leases, durable submission/source claims, batches,
+and the audit log. `WorkflowStore` is the typed gateway; payment and human mapping use explicit
+write transactions, and audit events are appended by `AuditRecorder`.
 
 ```mermaid
 erDiagram
@@ -528,11 +585,15 @@ erDiagram
     cases ||--o| final_decisions : "case_id UNIQUE"
     cases ||--o{ payments : "idempotency_key UNIQUE"
     cases ||--o{ events : "append-only audit"
+    source_artifacts ||--o| source_run_claims : "ordinary submission owner"
+    batches ||--o{ batch_entries : "durable membership"
+    cases ||--o{ batch_entries : "run result"
     source_artifacts {
         text source_id PK
         text source_hash "sha256"
-        text canonical_path
+        text canonical_path "content-addressed snapshot"
         text source_format
+        int size_bytes
     }
     cases {
         text case_id PK
@@ -540,6 +601,9 @@ erDiagram
         text stop_reason
         text result_json "terminal CaseResult"
         text team_state_json "paused Swarm state"
+        text execution_token "fencing authority"
+        int execution_generation
+        text lease_expires_at
     }
     extractions {
         int version "UNIQUE per case"
@@ -549,6 +613,26 @@ erDiagram
         int sequence "UNIQUE per case"
         text status "PENDING / RESOLVED"
         text payload_json "full review package"
+    }
+    critique_results {
+        int cycle "1 or 2"
+        text responds_to_critique_id FK
+        text payload_json "structured critique"
+    }
+    source_run_claims {
+        text source_id PK
+        text case_id FK
+        text state
+    }
+    batches {
+        text batch_id PK
+        text state
+    }
+    batch_entries {
+        text batch_id FK
+        text source_id FK
+        text case_id FK
+        text state
     }
     payments {
         text idempotency_key UK
@@ -564,12 +648,14 @@ erDiagram
 
 ### 7.2 Schema lifecycle
 
-Migrations are versioned SQL files applied only by explicit commands (`invoice-agents db
+Migrations are packaged versioned SQL resources applied only by explicit commands (`invoice-agents db
 migrate/seed/verify`) or by the `ui` command's idempotent `ensure_databases` bring-up. Normal
 case processing **never** migrates or repairs. Preflight verification demands the schema
 version match *exactly* — a database that is too new is rejected as hard as one that is too
 old — and pins the four inventory seed rows verbatim (WidgetA 15, WidgetB 10, GadgetX 5, and
-the deliberate zero-stock trap row FakeItem 0).
+the deliberate zero-stock trap row FakeItem 0). Verification checks table columns and types,
+`NOT NULL`, foreign/check/unique constraints, triggers, and exact index column order; a database
+with merely familiar object names does not pass.
 
 ### 7.3 The audit trail
 
@@ -580,6 +666,11 @@ terminal result. Payloads pass recursive credential redaction before persisting,
 event doubles as an OpenTelemetry span carrying the case ID and agent name. Even the retry
 count in the usage summary is recomputed from persisted `provider.retry` events rather than
 trusted to an in-memory counter.
+
+Free-text sanitization removes credential assignments, bearer/authorization/cookie values, unsafe
+control characters, and bounds output size before errors reach logs, artifacts, pages, or CLI.
+Tool requests and executions are normalized into one correlated row per tool-call ID; missing or
+unsafe IDs are not invented, and usage accounting is not inflated by request/execution pairs.
 
 The result artifact `artifacts/results/<case_id>.json` is the complete terminal record —
 status, stop reason, final decision, review package, payment, all errors, and token/latency
@@ -596,6 +687,11 @@ of truth.** The console renders stored state verbatim — it never recomputes, s
 reinterprets a status — and mutates only through the same three service seams the CLI uses:
 prepare/run, resume, and record-human-decision.
 
+Loopback binding is not the request-security boundary. Every mutation requires a session-bound
+CSRF token and same-origin request, accepted hosts are explicitly trusted, and every response adds
+CSP/frame/content-type/referrer protections. These checks run before paid route work. The explicit
+remote-bind flag acknowledges exposure risk; it does not create authentication.
+
 ```mermaid
 flowchart LR
     B["Browser<br/>htmx + vanilla JS"] -->|"GET pages + fragments"| R["routes.py"]
@@ -603,7 +699,7 @@ flowchart LR
     B -->|"htmx poll 2s<br/>until HTTP 286"| BATCH["batch matrix fragment"]
     R --> PF["preflight.py<br/>same checks as case preflight"]
     R --> Q["queries.py<br/>read-only SQL"]
-    R --> REG["RunRegistry - runs.py<br/>tracks in-flight tasks only"]
+    R --> REG["RunRegistry - runs.py<br/>global model slots + durable claims"]
     R --> HD["hitl.record_human_decision"]
     REG --> ORCH["orchestration<br/>prepare_invoice / run_prepared_case / resume_case"]
     Q --> WF[("workflow.db")]
@@ -617,8 +713,8 @@ The pages:
 | Page | What it shows |
 |---|---|
 | **Dashboard** `/` | Preflight strip (databases + key health; run actions disabled until green), status-count tiles, filterable case table. A broken database still blocks all work, but instead of a 500 taking down the console, the dashboard stays up to report the failure: the strip shows the exact stop reason, the verbatim error, and the copy-pasteable fix command. |
-| **Submit** `/submit` | Pick sample invoices or upload (uploads are copied into the corpus so hash provenance stays meaningful). One file → live case view; several → batch. |
-| **Live case** `/cases/{id}/live` | Real-time event timeline via SSE; the terminal banner comes from the stored case row, never inferred client-side. |
+| **Submit** `/submit` | Pick sample invoices or stream an upload through the hard byte limit into immutable content-addressed storage. One file → live case view; several → durable batch. Replayed submission/source claims reuse their authoritative destination. |
+| **Live case** `/cases/{id}/live` | Real-time event timeline via SSE; replay begins after the greater of the query cursor and standard `Last-Event-ID`, and the browser drops duplicate/nonincreasing sequence IDs. Terminal state comes from the stored result/lease, never process memory alone. |
 | **Case detail** `/cases/{id}` | The full evidence narrative: extraction (raw before normalized), identity, inventory, financial deltas, critique, review, payment (with duplicate links), errors first for failed cases, and the complete event log "rendered, not reinterpreted". |
 | **Reviews** `/reviews` | The pending queue with aging badges; review detail shows the whole package and an intentionally unbiased decision form (no decision preselected — a test asserts the page contains no `checked` attribute). |
 | **Batches** `/batches/{id}` | A per-case matrix polled by htmx; deliberately no aggregate roll-up. |
@@ -640,6 +736,13 @@ with no fallback permitted. Everything else comes from `.env` (prefix `INVOICE_`
 | `XAI_API_KEY` | — | Required; checked at preflight, value never surfaced |
 | `INVOICE_INVENTORY_DB` / `INVOICE_WORKFLOW_DB` | `inventory.db` / `workflow.db` | Database paths |
 | `INVOICE_SQLITE_JOURNAL_MODE` | `DELETE` | Fixed safety contract; `PERSIST`, `TRUNCATE`, and `WAL` are rejected before database access |
+| `INVOICE_SOURCE_ARCHIVE_DIR` | `artifacts/sources` | Content-addressed immutable source snapshots |
+| `INVOICE_SOURCE_MAX_BYTES` | `10485760` | Hard streamed source/upload ceiling (10 MiB) |
+| `INVOICE_PDF_MAX_PAGES` | `100` | PDF page ceiling before extraction/rendering |
+| `INVOICE_PDF_PARSE_TIMEOUT_SECONDS` | `15` | Killable PDF worker wall-clock timeout |
+| `INVOICE_PDF_WORKER_CPU_SECONDS` | `10` | Child-process CPU ceiling where supported |
+| `INVOICE_PDF_WORKER_MEMORY_BYTES` | `536870912` | Child-process virtual-memory headroom ceiling |
+| `INVOICE_PDF_WORKER_RESULT_MAX_BYTES` | `4194304` | Maximum serialized worker result |
 | `INVOICE_REVIEW_THRESHOLD_AMOUNT` | `10000.00` | Review at/above this declared amount |
 | `INVOICE_REVIEW_THRESHOLD_CURRENCY` | `USD` | Threshold currency; any other currency always reviews |
 | `INVOICE_REVIEW_THRESHOLD_EFFECTIVE_DATE` | `2026-08-06` | Policy effective date |
@@ -647,11 +750,13 @@ with no fallback permitted. Everything else comes from `.env` (prefix `INVOICE_`
 | `INVOICE_MAX_MESSAGES` | `40` | Swarm circuit breaker → `INCOMPLETE`, not success |
 | `INVOICE_MODEL_TIMEOUT_SECONDS` | `120` | Per-request model timeout |
 | `INVOICE_TRANSIENT_RETRIES` | `2` | SDK-level transient retries (audited as `provider.retry`) |
-| `INVOICE_CASE_CONCURRENCY` | `2` | Batch concurrency bound (1–8) |
+| `INVOICE_CASE_CONCURRENCY` | `2` | One application-wide paid-model concurrency bound (1–8), shared by single and batch runs |
+| `INVOICE_UI_ALLOWED_HOSTS` | derived loopback hosts | Additional explicit trusted hosts for the local console |
+| `INVOICE_UI_SESSION_SECRET` | generated per process only for loopback | Secret used for session-bound CSRF derivation; non-loopback authorities require an explicit stable secret of at least 32 bytes |
 | `INVOICE_REVIEW_AGE_AMBER_HOURS` | `24` | Console display only — review aging badge |
 | `INVOICE_LOG_LEVEL` | `INFO` | Logging level (console output is credential-redacted) |
 
-Provider compatibility is proven, not assumed: `invoice-agents contract --live` runs ten paid
+Provider compatibility must be proven, not assumed: `invoice-agents contract --live` runs ten paid
 checks against real Grok (basic authenticated completion, typed tool calling with structured
 output, sequential tool order, Swarm handoffs, pause/save/load/resume, tool-exception
 visibility, server-echoed model identity, invalid-key rejection, telemetry capture, and
@@ -659,6 +764,10 @@ bad-schema rejection). A skipped check reports
 "NOT RUN" and exits 2 — a skip is never a pass. One measured quirk: xAI rejects bad keys with
 HTTP 400 rather than 401, so bad credentials surface as a provider error, not an
 authentication error.
+
+The recorded 2026-08-06 run is historical. Current compatibility for the integrated remediated
+release remains **NOT REVERIFIED** until the free gate passes, the owner explicitly approves cost,
+and a fresh paid contract run succeeds. A local or skipped contract is never substituted.
 
 ---
 
@@ -680,8 +789,13 @@ The transparency principles:
   review rather than failing it.
 - **Circuit breakers never exhaust into success.** Max messages exhausts into `INCOMPLETE`;
   a model timeout or exhausted transient retries end the case `FAILED` under a specific stop
-  reason (`PROVIDER_TIMEOUT`, `PROVIDER_RATE_LIMIT_EXHAUSTED`); the batch concurrency bound
+  reason (`PROVIDER_TIMEOUT`, `PROVIDER_RATE_LIMIT_EXHAUSTED`); the global concurrency bound
   simply limits how many paid runs execute at once.
+- **Cancellation is not timeout.** Caller cancellation is exactly `INCOMPLETE / CANCELLED` and is
+  re-raised after durable recording. Provider timeout is exactly `FAILED / PROVIDER_TIMEOUT`.
+- **Orphan recovery is not provider failure.** Only startup recovery of an expired nonterminal
+  lease writes `INCOMPLETE / ORPHANED_EXECUTION`; it retains existing evidence, clears the dead
+  lease, and does not automatically resume the case.
 - **Secondary failures never mask primary ones** — if persisting a failure itself fails, both
   errors are kept on the result.
 
@@ -689,23 +803,28 @@ The transparency principles:
 
 ## 11. What the tests lock down
 
-The free suite (`uv run pytest -m "not live"`) covers, per area:
+The free suite (`uv run pytest -m "not live"`) defines the following coverage contracts. This
+table is not a current pass claim: the final integrated checkout must run the complete release gate
+and attach command output before any row is considered release evidence.
 
 | Area | Modules | What is locked down |
 |---|---|---|
 | Evidence extraction | `tests/unit/test_evidence.py` | Golden extraction for all 20 sample invoices; visible failure on corrupt/empty/unknown sources |
+| Source/PDF safety | `tests/unit/test_source_store.py`, `test_pdf_worker.py`, UI upload tests | Immutable hash/size verification, mutation refusal, byte/page/resource ceilings, worker timeout/crash cleanup |
 | Inventory & policy | `tests/unit/test_comparison.py` | Stock statuses, aggregation before stock check, fuzzy-never-auto-accepts, policy triggers |
 | Decision rules | `tests/unit/test_decision_rules.py` | The full truth table of `validate_final_decision` and `blocking_evidence` |
 | Mapping evidence | `tests/unit/test_mapping_evidence.py` | Mapping writes a new extraction version; originals never mutate |
-| Critic tools | `tests/unit/test_critic_tools.py` | Decimal-exact recomputation; alias lookups honor only approved aliases |
-| HITL & payment | `tests/unit/test_hitl_payment.py` | Review persistence; pay-once idempotency; failure never reported as success |
+| Critic tools/cycles | `tests/unit/test_critic_tools.py`, `test_critique_cycles.py` | Decimal-exact recomputation; persisted parent/cycle rules; required follow-up cannot be skipped or repeated forever |
+| HITL & payment | `tests/unit/test_hitl_payment.py`, `tests/integration/test_execution_races.py` | Evidence-bound attached-DB decisions; execution fencing; transaction-local payment authorization; pay-once idempotency |
 | Resume recompute | `tests/unit/test_resume_recompute.py` | Post-mapping recompute either clears the blocker or opens review cycle 2 |
 | Review rendering | `tests/unit/test_review_rendering.py` | PDF review packages carry hash-verifiable page images |
-| Database lifecycle | `tests/unit/test_database.py`, `test_migration_review_sequence.py` | Migrate/seed/verify idempotence; v1→v2 review sequencing; read-only enforcement |
-| Observability | `tests/unit/test_observability_models.py` | Credential redaction; strict schemas |
+| Database lifecycle | `tests/unit/test_database.py`, `test_migration_review_sequence.py`, packaging tests | Packaged migrations; migrate/seed/verify idempotence; strict columns/constraints/indexes; read-only enforcement |
+| Observability | observability model/round tests | Free-text credential redaction; bounded errors; normalized tool-call correlation; strict schemas |
 | Golden matrix | `tests/integration/test_golden_matrix.py` | The deterministic pipeline over all 20 artifacts with expected treatments, no model calls |
 | Failure transparency | `tests/failure_transparency/*` | Missing key fails before any model call; guard rails stay loudly visible |
-| Web console | `tests/ui/*` | The full route contract with only the paid model boundary stubbed; template principles (REJECT never red, raw before normalized, unbiased forms) |
+| Web security/admission | UI security and submission-admission tests | CSRF/origin/host/header enforcement, bounded uploads, one global model semaphore, durable replay-safe submissions/batches |
+| CLI | `tests/unit/test_cli_errors.py`, `tests/ui/test_cli_ui.py` | Missing/empty inputs fail; one sanitized concise boundary; explicit bounded debug; exit 2 retained for human/not-run states |
+| Browser/accessibility | `tests/ui/test_smoke_playwright.py`, route/template tests | Narrow layout, real-anchor keyboard focus, cursor-correct SSE replay, client-side duplicate suppression |
 | Contracts | `tests/contract/*` | Free AutoGen construction contract; the paid live suite is double-gated and a skip is never a pass |
 
 ---
@@ -726,14 +845,15 @@ A few choices are easy to misread as bugs; they are deliberate:
 - **Cases are born `INCOMPLETE`.** A crash at any point leaves an honest status.
 - **Preflight rejects databases that are too new**, not just too old, and processing never
   self-repairs schema.
-- **Batch preparation is sequential on purpose** so every case's identity agent can see all
-  sibling submissions before any model runs; concurrency applies only to the paid phase.
+- **Batch admission is durable before paid work.** Source identities, submission/source claims,
+  batch membership, and case relationships persist before runs start; one application-wide
+  semaphore covers both single and batch paid work.
 - **The extraction is versioned, never mutated**: v1 from preparation, v2 from the agent's
   re-extract, v3+ from mapping enrichment — raw evidence stays intact for provenance.
-- **A few behaviors are prompt-scripted rather than rule-enforced**: the critic's
-  one-follow-up limit, and the approval agent opening a second review cycle when an
-  authorizing decision leaves blocking evidence unaddressed. Both are backstopped by the
-  max-message breaker; the decision rules *permit* but do not *require* them.
+- **Critic follow-up is a persisted two-cycle state machine.** A requested follow-up requires an
+  exact linked response that addresses the named evidence, finalization checks completion, and a
+  third cycle fails. Approval rules separately refuse residual blocker IDs that the human did not
+  authorize; neither protection depends on prompt obedience.
 - **The audit records a non-claim**: provider configuration explicitly notes that
   zero-data-retention status is not exposed by the client, so no ZDR claim is recorded —
   documenting what cannot be proven rather than asserting it.

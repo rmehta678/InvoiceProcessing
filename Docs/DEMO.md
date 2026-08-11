@@ -1,5 +1,9 @@
 # Business demo narrative
 
+> **Documentation authority:** This Markdown file is the current demo narrative. The checked-in
+> [`DEMO.pdf`](DEMO.pdf) is a historical derived snapshot and was not regenerated or visually
+> verified for the application-audit repair.
+
 ## The point
 
 Acme's invoice team should see faster handling without losing control of uncertainty. This demo shows
@@ -35,10 +39,11 @@ uv run invoice-agents review resume CASE_ID
 
 ## 1. Prove the reasoning stack
 
-Run `uv run invoice-agents contract --live`. The matrix establishes that AutoGen 0.7.5 and the exact
-xAI `grok-4.5` endpoint support typed tools, structured output, sequential iterations, specialist
-handoffs, persisted human pause/resume, and visible exceptions. A skipped or failed check is not a
-green result.
+Only after the free release gate passes and the owner explicitly approves paid API cost, run
+`uv run invoice-agents contract --live`. A successful current matrix establishes that AutoGen
+0.7.5 and the exact xAI `grok-4.5` endpoint support typed tools, structured output, sequential
+iterations, specialist handoffs, persisted human pause/resume, and visible exceptions. A skipped
+or failed check is not a green result. Historical evidence does not reverify the current release.
 
 ## 2. Let a clean invoice flow
 
@@ -74,6 +79,8 @@ critic's findings, and proves the payment ledger has no transaction for the case
   success.
 - Missing xAI, bad SQLite, corrupt input, invalid model schema, circuit-breaker exhaustion, and payment
   exceptions remain distinct failure states.
+- Caller cancellation is `INCOMPLETE / CANCELLED`; provider timeout is
+  `FAILED / PROVIDER_TIMEOUT`; startup recovery of an expired execution is separately
+  `INCOMPLETE / ORPHANED_EXECUTION` and never masquerades as a provider error.
 
 The prototype saves manual effort on clean work while routing judgment—not hiding it—on risky work.
-

@@ -3,6 +3,10 @@
 Status: **Accepted**, 2026-08-06. Remediation decision D1 adopted with its default: keep the
 composite tools and grant the critic its own granular tools.
 
+> This ADR's architecture decision remains accepted. References to live verification and cost
+> below are dated historical evidence, not current release evidence; the remediated candidate
+> still requires its own explicitly approved provider contract run.
+
 Related: [`IMPLEMENTATION_PLAN.md`](../IMPLEMENTATION_PLAN.md) §5.1/§6 (original granular design;
 §5.1 carries a one-line amendment pointing here), [`REMEDIATION_PLAN.md`](../REMEDIATION_PLAN.md)
 §2 (R0) and §6.1 (observed live costs), [module boundaries](../../Docs/REFERENCE.md#module-boundaries).
@@ -24,7 +28,7 @@ The granular functions all exist, but as internal Python called by the composite
 model-visible tools. The 2026-08-06 review classified this deviation as **documentation drift,
 not a safety regression**: the deterministic tools still produce and persist all required
 evidence, and no path converts a failure into an approval, so the plan's §2 principles hold. The
-composite design also passed live end-to-end verification.
+composite design also passed the recorded 2026-08-06 live end-to-end run.
 
 ## Decision
 

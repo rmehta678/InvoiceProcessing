@@ -10,6 +10,10 @@ the system is real and its verification claims are truthful; the items below are
 thin spots, and loose ends that remained. It is written so the work can be executed in order,
 stopped after any phase, and audited afterward.
 
+> **Historical scope:** Completion here applies to the 2026-08-06 candidate only. The later
+> application-audit remediation supersedes conflicting operational claims. This plan's historical
+> gate and paid-provider run are not evidence for the current integrated release.
+
 Related documents: [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) (original plan),
 [`UI_PLAN.md`](UI_PLAN.md) (UI work - independent of this plan, but R1 items below reduce UI rework).
 
@@ -359,11 +363,11 @@ genuinely closed and the status header of `IMPLEMENTATION_PLAN.md` can say so wi
 
 ### 2026-08-06 - R0-R3 executed
 
-Verification evidence at completion: `ruff format --check` (50 files), `ruff check`, and
-`uv run mypy` (strict, 24 source files) all clean; the local suite grew from 44 to 112 collected
-tests, `111 passed, 1 skipped` (the skip is the `--live`-gated contract test, reported as skipped,
-never as passing); `uv run invoice-agents contract --live` printed the expanded ten-row matrix
-with **all checks PASS, exit code 0**. Migration 002 was additionally proven against copies of the
+Historical verification at completion recorded formatting, lint, strict type checking, and the
+then-current local suite as clean; the live-gated contract was reported separately, never counted
+as a local pass. Historical test counts are intentionally omitted because they are not the final
+integrated gate. `uv run invoice-agents contract --live` printed the expanded matrix with all
+checks passing at that time. Migration 002 was additionally proven against copies of the
 real populated v1 verification databases (`artifacts/verification/workflow_e2e2.db` carried its
 resolved review and human REJECT decision through with `sequence=1` and a clean
 `PRAGMA foreign_key_check`), and the root `workflow.db` was migrated in place to schema v2.

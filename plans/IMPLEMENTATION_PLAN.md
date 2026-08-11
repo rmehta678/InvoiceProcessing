@@ -2,13 +2,40 @@
 
 Prepared: 2026-08-06
 
-Status: implemented and verified on 2026-08-06; **all §13 phases including Phase 8 are closed.**
-The remediation recorded in [`REMEDIATION_PLAN.md`](REMEDIATION_PLAN.md) (R0-R4) landed the same
-day: the expanded live xAI/AutoGen compatibility matrix passes in full, the local suite covers
-the deterministic golden matrix across all 20 artifacts, and the Phase 8 full-corpus live
-reconciliation completed with every artifact terminal as scripted and exactly the expected
-payments - evidence in [`PHASE8_RECONCILIATION.md`](PHASE8_RECONCILIATION.md). Runtime databases
-and result artifacts remain local and Git-ignored.
+Historical status: the original phases and the 2026-08-06 Phase 8 run closed against that day's
+candidate; evidence is in [`PHASE8_RECONCILIATION.md`](PHASE8_RECONCILIATION.md). A later
+application audit required Tasks 1–16 safety repairs. Those repairs do not inherit the old gate or
+paid-provider result. The final integrated checkout still requires the current free release gate,
+installed-wheel smoke, publication check, and an explicitly approved paid xAI contract run. Until
+those are recorded, the remediated release is **NOT YET VERIFIED**. Runtime databases and result
+artifacts remain local and Git-ignored.
+
+## 0. Current application-audit contract
+
+This section supersedes conflicting historical implementation language below:
+
+- sources are streamed into immutable content-addressed snapshots before registration, and every
+  later read verifies size/SHA-256 without falling back to the submitted path;
+- uploads are byte-bounded and PDF parsing/rendering runs in a killable process with explicit
+  timeout, page, CPU, memory, result-size, and crash failures;
+- blocking evidence has stable IDs; human mapping/supersession/authorization is limited to exact
+  review evidence and commits with inventory aliases in one attached-database transaction;
+- a database-issued execution token, generation, and lease fence every evidence, decision,
+  terminal, resume, and payment write; payment authorizes and inserts from one transaction-local
+  snapshot, and a paid final decision is immutable;
+- caller cancellation is exactly `INCOMPLETE / CANCELLED`; provider timeout is exactly
+  `FAILED / PROVIDER_TIMEOUT`; startup recovery of an expired nonterminal lease is separately
+  `INCOMPLETE / ORPHANED_EXECUTION`, retains existing evidence, and never auto-resumes;
+- all UI mutations require session CSRF, same-origin, trusted-host, and response-header controls;
+  one application-wide semaphore bounds paid work, and durable submission/source/batch claims make
+  ordinary replay and restart behavior idempotent;
+- identity-query/database corruption fails rather than becoming a business conflict, and schema
+  verification checks exact columns, constraints, triggers, and index order;
+- free text is centrally bounded/redacted, tool-call request/execution events correlate by a safe
+  normalized ID, and the CLI uses one concise operational-error boundary;
+- critique cycles are persisted: required follow-up must be an exact linked second cycle, and no
+  third cycle is permitted; responsive keyboard behavior and SSE replay use real anchors and
+  monotonic sequence cursors.
 
 ## 1. Project outcome
 
@@ -332,8 +359,8 @@ The reviewer must choose approve, reject, request correction, or establish a map
 |---|---|
 | `SUCCEEDED` | Valid final structured decision exists, required evidence is complete, HITL is resolved, and any approved payment has a valid mock transaction result |
 | `NEEDS_HUMAN` | Team intentionally stopped with a persisted, valid review request |
-| `FAILED` | Authentication, provider, database, tool, schema, payment, or unrecoverable evidence failure prevented a trustworthy result |
-| `INCOMPLETE` | Timeout, cancellation, or iteration/message limit stopped the workflow before a final result |
+| `FAILED` | Authentication, provider, database, tool, schema, payment, or unrecoverable evidence failure prevented a trustworthy result. Provider timeout is exactly `FAILED / PROVIDER_TIMEOUT`. |
+| `INCOMPLETE` | Caller cancellation (`CANCELLED`), expired-lease recovery (`ORPHANED_EXECUTION`), or another named interruption/circuit breaker stopped the workflow. Neither cancellation nor orphan recovery is a provider timeout. |
 
 Rejection is a successful workflow outcome with `FinalDecision=REJECT`; it is not a technical failure and does not call payment.
 
@@ -489,7 +516,8 @@ Module and tool boundaries will be documented in the README. Public functions/cl
 - xAI error classes, rate limits, reasoning settings, and agent-name compatibility.
 - SQLite schema/integrity/read-only behavior.
 
-Live tests should be opt-in and clearly marked because they use the API and incur cost; skipping them must not be reported as a passing live contract.
+Live tests are opt-in because they use the API and incur cost; skipping them must not be reported
+as a passing live contract. Historical results do not reverify a changed release candidate.
 
 ### 14.3 Integration/golden cases
 
@@ -534,7 +562,9 @@ Assertions must verify status, stop reason, original error preservation, absence
 - Approved invoices call the mock payment tool exactly once; rejected/held/failed cases do not.
 - Technical failure, uncertainty, and policy hold are distinguishable in CLI output and stored JSON.
 - Secrets are absent from Git, logs, state snapshots, and test artifacts.
-- Code passes formatting, linting, type checking, and tests.
+- The final integrated candidate passes formatting, linting, strict type checking, the free suite,
+  browser smoke, dependency audit, package checks/build, and fresh-wheel smoke. This remains a
+  pending acceptance item until command evidence is attached.
 - The codebase contains helpful module/class/function docstrings and comments explaining orchestration, tool boundaries, normalization, error propagation, HITL, and idempotency.
 - README instructions allow another developer to understand and run the system without private context.
 
