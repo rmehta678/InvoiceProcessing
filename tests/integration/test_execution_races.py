@@ -287,6 +287,194 @@ def test_completed_critique_remains_authoritative_across_normal_human_review_res
     assert anchor["critique_disposition"] == "APPROVE"
 
 
+def _persist_approved_follow_up_case(
+    settings: Settings,
+    case_id: str,
+) -> tuple[WorkflowStore, ExtractedInvoice, ExecutionClaim, str, str]:
+    store = _persist_case(settings, case_id)
+    requested_item = "recompute the exact approved amount"
+    with connect_database(settings.workflow_db) as connection:
+        parent = connection.execute(
+            "SELECT critique_id, payload_json FROM critique_results WHERE case_id = ?",
+            (case_id,),
+        ).fetchone()
+        assert parent is not None
+        parent_critique = Critique.model_validate_json(parent["payload_json"]).model_copy(
+            update={
+                "recommended_disposition": DecisionKind.HOLD,
+                "requested_follow_up": [requested_item],
+            },
+            deep=True,
+        )
+        connection.execute(
+            "UPDATE critique_results SET payload_json = ? WHERE critique_id = ?",
+            (parent_critique.model_dump_json(), parent["critique_id"]),
+        )
+        connection.commit()
+    claim = store.claim_case_execution(
+        case_id,
+        frozenset({CaseStatus.INCOMPLETE}),
+        lease_seconds=60,
+    )
+    store.adopt_latest_evidence(claim)
+    evidence_event_id = AuditRecorder(settings.workflow_db, case_id).record(
+        "tool.critic_line_recompute",
+        {
+            "execution_generation": claim.generation,
+            "quantity": "2",
+            "unit_price": "5.00",
+            "extended_total": "10.00",
+        },
+        agent_name="independent_critic_agent",
+    )
+    child = Critique.model_validate(
+        {
+            "cycle": 2,
+            "responds_to_critique_id": str(parent["critique_id"]),
+            "supported_findings": [requested_item],
+            "challenged_findings": [],
+            "missing_evidence": [],
+            "requested_follow_up": [],
+            "recommended_disposition": "APPROVE",
+            "rationale": ["the exact persisted recomputation resolved the follow-up"],
+            "follow_up_responses": [
+                {
+                    "requested_item": requested_item,
+                    "outcome": "SUPPORTED",
+                    "evidence_event_ids": [evidence_event_id],
+                }
+            ],
+        }
+    )
+    child_id = store.save_critique(case_id, child, claim)
+    invoice = store.load_current_extraction(claim)
+    store.save_final_decision(
+        case_id,
+        FinalDecision(
+            decision=DecisionKind.APPROVE,
+            reasons=["the exact follow-up evidence supports approval"],
+            evidence=[reference for line in invoice.lines for reference in line.evidence[:1]],
+            critic_disposition=DecisionKind.APPROVE,
+            payment_eligible=True,
+        ),
+        claim,
+    )
+    return store, invoice, claim, str(parent["critique_id"]), child_id
+
+
+def _append_follow_up_relation_after_authorization(
+    settings: Settings,
+    case_id: str,
+    child_id: str,
+    *,
+    drop_immutability_trigger: bool,
+) -> str:
+    event_id = AuditRecorder(settings.workflow_db, case_id).record(
+        "tool.critic_line_recompute",
+        {
+            "execution_generation": claim.generation,
+            "quantity": "3",
+            "unit_price": "7.00",
+            "extended_total": "21.00",
+        },
+        agent_name="independent_critic_agent",
+    )
+    with connect_database(settings.workflow_db) as connection:
+        if drop_immutability_trigger:
+            connection.execute(
+                "DROP TRIGGER trg_critique_follow_up_evidence_immutable_after_authorization_insert"
+            )
+        connection.execute(
+            "INSERT INTO critique_follow_up_evidence("
+            "critique_id, requested_item, outcome, evidence_event_id) "
+            "VALUES (?, 'unauthorized appended relation', 'SUPPORTED', ?)",
+            (child_id, event_id),
+        )
+        connection.commit()
+    return event_id
+
+
+@pytest.mark.parametrize("authorized_state", ["final", "paid"])
+def test_schema_rejects_follow_up_relation_append_after_final_or_paid(
+    settings: Settings,
+    authorized_state: str,
+) -> None:
+    case_id = f"case_follow_up_append_after_{authorized_state}"
+    store, invoice, claim, _parent_id, child_id = _persist_approved_follow_up_case(
+        settings,
+        case_id,
+    )
+    if authorized_state == "paid":
+        paid = mock_payment(case_id, invoice, store, settings.workflow_db, claim)
+        assert paid.status is PaymentStatus.PAID
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="AUTHORIZATION_EVIDENCE_IMMUTABLE",
+    ):
+        _append_follow_up_relation_after_authorization(
+            settings,
+            case_id,
+            child_id,
+            drop_immutability_trigger=False,
+        )
+
+
+def test_payment_authorization_rejects_appended_follow_up_when_trigger_is_dropped(
+    settings: Settings,
+) -> None:
+    case_id = "case_follow_up_append_payment_authorization"
+    store, invoice, claim, _parent_id, child_id = _persist_approved_follow_up_case(
+        settings,
+        case_id,
+    )
+    _append_follow_up_relation_after_authorization(
+        settings,
+        case_id,
+        child_id,
+        drop_immutability_trigger=True,
+    )
+
+    result = mock_payment(case_id, invoice, store, settings.workflow_db, claim)
+
+    assert result.status is PaymentStatus.NOT_ELIGIBLE
+    assert result.error is not None
+    assert "critique follow-up evidence" in result.error
+
+
+def test_paid_ledger_validation_rejects_appended_follow_up_when_trigger_is_dropped(
+    settings: Settings,
+) -> None:
+    case_id = "case_follow_up_append_paid_ledger"
+    store, invoice, claim, _parent_id, child_id = _persist_approved_follow_up_case(
+        settings,
+        case_id,
+    )
+    paid = mock_payment(case_id, invoice, store, settings.workflow_db, claim)
+    assert paid.status is PaymentStatus.PAID
+    _append_follow_up_relation_after_authorization(
+        settings,
+        case_id,
+        child_id,
+        drop_immutability_trigger=True,
+    )
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        payment_row = connection.execute(
+            "SELECT * FROM payments WHERE payment_id = ?",
+            (paid.payment_id,),
+        ).fetchone()
+        assert payment_row is not None
+
+        with pytest.raises(InvoiceAgentsError) as excinfo:
+            payment_module._validate_paid_ledger_source(
+                connection,
+                payment_row,
+                settings,
+            )
+
+    assert excinfo.value.stop_reason == "PAYMENT_LEDGER_INCONSISTENT"
+
+
 def _finish_needs_human(
     store: WorkflowStore,
     case_id: str,

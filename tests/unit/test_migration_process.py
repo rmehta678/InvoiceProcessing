@@ -100,6 +100,10 @@ _EXPECTED_WORKER_DOMAIN_MESSAGES = {
         ErrorCategory.DATABASE,
         "inventory database must use DELETE journal mode",
     ),
+    "LEGACY_CRITIQUE_HISTORY_AMBIGUOUS": (
+        ErrorCategory.DATABASE,
+        "legacy critique history has no unique latest record",
+    ),
     "LEGACY_RECONCILIATION_ARCHIVE_INVALID": (
         ErrorCategory.DATABASE,
         "legacy reconciliation archive failed integrity verification",

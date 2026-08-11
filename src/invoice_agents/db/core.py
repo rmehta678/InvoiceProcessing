@@ -378,6 +378,91 @@ def _strict_case_result_json(value: object) -> int:
     return 1
 
 
+def _strict_critic_follow_up_payload(
+    event_type: object,
+    value: object,
+    execution_generation: object,
+) -> int:
+    """Validate direct critic evidence payloads without numeric or schema coercion."""
+
+    if (
+        type(event_type) is not str
+        or type(value) is not str
+        or type(execution_generation) is not int
+        or execution_generation < 1
+    ):
+        return 0
+
+    def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = item
+        return result
+
+    def reject_constant(_constant: str) -> object:
+        raise ValueError("non-finite JSON number")
+
+    try:
+        payload = json.loads(
+            value,
+            object_pairs_hook=strict_object,
+            parse_constant=reject_constant,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return 0
+    if type(payload) is not dict:
+        return 0
+    if event_type == "tool.critic_line_recompute":
+        if set(payload) != {
+            "execution_generation",
+            "quantity",
+            "unit_price",
+            "extended_total",
+        } or any(
+            type(payload[key]) is not str
+            for key in ("quantity", "unit_price", "extended_total")
+        ) or payload["execution_generation"] != execution_generation:
+            return 0
+        from invoice_agents.tools.comparison import recompute_line_extension
+
+        try:
+            return int(
+                recompute_line_extension(
+                    str(payload["quantity"]),
+                    str(payload["unit_price"]),
+                )
+                == {
+                    "quantity": payload["quantity"],
+                    "unit_price": payload["unit_price"],
+                    "extended_total": payload["extended_total"],
+                }
+            )
+        except ValueError:
+            return 0
+    if (
+        event_type != "tool.critic_inventory_recheck"
+        or set(payload) != {"execution_generation", "exact", "approved_alias"}
+        or payload["execution_generation"] != execution_generation
+    ):
+        return 0
+    from invoice_agents.models import InventoryLookupResult
+
+    try:
+        exact = InventoryLookupResult.model_validate_json(
+            json.dumps(payload["exact"], ensure_ascii=False, sort_keys=True),
+            strict=True,
+        )
+        approved_alias = InventoryLookupResult.model_validate_json(
+            json.dumps(payload["approved_alias"], ensure_ascii=False, sort_keys=True),
+            strict=True,
+        )
+    except ValueError:
+        return 0
+    return int(bool(exact.query.strip()) and exact.query == approved_alias.query)
+
+
 def _register_workflow_migration_functions(connection: sqlite3.Connection) -> None:
     """Install connection-local validators required by packaged workflow SQL."""
 
@@ -385,6 +470,12 @@ def _register_workflow_migration_functions(connection: sqlite3.Connection) -> No
         "strict_case_result_json",
         1,
         _strict_case_result_json,
+        deterministic=True,
+    )
+    connection.create_function(
+        "strict_critic_follow_up_payload",
+        3,
+        _strict_critic_follow_up_payload,
         deterministic=True,
     )
 
@@ -423,6 +514,12 @@ def connect_database(path: Path, *, read_only: bool = False) -> Iterator[sqlite3
                 "stored_unresolved_blocker_count",
                 2,
                 stored_unresolved_blocker_count,
+                deterministic=True,
+            )
+            connection.create_function(
+                "strict_critic_follow_up_payload",
+                3,
+                _strict_critic_follow_up_payload,
                 deterministic=True,
             )
             connection.execute("PRAGMA foreign_keys = ON")

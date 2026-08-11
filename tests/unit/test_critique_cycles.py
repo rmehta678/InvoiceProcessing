@@ -98,13 +98,19 @@ def _record_follow_up_evidence(
     case_id: str,
     requested_item: str,
 ) -> str:
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        generation = connection.execute(
+            "SELECT execution_generation FROM cases WHERE case_id = ?",
+            (case_id,),
+        ).fetchone()
+    assert generation is not None
     return AuditRecorder(settings.workflow_db, case_id).record(
         "tool.critic_line_recompute",
         {
-            "requested_item": requested_item,
+            "execution_generation": int(generation["execution_generation"]),
             "quantity": "2",
             "unit_price": "5.00",
-            "line_total": "10.00",
+            "extended_total": "10.00",
         },
         agent_name="independent_critic_agent",
     )
@@ -729,6 +735,361 @@ def test_cycle_two_rejects_an_unbound_or_preexisting_audit_event(
 
     assert excinfo.value.stop_reason == "CRITIQUE_FOLLOW_UP_EVIDENCE_INVALID"
     assert [item.cycle for item in store.list_critiques(claim.case_id)] == [1]
+
+
+@pytest.mark.parametrize(
+    "evidence_boundary",
+    ["fabricated-id", "stale-generation", "wrong-case", "wrong-kind"],
+)
+def test_cycle_two_rejects_specialist_events_without_exact_relational_provenance(
+    settings: Settings,
+    tmp_path: Path,
+    evidence_boundary: str,
+) -> None:
+    store, claim = _claimed_case(
+        settings,
+        tmp_path,
+        f"case_specialist_event_{evidence_boundary}",
+    )
+    requested_item = "re-evaluate persisted specialist evidence"
+    first_id = store.save_critique(
+        claim.case_id,
+        _critique(requested_follow_up=[requested_item]),
+        claim,
+    )
+    evidence_case_id = claim.case_id
+    if evidence_boundary == "wrong-case":
+        _other_store, other_claim = _claimed_case(
+            settings,
+            tmp_path,
+            "case_specialist_event_wrong_case_owner",
+        )
+        evidence_case_id = other_claim.case_id
+    evidence_id = f"ident_{evidence_boundary.replace('-', '_')}"
+    event_type = "tool.identity_candidates"
+    event_payload: object = []
+    if evidence_boundary != "fabricated-id":
+        with connect_database(settings.workflow_db) as connection:
+            if evidence_boundary == "wrong-kind":
+                evidence_id = "cmp_wrong_kind"
+                event_type = "tool.financial_risk_assessment"
+                event_payload = {}
+                connection.execute(
+                    "INSERT INTO comparison_results("
+                    "comparison_id, case_id, comparison_type, payload_json, created_at, "
+                    "execution_generation) VALUES (?, ?, 'inventory', '{}', ?, ?)",
+                    (
+                        evidence_id,
+                        evidence_case_id,
+                        datetime.now(UTC).isoformat(),
+                        claim.generation,
+                    ),
+                )
+            else:
+                connection.execute(
+                    "INSERT INTO identity_results("
+                    "identity_id, case_id, payload_json, created_at, "
+                    "execution_generation, evaluated_at) VALUES (?, ?, '[]', ?, ?, ?)",
+                    (
+                        evidence_id,
+                        evidence_case_id,
+                        datetime.now(UTC).isoformat(),
+                        0
+                        if evidence_boundary == "stale-generation"
+                        else claim.generation,
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+            connection.commit()
+    evidence_event_id = AuditRecorder(settings.workflow_db, claim.case_id).record(
+        event_type,
+        event_payload,
+        source_id=_source(tmp_path, claim.case_id).source_id,
+        agent_name=(
+            "financial_risk_agent"
+            if event_type == "tool.financial_risk_assessment"
+            else "identity_provenance_agent"
+        ),
+        db_evidence_id=evidence_id,
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.save_critique(
+            claim.case_id,
+            _critique(
+                cycle=2,
+                responds_to_critique_id=first_id,
+                supported_findings=[requested_item],
+                follow_up_responses=[
+                    _follow_up_response(
+                        requested_item,
+                        "SUPPORTED",
+                        evidence_event_id,
+                    )
+                ],
+            ),
+            claim,
+        )
+
+    assert excinfo.value.stop_reason == "CRITIQUE_FOLLOW_UP_EVIDENCE_INVALID"
+    assert [item.cycle for item in store.list_critiques(claim.case_id)] == [1]
+
+
+def test_cycle_two_accepts_exact_persisted_specialist_provenance(
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    store, claim = _claimed_case(settings, tmp_path, "case_exact_specialist_event")
+    requested_item = "re-evaluate the persisted identity candidates"
+    first_id = store.save_critique(
+        claim.case_id,
+        _critique(requested_follow_up=[requested_item]),
+        claim,
+    )
+    evidence_id = "ident_exact_follow_up"
+    with connect_database(settings.workflow_db) as connection:
+        created_at = datetime.now(UTC).isoformat()
+        connection.execute(
+            "INSERT INTO identity_results("
+            "identity_id, case_id, payload_json, created_at, "
+            "execution_generation, evaluated_at) VALUES (?, ?, '[]', ?, ?, ?)",
+            (evidence_id, claim.case_id, created_at, claim.generation, created_at),
+        )
+        connection.commit()
+    event_id = AuditRecorder(settings.workflow_db, claim.case_id).record(
+        "tool.identity_candidates",
+        [],
+        source_id=_source(tmp_path, claim.case_id).source_id,
+        agent_name="identity_provenance_agent",
+        db_evidence_id=evidence_id,
+    )
+
+    store.save_critique(
+        claim.case_id,
+        _critique(
+            cycle=2,
+            responds_to_critique_id=first_id,
+            supported_findings=[requested_item],
+            follow_up_responses=[
+                _follow_up_response(requested_item, "SUPPORTED", event_id)
+            ],
+        ),
+        claim,
+    )
+
+    assert [item.cycle for item in store.list_critiques(claim.case_id)] == [1, 2]
+
+
+@pytest.mark.parametrize(
+    "provenance_boundary",
+    ["wrong-agent", "wrong-generation", "invalid-payload", "unexpected-db-id"],
+)
+def test_cycle_two_rejects_fabricated_direct_critic_event_provenance(
+    settings: Settings,
+    tmp_path: Path,
+    provenance_boundary: str,
+) -> None:
+    store, claim = _claimed_case(
+        settings,
+        tmp_path,
+        f"case_direct_event_{provenance_boundary}",
+    )
+    requested_item = "recompute the exact line extension"
+    first_id = store.save_critique(
+        claim.case_id,
+        _critique(requested_follow_up=[requested_item]),
+        claim,
+    )
+    payload = {
+        "execution_generation": claim.generation,
+        "quantity": "2",
+        "unit_price": "5.00",
+        "extended_total": "10.00",
+    }
+    if provenance_boundary == "invalid-payload":
+        payload["extended_total"] = "11.00"
+    elif provenance_boundary == "wrong-generation":
+        payload["execution_generation"] = claim.generation + 1
+    evidence_event_id = AuditRecorder(settings.workflow_db, claim.case_id).record(
+        "tool.critic_line_recompute",
+        payload,
+        agent_name=(
+            "financial_risk_agent"
+            if provenance_boundary == "wrong-agent"
+            else "independent_critic_agent"
+        ),
+        db_evidence_id=(
+            "ident_fabricated"
+            if provenance_boundary == "unexpected-db-id"
+            else None
+        ),
+    )
+
+    with pytest.raises(InvoiceAgentsError) as excinfo:
+        store.save_critique(
+            claim.case_id,
+            _critique(
+                cycle=2,
+                responds_to_critique_id=first_id,
+                supported_findings=[requested_item],
+                follow_up_responses=[
+                    _follow_up_response(
+                        requested_item,
+                        "SUPPORTED",
+                        evidence_event_id,
+                    )
+                ],
+            ),
+            claim,
+        )
+
+    assert excinfo.value.stop_reason == "CRITIQUE_FOLLOW_UP_EVIDENCE_INVALID"
+    assert [item.cycle for item in store.list_critiques(claim.case_id)] == [1]
+
+
+@pytest.mark.parametrize("invalid_event", ["wrong-specialist-kind", "invalid-direct-payload"])
+def test_schema_rejects_follow_up_event_without_exact_type_specific_provenance(
+    settings: Settings,
+    tmp_path: Path,
+    invalid_event: str,
+) -> None:
+    store, claim = _claimed_case(
+        settings,
+        tmp_path,
+        f"case_sql_event_provenance_{invalid_event}",
+    )
+    requested_item = "recompute the exact line extension"
+    first_id = store.save_critique(
+        claim.case_id,
+        _critique(requested_follow_up=[requested_item]),
+        claim,
+    )
+    valid_event_id = _record_follow_up_evidence(
+        settings,
+        claim.case_id,
+        requested_item,
+    )
+    child_id = store.save_critique(
+        claim.case_id,
+        _critique(
+            cycle=2,
+            responds_to_critique_id=first_id,
+            supported_findings=[requested_item],
+            follow_up_responses=[
+                _follow_up_response(requested_item, "SUPPORTED", valid_event_id)
+            ],
+        ),
+        claim,
+    )
+    if invalid_event == "wrong-specialist-kind":
+        evidence_id = "cmp_sql_wrong_kind"
+        with connect_database(settings.workflow_db) as connection:
+            connection.execute(
+                "INSERT INTO comparison_results("
+                "comparison_id, case_id, comparison_type, payload_json, created_at, "
+                "execution_generation) VALUES (?, ?, 'inventory', '{}', ?, ?)",
+                (
+                    evidence_id,
+                    claim.case_id,
+                    datetime.now(UTC).isoformat(),
+                    claim.generation,
+                ),
+            )
+            connection.commit()
+        invalid_event_id = AuditRecorder(settings.workflow_db, claim.case_id).record(
+            "tool.financial_risk_assessment",
+            {},
+            source_id=_source(tmp_path, claim.case_id).source_id,
+            agent_name="financial_risk_agent",
+            db_evidence_id=evidence_id,
+        )
+    else:
+        invalid_event_id = AuditRecorder(settings.workflow_db, claim.case_id).record(
+            "tool.critic_line_recompute",
+            {
+                "execution_generation": claim.generation,
+                "quantity": "2",
+                "unit_price": "5.00",
+                "extended_total": "11.00",
+            },
+            agent_name="independent_critic_agent",
+        )
+
+    with (
+        connect_database(settings.workflow_db) as connection,
+        pytest.raises(
+            sqlite3.IntegrityError,
+            match="CRITIQUE_FOLLOW_UP_EVIDENCE_INVALID",
+        ),
+    ):
+        connection.execute(
+            "INSERT INTO critique_follow_up_evidence("
+            "critique_id, requested_item, outcome, evidence_event_id) "
+            "VALUES (?, 'unauthorized extra response', 'SUPPORTED', ?)",
+            (child_id, invalid_event_id),
+        )
+
+
+@pytest.mark.parametrize(
+    "transition_boundary",
+    ["clean-parent", "older-generation", "non-post-parent"],
+)
+def test_schema_rejects_cycle_two_that_bypasses_application_transition_fencing(
+    settings: Settings,
+    tmp_path: Path,
+    transition_boundary: str,
+) -> None:
+    store, claim = _claimed_case(
+        settings,
+        tmp_path,
+        f"case_sql_cycle_two_{transition_boundary}",
+    )
+    requested_item = "recompute amount"
+    first_id = store.save_critique(
+        claim.case_id,
+        _critique(
+            requested_follow_up=(
+                [] if transition_boundary == "clean-parent" else [requested_item]
+            )
+        ),
+        claim,
+    )
+    with connect_database(settings.workflow_db, read_only=True) as connection:
+        parent = connection.execute(
+            "SELECT created_at, execution_generation FROM critique_results "
+            "WHERE critique_id = ?",
+            (first_id,),
+        ).fetchone()
+    assert parent is not None
+    child = _critique(
+        cycle=2,
+        responds_to_critique_id=first_id,
+        supported_findings=[requested_item],
+    )
+    child_generation = int(parent["execution_generation"])
+    child_created_at = datetime.now(UTC).isoformat()
+    if transition_boundary == "older-generation":
+        child_generation -= 1
+    elif transition_boundary == "non-post-parent":
+        child_created_at = str(parent["created_at"])
+
+    with (
+        connect_database(settings.workflow_db) as connection,
+        pytest.raises(sqlite3.IntegrityError, match="CRITIQUE_RESPONSE_INVALID"),
+    ):
+        connection.execute(
+            "INSERT INTO critique_results("
+            "critique_id, case_id, payload_json, created_at, execution_generation, "
+            "cycle, responds_to_critique_id) VALUES (?, ?, ?, ?, ?, 2, ?)",
+            (
+                f"crit_sql_{transition_boundary}",
+                claim.case_id,
+                child.model_dump_json(),
+                child_created_at,
+                child_generation,
+                first_id,
+            ),
+        )
 
 
 @pytest.mark.parametrize(

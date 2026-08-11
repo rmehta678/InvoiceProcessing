@@ -23,6 +23,7 @@ from invoice_agents.db.store import (
     load_authoritative_review_authorization,
     load_authorization_evidence_snapshot,
     parse_canonical_utc,
+    reconcile_critique_follow_up_evidence,
     validate_execution_claim,
     validated_evidence_facts,
 )
@@ -80,6 +81,11 @@ def _load_authorization_snapshot(
 
     from invoice_agents.agents.decision_rules import validate_final_decision
 
+    try:
+        if reconcile_critique_follow_up_evidence(connection, case_id, generation) is None:
+            raise EvidenceSnapshotError("critique evidence is missing")
+    except EvidenceSnapshotError as exc:
+        raise _AuthorizationSnapshotError(str(exc)) from exc
     try:
         review_authorization = load_authoritative_review_authorization(
             connection,
@@ -188,8 +194,15 @@ def _validate_paid_ledger_source(
     case_id = payment.case_id
     generation = payment.decision_generation
     try:
+        if reconcile_critique_follow_up_evidence(connection, case_id, generation) is None:
+            raise EvidenceSnapshotError("critique evidence is missing")
         snapshot = _load_authorization_snapshot(connection, case_id, generation, settings)
-    except (InvoiceAgentsError, _AuthorizationSnapshotError, ValueError) as exc:
+    except (
+        EvidenceSnapshotError,
+        InvoiceAgentsError,
+        _AuthorizationSnapshotError,
+        ValueError,
+    ) as exc:
         raise InvoiceAgentsError(
             ErrorCategory.PAYMENT,
             f"paid ledger source snapshot is inconsistent for case {case_id}",

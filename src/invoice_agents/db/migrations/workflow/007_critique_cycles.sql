@@ -129,19 +129,39 @@ WHEN NEW.cycle = 2 AND NOT EXISTS (
     WHERE parent.critique_id = NEW.responds_to_critique_id
       AND parent.case_id = NEW.case_id
       AND parent.cycle = 1
+      AND typeof(NEW.execution_generation) = 'integer'
+      AND NEW.execution_generation >= parent.execution_generation
+      AND NEW.created_at > parent.created_at
+      AND CASE
+          WHEN json_valid(parent.payload_json) = 1 THEN
+              COALESCE(json_array_length(parent.payload_json, '$.challenged_findings'), 0)
+              + COALESCE(json_array_length(parent.payload_json, '$.missing_evidence'), 0)
+              + COALESCE(json_array_length(parent.payload_json, '$.requested_follow_up'), 0)
+          ELSE 0
+      END > 0
 )
 BEGIN
     SELECT RAISE(ABORT, 'CRITIQUE_RESPONSE_INVALID');
 END;
 
 CREATE TRIGGER trg_critique_results_cycle_parent_update
-BEFORE UPDATE OF case_id, cycle, responds_to_critique_id ON critique_results
+BEFORE UPDATE ON critique_results
 WHEN NEW.cycle = 2 AND NOT EXISTS (
     SELECT 1
     FROM critique_results AS parent
     WHERE parent.critique_id = NEW.responds_to_critique_id
       AND parent.case_id = NEW.case_id
       AND parent.cycle = 1
+      AND typeof(NEW.execution_generation) = 'integer'
+      AND NEW.execution_generation >= parent.execution_generation
+      AND NEW.created_at > parent.created_at
+      AND CASE
+          WHEN json_valid(parent.payload_json) = 1 THEN
+              COALESCE(json_array_length(parent.payload_json, '$.challenged_findings'), 0)
+              + COALESCE(json_array_length(parent.payload_json, '$.missing_evidence'), 0)
+              + COALESCE(json_array_length(parent.payload_json, '$.requested_follow_up'), 0)
+          ELSE 0
+      END > 0
 )
 BEGIN
     SELECT RAISE(ABORT, 'CRITIQUE_RESPONSE_INVALID');
@@ -163,23 +183,135 @@ WHEN NOT EXISTS (
     WHERE child.critique_id = NEW.critique_id
       AND child.cycle = 2
       AND (
-          evidence.event_type IN (
-              'tool.critic_inventory_recheck',
-              'tool.critic_line_recompute'
+          (
+              evidence.event_type = 'tool.critic_line_recompute'
+              AND evidence.agent_name = 'independent_critic_agent'
+              AND evidence.source_id IS NULL
+              AND evidence.tool_call_id IS NULL
+              AND evidence.db_evidence_id IS NULL
+              AND evidence.review_id IS NULL
+              AND evidence.payment_id IS NULL
+              AND evidence.provider_request_id IS NULL
+              AND strict_critic_follow_up_payload(
+                  evidence.event_type,
+                  evidence.payload_json,
+                  child.execution_generation
+              ) = 1
           )
           OR (
-              evidence.event_type IN (
-                  'tool.identity_candidates',
-                  'tool.inventory_comparison',
-                  'tool.mapping_evidence_recorded',
-                  'tool.financial_risk_assessment'
+              evidence.event_type = 'tool.critic_inventory_recheck'
+              AND evidence.agent_name = 'independent_critic_agent'
+              AND evidence.source_id IS NULL
+              AND evidence.tool_call_id IS NULL
+              AND evidence.db_evidence_id IS NULL
+              AND evidence.review_id IS NULL
+              AND evidence.payment_id IS NULL
+              AND evidence.provider_request_id IS NULL
+              AND strict_critic_follow_up_payload(
+                  evidence.event_type,
+                  evidence.payload_json,
+                  child.execution_generation
+              ) = 1
+          )
+          OR (
+              evidence.event_type = 'tool.identity_candidates'
+              AND evidence.agent_name = 'identity_provenance_agent'
+              AND evidence.source_id = (
+                  SELECT source_id FROM cases WHERE case_id = child.case_id
               )
-              AND evidence.db_evidence_id IS NOT NULL
+              AND evidence.tool_call_id IS NULL
+              AND evidence.review_id IS NULL
+              AND evidence.payment_id IS NULL
+              AND evidence.provider_request_id IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM identity_results identity_evidence
+                  WHERE identity_evidence.identity_id = evidence.db_evidence_id
+                    AND identity_evidence.case_id = child.case_id
+                    AND identity_evidence.execution_generation = child.execution_generation
+                    AND identity_evidence.created_at <= evidence.created_at
+              )
+          )
+          OR (
+              evidence.event_type = 'tool.inventory_comparison'
+              AND evidence.agent_name = 'inventory_comparison_agent'
+              AND evidence.source_id = (
+                  SELECT source_id FROM cases WHERE case_id = child.case_id
+              )
+              AND evidence.tool_call_id IS NULL
+              AND evidence.review_id IS NULL
+              AND evidence.payment_id IS NULL
+              AND evidence.provider_request_id IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM comparison_results inventory_evidence
+                  WHERE inventory_evidence.comparison_id = evidence.db_evidence_id
+                    AND inventory_evidence.case_id = child.case_id
+                    AND inventory_evidence.execution_generation = child.execution_generation
+                    AND inventory_evidence.comparison_type = 'inventory'
+                    AND inventory_evidence.created_at <= evidence.created_at
+              )
+          )
+          OR (
+              evidence.event_type = 'tool.mapping_evidence_recorded'
+              AND evidence.agent_name = 'inventory_comparison_agent'
+              AND evidence.source_id = (
+                  SELECT source_id FROM cases WHERE case_id = child.case_id
+              )
+              AND evidence.tool_call_id IS NULL
+              AND evidence.review_id IS NULL
+              AND evidence.payment_id IS NULL
+              AND evidence.provider_request_id IS NULL
+              AND json_valid(evidence.payload_json) = 1
+              AND json_extract(evidence.payload_json, '$.extraction_id') =
+                  evidence.db_evidence_id
+              AND EXISTS (
+                  SELECT 1 FROM extractions extraction_evidence
+                  WHERE extraction_evidence.extraction_id = evidence.db_evidence_id
+                    AND extraction_evidence.case_id = child.case_id
+                    AND extraction_evidence.execution_generation = child.execution_generation
+                    AND extraction_evidence.created_at <= evidence.created_at
+              )
+          )
+          OR (
+              evidence.event_type = 'tool.financial_risk_assessment'
+              AND evidence.agent_name = 'financial_risk_agent'
+              AND evidence.source_id = (
+                  SELECT source_id FROM cases WHERE case_id = child.case_id
+              )
+              AND evidence.tool_call_id IS NULL
+              AND evidence.review_id IS NULL
+              AND evidence.payment_id IS NULL
+              AND evidence.provider_request_id IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM comparison_results risk_evidence
+                  WHERE risk_evidence.comparison_id = evidence.db_evidence_id
+                    AND risk_evidence.case_id = child.case_id
+                    AND risk_evidence.execution_generation = child.execution_generation
+                    AND risk_evidence.comparison_type = 'risk'
+                    AND risk_evidence.created_at <= evidence.created_at
+              )
           )
       )
 )
 BEGIN
     SELECT RAISE(ABORT, 'CRITIQUE_FOLLOW_UP_EVIDENCE_INVALID');
+END;
+
+CREATE TRIGGER trg_critique_follow_up_evidence_immutable_after_authorization_insert
+BEFORE INSERT ON critique_follow_up_evidence
+WHEN EXISTS (
+    SELECT 1
+    FROM critique_results critique
+    JOIN final_decisions final ON final.case_id = critique.case_id
+    WHERE critique.critique_id = NEW.critique_id
+) OR EXISTS (
+    SELECT 1
+    FROM critique_results critique
+    JOIN payments payment ON payment.case_id = critique.case_id
+    WHERE critique.critique_id = NEW.critique_id
+      AND payment.status = 'PAID'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'AUTHORIZATION_EVIDENCE_IMMUTABLE');
 END;
 
 CREATE TRIGGER trg_critique_follow_up_evidence_immutable_update

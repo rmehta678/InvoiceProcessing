@@ -17,7 +17,7 @@ from uuid import uuid4
 from pydantic import BaseModel, TypeAdapter
 
 from invoice_agents.config import Settings
-from invoice_agents.db.core import connect_database
+from invoice_agents.db.core import _strict_critic_follow_up_payload, connect_database
 from invoice_agents.errors import ErrorCategory, InvoiceAgentsError
 from invoice_agents.evidence_snapshot import (
     EvidenceSnapshot,
@@ -37,11 +37,14 @@ from invoice_agents.models import (
     HumanDecision,
     HumanDecisionKind,
     IdentityCandidate,
+    InventoryComparison,
+    InventoryLookupResult,
     Money,
     PaymentResult,
     PaymentStatus,
     PersistedPaymentRow,
     ReviewRequest,
+    RiskAssessment,
     SourceArtifact,
 )
 from invoice_agents.observability.audit import sanitize_case_result, sanitize_text
@@ -460,6 +463,11 @@ def load_generation_evidence_snapshot(
 ) -> EvidenceSnapshot:
     """Load one generation's evidence plus the latest durable critique cycle."""
 
+    authoritative_critique = reconcile_critique_follow_up_evidence(
+        connection,
+        case_id,
+        generation,
+    )
     specifications = {
         "extraction": (
             "SELECT payload_json FROM extractions WHERE case_id = ? "
@@ -535,6 +543,18 @@ def load_generation_evidence_snapshot(
         )
     if identity_evaluated_at is None:
         raise EvidenceSnapshotError("identity evaluation boundary is missing")
+    if authoritative_critique is not None:
+        try:
+            selected_critique = Critique.model_validate_json(
+                payloads["critique"],
+                strict=True,
+            )
+        except ValueError as exc:
+            raise EvidenceSnapshotError("critique payload is invalid") from exc
+        if selected_critique != authoritative_critique:
+            raise EvidenceSnapshotError(
+                "critique follow-up evidence does not identify the authoritative cycle"
+            )
     try:
         stored_invoice = ExtractedInvoice.model_validate_json(payloads["extraction"])
     except ValueError as exc:
@@ -560,6 +580,29 @@ def load_generation_evidence_snapshot(
         inventory_connection=inventory_connection,
         inventory_schema=inventory_schema,
     )
+
+
+def reconcile_critique_follow_up_evidence(
+    connection: sqlite3.Connection,
+    case_id: str,
+    generation: int,
+) -> Critique | None:
+    """Reconcile critique payloads, relationships, events, and evidence source rows."""
+
+    if type(generation) is not int or generation < 1:
+        raise EvidenceSnapshotError("critique evidence generation is invalid")
+    try:
+        records = WorkflowStore._critique_records(connection, case_id)
+    except InvoiceAgentsError as exc:
+        raise EvidenceSnapshotError(
+            f"critique follow-up evidence is inconsistent: {exc.message}"
+        ) from exc
+    authoritative = [
+        critique
+        for _critique_id, critique, critique_generation in records
+        if critique_generation <= generation
+    ]
+    return authoritative[-1] if authoritative else None
 
 
 def encode(value: BaseModel | dict[str, Any] | list[Any]) -> str:
@@ -3707,6 +3750,7 @@ class WorkflowStore:
                                 connection,
                                 case_id,
                                 str(parent_row["created_at"]),
+                                claim.generation,
                                 event_id,
                             ):
                                 self._raise_critique_cycle_error(
@@ -3768,15 +3812,28 @@ class WorkflowStore:
         connection: sqlite3.Connection,
         case_id: str,
         parent_created_at: str,
+        child_generation: int,
         event_id: str,
     ) -> bool:
         row = connection.execute(
-            "SELECT case_id, event_type, db_evidence_id, created_at FROM events "
-            "WHERE event_id = ?",
-            (event_id,),
+            "SELECT evidence.event_id, evidence.case_id, evidence.source_id, "
+            "evidence.event_type, evidence.agent_name, evidence.tool_call_id, "
+            "evidence.db_evidence_id, evidence.review_id, evidence.payment_id, "
+            "evidence.provider_request_id, evidence.payload_json, evidence.created_at, "
+            "cases.source_id AS case_source_id FROM events evidence "
+            "JOIN cases ON cases.case_id = ? WHERE evidence.event_id = ?",
+            (case_id, event_id),
         ).fetchone()
         parent_timestamp = parse_canonical_utc(parent_created_at)
-        if row is None or parent_timestamp is None:
+        if (
+            row is None
+            or parent_timestamp is None
+            or type(child_generation) is not int
+            or child_generation < 1
+            or type(event_id) is not str
+            or not event_id.startswith("evt_")
+            or not event_id[4:]
+        ):
             return False
         event_timestamp = parse_canonical_utc(row["created_at"])
         event_type = row["event_type"]
@@ -3788,12 +3845,178 @@ class WorkflowStore:
         ):
             return False
         if event_type in _DIRECT_CRITIQUE_FOLLOW_UP_EVENT_TYPES:
-            return True
-        return (
-            event_type in _PERSISTED_SPECIALIST_FOLLOW_UP_EVENT_TYPES
-            and type(row["db_evidence_id"]) is str
-            and bool(str(row["db_evidence_id"]).strip())
+            return WorkflowStore._direct_critic_event_is_valid(row, child_generation)
+        if event_type not in _PERSISTED_SPECIALIST_FOLLOW_UP_EVENT_TYPES:
+            return False
+        return WorkflowStore._specialist_event_is_valid(
+            connection,
+            row,
+            case_id,
+            child_generation,
+            event_timestamp,
         )
+
+    @staticmethod
+    def _strict_event_payload(raw: object) -> object | None:
+        if type(raw) is not str:
+            return None
+        try:
+            return json.loads(
+                raw,
+                object_pairs_hook=_strict_json_object,
+                parse_constant=_reject_json_constant,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    @classmethod
+    def _direct_critic_event_is_valid(
+        cls,
+        row: sqlite3.Row,
+        child_generation: int,
+    ) -> bool:
+        if (
+            row["agent_name"] != "independent_critic_agent"
+            or row["source_id"] is not None
+            or row["tool_call_id"] is not None
+            or row["db_evidence_id"] is not None
+            or row["review_id"] is not None
+            or row["payment_id"] is not None
+            or row["provider_request_id"] is not None
+        ):
+            return False
+        return (
+            _strict_critic_follow_up_payload(
+                row["event_type"],
+                row["payload_json"],
+                child_generation,
+            )
+            == 1
+        )
+
+    @classmethod
+    def _specialist_event_is_valid(
+        cls,
+        connection: sqlite3.Connection,
+        event: sqlite3.Row,
+        case_id: str,
+        child_generation: int,
+        event_timestamp: datetime,
+    ) -> bool:
+        event_contracts = {
+            "tool.identity_candidates": (
+                "identity_results",
+                "identity_id",
+                None,
+                "identity_provenance_agent",
+            ),
+            "tool.inventory_comparison": (
+                "comparison_results",
+                "comparison_id",
+                "inventory",
+                "inventory_comparison_agent",
+            ),
+            "tool.mapping_evidence_recorded": (
+                "extractions",
+                "extraction_id",
+                None,
+                "inventory_comparison_agent",
+            ),
+            "tool.financial_risk_assessment": (
+                "comparison_results",
+                "comparison_id",
+                "risk",
+                "financial_risk_agent",
+            ),
+        }
+        event_type = str(event["event_type"])
+        table, id_column, comparison_type, agent_name = event_contracts[event_type]
+        evidence_id = event["db_evidence_id"]
+        if (
+            type(evidence_id) is not str
+            or not evidence_id.strip()
+            or event["agent_name"] != agent_name
+            or event["source_id"] != event["case_source_id"]
+            or event["tool_call_id"] is not None
+            or event["review_id"] is not None
+            or event["payment_id"] is not None
+            or event["provider_request_id"] is not None
+        ):
+            return False
+        predicate = " AND comparison_type = ?" if comparison_type is not None else ""
+        params: tuple[object, ...] = (
+            (evidence_id, case_id, child_generation, comparison_type)
+            if comparison_type is not None
+            else (evidence_id, case_id, child_generation)
+        )
+        evidence = connection.execute(
+            f"SELECT payload_json, created_at FROM {table} WHERE {id_column} = ? "
+            f"AND case_id = ? AND execution_generation = ?{predicate}",
+            params,
+        ).fetchone()
+        if evidence is None:
+            return False
+        evidence_timestamp = parse_canonical_utc(evidence["created_at"])
+        if evidence_timestamp is None or evidence_timestamp > event_timestamp:
+            return False
+        event_payload = cls._strict_event_payload(event["payload_json"])
+        stored_payload = cls._strict_event_payload(evidence["payload_json"])
+        if event_type != "tool.mapping_evidence_recorded":
+            if event_payload is None or event_payload != stored_payload:
+                return False
+            try:
+                if event_type == "tool.identity_candidates":
+                    TypeAdapter(list[IdentityCandidate]).validate_json(
+                        str(evidence["payload_json"]),
+                        strict=True,
+                    )
+                elif event_type == "tool.inventory_comparison":
+                    if type(stored_payload) is not dict or set(stored_payload) != {
+                        "comparisons",
+                        "unresolved_candidates",
+                    }:
+                        return False
+                    TypeAdapter(list[InventoryComparison]).validate_json(
+                        json.dumps(stored_payload["comparisons"], ensure_ascii=False),
+                        strict=True,
+                    )
+                    unresolved = stored_payload["unresolved_candidates"]
+                    if type(unresolved) is not dict:
+                        return False
+                    for result in unresolved.values():
+                        InventoryLookupResult.model_validate_json(
+                            json.dumps(result, ensure_ascii=False, sort_keys=True),
+                            strict=True,
+                        )
+                else:
+                    RiskAssessment.model_validate_json(
+                        str(evidence["payload_json"]),
+                        strict=True,
+                    )
+            except ValueError:
+                return False
+            return True
+        if type(event_payload) is not dict or set(event_payload) != {"extraction_id", "lines"}:
+            return False
+        try:
+            invoice = ExtractedInvoice.model_validate_json(
+                str(evidence["payload_json"]),
+                strict=True,
+            )
+        except ValueError:
+            return False
+        expected_lines = [
+            {
+                "line_id": line.line_id,
+                "canonical_sku": line.canonical_sku,
+                "candidate_skus": line.candidate_skus,
+            }
+            for line in invoice.lines
+        ]
+        return event_payload == {
+            "extraction_id": evidence_id,
+            "lines": expected_lines,
+        }
 
     @classmethod
     def _follow_up_rows_match_payload(
@@ -3801,6 +4024,7 @@ class WorkflowStore:
         connection: sqlite3.Connection,
         case_id: str,
         parent_created_at: str,
+        child_generation: int,
         critique_id: str,
         responses: list[CritiqueFollowUpResponse],
     ) -> bool:
@@ -3823,6 +4047,7 @@ class WorkflowStore:
                 connection,
                 case_id,
                 parent_created_at,
+                child_generation,
                 str(row["evidence_event_id"]),
             )
             for row in rows
@@ -3887,13 +4112,22 @@ class WorkflowStore:
                     and datetime.fromisoformat(created_at_by_id[second_id])
                     > datetime.fromisoformat(created_at_by_id[first_id])
                 )
-                relationship_is_valid = relationship_is_valid and cls._follow_up_rows_match_payload(
+                follow_up_is_valid = cls._follow_up_rows_match_payload(
                     connection,
                     case_id,
                     created_at_by_id[first_id],
+                    second_generation,
                     second_id,
                     second.follow_up_responses,
                 )
+                if relationship_is_valid and not follow_up_is_valid:
+                    raise InvoiceAgentsError(
+                        ErrorCategory.DATABASE,
+                        "persisted critique follow-up evidence does not match its payload",
+                        case_id=case_id,
+                        stop_reason="PERSISTED_RESULT_INVALID",
+                    )
+                relationship_is_valid = relationship_is_valid and follow_up_is_valid
             if len(records) > 2 or not relationship_is_valid:
                 raise InvoiceAgentsError(
                     ErrorCategory.DATABASE,
@@ -3942,6 +4176,7 @@ class WorkflowStore:
                     connection,
                     claim.case_id,
                     str(parent["created_at"]),
+                    claim.generation,
                     str(row["event_id"]),
                 )
             ]

@@ -301,7 +301,7 @@ def build_team(
         }
         evidence_event_id = context.audit.record(
             "tool.critic_inventory_recheck",
-            payload,
+            {"execution_generation": context.claim.generation, **payload},
             agent_name="independent_critic_agent",
         )
         return {"evidence_event_id": evidence_event_id, **payload}
@@ -312,7 +312,7 @@ def build_team(
         payload: dict[str, Any] = dict(recompute_line_extension(quantity, unit_price))
         evidence_event_id = context.audit.record(
             "tool.critic_line_recompute",
-            payload,
+            {"execution_generation": context.claim.generation, **payload},
             agent_name="independent_critic_agent",
         )
         return {"evidence_event_id": evidence_event_id, **payload}
