@@ -1,0 +1,28 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Generated at runtime -- rebuild with `python scripts/init_db.py`
+data/inventory.db
+
+# Per-run artifacts: trace, result JSON, HTML report
+runs/
+
+# Reports written by `--report out/...` and the browser UI
+out/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+.claude
+.env

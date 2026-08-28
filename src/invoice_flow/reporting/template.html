@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ invoice_number }} - {{ decision }}</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --border: #e2e5ea;
+    --text: #16181d;
+    --muted: #676e7b;
+    --accent: #2f6fed;
+    --ok: #17794a;
+    --ok-bg: #e6f4ec;
+    --warn: #8a5a00;
+    --warn-bg: #fdf3e0;
+    --bad: #b3261e;
+    --bad-bg: #fceceb;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --surface: #1c1f25;
+      --border: #2d323b;
+      --text: #e8eaed;
+      --muted: #9aa2b1;
+      --accent: #7aa2f7;
+      --ok: #6cc496;
+      --ok-bg: #17301f;
+      --warn: #e0b25c;
+      --warn-bg: #33280f;
+      --bad: #f28b82;
+      --bad-bg: #341c1a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1.25rem 4rem;
+    background: var(--bg); color: var(--text);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 60rem; margin: 0 auto; }
+  header.masthead { margin-bottom: 1.5rem; }
+  header.masthead .eyebrow {
+    font-size: .75rem; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: .35rem;
+  }
+  header.masthead h1 { margin: 0; font-size: 1.6rem; letter-spacing: -.01em; }
+  header.masthead .sub { color: var(--muted); font-size: .9rem; margin-top: .3rem; }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 1.25rem 1.5rem; margin-bottom: 1.25rem;
+  }
+  .card > h2 {
+    margin: 0 0 .9rem; font-size: .78rem; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--muted); font-weight: 600;
+  }
+
+  .verdict { border-left: 4px solid var(--muted); }
+  .verdict.approved  { border-left-color: var(--ok);  background: var(--ok-bg); }
+  .verdict.rejected  { border-left-color: var(--bad); background: var(--bad-bg); }
+  .verdict.escalated { border-left-color: var(--warn); background: var(--warn-bg); }
+  .verdict .label { font-size: 1.35rem; font-weight: 700; letter-spacing: -.01em; }
+  .verdict.approved .label  { color: var(--ok); }
+  .verdict.rejected .label  { color: var(--bad); }
+  .verdict.escalated .label { color: var(--warn); }
+  .verdict .rationale { margin-top: .6rem; }
+  .verdict .scrutiny {
+    display: inline-block; margin-top: .8rem; padding: .15rem .55rem;
+    border: 1px solid currentColor; border-radius: 999px;
+    font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; opacity: .8;
+  }
+
+  dl.facts { display: grid; grid-template-columns: minmax(7rem, auto) 1fr; gap: .4rem 1.5rem; margin: 0; }
+  dl.facts dt { color: var(--muted); font-size: .88rem; }
+  dl.facts dd { margin: 0; }
+  .missing { color: var(--bad); font-style: italic; }
+
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { text-align: left; padding: .45rem .7rem; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); }
+  tr:last-child td { border-bottom: none; }
+
+  .pill { display: inline-block; padding: .1rem .5rem; border-radius: 999px; font-size: .75rem; font-weight: 600; }
+  .pill.ok   { background: var(--ok-bg);   color: var(--ok); }
+  .pill.warn { background: var(--warn-bg); color: var(--warn); }
+  .pill.bad  { background: var(--bad-bg);  color: var(--bad); }
+
+  ul.findings { list-style: none; margin: 0; padding: 0; }
+  ul.findings li { padding: .55rem 0 .55rem .95rem; border-left: 3px solid var(--border); margin-bottom: .5rem; }
+  ul.findings li.critical { border-left-color: var(--bad); }
+  ul.findings li.warning  { border-left-color: var(--warn); }
+  ul.findings li.info     { border-left-color: var(--border); }
+  ul.findings code {
+    font-family: var(--mono); font-size: .72rem; color: var(--muted);
+    display: block; margin-bottom: .15rem;
+  }
+
+  .round { border: 1px solid var(--border); border-radius: 8px; padding: .8rem 1rem; margin-bottom: .75rem; }
+  .round .head { font-weight: 600; margin-bottom: .35rem; }
+  .round .agree  { color: var(--ok); font-size: .88rem; }
+  .round .object { color: var(--warn); font-size: .88rem; }
+  .round ul { margin: .3rem 0 0; padding-left: 1.1rem; font-size: .9rem; }
+  .round .revised { color: var(--accent); font-size: .85rem; margin-top: .4rem; }
+  .round .override {
+    background: var(--warn-bg); color: var(--warn); border-radius: 6px;
+    padding: .45rem .7rem; margin: .4rem 0; font-size: .85rem;
+  }
+
+  pre.source {
+    font-family: var(--mono); font-size: .78rem; line-height: 1.5;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: .9rem; overflow-x: auto; margin: 0; white-space: pre;
+  }
+  details > summary { cursor: pointer; color: var(--muted); font-size: .88rem; }
+  details[open] > summary { margin-bottom: .7rem; }
+
+  .notes { margin: 0; padding-left: 1.1rem; color: var(--muted); font-size: .88rem; }
+  footer { color: var(--muted); font-size: .8rem; text-align: center; margin-top: 2rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="eyebrow">Acme Corp &middot; Accounts Payable &middot; Automated Review</div>
+    <h1>{{ invoice_number }} &mdash; {{ vendor }}</h1>
+    <div class="sub">{{ source_name }} &middot; run {{ run_id }} &middot; {{ generated_at }}</div>
+  </header>
+
+  <section class="card verdict {{ decision_class }}">
+    <div class="label">{{ decision_label }}</div>
+    <div class="rationale">{{ rationale }}</div>
+    {% if key_factors %}
+    <ul class="notes" style="margin-top:.7rem">
+      {% for factor in key_factors %}<li>{{ factor }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+    {% if conditions %}
+    <div style="margin-top:.7rem"><strong>Conditions:</strong></div>
+    <ul class="notes">{% for c in conditions %}<li>{{ c }}</li>{% endfor %}</ul>
+    {% endif %}
+    <div class="scrutiny">{{ scrutiny }} scrutiny</div>
+  </section>
+
+  <section class="card">
+    <h2>Extracted invoice</h2>
+    <dl class="facts">
+      <dt>Invoice number</dt><dd>{{ invoice_number_html }}</dd>
+      <dt>Vendor</dt><dd>{{ vendor_html }}</dd>
+      <dt>Total</dt><dd>{{ total }}</dd>
+      <dt>Invoice date</dt><dd>{{ invoice_date }}</dd>
+      <dt>Due date</dt><dd>{{ due_date }}</dd>
+      <dt>Payment terms</dt><dd>{{ terms }}</dd>
+      <dt>Extraction confidence</dt><dd>{{ confidence }}</dd>
+    </dl>
+  </section>
+
+  {% if line_items %}
+  <section class="card">
+    <h2>Line items as billed</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr>
+          <th>Item</th><th class="num">Qty</th><th class="num">Unit price</th>
+          <th class="num">Amount</th><th>Note</th>
+        </tr></thead>
+        <tbody>
+        {% for item in line_items %}
+          <tr>
+            <td>{{ item.name }}</td>
+            <td class="num">{{ item.quantity }}</td>
+            <td class="num">{{ item.unit_price }}</td>
+            <td class="num">{{ item.amount }}</td>
+            <td>{{ item.note }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% endif %}
+
+  {% if item_checks %}
+  <section class="card">
+    <h2>Inventory reconciliation</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr>
+          <th>Item as written</th><th>Catalogue match</th>
+          <th class="num">Billed</th><th class="num">In stock</th><th>Status</th>
+        </tr></thead>
+        <tbody>
+        {% for check in item_checks %}
+          <tr>
+            <td>{{ check.invoice_name }}</td>
+            <td>{{ check.matched }}</td>
+            <td class="num">{{ check.billed }}</td>
+            <td class="num">{{ check.stock }}</td>
+            <td><span class="pill {{ check.pill }}">{{ check.status }}</span></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if aggregation_note %}<p class="notes" style="margin-top:.8rem">{{ aggregation_note }}</p>{% endif %}
+  </section>
+  {% endif %}
+
+  <section class="card">
+    <h2>Findings ({{ critical_count }} critical, {{ warning_count }} warning)</h2>
+    {% if findings %}
+    <ul class="findings">
+      {% for finding in findings %}
+      <li class="{{ finding.severity }}">
+        <code>{{ finding.code }}</code>{{ finding.message }}
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="notes">Nothing flagged. The invoice reconciles internally and every billed item
+    exists in inventory with sufficient stock.</p>
+    {% endif %}
+  </section>
+
+  {% if agent_summary %}
+  <section class="card">
+    <h2>Validation agent</h2>
+    <p style="margin:0">{{ agent_summary }}</p>
+  </section>
+  {% endif %}
+
+  <section class="card">
+    <h2>Approval reasoning</h2>
+    {% for round in rounds %}
+    <div class="round">
+      <div class="head">Round {{ round.index }} &mdash; VP proposed {{ round.decision }}</div>
+      {% if round.overridden_from %}
+      <div class="override">
+        Policy override: the model proposed <strong>{{ round.overridden_from }}</strong>,
+        which is not permitted for this invoice. The rule engine enforced
+        <strong>{{ round.decision }}</strong>.
+      </div>
+      {% endif %}
+      <div style="font-size:.9rem">{{ round.rationale }}</div>
+      {% if round.critique_available %}
+        {% if round.agrees %}
+          <div class="agree" style="margin-top:.5rem">Internal audit concurred.</div>
+        {% else %}
+          <div class="object" style="margin-top:.5rem">Internal audit objected:</div>
+          <ul>{% for objection in round.objections %}<li>{{ objection }}</li>{% endfor %}</ul>
+          {% if round.suggested %}<div class="notes" style="margin-top:.3rem">Audit suggested {{ round.suggested }}.</div>{% endif %}
+        {% endif %}
+      {% else %}
+        <div class="notes" style="margin-top:.5rem">Audit review unavailable for this round.</div>
+      {% endif %}
+      {% if round.revised %}<div class="revised">VP revised the decision after this challenge.</div>{% endif %}
+    </div>
+    {% endfor %}
+
+    {% if policy_reasons %}
+    <div style="margin-top:1rem">
+      <div style="font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600;margin-bottom:.4rem">Policy engine</div>
+      <ul class="notes">{% for reason in policy_reasons %}<li>{{ reason }}</li>{% endfor %}</ul>
+    </div>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>Payment</h2>
+    <p style="margin:0 0 .5rem">
+      <span class="pill {{ payment_pill }}">{{ payment_status }}</span>
+    </p>
+    <p style="margin:0">{{ payment_message }}</p>
+    {% if payment_reference %}
+    <p class="notes" style="margin-top:.5rem;padding:0">Reference {{ payment_reference }}</p>
+    {% endif %}
+  </section>
+
+  {% if extraction_attempts > 1 %}
+  <section class="card">
+    <h2>Extraction repair loop</h2>
+    <p class="notes" style="padding:0">
+      {{ extraction_attempts }} passes were needed. Each pass was reconciled against the
+      document's own arithmetic and re-read where the numbers did not agree.
+    </p>
+    <div class="scroll" style="margin-top:.7rem">
+      <table>
+        <thead><tr><th class="num">Pass</th><th class="num">Issues</th><th>Detail</th></tr></thead>
+        <tbody>
+        {% for attempt in attempts %}
+          <tr>
+            <td class="num">{{ attempt.round }}</td>
+            <td class="num">{{ attempt.issue_count }}</td>
+            <td>{{ attempt.issues }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% endif %}
+
+  <section class="card">
+    <h2>Source document</h2>
+    <details>
+      <summary>Show the raw {{ source_format }} as the agent received it</summary>
+      <pre class="source">{{ source_text }}</pre>
+    </details>
+  </section>
+
+  <footer>
+    {{ stats }}
+  </footer>
+
+</div>
+</body>
+</html>
