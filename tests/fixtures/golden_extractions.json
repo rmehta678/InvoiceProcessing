@@ -1,0 +1,624 @@
+{
+  "_comment": "Expected extraction for each sample invoice, transcribed by hand from the source documents. Two uses: the scripted client replays these so the pipeline can be tested deterministically without an API key, and a live run can be diffed against them to measure real extraction accuracy. Figures are copied VERBATIM from the documents, including the ones that do not add up.",
+  "invoice_1001.txt": {
+    "invoice_number": "INV-1001",
+    "vendor_name": "Widgets Inc.",
+    "invoice_date_raw": "2026-01-15",
+    "due_date_raw": "2026-02-01",
+    "line_items": [
+      {
+        "name": "WidgetA",
+        "quantity": 10,
+        "unit_price": 250.0
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 5,
+        "unit_price": 500.0
+      }
+    ],
+    "subtotal": 5000.0,
+    "tax_rate": 0.0,
+    "tax_amount": 0.0,
+    "total": 5000.0,
+    "currency": "USD",
+    "payment_terms": "Net 15"
+  },
+  "invoice_1002.txt": {
+    "invoice_number": "1002",
+    "vendor_name": "Gadgets Co.",
+    "invoice_date_raw": "Jan 30 2026",
+    "due_date_raw": "2026-01-30",
+    "line_items": [
+      {
+        "name": "GadgetX",
+        "quantity": 20,
+        "unit_price": 750.0
+      }
+    ],
+    "subtotal": 15000.0,
+    "total": 15000.0,
+    "currency": "USD",
+    "payment_terms": "Net 30"
+  },
+  "invoice_1003.txt": {
+    "invoice_number": "INV-1003",
+    "vendor_name": "Fraudster LLC",
+    "invoice_date_raw": "2026-01-20",
+    "due_date_raw": "yesterday",
+    "line_items": [
+      {
+        "name": "FakeItem",
+        "quantity": 100,
+        "unit_price": 1000.0
+      }
+    ],
+    "total": 100000.0,
+    "currency": "USD",
+    "payment_terms": "Immediate",
+    "notes": "URGENT - Pay immediately to avoid penalties!!! Wire transfer preferred."
+  },
+  "invoice_1004.json": {
+    "invoice_number": "INV-1004",
+    "vendor_name": "Precision Parts Ltd.",
+    "vendor_address": "742 Evergreen Terrace, Springfield, IL 62704",
+    "invoice_date_raw": "2026-01-22",
+    "due_date_raw": "2026-02-22",
+    "line_items": [
+      {
+        "name": "WidgetA",
+        "quantity": 3,
+        "unit_price": 250.0
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 2,
+        "unit_price": 500.0
+      }
+    ],
+    "subtotal": 1750.0,
+    "tax_rate": 0.08,
+    "tax_amount": 140.0,
+    "total": 1890.0,
+    "currency": "USD",
+    "payment_terms": "Net 30"
+  },
+  "invoice_1004_revised.json": {
+    "invoice_number": "INV-1004",
+    "revision": "R1",
+    "vendor_name": "Precision Parts Ltd.",
+    "vendor_address": "742 Evergreen Terrace, Springfield, IL 62704",
+    "invoice_date_raw": "2026-01-22",
+    "due_date_raw": "2026-02-22",
+    "line_items": [
+      {
+        "name": "WidgetA",
+        "quantity": 3,
+        "unit_price": 250.0
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 2,
+        "unit_price": 500.0
+      },
+      {
+        "name": "GadgetX",
+        "quantity": 5,
+        "unit_price": 750.0
+      }
+    ],
+    "subtotal": 5500.0,
+    "tax_rate": 0.08,
+    "tax_amount": 440.0,
+    "total": 5940.0,
+    "currency": "USD",
+    "payment_terms": "Net 30",
+    "notes": "Revised invoice - additional items added per PO amendment"
+  },
+  "invoice_1005.json": {
+    "invoice_number": "INV-1005",
+    "vendor_name": "Global Supply Chain Partners",
+    "vendor_address": "1600 Pennsylvania Ave, Washington, DC 20500",
+    "invoice_date_raw": "2026-01-18",
+    "due_date_raw": "2026-03-18",
+    "line_items": [
+      {
+        "name": "WidgetA",
+        "quantity": 14,
+        "unit_price": 250.0
+      },
+      {
+        "name": "GadgetX",
+        "quantity": 8,
+        "unit_price": 750.0
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 10,
+        "unit_price": 500.0
+      }
+    ],
+    "subtotal": 14500.0,
+    "tax_rate": 0.05,
+    "tax_amount": 725.0,
+    "total": 15225.0,
+    "currency": "USD",
+    "payment_terms": "Net 60"
+  },
+  "invoice_1006.csv": {
+    "invoice_number": "INV-1006",
+    "vendor_name": "Acme Industrial Supplies",
+    "invoice_date_raw": "2026-01-25",
+    "due_date_raw": "2026-02-10",
+    "line_items": [
+      {
+        "name": "WidgetA",
+        "quantity": 5,
+        "unit_price": 250.0
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 3,
+        "unit_price": 500.0
+      }
+    ],
+    "subtotal": 2750.0,
+    "tax_amount": 0.0,
+    "total": 2750.0,
+    "currency": "USD",
+    "payment_terms": "Net 15"
+  },
+  "invoice_1007.csv": {
+    "invoice_number": "INV-1007",
+    "vendor_name": "MegaWidgets Corp",
+    "invoice_date_raw": "01/28/2026",
+    "due_date_raw": "02/28/2026",
+    "line_items": [
+      {
+        "name": "WidgetA",
+        "quantity": 20,
+        "unit_price": 250.0,
+        "amount": 5000.0
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 15,
+        "unit_price": 500.0,
+        "amount": 7500.0
+      },
+      {
+        "name": "GadgetX",
+        "quantity": 3,
+        "unit_price": 750.0,
+        "amount": 2250.0
+      }
+    ],
+    "subtotal": 14750.0,
+    "tax_rate": 0.06,
+    "tax_amount": 885.0,
+    "total": 15525.0,
+    "currency": "USD"
+  },
+  "invoice_1008.txt": {
+    "invoice_number": "INV-1008",
+    "vendor_name": "NoProd Industries",
+    "invoice_date_raw": "2026-01-10",
+    "due_date_raw": "2026-01-20",
+    "line_items": [
+      {
+        "name": "SuperGizmo",
+        "quantity": 12,
+        "unit_price": 400.0
+      },
+      {
+        "name": "MegaSprocket",
+        "quantity": 6,
+        "unit_price": 850.0
+      }
+    ],
+    "total": 9900.0,
+    "currency": "USD"
+  },
+  "invoice_1009.json": {
+    "invoice_number": "INV-1009",
+    "vendor_name": "",
+    "vendor_address": null,
+    "invoice_date_raw": "2026-01-15",
+    "due_date_raw": null,
+    "line_items": [
+      {
+        "name": "WidgetA",
+        "quantity": -5,
+        "unit_price": 250.0
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 2,
+        "unit_price": 500.0
+      }
+    ],
+    "subtotal": 1000.0,
+    "tax_rate": 0.0,
+    "tax_amount": 0.0,
+    "total": -250.0,
+    "currency": "USD",
+    "payment_terms": ""
+  },
+  "invoice_1010.txt": {
+    "invoice_number": "INV-1010",
+    "vendor_name": "Consolidated Materials Group",
+    "invoice_date_raw": "January 27, 2026",
+    "due_date_raw": "February 26, 2026",
+    "line_items": [
+      {
+        "name": "WidgetA",
+        "quantity": 8,
+        "unit_price": 250.0,
+        "amount": 2000.0
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 4,
+        "unit_price": 500.0,
+        "amount": 2000.0
+      },
+      {
+        "name": "GadgetX",
+        "quantity": 2,
+        "unit_price": 750.0,
+        "amount": 1500.0
+      },
+      {
+        "name": "WidgetA",
+        "quantity": 4,
+        "unit_price": 300.0,
+        "amount": 1200.0,
+        "note": "rush order"
+      }
+    ],
+    "subtotal": 6700.0,
+    "tax_amount": 335.0,
+    "shipping": 150.0,
+    "total": 7185.0,
+    "currency": "USD",
+    "payment_terms": "Net 30"
+  },
+  "invoice_1011.txt": {
+    "invoice_number": "INV-1011",
+    "vendor_name": "Summit Manufacturing Co.",
+    "invoice_date_raw": "2026-01-20",
+    "due_date_raw": "2026-02-20",
+    "line_items": [
+      {
+        "name": "WidgetA",
+        "quantity": 6,
+        "unit_price": 250.0,
+        "amount": 1500.0
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 3,
+        "unit_price": 500.0,
+        "amount": 1500.0
+      }
+    ],
+    "subtotal": 3000.0,
+    "tax_rate": 0.0,
+    "tax_amount": 0.0,
+    "total": 3000.0,
+    "currency": "USD",
+    "payment_terms": "Net 30"
+  },
+  "invoice_1011.pdf": {
+    "invoice_number": "INV-1011",
+    "vendor_name": "Summit Manufacturing Co.",
+    "invoice_date_raw": "2026-01-20",
+    "due_date_raw": "2026-02-20",
+    "line_items": [
+      {
+        "name": "WidgetA",
+        "quantity": 6,
+        "unit_price": 250.0,
+        "amount": 1500.0
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 3,
+        "unit_price": 500.0,
+        "amount": 1500.0
+      }
+    ],
+    "subtotal": 3000.0,
+    "total": 3000.0,
+    "currency": "USD"
+  },
+  "invoice_1012.txt": {
+    "invoice_number": "INV 1012",
+    "vendor_name": "QuickShip Distributers",
+    "invoice_date_raw": "26-Jan-2O26",
+    "due_date_raw": "25-Feb-2026",
+    "line_items": [
+      {
+        "name": "Widget A",
+        "quantity": 12,
+        "unit_price": 250.0,
+        "amount": 3000.0
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 7,
+        "unit_price": 500.0,
+        "amount": 3500.0
+      },
+      {
+        "name": "Gadget X",
+        "quantity": 4,
+        "unit_price": 750.0,
+        "amount": 3000.0
+      }
+    ],
+    "subtotal": 9500.0,
+    "tax_rate": 0.05,
+    "tax_amount": 475.0,
+    "total": 9975.0,
+    "currency": "USD",
+    "payment_terms": "Net 30",
+    "notes": "Ref PO-20260115. Deliver to warehouse dock B. Contact Jim at ext 4421 with questions."
+  },
+  "invoice_1012.pdf": {
+    "invoice_number": "INV 1012",
+    "vendor_name": "QuickShip Distributers",
+    "invoice_date_raw": "26-Jan-2O26",
+    "due_date_raw": "25-Feb-2026",
+    "line_items": [
+      {
+        "name": "Widget A",
+        "quantity": 12,
+        "unit_price": 250.0,
+        "amount": 3000.0
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 7,
+        "unit_price": 500.0,
+        "amount": 3500.0
+      },
+      {
+        "name": "Gadget X",
+        "quantity": 4,
+        "unit_price": 750.0,
+        "amount": 3000.0
+      }
+    ],
+    "subtotal": 9500.0,
+    "tax_rate": 0.05,
+    "tax_amount": 475.0,
+    "total": 9975.0,
+    "currency": "USD",
+    "payment_terms": "Net 30",
+    "notes": "Ref PO-20260115. Deliver to warehouse dock B. Contact Jim at ext 4421 with questions."
+  },
+  "invoice_1013.json": {
+    "invoice_number": "INV-1013",
+    "vendor_name": "Atlas Industrial Supply",
+    "vendor_address": "500 Commerce Blvd, Detroit, MI 48201",
+    "invoice_date_raw": "2026-01-24",
+    "due_date_raw": "2026-03-24",
+    "line_items": [
+      {
+        "name": "WidgetA",
+        "quantity": 15,
+        "unit_price": 250.0,
+        "amount": 3750.0
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 10,
+        "unit_price": 500.0,
+        "amount": 5000.0
+      },
+      {
+        "name": "GadgetX",
+        "quantity": 5,
+        "unit_price": 750.0,
+        "amount": 3750.0
+      },
+      {
+        "name": "WidgetA",
+        "quantity": 5,
+        "unit_price": 240.0,
+        "amount": 1200.0,
+        "note": "Volume discount"
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 8,
+        "unit_price": 480.0,
+        "amount": 3840.0,
+        "note": "Volume discount"
+      },
+      {
+        "name": "GadgetX",
+        "quantity": 3,
+        "unit_price": 750.0,
+        "amount": 2250.0,
+        "note": "Expedited"
+      },
+      {
+        "name": "WidgetA",
+        "quantity": 2,
+        "unit_price": 250.0,
+        "amount": 500.0,
+        "note": "Replacement"
+      },
+      {
+        "name": "GadgetX",
+        "quantity": 1,
+        "unit_price": 750.0,
+        "amount": 750.0,
+        "note": "Sample"
+      }
+    ],
+    "subtotal": 21040.0,
+    "tax_rate": 0.07,
+    "tax_amount": 1472.8,
+    "total": 22562.8,
+    "currency": "USD",
+    "payment_terms": "Net 60"
+  },
+  "invoice_1013.pdf": {
+    "invoice_number": "INV-1013",
+    "vendor_name": "Atlas Industrial Supply",
+    "invoice_date_raw": "2026-01-24",
+    "due_date_raw": "2026-03-24",
+    "line_items": [
+      {
+        "name": "WidgetA",
+        "quantity": 15,
+        "unit_price": 250.0,
+        "amount": 3750.0
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 10,
+        "unit_price": 500.0,
+        "amount": 5000.0
+      },
+      {
+        "name": "GadgetX",
+        "quantity": 5,
+        "unit_price": 750.0,
+        "amount": 3750.0
+      },
+      {
+        "name": "WidgetA",
+        "quantity": 5,
+        "unit_price": 240.0,
+        "amount": 1200.0,
+        "note": "Volume discount"
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 8,
+        "unit_price": 480.0,
+        "amount": 3840.0,
+        "note": "Volume discount"
+      },
+      {
+        "name": "GadgetX",
+        "quantity": 3,
+        "unit_price": 750.0,
+        "amount": 2250.0,
+        "note": "Expedited"
+      },
+      {
+        "name": "WidgetA",
+        "quantity": 2,
+        "unit_price": 250.0,
+        "amount": 500.0,
+        "note": "Replacement"
+      },
+      {
+        "name": "GadgetX",
+        "quantity": 1,
+        "unit_price": 750.0,
+        "amount": 750.0,
+        "note": "Sample"
+      }
+    ],
+    "subtotal": 21040.0,
+    "tax_rate": 0.07,
+    "tax_amount": 1472.8,
+    "total": 22562.8,
+    "currency": "USD",
+    "payment_terms": "Net 60"
+  },
+  "invoice_1014.xml": {
+    "invoice_number": "INV-1014",
+    "vendor_name": "TechParts International",
+    "invoice_date_raw": "2026-01-26",
+    "due_date_raw": "2026-02-26",
+    "line_items": [
+      {
+        "name": "WidgetA",
+        "quantity": 4,
+        "unit_price": 225.0
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 6,
+        "unit_price": 475.0
+      }
+    ],
+    "subtotal": 3750.0,
+    "tax_rate": 0.1,
+    "tax_amount": 375.0,
+    "total": 4125.0,
+    "currency": "EUR",
+    "payment_terms": "Net 30"
+  },
+  "invoice_1015.csv": {
+    "invoice_number": "INV-1015",
+    "vendor_name": "Reliable Components Inc.",
+    "invoice_date_raw": "2026-01-29",
+    "due_date_raw": "2026-02-28",
+    "line_items": [
+      {
+        "name": "WidgetA",
+        "quantity": 10,
+        "unit_price": 250.0,
+        "amount": 2500.0
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 5,
+        "unit_price": 500.0,
+        "amount": 2500.0
+      },
+      {
+        "name": "GadgetX",
+        "quantity": 2,
+        "unit_price": 750.0,
+        "amount": 1500.0
+      }
+    ],
+    "subtotal": 6500.0,
+    "tax_rate": 0.0,
+    "tax_amount": 0.0,
+    "total": 6500.0,
+    "currency": "USD"
+  },
+  "invoice_1016.json": {
+    "invoice_number": "INV-1016",
+    "vendor_name": "Widgets Inc.",
+    "vendor_address": "100 Main St, Chicago, IL 60601",
+    "invoice_date_raw": "2026-01-27",
+    "due_date_raw": "2026-02-27",
+    "line_items": [
+      {
+        "name": "WidgetA",
+        "quantity": 4,
+        "unit_price": 250.0,
+        "amount": 1000.0
+      },
+      {
+        "name": "WidgetB",
+        "quantity": 2,
+        "unit_price": 500.0,
+        "amount": 1000.0
+      },
+      {
+        "name": "WidgetC",
+        "quantity": 3,
+        "unit_price": 350.0,
+        "amount": 1050.0
+      }
+    ],
+    "subtotal": 3050.0,
+    "tax_rate": 0.06,
+    "tax_amount": 183.0,
+    "total": 3233.0,
+    "currency": "USD",
+    "payment_terms": "Net 30"
+  }
+}
