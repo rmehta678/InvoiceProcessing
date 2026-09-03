@@ -34,6 +34,9 @@ export APPROVAL_THRESHOLD=1
 python main.py --invoice_path=data/invoices/invoice_1004.json
 ```
 
-## What “done” looks like for Acme
+## What this MVP Accomplishes for ACME
 
-A clerk drops a file. Clean PO-match invoices under policy clear the same day. Exceptions show up as a one-screen question (`Pay 15225 to …?`) with the reviewer’s flags, not a 40-message email thread. Every decision is in `output/` with a thread id finance can replay. That is the MVP: stop paying the wrong SKUs, stop waiting a week to pay the right ones.
+1. Clerk provides a file
+2. Invoices within policy process within minutes
+3. Clear rule violations are rejected, but otherwise one screen question of approve/reject given with context
+4. Every decision is output with thread for replay/audit
