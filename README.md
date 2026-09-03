@@ -1,5 +1,8 @@
 # Galatiq Case: Invoice Processing Automation
 
+**Solution writeup (what we built and why it matters):** [SOLUTION.md](SOLUTION.md)
+
+
 ## Background
 
 Acme Corp is a PE-backed manufacturing firm losing **$2M/year** on manual invoice processing. Invoices arrive via email as PDFs in messy formats with frequent errors. Staff manually extract data, validate against a legacy inventory database (inconsistent), obtain VP approval (via email chains), and process payment (via a banking API).

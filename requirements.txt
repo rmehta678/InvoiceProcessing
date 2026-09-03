@@ -1,0 +1,6 @@
+pdfplumber
+langgraph
+langgraph-checkpoint-sqlite
+pydantic
+typing_extensions
+pytest
