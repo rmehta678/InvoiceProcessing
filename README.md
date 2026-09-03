@@ -40,3 +40,9 @@ python main.py --invoice_path=data/invoices/invoice_1004.json
 2. Invoices within policy process within minutes
 3. Clear rule violations are rejected, but otherwise one screen question of approve/reject given with context
 4. Every decision is output with thread for replay/audit
+
+## Next Steps for Production
+1. Eval Harness
+2. VP Gate (HITL) a Robust Product: Auth/Audit Logs of Approval/SLA Timeouts/No command-line approval but via a ticketing system
+3. Auth/Tenancy/PII: Encrypt at rest, retention policy
+4. Model Constraints: Pin model version + schema, timeouts, retries, fallbacks to humans upon failures
